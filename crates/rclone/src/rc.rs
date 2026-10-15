@@ -115,6 +115,94 @@ impl RcClient {
         self.call("config/dump", &json!({})).await
     }
 
+    /// 新建 remote：parameters 为键值对（type 单独传）
+    pub async fn config_create(&self, name: &str, rtype: &str, parameters: Value) -> Result<()> {
+        self.call(
+            "config/create",
+            &json!({ "name": name, "type": rtype, "parameters": parameters }),
+        )
+        .await
+        .map(drop)
+    }
+
+    /// 更新 remote 参数（仅覆盖给出的键）
+    pub async fn config_update(&self, name: &str, parameters: Value) -> Result<()> {
+        self.call("config/update", &json!({ "name": name, "parameters": parameters }))
+            .await
+            .map(drop)
+    }
+
+    pub async fn config_delete(&self, name: &str) -> Result<()> {
+        self.call("config/delete", &json!({ "name": name }))
+            .await
+            .map(drop)
+    }
+
+    // ---------- serve ----------
+
+    pub async fn serve_list(&self) -> Result<Value> {
+        self.call("serve/list", &json!({})).await
+    }
+
+    /// 启动服务（webdav/sftp/http/ftp/dlna/nfs/docker），返回分配的 id
+    pub async fn serve_start(
+        &self,
+        stype: &str,
+        fs: &str,
+        addr: &str,
+        user: &str,
+        pass: &str,
+    ) -> Result<String> {
+        let mut params = json!({ "type": stype, "fs": fs, "addr": addr });
+        if !user.is_empty() {
+            params["user"] = json!(user);
+        }
+        if !pass.is_empty() {
+            params["pass"] = json!(pass);
+        }
+        let v = self.call("serve/start", &params).await?;
+        Ok(v.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string())
+    }
+
+    pub async fn serve_stop(&self, id: &str) -> Result<()> {
+        self.call("serve/stop", &json!({ "id": id })).await.map(drop)
+    }
+
+    // ---------- job ----------
+
+    pub async fn job_list(&self) -> Result<Vec<i64>> {
+        let v = self.call("job/list", &json!({})).await?;
+        Ok(v.get("jobids")
+            .and_then(|j| j.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+            .unwrap_or_default())
+    }
+
+    pub async fn job_status(&self, jobid: i64) -> Result<Value> {
+        self.call("job/status", &json!({ "jobid": jobid })).await
+    }
+
+    pub async fn job_stop(&self, jobid: i64) -> Result<()> {
+        self.call("job/stop", &json!({ "jobid": jobid })).await.map(drop)
+    }
+
+    // ---------- options / bwlimit ----------
+
+    /// 设置带宽限速，如 "1M"、"10M:100K"、"off"
+    pub async fn bwlimit(&self, rate: &str) -> Result<String> {
+        let v = self.call("core/bwlimit", &json!({ "rate": rate })).await?;
+        Ok(v.get("rate").and_then(|x| x.as_str()).unwrap_or(rate).to_string())
+    }
+
+    pub async fn options_get(&self) -> Result<Value> {
+        self.call("options/get", &json!({})).await
+    }
+
+    /// 设置运行时选项：{"main": {"Transfers": 4, ...}}（字段名为 Go 风格大写）
+    pub async fn options_set(&self, opts: Value) -> Result<()> {
+        self.call("options/set", &opts).await.map(drop)
+    }
+
     // ---------- operations ----------
 
     pub async fn list(&self, fs: &str, remote: &str, options: Option<Value>) -> Result<Vec<ListEntry>> {

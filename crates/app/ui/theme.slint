@@ -1,21 +1,32 @@
-// 主题全局：亮暗两套调色板，dark 由 Rust 侧根据系统/用户设置注入
+// 主题全局：rcdeck（GitHub 风）亮暗两套调色板，dark 由 Rust 侧根据系统/用户设置注入
 export global ThemeG {
     in-out property <bool> dark: false;
 
-    in-out property <color> bg: dark ? #121417 : #f5f6f8;
-    in-out property <color> panel: dark ? #191c21 : #ffffff;
-    in-out property <color> panel-2: dark ? #21252c : #f0f1f4;
-    in-out property <color> border: dark ? #2a2f38 : #e2e4e9;
-    in-out property <color> text: dark ? #e8eaed : #1c1e22;
-    in-out property <color> text-dim: dark ? #99a0ac : #6b7280;
-    in-out property <color> accent: dark ? #5b95ff : #2563eb;
-    in-out property <color> accent-soft: dark ? #5b95ff22 : #2563eb16;
-    in-out property <color> ok: dark ? #4ade80 : #16a34a;
-    in-out property <color> warn: dark ? #fbbf24 : #d97706;
-    in-out property <color> err: dark ? #f87171 : #dc2626;
-    in-out property <color> hover: dark ? #ffffff12 : #0000000d;
-    in-out property <color> pressed: dark ? #ffffff1c : #00000014;
+    // 背景 / 面板 / 边框
+    in-out property <color> bg: dark ? #0d1117 : #f6f8fa;
+    in-out property <color> panel: dark ? #161b22 : #ffffff;
+    in-out property <color> panel-2: dark ? #21262d : #eaeef2;
+    in-out property <color> border: dark ? #30363d : #e1e4e8;
 
-    in-out property <length> radius: 10px;
+    // 文字
+    in-out property <color> text: dark ? #c9d1d9 : #24292f;
+    in-out property <color> text-dim: dark ? #8b949e : #656d76;
+    in-out property <color> placeholder: dark ? #484f58 : #8c959f;
+
+    // 主色与状态色
+    in-out property <color> accent: dark ? #58a6ff : #0969da;
+    in-out property <color> accent-soft: dark ? #58a6ff22 : #0969da16;
+    in-out property <color> primary: dark ? #1f6feb : #0969da;
+    in-out property <color> primary-hover: dark ? #388bfd : #0860ca;
+    in-out property <color> ok: dark ? #3fb950 : #1a7f37;
+    in-out property <color> warn: dark ? #d29922 : #bf8700;
+    in-out property <color> err: dark ? #f85149 : #cf222e;
+
+    // 交互态
+    in-out property <color> hover: dark ? #ffffff12 : #00000008;
+    in-out property <color> pressed: dark ? #ffffff1c : #00000012;
+
+    // 圆角：卡片 8px，按钮/输入框 6px
+    in-out property <length> radius: 8px;
     in-out property <length> radius-s: 6px;
 }

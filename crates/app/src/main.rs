@@ -33,6 +33,21 @@ enum Cmd {
     MountsRefresh,
     MountAdd,
     MountRemove { point: String },
+    RemotesRefresh,
+    RemotesFilter,
+    RemoteAdd,
+    RemoteEditLoad { name: String },
+    RemoteDelete { name: String },
+    RemoteSave,
+    RemoteCancel,
+    ServesRefresh,
+    ServeStart,
+    ServeStop { id: String },
+    JobsRefresh,
+    JobStop { id: i64 },
+    BwLimitApply,
+    OptionsLoad,
+    OptionsSave,
     PluginsRescan,
     IhSaveConfig,
     IhAddRoot,
@@ -55,6 +70,8 @@ struct Ctx {
     exe: PathBuf,
     cfg: Arc<std::sync::Mutex<config::AppConfig>>,
     http_restart: Arc<tokio::sync::Notify>,
+    /// (name, type, usage) 全量远程缓存，筛选时避免重复请求
+    remotes_cache: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
 }
 
 impl Ctx {
@@ -200,6 +217,56 @@ fn split_name(name: &str) -> (String, String) {
     }
 }
 
+fn parse_kv_lines(text: &str) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(eq) = line.find('=') {
+            let k = line[..eq].trim();
+            let v = line[eq + 1..].trim();
+            if !k.is_empty() {
+                m.insert(k.to_string(), Value::String(v.to_string()));
+            }
+        }
+    }
+    m
+}
+
+fn fmt_duration(secs: f64) -> String {
+    let s = secs.round() as u64;
+    if s >= 3600 {
+        format!("{}h {}m", s / 3600, (s % 3600) / 60)
+    } else if s >= 60 {
+        format!("{}m {}s", s / 60, s % 60)
+    } else {
+        format!("{}s", s)
+    }
+}
+
+fn apply_remotes_filter(ui: &Weak<MainWindow>, full: &[(String, String, String)]) {
+    let filter = ui
+        .upgrade()
+        .map(|u| u.global::<RemotesG>().get_filter().to_string())
+        .unwrap_or_default()
+        .to_lowercase();
+    let rows: Vec<RemoteRow> = full
+        .iter()
+        .filter(|(n, _, _)| filter.is_empty() || n.to_lowercase().contains(&filter))
+        .map(|(n, t, u)| RemoteRow {
+            name: n.clone().into(),
+            rtype: t.clone().into(),
+            usage: u.clone().into(),
+        })
+        .collect();
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.global::<RemotesG>()
+            .set_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+    });
+}
+
 fn b64(data: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(data)
@@ -277,6 +344,7 @@ fn main() {
         exe: PathBuf::from(&cfg.rclone.exe),
         cfg: cfg_arc.clone(),
         http_restart: Arc::new(tokio::sync::Notify::new()),
+        remotes_cache: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
 
     {
@@ -364,15 +432,16 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
         if let Err(e) = res {
             toast(&ui, 2, format!("rclone 连接失败: {e}"));
         }
-        let version = ctx
+        let ver_info = ctx
             .mgr
             .client
             .read()
             .await
             .version()
             .await
-            .map(|v| v.version)
             .unwrap_or_default();
+        let version = ver_info.version;
+        let os_info = format!("{} / {}", ver_info.os, ver_info.arch);
         let running = version.starts_with('v');
         let managed = cfg.rclone.mode == 0;
         let url = if managed {
@@ -384,6 +453,7 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
             move |ui| {
                 let g = ui.global::<DashboardG>();
                 g.set_version(version.into());
+                g.set_os_info(os_info.into());
                 g.set_running(running);
                 g.set_managed(managed);
                 g.set_url(url.into());
@@ -514,7 +584,10 @@ async fn poll_stats(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
                     percent: t.percentage.clamp(0.0, 100.0) as i32,
                 })
                 .collect();
-            g.set_xfers(ModelRc::from(Rc::new(VecModel::from(rows))));
+            let model = ModelRc::from(Rc::new(VecModel::from(rows.clone())));
+            g.set_xfers(model);
+            ui.global::<TransfersG>()
+                .set_active(ModelRc::from(Rc::new(VecModel::from(rows))));
         },
     );
 }
@@ -529,7 +602,9 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
         }
         Cmd::RefreshDashboard => {
             let client = ctx.mgr.client.read().await.clone();
-            let version = client.version().await.map(|v| v.version).unwrap_or_default();
+            let ver_info = client.version().await.unwrap_or_default();
+            let version = ver_info.version;
+            let os_info = format!("{} / {}", ver_info.os, ver_info.arch);
             let remotes = client.list_remotes().await.map(|r| r.len()).unwrap_or(0);
             let errs = client.core_stats().await.map(|s| s.errors).unwrap_or(0);
             let managed = ctx.cfg.lock().unwrap().rclone.mode == 0;
@@ -546,6 +621,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 move |ui| {
                     let g = ui.global::<DashboardG>();
                     g.set_version(version.into());
+                    g.set_os_info(os_info.into());
                     g.set_remotes(remotes as i32);
                     g.set_errors(errs as i32);
                     g.set_running(running);
@@ -810,6 +886,439 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     toast(ui, 1, format!("已卸载 {point}"));
                 }
                 Err(e) => toast(ui, 2, format!("卸载失败: {e}")),
+            }
+            false
+        }
+        Cmd::RemotesRefresh => {
+            let client = ctx.mgr.client.read().await.clone();
+            let names = client.list_remotes().await.unwrap_or_default();
+            let dump = client.config_dump().await.unwrap_or(json!({}));
+            let mut full: Vec<(String, String, String)> = Vec::with_capacity(names.len());
+            {
+                let cache = ctx.remotes_cache.lock().unwrap();
+                for n in &names {
+                    let ty = dump
+                        .get(n)
+                        .and_then(|e| e.get("type"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    let usage = cache
+                        .iter()
+                        .find(|(cn, _, _)| cn == n)
+                        .map(|(_, _, u)| u.clone())
+                        .unwrap_or_else(|| "…".into());
+                    full.push((n.clone(), ty, usage));
+                }
+            }
+            *ctx.remotes_cache.lock().unwrap() = full.clone();
+            apply_remotes_filter(ui, &full);
+            // 异步加载用量
+            for n in names {
+                let client = client.clone();
+                let ctx2 = ctx.clone();
+                let ui2 = ui.clone();
+                tokio::spawn(async move {
+                    let usage = match client.about(&format!("{n}:")).await {
+                        Ok(v) => {
+                            let total = v.get("total").and_then(|x| x.as_f64());
+                            let used = v.get("used").and_then(|x| x.as_f64());
+                            match (total, used) {
+                                (Some(t), Some(u)) => format!("{} / {}", fmt_bytes(u), fmt_bytes(t)),
+                                (None, Some(u)) => format!("已用 {}", fmt_bytes(u)),
+                                _ => "—".into(),
+                            }
+                        }
+                        Err(_) => "—".into(),
+                    };
+                    {
+                        let mut cache = ctx2.remotes_cache.lock().unwrap();
+                        if let Some(e) = cache.iter_mut().find(|(cn, _, _)| cn == &n) {
+                            e.2 = usage.clone();
+                        }
+                    }
+                    let _ = ui2.upgrade_in_event_loop(move |ui| {
+                        let g = ui.global::<RemotesG>();
+                        let rows = g.get_rows();
+                        for i in 0..rows.row_count() {
+                            if let Some(mut r) = rows.row_data(i) {
+                                if r.name.as_str() == n.as_str() {
+                                    r.usage = usage.clone().into();
+                                    rows.set_row_data(i, r);
+                                }
+                            }
+                        }
+                    });
+                    let full2 = ctx2.remotes_cache.lock().unwrap().clone();
+                    apply_remotes_filter(&ui2, &full2);
+                });
+            }
+            false
+        }
+        Cmd::RemotesFilter => {
+            let full = ctx.remotes_cache.lock().unwrap().clone();
+            apply_remotes_filter(ui, &full);
+            false
+        }
+        Cmd::RemoteAdd => {
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                let g = ui.global::<RemotesG>();
+                g.set_edit_is_new(true);
+                g.set_edit_name("".into());
+                g.set_edit_params("".into());
+                g.set_type_idx(0);
+                g.set_show_editor(true);
+            });
+            false
+        }
+        Cmd::RemoteEditLoad { name } => {
+            let client = ctx.mgr.client.read().await.clone();
+            let dump = client.config_dump().await.unwrap_or(json!({}));
+            let entry = dump.get(&name).cloned().unwrap_or(json!({}));
+            let ty = entry
+                .get("type")
+                .and_then(|x| x.as_str())
+                .unwrap_or("local")
+                .to_string();
+            let params_text = entry
+                .as_object()
+                .map(|o| {
+                    o.iter()
+                        .filter(|(k, _)| *k != "type")
+                        .map(|(k, v)| format!("{}={}", k, v.as_str().unwrap_or(&v.to_string())))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                let g = ui.global::<RemotesG>();
+                let mut types: Vec<slint::SharedString> =
+                    (0..g.get_types().row_count()).filter_map(|i| g.get_types().row_data(i)).collect();
+                let idx = types.iter().position(|t| t.as_str() == ty);
+                if idx.is_none() {
+                    types.push(ty.clone().into());
+                }
+                g.set_types(ModelRc::from(Rc::new(VecModel::from(types.clone()))));
+                let new_idx = idx.unwrap_or(types.len() - 1) as i32;
+                g.set_type_idx(new_idx);
+                g.set_edit_is_new(false);
+                g.set_edit_name(name.into());
+                g.set_edit_params(params_text.into());
+                g.set_show_editor(true);
+            });
+            false
+        }
+        Cmd::RemoteSave => {
+            let (name, type_str, params_text, is_new) = ui
+                .upgrade()
+                .map(|ui| {
+                    let g = ui.global::<RemotesG>();
+                    let ti = g.get_type_idx().max(0) as usize;
+                    let ty = g.get_types().row_data(ti).unwrap_or_default().to_string();
+                    (
+                        g.get_edit_name().to_string(),
+                        ty,
+                        g.get_edit_params().to_string(),
+                        g.get_edit_is_new(),
+                    )
+                })
+                .unwrap_or_default();
+            if name.trim().is_empty() || name.contains(':') || name.contains(' ') {
+                toast(ui, 2, "名称不能为空，且不能包含空格或冒号");
+                return false;
+            }
+            let params = serde_json::Value::Object(parse_kv_lines(&params_text));
+            let client = ctx.mgr.client.read().await.clone();
+            let res = if is_new {
+                client.config_create(&name, &type_str, params).await
+            } else {
+                client.config_update(&name, params).await
+            };
+            match res {
+                Ok(()) => {
+                    let _ = ui.upgrade_in_event_loop(|ui| {
+                        ui.global::<RemotesG>().set_show_editor(false);
+                    });
+                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::RemotesRefresh)).await;
+                    toast(ui, 1, format!("远程存储 {} 已保存", name));
+                }
+                Err(e) => toast(ui, 2, format!("保存失败: {e}")),
+            }
+            false
+        }
+        Cmd::RemoteDelete { name } => {
+            if !confirm_dialog(format!("确认删除远程存储 {}？", name)) {
+                return false;
+            }
+            let client = ctx.mgr.client.read().await.clone();
+            match client.config_delete(&name).await {
+                Ok(()) => {
+                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::RemotesRefresh)).await;
+                    toast(ui, 1, format!("已删除 {name}"));
+                }
+                Err(e) => toast(ui, 2, format!("删除失败: {e}")),
+            }
+            false
+        }
+        Cmd::RemoteCancel => {
+            let _ = ui.upgrade_in_event_loop(|ui| {
+                ui.global::<RemotesG>().set_show_editor(false);
+            });
+            false
+        }
+        Cmd::ServesRefresh => {
+            let client = ctx.mgr.client.read().await.clone();
+            let remotes = client.list_remotes().await.unwrap_or_default();
+            let v = client.serve_list().await.unwrap_or(json!({}));
+            let items = v
+                .get("list")
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let rows: Vec<ServeRow> = items
+                .iter()
+                .map(|it| {
+                    let id = it
+                        .get("id")
+                        .and_then(|x| {
+                            x.as_str()
+                                .map(|s| s.to_string())
+                                .or_else(|| x.as_i64().map(|n| n.to_string()))
+                        })
+                        .unwrap_or_default();
+                    let ty = it
+                        .get("type")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let params = it.get("params").cloned().unwrap_or(json!({}));
+                    let getp = |keys: &[&str]| -> String {
+                        for k in keys {
+                            if let Some(v) = params.get(*k).and_then(|x| x.as_str()) {
+                                return v.to_string();
+                            }
+                            if let Some(v) = it.get(*k).and_then(|x| x.as_str()) {
+                                return v.to_string();
+                            }
+                        }
+                        String::new()
+                    };
+                    ServeRow {
+                        id: id.into(),
+                        stype: ty.into(),
+                        fs: getp(&["fs", "Fs"]).into(),
+                        addr: getp(&["addr", "Addr", "listen", "Listen"]).into(),
+                    }
+                })
+                .collect();
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                ui.global::<ServesG>().set_remotes(ModelRc::from(Rc::new(VecModel::from(
+                    remotes.iter().map(|r| r.clone().into()).collect::<Vec<slint::SharedString>>(),
+                ))));
+                ui.global::<ServesG>()
+                    .set_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+            });
+            false
+        }
+        Cmd::ServeStart => {
+            let (stype, fs, addr, user, pass) = ui
+                .upgrade()
+                .map(|ui| {
+                    let g = ui.global::<ServesG>();
+                    let ty = g
+                        .get_types()
+                        .row_data(g.get_type_idx().max(0) as usize)
+                        .unwrap_or_default()
+                        .to_string();
+                    let fs = g
+                        .get_remotes()
+                        .row_data(g.get_remote_idx().max(0) as usize)
+                        .unwrap_or_default()
+                        .to_string();
+                    (
+                        ty,
+                        fs,
+                        g.get_addr().to_string(),
+                        g.get_user().to_string(),
+                        g.get_pass().to_string(),
+                    )
+                })
+                .unwrap_or_default();
+            if fs.is_empty() {
+                toast(ui, 2, "请先在「远程」页创建远程存储");
+                return false;
+            }
+            if addr.trim().is_empty() {
+                toast(ui, 2, "请填写监听地址");
+                return false;
+            }
+            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<ServesG>().set_busy(true));
+            let client = ctx.mgr.client.read().await.clone();
+            let res = client
+                .serve_start(&stype, &format!("{fs}:"), &addr, &user, &pass)
+                .await;
+            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<ServesG>().set_busy(false));
+            match res {
+                Ok(id) => {
+                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ServesRefresh)).await;
+                    toast(ui, 1, format!("服务已启动: {id}"));
+                }
+                Err(e) => toast(ui, 2, format!("启动失败: {e}")),
+            }
+            false
+        }
+        Cmd::ServeStop { id } => {
+            let client = ctx.mgr.client.read().await.clone();
+            match client.serve_stop(&id).await {
+                Ok(()) => {
+                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ServesRefresh)).await;
+                    toast(ui, 1, format!("已停止 {id}"));
+                }
+                Err(e) => toast(ui, 2, format!("停止失败: {e}")),
+            }
+            false
+        }
+        Cmd::JobsRefresh => {
+            let client = ctx.mgr.client.read().await.clone();
+            let ids = client.job_list().await.unwrap_or_default();
+            let mut rows: Vec<JobRow> = Vec::new();
+            for id in &ids {
+                if let Ok(st) = client.job_status(*id).await {
+                    let finished = st
+                        .get("finished")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false);
+                    let success = st
+                        .get("success")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false);
+                    let error = st
+                        .get("error")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let duration = st.get("duration").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    let status = if !finished {
+                        "运行中"
+                    } else if success {
+                        "已完成"
+                    } else {
+                        "失败"
+                    }
+                    .to_string();
+                    let progress = st
+                        .get("progress")
+                        .and_then(|p| {
+                            p.as_f64()
+                                .or_else(|| p.get("percent").and_then(|x| x.as_f64()))
+                        })
+                        .unwrap_or(0.0) as i32;
+                    let desc = if finished && !success && !error.is_empty() {
+                        format!("#{} · {}", id, error)
+                    } else {
+                        format!("任务 #{}", id)
+                    };
+                    rows.push(JobRow {
+                        id: *id as i32,
+                        desc: desc.into(),
+                        status: status.into(),
+                        progress,
+                        duration: fmt_duration(duration).into(),
+                    });
+                }
+            }
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                ui.global::<TransfersG>()
+                    .set_jobs(ModelRc::from(Rc::new(VecModel::from(rows))));
+            });
+            false
+        }
+        Cmd::JobStop { id } => {
+            let client = ctx.mgr.client.read().await.clone();
+            match client.job_stop(id).await {
+                Ok(()) => {
+                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::JobsRefresh)).await;
+                    toast(ui, 1, format!("任务 #{} 已停止", id));
+                }
+                Err(e) => toast(ui, 2, format!("停止失败: {e}")),
+            }
+            false
+        }
+        Cmd::BwLimitApply => {
+            let rate = ui
+                .upgrade()
+                .map(|ui| ui.global::<TransfersG>().get_bwlimit().to_string())
+                .unwrap_or_default();
+            let rate = if rate.trim().is_empty() { "off".into() } else { rate.trim().to_string() };
+            let client = ctx.mgr.client.read().await.clone();
+            match client.bwlimit(&rate).await {
+                Ok(applied) => toast(ui, 1, format!("限速已设为 {}", applied)),
+                Err(e) => toast(ui, 2, format!("限速设置失败: {e}")),
+            }
+            false
+        }
+        Cmd::OptionsLoad => {
+            let client = ctx.mgr.client.read().await.clone();
+            match client.options_get().await {
+                Ok(v) => {
+                    let main = v.get("main").cloned().unwrap_or(json!({}));
+                    let transfers = main.get("Transfers").and_then(|x| x.as_i64()).map(|n| n.to_string()).unwrap_or_default();
+                    let checkers = main.get("Checkers").and_then(|x| x.as_i64()).map(|n| n.to_string()).unwrap_or_default();
+                    let tps = main.get("TPSLimit").and_then(|x| x.as_f64()).map(|n| format!("{:.1}", n)).unwrap_or_default();
+                    let log = main
+                        .get("LogLevel")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("INFO")
+                        .to_string();
+                    let _ = ui.upgrade_in_event_loop(move |ui| {
+                        let g = ui.global::<SettingsG>();
+                        g.set_opt_transfers(transfers.into());
+                        g.set_opt_checkers(checkers.into());
+                        g.set_opt_tpslimit(tps.into());
+                        let lv = g.get_log_levels();
+                        let mut idx: i32 = 1;
+                        for i in 0..lv.row_count() {
+                            if lv.row_data(i).as_deref() == Some(log.as_str()) {
+                                idx = i as i32;
+                            }
+                        }
+                        g.set_log_level_idx(idx);
+                    });
+                }
+                Err(e) => toast(ui, 2, format!("读取参数失败: {e}")),
+            }
+            false
+        }
+        Cmd::OptionsSave => {
+            let (transfers, checkers, tps, log_level) = ui
+                .upgrade()
+                .map(|ui| {
+                    let g = ui.global::<SettingsG>();
+                    let li = g.get_log_level_idx() as usize;
+                    let lv = g.get_log_levels().row_data(li).unwrap_or_default().to_string();
+                    (
+                        g.get_opt_transfers().to_string(),
+                        g.get_opt_checkers().to_string(),
+                        g.get_opt_tpslimit().to_string(),
+                        lv,
+                    )
+                })
+                .unwrap_or_default();
+            let t: i64 = transfers.parse().unwrap_or(4);
+            let c: i64 = checkers.parse().unwrap_or(8);
+            let p: f64 = tps.parse().unwrap_or(0.0);
+            let opts = json!({
+                "main": {
+                    "Transfers": t,
+                    "Checkers": c,
+                    "TPSLimit": p,
+                    "LogLevel": log_level,
+                }
+            });
+            let client = ctx.mgr.client.read().await.clone();
+            match client.options_set(opts).await {
+                Ok(()) => toast(ui, 1, "运行参数已保存"),
+                Err(e) => toast(ui, 2, format!("保存失败: {e}")),
             }
             false
         }
@@ -1396,6 +1905,117 @@ fn wire_callbacks(ui: &MainWindow, ctx: Arc<Ctx>, tx: mpsc::UnboundedSender<Cmd>
             let _ = tx.send(Cmd::MountRemove { point: point.to_string() });
         }
     });
+    ui.on_nav_select({
+        let tx = tx.clone();
+        move |i| {
+            match i {
+                0 => { let _ = tx.send(Cmd::RefreshDashboard); }
+                1 => { let _ = tx.send(Cmd::FilesInit); }
+                2 => { let _ = tx.send(Cmd::RemotesRefresh); }
+                3 => { let _ = tx.send(Cmd::MountsRefresh); }
+                4 => { let _ = tx.send(Cmd::ServesRefresh); }
+                5 => { let _ = tx.send(Cmd::JobsRefresh); }
+                7 => { let _ = tx.send(Cmd::OptionsLoad); }
+                _ => {}
+            }
+        }
+    });
+    ui.on_remotes_refresh({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::RemotesRefresh);
+        }
+    });
+    ui.on_remotes_filter({
+        let tx = tx.clone();
+        move |_| {
+            let _ = tx.send(Cmd::RemotesFilter);
+        }
+    });
+    ui.on_remote_add({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::RemoteAdd);
+        }
+    });
+    ui.on_remote_edit({
+        let tx = tx.clone();
+        let ui = ui.as_weak();
+        move |i| {
+            let name = ui
+                .upgrade()
+                .and_then(|ui| ui.global::<RemotesG>().get_rows().row_data(i as usize))
+                .map(|r| r.name.to_string())
+                .unwrap_or_default();
+            let _ = tx.send(Cmd::RemoteEditLoad { name });
+        }
+    });
+    ui.on_remote_del({
+        let tx = tx.clone();
+        let ui = ui.as_weak();
+        move |i| {
+            let name = ui
+                .upgrade()
+                .and_then(|ui| ui.global::<RemotesG>().get_rows().row_data(i as usize))
+                .map(|r| r.name.to_string())
+                .unwrap_or_default();
+            let _ = tx.send(Cmd::RemoteDelete { name });
+        }
+    });
+    ui.on_remote_editor_save({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::RemoteSave);
+        }
+    });
+    ui.on_remote_editor_cancel({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::RemoteCancel);
+        }
+    });
+    ui.on_serves_refresh({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::ServesRefresh);
+        }
+    });
+    ui.on_serve_start({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::ServeStart);
+        }
+    });
+    ui.on_serve_stop({
+        let tx = tx.clone();
+        move |id| {
+            let _ = tx.send(Cmd::ServeStop { id: id.to_string() });
+        }
+    });
+    ui.on_transfers_refresh({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::JobsRefresh);
+        }
+    });
+    ui.on_bwlimit_apply({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::BwLimitApply);
+        }
+    });
+    ui.on_job_stop({
+        let tx = tx.clone();
+        move |id| {
+            let _ = tx.send(Cmd::JobStop { id: id as i64 });
+        }
+    });
+    ui.on_options_save({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::OptionsSave);
+        }
+    });
     ui.on_plugins_rescan({
         let tx = tx.clone();
         move || {
@@ -1526,6 +2146,8 @@ fn wire_callbacks(ui: &MainWindow, ctx: Arc<Ctx>, tx: mpsc::UnboundedSender<Cmd>
     // 初始加载
     let _ = tx.send(Cmd::RefreshDashboard);
     let _ = tx.send(Cmd::FilesInit);
+    let _ = tx.send(Cmd::RemotesRefresh);
+    let _ = tx.send(Cmd::MountsRefresh);
     let _ = tx.send(Cmd::PluginsRescan);
 }
 
