@@ -29,6 +29,17 @@ pub struct HttpState {
     pub caps: Arc<RealCaps>,
     pub mgr: Arc<RcloneManager>,
     pub exe: PathBuf,
+    pub cfg: Arc<std::sync::Mutex<config::AppConfig>>,
+}
+
+impl HttpState {
+    /// 插件是否已启用（默认启用）
+    fn plugin_enabled(&self, id: &str) -> bool {
+        self.cfg
+            .lock()
+            .map(|c| c.plugin_enabled.get(id).copied().unwrap_or(true))
+            .unwrap_or(true)
+    }
 }
 
 pub fn build_router(state: HttpState) -> Router {
@@ -73,6 +84,13 @@ async fn plugin_dispatch(
     req: Request,
 ) -> impl IntoResponse {
     let plugin_path = format!("/{rest}");
+    if !st.plugin_enabled(&id) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"error": format!("插件 {id} 已停用")})),
+        )
+            .into_response();
+    }
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

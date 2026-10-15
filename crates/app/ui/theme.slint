@@ -1,30 +1,83 @@
-// 主题全局：rcdeck（GitHub 风）亮暗两套调色板，dark 由 Rust 侧根据系统/用户设置注入
+// 主题全局：rcdeck（GitHub 风）
+// 两个独立模块：
+//   1. 明暗模式（dark）：决定背景/面板/边框/文字等中性色
+//   2. 强调色（accent-idx）：决定主色/选中色，每种强调色在明/暗下各有一套取值
+// dark 由 Rust 侧根据系统/用户设置注入
+
+// 强调色定义：每种颜色给出 [暗色 accent, 亮色 accent, 暗色 primary, 亮色 primary, 暗色 primary-hover, 亮色 primary-hover]
+global AccentDef {
+    // 蓝（默认，GitHub 风）
+    out property <color> blue-accent-d: #58a6ff;
+    out property <color> blue-accent-l: #0969da;
+    out property <color> blue-primary-d: #1f6feb;
+    out property <color> blue-primary-l: #0969da;
+    out property <color> blue-primary-hover-d: #388bfd;
+    out property <color> blue-primary-hover-l: #0860ca;
+    // 绿
+    out property <color> green-accent-d: #3fb950;
+    out property <color> green-accent-l: #1a7f37;
+    out property <color> green-primary-d: #238636;
+    out property <color> green-primary-l: #1f883d;
+    out property <color> green-primary-hover-d: #2ea043;
+    out property <color> green-primary-hover-l: #1a7f37;
+    // 紫
+    out property <color> purple-accent-d: #d2a8ff;
+    out property <color> purple-accent-l: #8250df;
+    out property <color> purple-primary-d: #8957e5;
+    out property <color> purple-primary-l: #8250df;
+    out property <color> purple-primary-hover-d: #a371f7;
+    out property <color> purple-primary-hover-l: #6f42c1;
+    // 橙
+    out property <color> orange-accent-d: #ffa657;
+    out property <color> orange-accent-l: #bc4c00;
+    out property <color> orange-primary-d: #d4760a;
+    out property <color> orange-primary-l: #bf5b00;
+    out property <color> orange-primary-hover-d: #f0883e;
+    out property <color> orange-primary-hover-l: #a44e00;
+}
+
 export global ThemeG {
     in-out property <bool> dark: false;
+    in-out property <int> accent-idx: 0; // 0 蓝 / 1 绿 / 2 紫 / 3 橙
 
-    // 背景 / 面板 / 边框
+    // ---------- 强调色模块（随明暗变化） ----------
+    in-out property <color> accent:
+        accent-idx == 1 ? (dark ? AccentDef.green-accent-d : AccentDef.green-accent-l) :
+        accent-idx == 2 ? (dark ? AccentDef.purple-accent-d : AccentDef.purple-accent-l) :
+        accent-idx == 3 ? (dark ? AccentDef.orange-accent-d : AccentDef.orange-accent-l) :
+                          (dark ? AccentDef.blue-accent-d : AccentDef.blue-accent-l);
+    // 选中背景：强调色 + 低透明度
+    in-out property <color> accent-soft:
+        accent-idx == 1 ? (dark ? #3fb95026 : #1a7f371a) :
+        accent-idx == 2 ? (dark ? #d2a8ff26 : #8250df1a) :
+        accent-idx == 3 ? (dark ? #ffa65726 : #bc4c001a) :
+                          (dark ? #58a6ff26 : #0969da1a);
+    in-out property <color> primary:
+        accent-idx == 1 ? (dark ? AccentDef.green-primary-d : AccentDef.green-primary-l) :
+        accent-idx == 2 ? (dark ? AccentDef.purple-primary-d : AccentDef.purple-primary-l) :
+        accent-idx == 3 ? (dark ? AccentDef.orange-primary-d : AccentDef.orange-primary-l) :
+                          (dark ? AccentDef.blue-primary-d : AccentDef.blue-primary-l);
+    in-out property <color> primary-hover:
+        accent-idx == 1 ? (dark ? AccentDef.green-primary-hover-d : AccentDef.green-primary-hover-l) :
+        accent-idx == 2 ? (dark ? AccentDef.purple-primary-hover-d : AccentDef.purple-primary-hover-l) :
+        accent-idx == 3 ? (dark ? AccentDef.orange-primary-hover-d : AccentDef.orange-primary-hover-l) :
+                          (dark ? AccentDef.blue-primary-hover-d : AccentDef.blue-primary-hover-l);
+
+    // ---------- 明暗模块（中性色，不随强调色变化） ----------
     in-out property <color> bg: dark ? #0d1117 : #f6f8fa;
     in-out property <color> panel: dark ? #161b22 : #ffffff;
     in-out property <color> panel-2: dark ? #21262d : #eaeef2;
     in-out property <color> border: dark ? #30363d : #e1e4e8;
-
-    // 文字
     in-out property <color> text: dark ? #c9d1d9 : #24292f;
     in-out property <color> text-dim: dark ? #8b949e : #656d76;
     in-out property <color> placeholder: dark ? #484f58 : #8c959f;
+    in-out property <color> hover: dark ? #ffffff12 : #00000008;
+    in-out property <color> pressed: dark ? #ffffff1c : #00000012;
 
-    // 主色与状态色
-    in-out property <color> accent: dark ? #58a6ff : #0969da;
-    in-out property <color> accent-soft: dark ? #58a6ff22 : #0969da16;
-    in-out property <color> primary: dark ? #1f6feb : #0969da;
-    in-out property <color> primary-hover: dark ? #388bfd : #0860ca;
+    // ---------- 状态色（语义色，随明暗微调） ----------
     in-out property <color> ok: dark ? #3fb950 : #1a7f37;
     in-out property <color> warn: dark ? #d29922 : #bf8700;
     in-out property <color> err: dark ? #f85149 : #cf222e;
-
-    // 交互态
-    in-out property <color> hover: dark ? #ffffff12 : #00000008;
-    in-out property <color> pressed: dark ? #ffffff1c : #00000012;
 
     // 圆角：卡片 8px，按钮/输入框 6px
     in-out property <length> radius: 8px;

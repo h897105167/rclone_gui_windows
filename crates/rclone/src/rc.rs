@@ -99,13 +99,14 @@ impl RcClient {
 
     // ---------- config ----------
 
+    /// 远程名统一去掉结尾冒号，调用方拼接 fs 时用 format!("{name}:")
     pub async fn list_remotes(&self) -> Result<Vec<String>> {
         let v = self.call("config/listremotes", &json!({})).await?;
         Ok(v.get("remotes")
             .and_then(|r| r.as_array())
             .map(|a| {
                 a.iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .filter_map(|x| x.as_str().map(|s| s.trim_end_matches(':').to_string()))
                     .collect()
             })
             .unwrap_or_default())

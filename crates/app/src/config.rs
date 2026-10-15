@@ -65,6 +65,9 @@ pub struct AppConfig {
     /// 0 跟随系统 / 1 浅色 / 2 深色
     #[serde(default)]
     pub theme_mode: u8,
+    /// 强调色：0 蓝 / 1 绿 / 2 紫 / 3 橙
+    #[serde(default)]
+    pub accent_idx: u8,
     #[serde(default)]
     pub autostart: bool,
     #[serde(default)]

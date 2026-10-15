@@ -49,6 +49,7 @@ enum Cmd {
     OptionsLoad,
     OptionsSave,
     PluginsRescan,
+    PluginToggle { idx: i32 },
     IhSaveConfig,
     IhAddRoot,
     IhDelRoot { id: String },
@@ -316,6 +317,8 @@ fn main() {
     ui.global::<SettingsG>().set_rc_pass(cfg.rclone.pass.clone().into());
     ui.global::<SettingsG>().set_rc_url(cfg.rclone.url.clone().into());
     ui.global::<SettingsG>().set_theme_idx(cfg.theme_mode as i32);
+    ui.global::<ThemeG>().set_accent_idx(cfg.accent_idx as i32);
+    ui.global::<SettingsG>().set_accent_idx(cfg.accent_idx as i32);
     ui.global::<SettingsG>().set_autostart(get_autostart());
     ui.global::<SettingsG>().set_silent(cfg.silent_start);
     ui.global::<SettingsG>().set_http_enabled(cfg.http.enabled);
@@ -550,6 +553,7 @@ async fn spawn_http(ctx: &Arc<Ctx>, port: u16, ui: Weak<MainWindow>) {
         caps,
         mgr: ctx.mgr.clone(),
         exe: ctx.exe.clone(),
+        cfg: ctx.cfg.clone(),
     };
     tokio::spawn(async move {
         if let Err(e) = http::serve(st, port).await {
@@ -645,11 +649,17 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     ui.global::<FilesG>().set_remote_idx(0);
                 },
             );
+            // 给事件循环留时间完成 remotes 设置，避免 FilesRefresh 读到空 remote
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh)).await;
             false
         }
         Cmd::FilesRefresh => {
             let (remote, path) = ui_files_pos(ui);
+            // remotes 尚未加载完成时静默跳过，避免 fs=":" 报错
+            if remote.is_empty() {
+                return false;
+            }
             let client = ctx.mgr.client.read().await.clone();
             let fs = format!("{remote}:");
             let res = client.list(&fs, &path, None).await;
@@ -1326,6 +1336,34 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             rescan_plugins(ctx, ui).await;
             false
         }
+        Cmd::PluginToggle { idx } => {
+            let row = ui
+                .upgrade()
+                .and_then(|ui| ui.global::<PluginsG>().get_rows().row_data(idx as usize));
+            if let Some(r) = row {
+                let id = r.id.to_string();
+                let enabled = !r.enabled;
+                {
+                    let mut cfg = ctx.cfg.lock().unwrap();
+                    cfg.plugin_enabled.insert(id.clone(), enabled);
+                    let _ = config::save(&cfg);
+                }
+                let _ = ui.upgrade_in_event_loop(move |ui| {
+                    let g = ui.global::<PluginsG>();
+                    let model = g.get_rows();
+                    if let Some(mut row) = model.row_data(idx as usize) {
+                        row.enabled = enabled;
+                        model.set_row_data(idx as usize, row);
+                    }
+                    toast_ui(
+                        &ui,
+                        1,
+                        format!("插件 {} 已{}", id, if enabled { "启用" } else { "停用" }),
+                    );
+                });
+            }
+            false
+        }
         Cmd::IhSaveConfig => {
             ih_save_config(ctx, ui).await;
             false
@@ -1499,12 +1537,14 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 cfg.rclone.pass = s.get_rc_pass().to_string();
                 cfg.rclone.url = s.get_rc_url().to_string();
                 cfg.theme_mode = s.get_theme_idx() as u8;
+                cfg.accent_idx = s.get_accent_idx() as u8;
                 cfg.autostart = s.get_autostart();
                 cfg.silent_start = s.get_silent();
                 cfg.http.enabled = s.get_http_enabled();
                 cfg.http.port = s.get_http_port().parse().unwrap_or(5273);
                 set_autostart(cfg.autostart, cfg.silent_start);
                 apply_theme(&ui, cfg.theme_mode);
+                ui.global::<ThemeG>().set_accent_idx(cfg.accent_idx as i32);
                 *ctx.cfg.lock().unwrap() = cfg.clone();
                 if let Err(e) = config::save(&cfg) {
                     toast_ui(&ui, 2, format!("配置保存失败: {e}"));
@@ -1536,18 +1576,21 @@ async fn rescan_plugins(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             dirs.push(d.join("assets/plugins"));
         }
     }
+    let enabled_map = ctx.cfg.lock().unwrap().plugin_enabled.clone();
     for dir in dirs {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for entry in rd.flatten() {
             let p = entry.path();
             if p.extension().and_then(|e| e.to_str()) == Some("wasm") {
                 if let Ok(m) = ctx.host.load_manifest(&p).await {
+                    let enabled = enabled_map.get(&m.id).copied().unwrap_or(true);
                     rows.push(PluginRow {
                         id: m.id.clone().into(),
                         name: m.name.clone().into(),
                         version: m.version.into(),
                         desc: m.description.into(),
                         loaded: true,
+                        enabled,
                     });
                 }
             }
@@ -2114,6 +2157,12 @@ fn wire_callbacks(ui: &MainWindow, ctx: Arc<Ctx>, tx: mpsc::UnboundedSender<Cmd>
     });
     ui.on_copy_text(move |text| {
         clipboard_copy(&text);
+    });
+    ui.on_plugin_toggle({
+        let tx = tx.clone();
+        move |i| {
+            let _ = tx.send(Cmd::PluginToggle { idx: i });
+        }
     });
     ui.on_settings_save({
         let tx = tx.clone();
