@@ -977,6 +977,8 @@ fn upload_phase(
         }
     }
     ops.push(json!({"op": "kv.set", "key": "index", "value": {"items": index}}));
+    // 持久化当前生效配置（含默认值），供宿主直链解析 root→remote
+    ops.push(json!({"op": "kv.set", "key": "config", "value": cfg.to_value()}));
     Ok(ok_with_ops(id, ops, json!({"items": results})))
 }
 
