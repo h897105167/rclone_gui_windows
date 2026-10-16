@@ -25,7 +25,12 @@ slint::include_modules!();
 enum Cmd {
     RefreshDashboard,
     FilesInit,
-    FilesRefresh,
+    /// 文件页刷新（seq: UI 请求序号，-1 表示总是应用结果）
+    FilesRefresh { seq: i32 },
+    /// 进入子目录（成功后才更新路径，防止网络慢时拼出不存在的路径）
+    FilesEnter { name: String, seq: i32 },
+    /// 返回上级目录
+    FilesUp { seq: i32 },
     FilesDownload { name: String, local: PathBuf },
     FilesMkdir,
     FilesDel { name: String, is_dir: bool },
@@ -52,13 +57,10 @@ enum Cmd {
     ServesRefresh,
     ServeStart,
     ServeStop { id: String },
-    /// 传输页：进入 / 切换子页 / 刷新
+    /// 传输页：进入 / 刷新
     TransfersEnter,
-    TransfersTabChanged { tab: i32 },
     HideDoneChanged,
-    /// 限速草稿输入（scope 由当前子页决定：0 远程 / 1 服务）
-    LimitText { idx: i32, field: i32, text: String },
-    LimitUnit { idx: i32, field: i32, unit: i32 },
+    /// 应用全局限速（上传/下载）
     LimitApply,
     JobStop { id: i64 },
     OptionsLoad,
@@ -477,180 +479,18 @@ fn byte_rate_str(v: Option<f64>) -> String {
     }
 }
 
-/// 确保 cfg.remote_limits 与当前远程一一对应（新增缺失项、移除已删除项）
-fn sync_remote_limit_entries(cfg: &mut config::AppConfig, names: &[String]) {
-    for n in names {
-        if !cfg.remote_limits.iter().any(|e| &e.name == n) {
-            cfg.remote_limits.push(config::RemoteLimit {
-                name: n.clone(),
-                up: String::new(),
-                up_unit: 1,
-                down: String::new(),
-                down_unit: 1,
-            });
-        }
-    }
-    cfg.remote_limits.retain(|e| names.iter().any(|n| n == &e.name));
-}
-
-/// 构建「远程限速」列表
-async fn build_remote_limits(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
-    let client = ctx.mgr.client.read().await.clone();
-    let names = client.list_remotes().await.unwrap_or_default();
-    let stats = client.core_stats().await.ok();
-    let filter = read_ui(ui, |u| u.global::<TransfersG>().get_remote_search().to_string())
-        .await
-        .unwrap_or_default()
-        .to_lowercase();
-
-    let mut up: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-    let mut down: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-    if let Some(s) = &stats {
-        for t in &s.transferring {
-            if let Some(r) = remote_name_of(&t.dst_fs) {
-                *up.entry(r).or_insert(0.0) += t.speed;
-            }
-            if let Some(r) = remote_name_of(&t.src_fs) {
-                *down.entry(r).or_insert(0.0) += t.speed;
-            }
-        }
-    }
-
-    let rows: Vec<RemoteLimitRow> = {
-        let mut cfg = ctx.cfg.lock().unwrap();
-        sync_remote_limit_entries(&mut cfg, &names);
-        cfg.remote_limits
-            .iter()
-            .filter(|e| filter.is_empty() || e.name.to_lowercase().contains(&filter))
-            .map(|e| RemoteLimitRow {
-                name: e.name.clone().into(),
-                up_speed: fmt_speed(*up.get(&e.name).unwrap_or(&0.0)).into(),
-                down_speed: fmt_speed(*down.get(&e.name).unwrap_or(&0.0)).into(),
-                up_limit: e.up.clone().into(),
-                up_unit: e.up_unit,
-                down_limit: e.down.clone().into(),
-                down_unit: e.down_unit,
-            })
-            .collect()
-    };
-
-    let _ = ui.upgrade_in_event_loop(move |ui| {
-        ui.global::<TransfersG>()
-            .set_remote_limits(ModelRc::from(Rc::new(VecModel::from(rows))));
-    });
-}
-
-/// 构建「服务限速」列表
-async fn build_serve_limits(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
-    let client = ctx.mgr.client.read().await.clone();
-    let stats = client.core_stats().await.ok();
-    let serves = ctx.serves_cache.lock().unwrap().clone();
-    let filter = read_ui(ui, |u| u.global::<TransfersG>().get_serve_search().to_string())
-        .await
-        .unwrap_or_default()
-        .to_lowercase();
-
-    // 速度归属：与服务的 fs 前缀匹配的传输
-    let mut up: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-    let mut down: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-    if let Some(s) = &stats {
-        for t in &s.transferring {
-            for sv in &serves {
-                if sv.fs.is_empty() {
-                    continue;
-                }
-                let key = sv.id.as_str().to_string();
-                if t.dst_fs.starts_with(sv.fs.as_str()) {
-                    *up.entry(key.clone()).or_insert(0.0) += t.speed;
-                }
-                if t.src_fs.starts_with(sv.fs.as_str()) {
-                    *down.entry(key).or_insert(0.0) += t.speed;
-                }
-            }
-        }
-    }
-
-    let rows: Vec<ServeLimitRow> = {
-        let mut cfg = ctx.cfg.lock().unwrap();
-        // 确保每个运行中服务都有对应限速条目
-        for sv in &serves {
-            let (st, fsp, ad, nm) = (
-                sv.stype.as_str(),
-                sv.fs.as_str(),
-                sv.addr.as_str(),
-                sv.name.as_str(),
-            );
-            if !cfg
-                .serve_limits
-                .iter()
-                .any(|e| e.stype == st && e.fs == fsp && e.addr == ad)
-            {
-                cfg.serve_limits.push(config::ServeLimit {
-                    stype: st.to_string(),
-                    fs: fsp.to_string(),
-                    addr: ad.to_string(),
-                    name: nm.to_string(),
-                    up: String::new(),
-                    up_unit: 1,
-                    down: String::new(),
-                    down_unit: 1,
-                });
-            } else if let Some(e) = cfg
-                .serve_limits
-                .iter_mut()
-                .find(|e| e.stype == st && e.fs == fsp && e.addr == ad)
-            {
-                e.name = nm.to_string();
-            }
-        }
-        serves
-            .iter()
-            .filter(|sv| {
-                filter.is_empty()
-                    || sv.id.as_str().to_lowercase().contains(&filter)
-                    || sv.name.as_str().to_lowercase().contains(&filter)
-            })
-            .map(|sv| {
-                let e = cfg
-                    .serve_limits
-                    .iter()
-                    .find(|e| e.stype == sv.stype.as_str() && e.fs == sv.fs.as_str() && e.addr == sv.addr.as_str());
-                let (up_l, up_u, down_l, down_u) = match e {
-                    Some(e) => (
-                        e.up.clone(),
-                        e.up_unit,
-                        e.down.clone(),
-                        e.down_unit,
-                    ),
-                    None => (String::new(), 1, String::new(), 1),
-                };
-                let id = sv.id.as_str().to_string();
-                ServeLimitRow {
-                    id: sv.id.as_str().into(),
-                    name: sv.name.as_str().into(),
-                    up_speed: fmt_speed(*up.get(&id).unwrap_or(&0.0)).into(),
-                    down_speed: fmt_speed(*down.get(&id).unwrap_or(&0.0)).into(),
-                    up_limit: up_l.into(),
-                    up_unit: up_u,
-                    down_limit: down_l.into(),
-                    down_unit: down_u,
-                }
-            })
-            .collect()
-    };
-
-    let _ = ui.upgrade_in_event_loop(move |ui| {
-        ui.global::<TransfersG>()
-            .set_serve_limits(ModelRc::from(Rc::new(VecModel::from(rows))));
-    });
-}
-
 /// 构建「后台任务」列表（job/list + job/status + core/transferred 关联推导）
 async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let client = ctx.mgr.client.read().await.clone();
-    let hide = read_ui(ui, |u| u.global::<TransfersG>().get_hide_done())
-        .await
-        .unwrap_or(false);
+    let (hide, filter) = read_ui(ui, |u| {
+        let g = u.global::<TransfersG>();
+        (
+            g.get_hide_done(),
+            g.get_task_search().to_string().to_lowercase(),
+        )
+    })
+    .await
+    .unwrap_or((false, String::new()));
     let ids = client.job_list().await.unwrap_or_default();
 
     // group -> (文件名, srcFs, dstFs, 已完成字节)
@@ -672,15 +512,31 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         }
     }
 
-    // 运行中传输速度按 group 汇总
+    // 运行中传输速度按 group 汇总；同时汇总全局上传/下载速度
     let stats = client.core_stats().await.ok();
     let mut rmap: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let (mut up_total, mut down_total) = (0.0f64, 0.0f64);
     if let Some(s) = &stats {
         for t in &s.transferring {
             if !t.group.is_empty() {
                 *rmap.entry(t.group.clone()).or_insert(0.0) += t.speed;
             }
+            // 上传：目标是远程；下载：来源是远程
+            if remote_name_of(&t.dst_fs).is_some() {
+                up_total += t.speed;
+            }
+            if remote_name_of(&t.src_fs).is_some() {
+                down_total += t.speed;
+            }
         }
+    }
+    {
+        let (up, down) = (fmt_speed(up_total), fmt_speed(down_total));
+        let _ = ui.upgrade_in_event_loop(move |ui| {
+            let g = ui.global::<TransfersG>();
+            g.set_up_speed(up.into());
+            g.set_down_speed(down.into());
+        });
     }
 
     let serves = ctx.serves_cache.lock().unwrap().clone();
@@ -749,6 +605,16 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         });
     }
     rows.sort_by(|a, b| b.id.cmp(&a.id));
+    // 任务搜索过滤（匹配 标签/远程/路径/服务/状态）
+    if !filter.is_empty() {
+        rows.retain(|t| {
+            t.op.as_str().contains(&filter)
+                || t.remote.as_str().to_lowercase().contains(&filter)
+                || t.path.as_str().to_lowercase().contains(&filter)
+                || t.svc.as_str().to_lowercase().contains(&filter)
+                || t.status.as_str().contains(&filter)
+        });
+    }
 
     let _ = ui.upgrade_in_event_loop(move |ui| {
         ui.global::<TransfersG>()
@@ -763,64 +629,17 @@ fn set_effective(ui: &Weak<MainWindow>, text: String) {
     });
 }
 
-/// 按当前活动传输计算 min(远程限速, 服务限速)，动态下发全局 tx:rx 限速
-async fn apply_effective_limit(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+/// 把配置中的全局上传/下载限速下发到 rclone（tx:rx，值无变化时不重复调用）
+async fn apply_global_limit(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let client = ctx.mgr.client.read().await.clone();
-    let Ok(stats) = client.core_stats().await else { return };
-    let serves = ctx.serves_cache.lock().unwrap().clone();
-
-    let (mut tx, mut rx): (Option<f64>, Option<f64>) = (None, None);
-    {
+    let (up, down) = {
         let cfg = ctx.cfg.lock().unwrap();
-        for t in &stats.transferring {
-            if let Some(rn) = remote_name_of(&t.dst_fs) {
-                if let Some(e) = cfg.remote_limits.iter().find(|e| e.name == rn) {
-                    if let Some(v) = parse_limit(&e.up, e.up_unit) {
-                        tx = Some(tx.map_or(v, |c| c.min(v)));
-                    }
-                }
-            }
-            if let Some(rn) = remote_name_of(&t.src_fs) {
-                if let Some(e) = cfg.remote_limits.iter().find(|e| e.name == rn) {
-                    if let Some(v) = parse_limit(&e.down, e.down_unit) {
-                        rx = Some(rx.map_or(v, |c| c.min(v)));
-                    }
-                }
-            }
-            for sv in &serves {
-                if sv.fs.is_empty() {
-                    continue;
-                }
-                if !(t.src_fs.starts_with(sv.fs.as_str()) || t.dst_fs.starts_with(sv.fs.as_str())) {
-                    continue;
-                }
-                if let Some(e) = cfg
-                    .serve_limits
-                    .iter()
-                    .find(|e| e.stype == sv.stype.as_str() && e.fs == sv.fs.as_str() && e.addr == sv.addr.as_str())
-                {
-                    if let Some(v) = parse_limit(&e.up, e.up_unit) {
-                        tx = Some(tx.map_or(v, |c| c.min(v)));
-                    }
-                    if let Some(v) = parse_limit(&e.down, e.down_unit) {
-                        rx = Some(rx.map_or(v, |c| c.min(v)));
-                    }
-                }
-            }
-        }
-    }
-
-    // 无活动传输 → 全局关闭限速
-    let (tx, rx) = if stats.transferring.is_empty() {
-        (None, None)
-    } else {
-        (tx, rx)
+        (
+            parse_limit(&cfg.bw_up, cfg.bw_up_unit),
+            parse_limit(&cfg.bw_down, cfg.bw_down_unit),
+        )
     };
-    let rate = if tx.is_none() && rx.is_none() {
-        "off".to_string()
-    } else {
-        format!("{}:{}", byte_rate_str(tx), byte_rate_str(rx))
-    };
+    let rate = format!("{}:{}", byte_rate_str(up), byte_rate_str(down));
     let changed = {
         let mut last = ctx.last_bwlimit.lock().unwrap();
         if *last == rate {
@@ -833,39 +652,16 @@ async fn apply_effective_limit(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     if changed {
         let _ = client.bwlimit(&rate).await;
     }
-
-    let disp = if tx.is_none() && rx.is_none() {
+    let disp = if up.is_none() && down.is_none() {
         String::new()
     } else {
         format!(
             "上传 {} · 下载 {}",
-            tx.map(fmt_bytes).unwrap_or_else(|| "不限".into()),
-            rx.map(fmt_bytes).unwrap_or_else(|| "不限".into())
+            up.map(fmt_bytes).unwrap_or_else(|| "不限".into()),
+            down.map(fmt_bytes).unwrap_or_else(|| "不限".into())
         )
     };
     set_effective(ui, disp);
-}
-
-/// 从当前子页读取限速行的标识键：远程=名称，服务=ID
-async fn limit_row_key(ui: &Weak<MainWindow>, idx: i32) -> (i32, String) {
-    read_ui(ui, move |u| {
-        let g = u.global::<TransfersG>();
-        let t = g.get_tab();
-        let key = if t == 0 {
-            g.get_remote_limits()
-                .row_data(idx as usize)
-                .map(|r| r.name.to_string())
-                .unwrap_or_default()
-        } else {
-            g.get_serve_limits()
-                .row_data(idx as usize)
-                .map(|r| r.id.to_string())
-                .unwrap_or_default()
-        };
-        (t, key)
-    })
-    .await
-    .unwrap_or((0, String::new()))
 }
 
 /// 从 config/providers 响应中提取指定类型的字段列表
@@ -1426,47 +1222,14 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
         let _ = Box::pin(handle_cmd(&ctx, &ui, Cmd::ServesRefresh)).await;
     }
 
-    // 1.6) 后台执行自动挂载 / 自动服务（放在后台任务里，不阻塞命令循环）
+    // 1.6) 启动流程：并发校验每个远程预设（≤20 并发），成功后异步执行其挂载/服务
+    //      不阻塞命令循环，文件浏览等操作在预热期间即可正常响应
     if ready {
-        let (mounts, serves) = {
-            let c = ctx.cfg.lock().unwrap();
-            (c.auto_mounts.clone(), c.auto_serves.clone())
-        };
-        if !mounts.is_empty() || !serves.is_empty() {
-            let ctx2 = ctx.clone();
-            let ui2 = ui.clone();
-            tokio::spawn(async move {
-                let client = ctx2.mgr.client.read().await.clone();
-                for m in &mounts {
-                    ctx2.pending_mounts
-                        .lock()
-                        .unwrap()
-                        .push((m.fs.clone(), m.point.clone()));
-                    let _ = Box::pin(handle_cmd(&ctx2, &ui2, Cmd::MountsRefresh)).await;
-                    let res = client
-                        .mount(&m.fs, &m.point, json!({ "vfs_cache_mode": m.cache, "read_only": m.ro }))
-                        .await;
-                    ctx2.pending_mounts
-                        .lock()
-                        .unwrap()
-                        .retain(|(_, p)| p != &m.point);
-                    match res {
-                        Ok(actual) => toast(&ui2, 1, format!("已自动挂载 {} → {actual}", m.fs)),
-                        Err(e) => toast(&ui2, 2, format!("自动挂载 {} 失败: {e}", m.fs)),
-                    }
-                    let _ = Box::pin(handle_cmd(&ctx2, &ui2, Cmd::MountsRefresh)).await;
-                }
-                for s in &serves {
-                    match client.serve_start(&s.stype, &s.fs, &s.addr, &s.user, &s.pass).await {
-                        Ok(id) => toast(&ui2, 1, format!("已自动启动服务 {id}")),
-                        Err(e) => toast(&ui2, 2, format!("自动启动服务失败: {e}")),
-                    }
-                }
-                if !serves.is_empty() {
-                    let _ = Box::pin(handle_cmd(&ctx2, &ui2, Cmd::ServesRefresh)).await;
-                }
-            });
-        }
+        let ctx2 = ctx.clone();
+        let ui2 = ui.clone();
+        tokio::spawn(async move {
+            startup_flow(&ctx2, &ui2).await;
+        });
     }
 
     // 2) 内嵌 HTTP
@@ -1517,7 +1280,7 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
                 // 传输页：后台任务列表 + 全局限速（每 2s）
                 if tick % 2 == 0 {
                     build_tasks(&ctx, &ui).await;
-                    apply_effective_limit(&ctx, &ui).await;
+                    apply_global_limit(&ctx, &ui).await;
                 }
                 // 主题跟随系统（每 3s 检查）
                 if tick % 3 == 0 {
@@ -1551,6 +1314,138 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
         }
     }
     let _ = ctx.mgr.stop().await;
+}
+
+/// 启动流程：对每个远程预设并发执行（最大 20 并发，避免预设过多时网络拥堵）：
+/// 连接(about) → 列根目录（校验+预热连接）→ 刷新文件列表 → 执行该远程的挂载/服务预设
+/// 任一步骤失败的预设立即终止自身流程，不影响其他预设；全程不阻塞命令循环。
+async fn startup_flow(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    let client = ctx.mgr.client.read().await.clone();
+    let remotes = client.list_remotes().await.unwrap_or_default();
+    if remotes.is_empty() {
+        return;
+    }
+    let (mounts, serves) = {
+        let c = ctx.cfg.lock().unwrap();
+        (c.auto_mounts.clone(), c.auto_serves.clone())
+    };
+    // 侧边栏"远程"图标 spinner（预热期间）
+    let _ = ui.upgrade_in_event_loop(|ui| ui.global::<NavG>().set_starting(true));
+
+    // 已运行服务快照，防重复部署（如上一实例异常退出后的残留服务占用端口）
+    let mut running: Vec<(String, String)> = Vec::new();
+    if let Ok(v) = client.serve_list().await {
+        if let Some(items) = v.get("list").and_then(|x| x.as_array()) {
+            for it in items {
+                let params = it.get("params").cloned().unwrap_or(json!({}));
+                let getp = |keys: &[&str]| -> String {
+                    for k in keys {
+                        if let Some(s) = params.get(*k).and_then(|x| x.as_str()) {
+                            return s.to_string();
+                        }
+                        if let Some(s) = it.get(*k).and_then(|x| x.as_str()) {
+                            return s.to_string();
+                        }
+                    }
+                    String::new()
+                };
+                running.push((
+                    getp(&["fs", "Fs"]),
+                    getp(&["addr", "Addr", "listen", "Listen"]),
+                ));
+            }
+        }
+    }
+
+    let sem = Arc::new(tokio::sync::Semaphore::new(20));
+    let mut handles = Vec::new();
+    for name in &remotes {
+        let ctx2 = ctx.clone();
+        let ui2 = ui.clone();
+        let client = client.clone();
+        let sem = sem.clone();
+        let running = running.clone();
+        let name = name.clone();
+        // 只处理属于该远程的挂载/服务预设（fs 形如 "name:"）
+        let mounts: Vec<_> = mounts
+            .iter()
+            .filter(|m| m.fs.trim_end_matches(':') == name)
+            .cloned()
+            .collect();
+        let serves: Vec<_> = serves
+            .iter()
+            .filter(|s| s.fs.trim_end_matches(':') == name)
+            .cloned()
+            .collect();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await;
+            // 1) 连接校验（失败 → 该预设流程终止）
+            if client.about(&format!("{name}:")).await.is_err() {
+                toast(&ui2, 2, format!("预设 {name} 连接失败，已跳过其挂载/服务"));
+                return;
+            }
+            // 2) 列根目录校验（同时预热远程连接，避免文件页首次访问被连接建立阻塞）
+            if client.list(&format!("{name}:"), "", None).await.is_err() {
+                toast(&ui2, 2, format!("预设 {name} 获取文件列表失败，已跳过其挂载/服务"));
+                return;
+            }
+            // 3) 文件页当前显示的正是该远程 → 刷新列表
+            let (cur_remote, _) = ui_files_pos(&ui2).await;
+            if cur_remote == name {
+                let _ = Box::pin(handle_cmd(&ctx2, &ui2, Cmd::FilesRefresh { seq: -1 })).await;
+            }
+            // 4) 该远程的挂载预设（并发执行，条目带 spinner）
+            let mut mh = Vec::new();
+            for m in mounts {
+                let ctx3 = ctx2.clone();
+                let ui3 = ui2.clone();
+                let client3 = client.clone();
+                mh.push(tokio::spawn(async move {
+                    ctx3.pending_mounts
+                        .lock()
+                        .unwrap()
+                        .push((m.fs.clone(), m.point.clone()));
+                    let _ = Box::pin(handle_cmd(&ctx3, &ui3, Cmd::MountsRefresh)).await;
+                    let res = client3
+                        .mount(
+                            &m.fs,
+                            &m.point,
+                            json!({ "vfs_cache_mode": m.cache, "read_only": m.ro }),
+                        )
+                        .await;
+                    ctx3.pending_mounts
+                        .lock()
+                        .unwrap()
+                        .retain(|(_, p)| p != &m.point);
+                    match res {
+                        Ok(actual) => toast(&ui3, 1, format!("已自动挂载 {} → {actual}", m.fs)),
+                        Err(e) => toast(&ui3, 2, format!("自动挂载 {} 失败: {e}", m.fs)),
+                    }
+                    let _ = Box::pin(handle_cmd(&ctx3, &ui3, Cmd::MountsRefresh)).await;
+                }));
+            }
+            // 5) 该远程的服务预设（先查重，避免重复部署报端口占用）
+            for s in serves {
+                if running.iter().any(|(f, a)| *f == s.fs && *a == s.addr) {
+                    continue;
+                }
+                match client
+                    .serve_start(&s.stype, &s.fs, &s.addr, &s.user, &s.pass)
+                    .await
+                {
+                    Ok(id) => toast(&ui2, 1, format!("已自动启动服务 {id}")),
+                    Err(e) => toast(&ui2, 2, format!("自动启动服务失败: {e}")),
+                }
+            }
+            for h in mh {
+                let _ = h.await;
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    let _ = ui.upgrade_in_event_loop(|ui| ui.global::<NavG>().set_starting(false));
 }
 
 async fn spawn_http(ctx: &Arc<Ctx>, port: u16, ui: Weak<MainWindow>) {
@@ -1608,12 +1503,29 @@ async fn poll_stats(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
 async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
     match cmd {
         Cmd::Quit => {
-            // 优雅退出 rclone：core/quit 会自动卸载挂载、停止服务
+            // 托管模式：先显式清理全部挂载与服务，再优雅退出 rclone，确保无残留
             let managed = ctx.cfg.lock().unwrap().rclone.mode == 0;
             if managed {
                 let client = ctx.mgr.client.read().await.clone();
+                if let Ok(ms) = client.mounts().await {
+                    for m in ms {
+                        let _ = client.unmount(&m.mount_point).await;
+                    }
+                }
+                if let Ok(v) = client.serve_list().await {
+                    if let Some(items) = v.get("list").and_then(|x| x.as_array()) {
+                        for it in items {
+                            if let Some(id) = it.get("id").and_then(|x| {
+                                x.as_str().map(|s| s.to_string())
+                                    .or_else(|| x.as_i64().map(|n| n.to_string()))
+                            }) {
+                                let _ = client.serve_stop(&id).await;
+                            }
+                        }
+                    }
+                }
                 let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
+                    std::time::Duration::from_secs(5),
                     client.core_quit(),
                 )
                 .await;
@@ -1677,10 +1589,10 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             );
             // 给事件循环留时间完成 remotes 设置，避免 FilesRefresh 读到空 remote
             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-            let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh)).await;
+            let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
             false
         }
-        Cmd::FilesRefresh => {
+        Cmd::FilesRefresh { seq } => {
             let (remote, path) = ui_files_pos(ui).await;
             // remotes 尚未加载完成时静默跳过，避免 fs=":" 报错
             if remote.is_empty() {
@@ -1689,6 +1601,12 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             let client = ctx.mgr.client.read().await.clone();
             let fs = format!("{remote}:");
             let res = client.list(&fs, &path, None).await;
+            // 请求期间用户可能已发起更新操作（seq 变化），丢弃过期结果
+            let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq()).await.unwrap_or(-2);
+            if seq >= 0 && cur_seq != seq {
+                let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
+                return false;
+            }
             let _ = ui.upgrade_in_event_loop(
                 move |ui| {
                     let g = ui.global::<FilesG>();
@@ -1709,6 +1627,96 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                         Err(e) => {
                             g.set_entries(ModelRc::from(Rc::new(VecModel::from(Vec::<FileRow>::new()))));
                             toast_ui(&ui, 2, format!("列目录失败: {e}"));
+                        }
+                    }
+                    g.set_sel(-1);
+                    g.set_loading(false);
+                },
+            );
+            false
+        }
+        Cmd::FilesEnter { name, seq } => {
+            let (remote, path) = ui_files_pos(ui).await;
+            if remote.is_empty() {
+                return false;
+            }
+            let target = join_path(&path, &name);
+            let client = ctx.mgr.client.read().await.clone();
+            let fs = format!("{remote}:");
+            let res = client.list(&fs, &target, None).await;
+            // 请求期间用户可能已切换远程或发起新操作，丢弃过期结果
+            let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq()).await.unwrap_or(-2);
+            if seq >= 0 && cur_seq != seq {
+                let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
+                return false;
+            }
+            let _ = ui.upgrade_in_event_loop(
+                move |ui| {
+                    let g = ui.global::<FilesG>();
+                    g.set_loading(false);
+                    match res {
+                        Ok(entries) => {
+                            let mut rows: Vec<FileRow> = entries
+                                .iter()
+                                .map(|e| FileRow {
+                                    name: e.name.clone().into(),
+                                    is_dir: e.is_dir,
+                                    size: fmt_bytes(e.size as f64).into(),
+                                    mtime: fmt_mtime(&e.mod_time).into(),
+                                })
+                                .collect();
+                            rows.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+                            // 成功进入后才更新路径，避免网络慢时拼出不存在的路径
+                            g.set_path(target.clone().into());
+                            g.set_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
+                        }
+                        Err(e) => {
+                            toast_ui(&ui, 2, format!("无法进入 {name}: {e}"));
+                        }
+                    }
+                    g.set_sel(-1);
+                },
+            );
+            false
+        }
+        Cmd::FilesUp { seq } => {
+            let (remote, path) = ui_files_pos(ui).await;
+            if remote.is_empty() {
+                return false;
+            }
+            let parent = match path.rfind('/') {
+                Some(idx) => path[..idx].to_string(),
+                None => String::new(),
+            };
+            let client = ctx.mgr.client.read().await.clone();
+            let fs = format!("{remote}:");
+            let res = client.list(&fs, &parent, None).await;
+            let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq()).await.unwrap_or(-2);
+            if seq >= 0 && cur_seq != seq {
+                let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
+                return false;
+            }
+            let _ = ui.upgrade_in_event_loop(
+                move |ui| {
+                    let g = ui.global::<FilesG>();
+                    g.set_loading(false);
+                    match res {
+                        Ok(entries) => {
+                            let mut rows: Vec<FileRow> = entries
+                                .iter()
+                                .map(|e| FileRow {
+                                    name: e.name.clone().into(),
+                                    is_dir: e.is_dir,
+                                    size: fmt_bytes(e.size as f64).into(),
+                                    mtime: fmt_mtime(&e.mod_time).into(),
+                                })
+                                .collect();
+                            rows.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+                            g.set_path(parent.clone().into());
+                            g.set_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
+                        }
+                        Err(e) => {
+                            toast_ui(&ui, 2, format!("返回上级失败: {e}"));
                         }
                     }
                     g.set_sel(-1);
@@ -1746,7 +1754,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                             ui.global::<FilesG>().set_rename_name("新建文件夹".into());
                         },
                     );
-                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh)).await;
+                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
                     toast(ui, 1, "文件夹已创建（选中后可重命名）");
                 }
                 Err(e) => toast(ui, 2, format!("创建失败: {e}")),
@@ -1765,7 +1773,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             };
             match res {
                 Ok(_) => {
-                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh)).await;
+                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
                     toast(ui, 1, format!("已删除 {name}"));
                 }
                 Err(e) => toast(ui, 2, format!("删除失败: {e}")),
@@ -1789,7 +1797,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                             ui.global::<FilesG>().set_sel(-1);
                         },
                     );
-                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh)).await;
+                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
                     toast(ui, 1, "重命名完成");
                 }
                 Err(e) => toast(ui, 2, format!("重命名失败: {e}")),
@@ -1814,7 +1822,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 .await;
             match res {
                 Ok(_) => {
-                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh)).await;
+                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
                     toast(ui, 1, format!("已复制为 {cand}"));
                 }
                 Err(e) => toast(ui, 2, format!("复制失败: {e}")),
@@ -2181,11 +2189,9 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     apply_serves_filter(ui, &full).await;
                 }
                 3 => {
-                    build_remote_limits(ctx, ui).await;
+                    build_tasks(ctx, ui).await;
                 }
-                _ => {
-                    build_serve_limits(ctx, ui).await;
-                }
+                _ => {}
             }
             false
         }
@@ -2544,117 +2550,47 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::TransfersEnter => {
-            build_remote_limits(ctx, ui).await;
-            build_serve_limits(ctx, ui).await;
+            // 把已保存的全局限速回填到 UI（仅在进入页面时，不覆盖正在输入的草稿）
+            {
+                let cfg = ctx.cfg.lock().unwrap().clone();
+                let _ = ui.upgrade_in_event_loop(move |ui| {
+                    let g = ui.global::<TransfersG>();
+                    g.set_up_limit(cfg.bw_up.clone().into());
+                    g.set_up_unit(cfg.bw_up_unit);
+                    g.set_down_limit(cfg.bw_down.clone().into());
+                    g.set_down_unit(cfg.bw_down_unit);
+                });
+            }
             build_tasks(ctx, ui).await;
-            apply_effective_limit(ctx, ui).await;
-            false
-        }
-        Cmd::TransfersTabChanged { tab } => {
-            let _ = ui.upgrade_in_event_loop(move |ui| ui.global::<TransfersG>().set_tab(tab));
-            build_remote_limits(ctx, ui).await;
-            build_serve_limits(ctx, ui).await;
-            build_tasks(ctx, ui).await;
+            apply_global_limit(ctx, ui).await;
             false
         }
         Cmd::HideDoneChanged => {
             build_tasks(ctx, ui).await;
             false
         }
-        Cmd::LimitText { idx, field, text } => {
-            let (tab, key) = limit_row_key(ui, idx).await;
-            if !key.is_empty() {
-                if tab == 0 {
-                    let mut cfg = ctx.cfg.lock().unwrap();
-                    if let Some(e) = cfg.remote_limits.iter_mut().find(|e| e.name == key) {
-                        if field == 0 {
-                            e.up = text;
-                        } else {
-                            e.down = text;
-                        }
-                    }
-                } else {
-                    let sk = ctx
-                        .serves_cache
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .find(|s| s.id == key)
-                        .map(|s| {
-                            (
-                                s.stype.as_str().to_string(),
-                                s.fs.as_str().to_string(),
-                                s.addr.as_str().to_string(),
-                            )
-                        });
-                    if let Some((st, fs, ad)) = sk {
-                        let mut cfg = ctx.cfg.lock().unwrap();
-                        if let Some(e) = cfg
-                            .serve_limits
-                            .iter_mut()
-                            .find(|e| e.stype == st && e.fs == fs && e.addr == ad)
-                        {
-                            if field == 0 {
-                                e.up = text;
-                            } else {
-                                e.down = text;
-                            }
-                        }
-                    }
-                }
-            }
-            false
-        }
-        Cmd::LimitUnit { idx, field, unit } => {
-            let (tab, key) = limit_row_key(ui, idx).await;
-            if !key.is_empty() {
-                if tab == 0 {
-                    let mut cfg = ctx.cfg.lock().unwrap();
-                    if let Some(e) = cfg.remote_limits.iter_mut().find(|e| e.name == key) {
-                        if field == 0 {
-                            e.up_unit = unit;
-                        } else {
-                            e.down_unit = unit;
-                        }
-                    }
-                } else {
-                    let sk = ctx
-                        .serves_cache
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .find(|s| s.id == key)
-                        .map(|s| {
-                            (
-                                s.stype.as_str().to_string(),
-                                s.fs.as_str().to_string(),
-                                s.addr.as_str().to_string(),
-                            )
-                        });
-                    if let Some((st, fs, ad)) = sk {
-                        let mut cfg = ctx.cfg.lock().unwrap();
-                        if let Some(e) = cfg
-                            .serve_limits
-                            .iter_mut()
-                            .find(|e| e.stype == st && e.fs == fs && e.addr == ad)
-                        {
-                            if field == 0 {
-                                e.up_unit = unit;
-                            } else {
-                                e.down_unit = unit;
-                            }
-                        }
-                    }
-                }
-            }
-            false
-        }
         Cmd::LimitApply => {
+            // 从 UI 读取草稿 → 写配置 → 下发 rclone
+            let draft = read_ui(ui, |u| {
+                let g = u.global::<TransfersG>();
+                (
+                    g.get_up_limit().to_string(),
+                    g.get_up_unit(),
+                    g.get_down_limit().to_string(),
+                    g.get_down_unit(),
+                )
+            })
+            .await
+            .unwrap_or_default();
             {
-                let cfg = ctx.cfg.lock().unwrap();
+                let mut cfg = ctx.cfg.lock().unwrap();
+                cfg.bw_up = draft.0;
+                cfg.bw_up_unit = draft.1;
+                cfg.bw_down = draft.2;
+                cfg.bw_down_unit = draft.3;
                 let _ = config::save(&cfg);
             }
-            apply_effective_limit(ctx, ui).await;
+            apply_global_limit(ctx, ui).await;
             toast(ui, 1, "限速已应用");
             false
         }
@@ -2663,7 +2599,6 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             match client.job_stop(id).await {
                 Ok(()) => {
                     build_tasks(ctx, ui).await;
-                    apply_effective_limit(ctx, ui).await;
                     toast(ui, 1, format!("任务 #{} 已停止", id));
                 }
                 Err(e) => toast(ui, 2, format!("停止失败: {e}")),
@@ -3233,8 +3168,14 @@ fn wire_callbacks(
     });
     ui.on_files_refresh({
         let tx = tx.clone();
+        let ui = ui.as_weak();
         move || {
-            let _ = tx.send(Cmd::FilesRefresh);
+            // 抢占式刷新：递增 seq 使旧的在途请求结果失效
+            let Some(ui) = ui.upgrade() else { return };
+            let g = ui.global::<FilesG>();
+            g.set_loading(true);
+            g.set_seq(g.get_seq() + 1);
+            let _ = tx.send(Cmd::FilesRefresh { seq: g.get_seq() });
         }
     });
     ui.on_files_open({
@@ -3246,13 +3187,19 @@ fn wire_callbacks(
                 .and_then(|ui| ui.global::<FilesG>().get_entries().row_data(i as usize));
             let Some(row) = row else { return };
             if row.is_dir {
-                // 进入目录
+                // 进入目录：请求进行中禁点；成功后才更新路径（防拼出不存在的路径）
                 if let Some(ui) = ui.upgrade() {
                     let g = ui.global::<FilesG>();
-                    let cur = g.get_path().to_string();
-                    g.set_path(join_path(&cur, &row.name).into());
+                    if g.get_loading() {
+                        return;
+                    }
+                    g.set_loading(true);
+                    g.set_seq(g.get_seq() + 1);
+                    let _ = tx.send(Cmd::FilesEnter {
+                        name: row.name.to_string(),
+                        seq: g.get_seq(),
+                    });
                 }
-                let _ = tx.send(Cmd::FilesRefresh);
             } else if let Some(local) = rfd::FileDialog::new()
                 .set_file_name(&row.name)
                 .set_title("保存文件到…")
@@ -3269,16 +3216,12 @@ fn wire_callbacks(
         let tx = tx.clone();
         let ui = ui.as_weak();
         move || {
-            if let Some(ui) = ui.upgrade() {
-                let g = ui.global::<FilesG>();
-                let cur = g.get_path().to_string();
-                let parent = match cur.rfind('/') {
-                    Some(idx) => cur[..idx].to_string(),
-                    None => String::new(),
-                };
-                g.set_path(parent.into());
-            }
-            let _ = tx.send(Cmd::FilesRefresh);
+            // 抢占式返回上级：同样走 seq 失效机制
+            let Some(ui) = ui.upgrade() else { return };
+            let g = ui.global::<FilesG>();
+            g.set_loading(true);
+            g.set_seq(g.get_seq() + 1);
+            let _ = tx.send(Cmd::FilesUp { seq: g.get_seq() });
         }
     });
     ui.on_files_mkdir({
@@ -3504,53 +3447,21 @@ fn wire_callbacks(
             let _ = tx.send(Cmd::TransfersEnter);
         }
     });
-    ui.on_transfers_tab_changed({
-        let tx = tx.clone();
-        move |tab| {
-            let _ = tx.send(Cmd::TransfersTabChanged { tab });
-        }
-    });
     ui.on_hide_done_changed({
         let tx = tx.clone();
         move || {
             let _ = tx.send(Cmd::HideDoneChanged);
         }
     });
-    ui.on_transfers_remote_search({
+    ui.on_transfers_task_search({
         let db = debounce.clone();
         move |_| {
             db.bump(3);
         }
     });
-    ui.on_transfers_serve_search({
-        let db = debounce.clone();
-        move |_| {
-            db.bump(4);
-        }
-    });
-    ui.on_limit_text({
-        let tx = tx.clone();
-        move |i, f, t| {
-            let _ = tx.send(Cmd::LimitText {
-                idx: i,
-                field: f,
-                text: t.to_string(),
-            });
-        }
-    });
-    ui.on_limit_unit({
-        let tx = tx.clone();
-        move |i, f, u| {
-            let _ = tx.send(Cmd::LimitUnit {
-                idx: i,
-                field: f,
-                unit: u,
-            });
-        }
-    });
     ui.on_limit_apply({
         let tx = tx.clone();
-        move |_| {
+        move || {
             let _ = tx.send(Cmd::LimitApply);
         }
     });

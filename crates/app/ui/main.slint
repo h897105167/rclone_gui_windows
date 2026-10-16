@@ -75,25 +75,6 @@ export struct PathItem {
     name: string,
     is-dir: bool,
 }
-export struct RemoteLimitRow {
-    name: string,
-    up-speed: string,
-    down-speed: string,
-    up-limit: string,
-    up-unit: int,
-    down-limit: string,
-    down-unit: int,
-}
-export struct ServeLimitRow {
-    id: string,
-    name: string,
-    up-speed: string,
-    down-speed: string,
-    up-limit: string,
-    up-unit: int,
-    down-limit: string,
-    down-unit: int,
-}
 export struct TaskRow {
     id: int,
     op: string,
@@ -110,6 +91,8 @@ export struct TaskRow {
 
 export global NavG {
     in-out property <int> idx: 0;
+    // 启动预热进行中（侧边栏"远程"图标显示 spinner，不遮挡输入）
+    in-out property <bool> starting: false;
 }
 
 export global ToastG {
@@ -152,7 +135,10 @@ export global FilesG {
     in-out property <int> remote-idx: 0;
     in-out property <string> path: "";
     in-out property <[FileRow]> entries: [];
+    // 目录请求进行中：禁点文件 + spinner，成功后才更新路径
     in-out property <bool> loading: false;
+    // 请求序号：新请求递增，旧请求的迟到结果按序号丢弃
+    in-out property <int> seq: 0;
     in-out property <int> sel: -1;
     in-out property <string> rename-name: "";
 }
@@ -226,14 +212,18 @@ export global ServesG {
 }
 
 export global TransfersG {
-    in-out property <[RemoteLimitRow]> remote-limits: [];
-    in-out property <[ServeLimitRow]> serve-limits: [];
     in-out property <[TaskRow]> tasks: [];
     in-out property <[string]> units: ["B", "KB", "MB", "GB"];
-    in-out property <int> tab: 0;            // 0=远程限速 1=服务限速 2=后台任务
+    // 全局限速草稿（空 = 不限；rclone 仅支持全局 tx:rx）
+    in-out property <string> up-limit: "";
+    in-out property <int> up-unit: 1;
+    in-out property <string> down-limit: "";
+    in-out property <int> down-unit: 1;
+    // 全局实时网速（监控）
+    in-out property <string> up-speed: "—";
+    in-out property <string> down-speed: "—";
     in-out property <bool> hide-done: false;
-    in-out property <string> remote-search: "";
-    in-out property <string> serve-search: "";
+    in-out property <string> task-search: "";
     in-out property <string> effective: "";  // 当前生效的全局限速（展示用）
 }
 
@@ -733,6 +723,17 @@ component FilesView inherits Rectangle {
                                 background: ThemeG.border;
                                 opacity: 0.5;
                             }
+                        }
+                    }
+                    // 加载遮罩：目录请求期间禁用文件点击 + spinner，防止拼出不存在的路径
+                    if FilesG.loading : Rectangle {
+                        background: #80808033;
+                        block := TouchArea { }
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 8px;
+                            Spinner { running: true; }
+                            Text { text: "加载中…"; font-size: 12px; color: ThemeG.text; vertical-alignment: center; }
                         }
                     }
                 }
@@ -1492,27 +1493,6 @@ component ServesView inherits Rectangle {
     }
 }
 
-// 传输页子页标签
-component SubTab inherits Rectangle {
-    in property <string> label;
-    in property <bool> active: false;
-    callback clicked;
-    width: 104px;
-    height: 34px;
-    border-radius: ThemeG.radius-s;
-    border-width: 1px;
-    border-color: root.active ? ThemeG.accent : ThemeG.border;
-    background: root.active ? ThemeG.accent-soft : (ta.has-hover ? ThemeG.hover : ThemeG.panel);
-    Text {
-        text: root.label;
-        font-size: 13px;
-        color: root.active ? ThemeG.accent : ThemeG.text-dim;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-    ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
-}
-
 // 标签小胶囊（后台任务标签用）
 component TagPill inherits Rectangle {
     in property <string> label;
@@ -1537,14 +1517,10 @@ component TagPill inherits Rectangle {
 
 component TransfersView inherits Rectangle {
     background: transparent;
-    callback tab-changed(int);
     callback refresh;
     callback hide-done-changed;
-    callback remote-search(string);
-    callback serve-search(string);
-    callback limit-text(int, int, string);   // (idx, field 0=上传 1=下载, text)
-    callback limit-unit(int, int, int);      // (idx, field 0=上传 1=下载, unit)
-    callback limit-apply(int);
+    callback task-search(string);
+    callback limit-apply();                  // 应用全局限速（tx:rx）
     callback job-stop(int);
 
     VerticalLayout {
@@ -1553,11 +1529,15 @@ component TransfersView inherits Rectangle {
         HorizontalLayout {
             spacing: 8px;
             height: 34px;
-            SubTab { label: "远程限速"; active: TransfersG.tab == 0; clicked => { root.tab-changed(0); } }
-            SubTab { label: "服务限速"; active: TransfersG.tab == 1; clicked => { root.tab-changed(1); } }
-            SubTab { label: "后台任务"; active: TransfersG.tab == 2; clicked => { root.tab-changed(2); } }
+            Text { text: "传输"; font-size: 16px; font-weight: 700; color: ThemeG.text; vertical-alignment: center; }
             Rectangle { horizontal-stretch: 1; }
-            if TransfersG.tab == 2 : CheckBox {
+            LineEdit {
+                width: 200px;
+                text <=> TransfersG.task-search;
+                placeholder-text: "搜索任务";
+                edited(t) => { root.task-search(t); }
+            }
+            CheckBox {
                 text: "隐藏已完成任务";
                 checked <=> TransfersG.hide-done;
                 toggled => { root.hide-done-changed(); }
@@ -1570,148 +1550,51 @@ component TransfersView inherits Rectangle {
             color: ThemeG.text-dim;
         }
 
-        // ---------- 远程限速 ----------
-        if TransfersG.tab == 0 : VerticalLayout {
-            spacing: 10px;
-            LineEdit {
-                width: 280px;
-                text <=> TransfersG.remote-search;
-                placeholder-text: "搜索远程名称";
-                edited(t) => { root.remote-search(t); }
-            }
-            Card {
-                title: "远程限速（" + TransfersG.remote-limits.length + "）";
-                pad: 0px;
-                fill: true;
-                vertical-stretch: 1;
-                VerticalLayout {
-                    Rectangle {
-                        height: 36px;
-                        background: ThemeG.panel-2;
-                        HorizontalLayout {
-                            padding-left: 14px;
-                            padding-right: 14px;
-                            spacing: 8px;
-                            Text { text: "远程名称"; horizontal-stretch: 1; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                            Text { text: "上传速度↑"; width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                            Text { text: "下载速度↓"; width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                            Text { text: "上传限速"; width: 200px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                            Text { text: "下载限速"; width: 200px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                            Text { text: "操作"; width: 64px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                        }
-                    }
-                    Rectangle {
-                        vertical-stretch: 1;
-                        ListView {
-                            for r[i] in TransfersG.remote-limits : Rectangle {
-                                height: 42px;
-                                background: hit0.has-hover ? ThemeG.hover : transparent;
-                                hit0 := TouchArea { mouse-cursor: pointer; }
-                                HorizontalLayout {
-                                    padding-left: 14px;
-                                    padding-right: 14px;
-                                    spacing: 8px;
-                                    Text { text: r.name; horizontal-stretch: 1; horizontal-alignment: left; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
-                                    Text { text: r.up-speed; width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.accent; vertical-alignment: center; }
-                                    Text { text: r.down-speed; width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.accent; vertical-alignment: center; }
-                                    HorizontalLayout {
-                                        width: 200px;
-                                        spacing: 6px;
-                                        LineEdit { horizontal-stretch: 1; text: r.up-limit; placeholder-text: "不限"; edited(t) => { root.limit-text(i, 0, t); } }
-                                        ComboBox { width: 76px; model: TransfersG.units; current-index: r.up-unit; changed current-index => { root.limit-unit(i, 0, self.current-index); } }
-                                    }
-                                    HorizontalLayout {
-                                        width: 200px;
-                                        spacing: 6px;
-                                        LineEdit { horizontal-stretch: 1; text: r.down-limit; placeholder-text: "不限"; edited(t) => { root.limit-text(i, 1, t); } }
-                                        ComboBox { width: 76px; model: TransfersG.units; current-index: r.down-unit; changed current-index => { root.limit-unit(i, 1, self.current-index); } }
-                                    }
-                                    HorizontalLayout {
-                                        width: 64px;
-                                        VerticalLayout { alignment: center; PillBtn { label: "应用"; compact: true; primary: true; clicked => { root.limit-apply(i); } } }
-                                    }
-                                }
-                                Rectangle { y: parent.height - 1px; height: 1px; background: ThemeG.border; opacity: 0.5; }
-                            }
-                        }
-                    }
+        // ---------- 网速监控 + 全局限速（rclone 仅支持全局 tx:rx） ----------
+        Card {
+            title: "网速与限速";
+            fill: false;
+            VerticalLayout {
+                spacing: 10px;
+                HorizontalLayout {
+                    spacing: 24px;
+                    Text { text: "上传 ↑ " + TransfersG.up-speed; font-size: 13px; color: ThemeG.accent; vertical-alignment: center; }
+                    Text { text: "下载 ↓ " + TransfersG.down-speed; font-size: 13px; color: ThemeG.ok; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
                 }
-            }
-        }
-
-        // ---------- 服务限速 ----------
-        if TransfersG.tab == 1 : VerticalLayout {
-            spacing: 10px;
-            LineEdit {
-                width: 280px;
-                text <=> TransfersG.serve-search;
-                placeholder-text: "搜索 ID / 服务名称";
-                edited(t) => { root.serve-search(t); }
-            }
-            Card {
-                title: "服务限速（" + TransfersG.serve-limits.length + "）";
-                pad: 0px;
-                fill: true;
-                vertical-stretch: 1;
-                VerticalLayout {
-                    Rectangle {
-                        height: 36px;
-                        background: ThemeG.panel-2;
-                        HorizontalLayout {
-                            padding-left: 14px;
-                            padding-right: 14px;
-                            spacing: 8px;
-                            Text { text: "服务名称"; horizontal-stretch: 1; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                            Text { text: "ID"; width: 110px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                            Text { text: "上传速度↑"; width: 80px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                            Text { text: "下载速度↓"; width: 80px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                            Text { text: "上传限速"; width: 180px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                            Text { text: "下载限速"; width: 180px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                            Text { text: "操作"; width: 64px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                        }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "上传限速"; width: 64px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                    LineEdit {
+                        width: 140px;
+                        text <=> TransfersG.up-limit;
+                        placeholder-text: "不限";
                     }
-                    Rectangle {
-                        vertical-stretch: 1;
-                        ListView {
-                            for r[i] in TransfersG.serve-limits : Rectangle {
-                                height: 42px;
-                                background: hit1.has-hover ? ThemeG.hover : transparent;
-                                hit1 := TouchArea { mouse-cursor: pointer; }
-                                HorizontalLayout {
-                                    padding-left: 14px;
-                                    padding-right: 14px;
-                                    spacing: 8px;
-                                    Text { text: r.name; horizontal-stretch: 1; horizontal-alignment: left; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
-                                    Text { text: r.id; width: 110px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
-                                    Text { text: r.up-speed; width: 80px; horizontal-alignment: left; font-size: 12px; color: ThemeG.accent; vertical-alignment: center; }
-                                    Text { text: r.down-speed; width: 80px; horizontal-alignment: left; font-size: 12px; color: ThemeG.accent; vertical-alignment: center; }
-                                    HorizontalLayout {
-                                        width: 180px;
-                                        spacing: 6px;
-                                        LineEdit { horizontal-stretch: 1; text: r.up-limit; placeholder-text: "不限"; edited(t) => { root.limit-text(i, 0, t); } }
-                                        ComboBox { width: 72px; model: TransfersG.units; current-index: r.up-unit; changed current-index => { root.limit-unit(i, 0, self.current-index); } }
-                                    }
-                                    HorizontalLayout {
-                                        width: 180px;
-                                        spacing: 6px;
-                                        LineEdit { horizontal-stretch: 1; text: r.down-limit; placeholder-text: "不限"; edited(t) => { root.limit-text(i, 1, t); } }
-                                        ComboBox { width: 72px; model: TransfersG.units; current-index: r.down-unit; changed current-index => { root.limit-unit(i, 1, self.current-index); } }
-                                    }
-                                    HorizontalLayout {
-                                        width: 64px;
-                                        VerticalLayout { alignment: center; PillBtn { label: "应用"; compact: true; primary: true; clicked => { root.limit-apply(i); } } }
-                                    }
-                                }
-                                Rectangle { y: parent.height - 1px; height: 1px; background: ThemeG.border; opacity: 0.5; }
-                            }
-                        }
+                    ComboBox {
+                        width: 76px;
+                        model: TransfersG.units;
+                        current-index <=> TransfersG.up-unit;
                     }
+                    Rectangle { width: 16px; }
+                    Text { text: "下载限速"; width: 64px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                    LineEdit {
+                        width: 140px;
+                        text <=> TransfersG.down-limit;
+                        placeholder-text: "不限";
+                    }
+                    ComboBox {
+                        width: 76px;
+                        model: TransfersG.units;
+                        current-index <=> TransfersG.down-unit;
+                    }
+                    PillBtn { label: "应用限速"; primary: true; compact: true; clicked => { root.limit-apply(); } }
+                    Rectangle { horizontal-stretch: 1; }
                 }
             }
         }
 
         // ---------- 后台任务 ----------
-        if TransfersG.tab == 2 : Card {
+        Card {
             title: "后台任务（" + TransfersG.tasks.length + "）";
             pad: 0px;
             fill: true;
@@ -2246,13 +2129,9 @@ export component MainWindow inherits Window {
     callback serve-start();
     callback serve-stop(string);
     callback transfers-refresh();
-    callback transfers-tab-changed(int);
     callback hide-done-changed();
-    callback transfers-remote-search(string);
-    callback transfers-serve-search(string);
-    callback limit-text(int, int, string);
-    callback limit-unit(int, int, int);
-    callback limit-apply(int);
+    callback transfers-task-search(string);
+    callback limit-apply();
     callback job-stop(int);
     callback plugins-rescan();
     callback ih-save-config();
@@ -2306,7 +2185,22 @@ export component MainWindow inherits Window {
                     VerticalLayout {
                         alignment: center;
                         spacing: 3px;
-                        Text { text: root.nav-icons[i]; font-family: "Segoe MDL2 Assets"; font-size: 20px; color: NavG.idx == i ? ThemeG.accent : ThemeG.text-dim; horizontal-alignment: center; }
+                        Rectangle {
+                            height: 22px;
+                            Text { text: root.nav-icons[i]; font-family: "Segoe MDL2 Assets"; font-size: 20px; color: NavG.idx == i ? ThemeG.accent : ThemeG.text-dim; horizontal-alignment: center; vertical-alignment: center; }
+                            // 启动预热中：远程图标右上角迷你 spinner（纯文本，不遮挡输入）
+                            if i == 2 && NavG.starting : Text {
+                                x: parent.width - 11px;
+                                y: 0;
+                                width: 11px;
+                                height: 11px;
+                                text: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][Math.mod(BusyG.frame, 10)];
+                                font-size: 10px;
+                                color: ThemeG.accent;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
                         Text { text: n; font-size: 9px; color: NavG.idx == i ? ThemeG.accent : ThemeG.text-dim; horizontal-alignment: center; }
                     }
                     Rectangle {
@@ -2428,14 +2322,10 @@ export component MainWindow inherits Window {
                     search-changed(t) => { root.serves-search(t); }
                 }
                 if NavG.idx == 5 : TransfersView {
-                    tab-changed(i) => { root.transfers-tab-changed(i); }
                     refresh => { root.transfers-refresh(); }
                     hide-done-changed => { root.hide-done-changed(); }
-                    remote-search(t) => { root.transfers-remote-search(t); }
-                    serve-search(t) => { root.transfers-serve-search(t); }
-                    limit-text(i, f, t) => { root.limit-text(i, f, t); }
-                    limit-unit(i, f, u) => { root.limit-unit(i, f, u); }
-                    limit-apply(i) => { root.limit-apply(i); }
+                    task-search(t) => { root.transfers-task-search(t); }
+                    limit-apply() => { root.limit-apply(); }
                     job-stop(id) => { root.job-stop(id); }
                 }
                 if NavG.idx == 6 : PluginsView {
