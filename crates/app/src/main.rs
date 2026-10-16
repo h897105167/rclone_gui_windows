@@ -9,6 +9,7 @@ mod config;
 mod http;
 mod kv;
 
+use anyhow::anyhow;
 use rclone_client::{discover_exe, generate_password, local_fs, RcloneManager};
 use serde_json::{json, Value};
 use slint::{ComponentHandle, Model, ModelRc, VecModel, Weak};
@@ -1269,6 +1270,9 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
     }
 
     // 4) 轮询 + 命令循环
+    // 关键：所有耗时操作（RC 请求/网络 IO）全部 spawn 出去执行，
+    // select 循环只负责收命令和派发，保证 UI 命令永远即时响应，
+    // 不会因某个慢请求（如失效远程的 list 挂起）导致全部功能无响应。
     let mut tick: u64 = 0;
     let mut last_dark: Option<bool> = None;
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(1000));
@@ -1276,11 +1280,19 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
         tokio::select! {
             _ = interval.tick() => {
                 tick += 1;
-                poll_stats(&ctx, &ui).await;
+                {
+                    let ctx2 = ctx.clone();
+                    let ui2 = ui.clone();
+                    tokio::spawn(async move { poll_stats(&ctx2, &ui2).await; });
+                }
                 // 传输页：后台任务列表 + 全局限速（每 2s）
                 if tick % 2 == 0 {
-                    build_tasks(&ctx, &ui).await;
-                    apply_global_limit(&ctx, &ui).await;
+                    let ctx2 = ctx.clone();
+                    let ui2 = ui.clone();
+                    tokio::spawn(async move {
+                        build_tasks(&ctx2, &ui2).await;
+                        apply_global_limit(&ctx2, &ui2).await;
+                    });
                 }
                 // 主题跟随系统（每 3s 检查）
                 if tick % 3 == 0 {
@@ -1298,8 +1310,15 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
             }
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { break };
-                if handle_cmd(&ctx, &ui, cmd).await {
-                    break;
+                // Quit 需要顺序执行清理并结束主循环，直接在循环内 await
+                if matches!(cmd, Cmd::Quit) {
+                    if handle_cmd(&ctx, &ui, cmd).await {
+                        break;
+                    }
+                } else {
+                    let ctx2 = ctx.clone();
+                    let ui2 = ui.clone();
+                    tokio::spawn(async move { handle_cmd(&ctx2, &ui2, cmd).await; });
                 }
             }
             _ = ctx.http_restart.notified() => {
@@ -1308,7 +1327,9 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
                     (c.http.enabled, c.http.port)
                 };
                 if enabled {
-                    spawn_http(&ctx, port, ui.clone()).await;
+                    let ctx2 = ctx.clone();
+                    let ui2 = ui.clone();
+                    tokio::spawn(async move { spawn_http(&ctx2, port, ui2).await; });
                 }
             }
         }
@@ -1379,14 +1400,27 @@ async fn startup_flow(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             .collect();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await;
-            // 1) 连接校验（失败 → 该预设流程终止）
-            if client.about(&format!("{name}:")).await.is_err() {
-                toast(&ui2, 2, format!("预设 {name} 连接失败，已跳过其挂载/服务"));
-                return;
+            // 1) 连接校验（失败 → 该预设流程终止）。8s 超时，防止慢后端把整个启动流程拖死
+            let fs = format!("{name}:");
+            let ok = tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                client.about(&fs),
+            )
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+            if !ok {
+                return; // 预热失败静默跳过（不打扰用户）
             }
             // 2) 列根目录校验（同时预热远程连接，避免文件页首次访问被连接建立阻塞）
-            if client.list(&format!("{name}:"), "", None).await.is_err() {
-                toast(&ui2, 2, format!("预设 {name} 获取文件列表失败，已跳过其挂载/服务"));
+            let ok = tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                client.list(&fs, "", None),
+            )
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+            if !ok {
                 return;
             }
             // 3) 文件页当前显示的正是该远程 → 刷新列表
@@ -1394,7 +1428,7 @@ async fn startup_flow(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             if cur_remote == name {
                 let _ = Box::pin(handle_cmd(&ctx2, &ui2, Cmd::FilesRefresh { seq: -1 })).await;
             }
-            // 4) 该远程的挂载预设（并发执行，条目带 spinner）
+            // 4) 该远程的挂载预设（并发执行，条目带 spinner）。成功静默，失败才提示
             let mut mh = Vec::new();
             for m in mounts {
                 let ctx3 = ctx2.clone();
@@ -1406,35 +1440,41 @@ async fn startup_flow(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
                         .unwrap()
                         .push((m.fs.clone(), m.point.clone()));
                     let _ = Box::pin(handle_cmd(&ctx3, &ui3, Cmd::MountsRefresh)).await;
-                    let res = client3
-                        .mount(
+                    let res = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        client3.mount(
                             &m.fs,
                             &m.point,
                             json!({ "vfs_cache_mode": m.cache, "read_only": m.ro }),
-                        )
-                        .await;
+                        ),
+                    )
+                    .await
+                    .map_err(|_| anyhow!("挂载超时"))
+                    .and_then(|r| r);
                     ctx3.pending_mounts
                         .lock()
                         .unwrap()
                         .retain(|(_, p)| p != &m.point);
-                    match res {
-                        Ok(actual) => toast(&ui3, 1, format!("已自动挂载 {} → {actual}", m.fs)),
-                        Err(e) => toast(&ui3, 2, format!("自动挂载 {} 失败: {e}", m.fs)),
+                    if let Err(e) = res {
+                        toast(&ui3, 2, format!("自动挂载 {} 失败: {e}", m.fs));
                     }
                     let _ = Box::pin(handle_cmd(&ctx3, &ui3, Cmd::MountsRefresh)).await;
                 }));
             }
-            // 5) 该远程的服务预设（先查重，避免重复部署报端口占用）
+            // 5) 该远程的服务预设（先查重，避免重复部署报端口占用）。成功静默，失败才提示
             for s in serves {
                 if running.iter().any(|(f, a)| *f == s.fs && *a == s.addr) {
                     continue;
                 }
-                match client
-                    .serve_start(&s.stype, &s.fs, &s.addr, &s.user, &s.pass)
-                    .await
-                {
-                    Ok(id) => toast(&ui2, 1, format!("已自动启动服务 {id}")),
-                    Err(e) => toast(&ui2, 2, format!("自动启动服务失败: {e}")),
+                let res = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    client.serve_start(&s.stype, &s.fs, &s.addr, &s.user, &s.pass),
+                )
+                .await
+                .map_err(|_| anyhow!("服务启动超时"))
+                .and_then(|r| r);
+                if let Err(e) = res {
+                    toast(&ui2, 2, format!("自动启动服务失败: {e}"));
                 }
             }
             for h in mh {
@@ -1442,9 +1482,13 @@ async fn startup_flow(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             }
         }));
     }
-    for h in handles {
-        let _ = h.await;
-    }
+    // 总兜底：60s 后强制结束 spinner，即使个别任务挂起也不阻塞 UI
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        for h in handles {
+            let _ = h.await;
+        }
+    })
+    .await;
     let _ = ui.upgrade_in_event_loop(|ui| ui.global::<NavG>().set_starting(false));
 }
 
@@ -1600,7 +1644,13 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             }
             let client = ctx.mgr.client.read().await.clone();
             let fs = format!("{remote}:");
-            let res = client.list(&fs, &path, None).await;
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                client.list(&fs, &path, None),
+            )
+            .await
+            .map_err(|_| anyhow!("请求超时"))
+            .and_then(|r| r);
             // 请求期间用户可能已发起更新操作（seq 变化），丢弃过期结果
             let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq()).await.unwrap_or(-2);
             if seq >= 0 && cur_seq != seq {
@@ -1643,7 +1693,13 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             let target = join_path(&path, &name);
             let client = ctx.mgr.client.read().await.clone();
             let fs = format!("{remote}:");
-            let res = client.list(&fs, &target, None).await;
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                client.list(&fs, &target, None),
+            )
+            .await
+            .map_err(|_| anyhow!("请求超时"))
+            .and_then(|r| r);
             // 请求期间用户可能已切换远程或发起新操作，丢弃过期结果
             let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq()).await.unwrap_or(-2);
             if seq >= 0 && cur_seq != seq {
@@ -1690,7 +1746,13 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             };
             let client = ctx.mgr.client.read().await.clone();
             let fs = format!("{remote}:");
-            let res = client.list(&fs, &parent, None).await;
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                client.list(&fs, &parent, None),
+            )
+            .await
+            .map_err(|_| anyhow!("请求超时"))
+            .and_then(|r| r);
             let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq()).await.unwrap_or(-2);
             if seq >= 0 && cur_seq != seq {
                 let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
