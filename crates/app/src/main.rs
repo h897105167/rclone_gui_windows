@@ -250,10 +250,9 @@ fn fmt_duration(secs: f64) -> String {
     }
 }
 
-fn apply_remotes_filter(ui: &Weak<MainWindow>, full: &[(String, String, String)]) {
-    let filter = ui
-        .upgrade()
-        .map(|u| u.global::<RemotesG>().get_filter().to_string())
+async fn apply_remotes_filter(ui: &Weak<MainWindow>, full: &[(String, String, String)]) {
+    let filter = read_ui(ui, |u| u.global::<RemotesG>().get_filter().to_string())
+        .await
         .unwrap_or_default()
         .to_lowercase();
     let rows: Vec<RemoteRow> = full
@@ -387,16 +386,31 @@ fn fill_fields_with_existing(fields: &mut [FieldRow], existing: &serde_json::Map
     }
 }
 
-/// 从 UI 读取当前 FieldRow 列表
-fn read_fields_from_ui(ui: &Weak<MainWindow>) -> Vec<FieldRow> {
-    ui.upgrade()
-        .map(|u| {
-            let m = u.global::<RemotesG>().get_edit_fields();
-            (0..m.row_count())
-                .filter_map(|i| m.row_data(i))
-                .collect()
-        })
-        .unwrap_or_default()
+/// 在 UI 线程执行闭包并取回结果。
+/// Slint 的 Weak::upgrade() 有线程归属检查，后台线程调用必然返回 None；
+/// 后台命令读取 UI 属性必须通过本函数桥接到 UI 线程。
+async fn read_ui<T, F>(ui: &Weak<MainWindow>, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce(MainWindow) -> T + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if ui.upgrade_in_event_loop(move |u| {
+        let _ = tx.send(f(u));
+    }).is_err() {
+        return None;
+    }
+    rx.await.ok()
+}
+
+/// 从 UI 读取当前 FieldRow 列表（必须在后台线程通过 read_ui 调用）
+async fn read_fields_from_ui(ui: &Weak<MainWindow>) -> Vec<FieldRow> {
+    read_ui(ui, |u| {
+        let m = u.global::<RemotesG>().get_edit_fields();
+        (0..m.row_count()).filter_map(|i| m.row_data(i)).collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// 获取 providers（优先缓存，否则网络请求）
@@ -839,7 +853,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::FilesRefresh => {
-            let (remote, path) = ui_files_pos(ui);
+            let (remote, path) = ui_files_pos(ui).await;
             // remotes 尚未加载完成时静默跳过，避免 fs=":" 报错
             if remote.is_empty() {
                 return false;
@@ -875,7 +889,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::FilesDownload { name, local } => {
-            let (remote, path) = ui_files_pos(ui);
+            let (remote, path) = ui_files_pos(ui).await;
             let client = ctx.mgr.client.read().await.clone();
             let fs = local_fs(local.parent().unwrap_or(Path::new(".")));
             let res = client
@@ -893,7 +907,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::FilesMkdir => {
-            let (remote, path) = ui_files_pos(ui);
+            let (remote, path) = ui_files_pos(ui).await;
             let client = ctx.mgr.client.read().await.clone();
             let fs = format!("{remote}:");
             let res = client.mkdir(&fs, &join_path(&path, "新建文件夹")).await;
@@ -912,7 +926,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::FilesDel { name, is_dir } => {
-            let (remote, path) = ui_files_pos(ui);
+            let (remote, path) = ui_files_pos(ui).await;
             let client = ctx.mgr.client.read().await.clone();
             let fs = format!("{remote}:");
             let full = join_path(&path, &name);
@@ -934,7 +948,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             if to.trim().is_empty() || to == from {
                 return false;
             }
-            let (remote, path) = ui_files_pos(ui);
+            let (remote, path) = ui_files_pos(ui).await;
             let client = ctx.mgr.client.read().await.clone();
             let fs = format!("{remote}:");
             let res = client
@@ -955,7 +969,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::FilesCopy { name } => {
-            let (remote, path) = ui_files_pos(ui);
+            let (remote, path) = ui_files_pos(ui).await;
             let client = ctx.mgr.client.read().await.clone();
             let fs = format!("{remote}:");
             let (base, ext) = split_name(&name);
@@ -980,7 +994,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::FilesCopyLink { name } => {
-            let (remote, path) = ui_files_pos(ui);
+            let (remote, path) = ui_files_pos(ui).await;
             let cfg_raw = ctx.store.get_all("imagehost");
             let cfg = cfg_raw.get("config").cloned().unwrap_or(json!({}));
             let roots = cfg
@@ -1028,21 +1042,20 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::MountAdd => {
-            let (fs, point, ro, cache) = ui
-                .upgrade()
-                .map(|ui| {
-                    let m = ui.global::<MountsG>();
-                    let fs = m.get_new_fs().to_string();
-                    let point = m.get_new_point().to_string();
-                    let ro = m.get_ro();
-                    let cache = m
-                        .get_caches()
-                        .row_data(m.get_cache_idx().max(0) as usize)
-                        .unwrap_or("minimal".into())
-                        .to_string();
-                    (fs, point, ro, cache)
-                })
-                .unwrap_or_default();
+            let (fs, point, ro, cache) = read_ui(ui, |ui| {
+                let m = ui.global::<MountsG>();
+                let fs = m.get_new_fs().to_string();
+                let point = m.get_new_point().to_string();
+                let ro = m.get_ro();
+                let cache = m
+                    .get_caches()
+                    .row_data(m.get_cache_idx().max(0) as usize)
+                    .unwrap_or("minimal".into())
+                    .to_string();
+                (fs, point, ro, cache)
+            })
+            .await
+            .unwrap_or_default();
             if fs.trim().is_empty() {
                 toast(ui, 2, "请填写远程路径（如 teldrive:）");
                 return false;
@@ -1106,7 +1119,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 }
             }
             *ctx.remotes_cache.lock().unwrap() = full.clone();
-            apply_remotes_filter(ui, &full);
+            apply_remotes_filter(ui, &full).await;
             // 异步加载用量
             for n in names {
                 let client = client.clone();
@@ -1144,14 +1157,14 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                         }
                     });
                     let full2 = ctx2.remotes_cache.lock().unwrap().clone();
-                    apply_remotes_filter(&ui2, &full2);
+                    apply_remotes_filter(&ui2, &full2).await;
                 });
             }
             false
         }
         Cmd::RemotesFilter => {
             let full = ctx.remotes_cache.lock().unwrap().clone();
-            apply_remotes_filter(ui, &full);
+            apply_remotes_filter(ui, &full).await;
             false
         }
         Cmd::RemoteAdd => {
@@ -1190,13 +1203,13 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::RemoteTypeChanged => {
-            let type_name = ui.upgrade()
-                .map(|ui| {
-                    let g = ui.global::<RemotesG>();
-                    let ti = g.get_type_idx().max(0) as usize;
-                    g.get_types().row_data(ti).unwrap_or_default().to_string()
-                })
-                .unwrap_or_default();
+            let type_name = read_ui(ui, |ui| {
+                let g = ui.global::<RemotesG>();
+                let ti = g.get_type_idx().max(0) as usize;
+                g.get_types().row_data(ti).unwrap_or_default().to_string()
+            })
+            .await
+            .unwrap_or_default();
             let providers = get_providers(&ctx).await;
             update_editor_fields(ui, &providers, &type_name);
             false
@@ -1248,28 +1261,27 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::RemoteSave => {
-            let (name, type_str, params_text, is_new, show_raw) = ui
-                .upgrade()
-                .map(|ui| {
-                    let g = ui.global::<RemotesG>();
-                    let ti = g.get_type_idx().max(0) as usize;
-                    let ty = g.get_types().row_data(ti).unwrap_or_default().to_string();
-                    (
-                        g.get_edit_name().to_string(),
-                        ty,
-                        g.get_edit_params().to_string(),
-                        g.get_edit_is_new(),
-                        g.get_show_raw(),
-                    )
-                })
-                .unwrap_or_default();
+            let (name, type_str, params_text, is_new, show_raw) = read_ui(ui, |ui| {
+                let g = ui.global::<RemotesG>();
+                let ti = g.get_type_idx().max(0) as usize;
+                let ty = g.get_types().row_data(ti).unwrap_or_default().to_string();
+                (
+                    g.get_edit_name().to_string(),
+                    ty,
+                    g.get_edit_params().to_string(),
+                    g.get_edit_is_new(),
+                    g.get_show_raw(),
+                )
+            })
+            .await
+            .unwrap_or_default();
             if name.trim().is_empty() || name.contains(':') || name.contains(' ') {
                 toast(ui, 2, "名称不能为空，且不能包含空格或冒号");
                 return false;
             }
             // 优先使用模板字段，原始模式或字段为空时用 key=value
             let params = if !show_raw {
-                let fields = read_fields_from_ui(ui);
+                let fields = read_fields_from_ui(ui).await;
                 if !fields.is_empty() {
                     fields_to_params(&fields)
                 } else {
@@ -1371,29 +1383,28 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::ServeStart => {
-            let (stype, fs, addr, user, pass) = ui
-                .upgrade()
-                .map(|ui| {
-                    let g = ui.global::<ServesG>();
-                    let ty = g
-                        .get_types()
-                        .row_data(g.get_type_idx().max(0) as usize)
-                        .unwrap_or_default()
-                        .to_string();
-                    let fs = g
-                        .get_remotes()
-                        .row_data(g.get_remote_idx().max(0) as usize)
-                        .unwrap_or_default()
-                        .to_string();
-                    (
-                        ty,
-                        fs,
-                        g.get_addr().to_string(),
-                        g.get_user().to_string(),
-                        g.get_pass().to_string(),
-                    )
-                })
-                .unwrap_or_default();
+            let (stype, fs, addr, user, pass) = read_ui(ui, |ui| {
+                let g = ui.global::<ServesG>();
+                let ty = g
+                    .get_types()
+                    .row_data(g.get_type_idx().max(0) as usize)
+                    .unwrap_or_default()
+                    .to_string();
+                let fs = g
+                    .get_remotes()
+                    .row_data(g.get_remote_idx().max(0) as usize)
+                    .unwrap_or_default()
+                    .to_string();
+                (
+                    ty,
+                    fs,
+                    g.get_addr().to_string(),
+                    g.get_user().to_string(),
+                    g.get_pass().to_string(),
+                )
+            })
+            .await
+            .unwrap_or_default();
             if fs.is_empty() {
                 toast(ui, 2, "请先在「远程」页创建远程存储");
                 return false;
@@ -1495,9 +1506,8 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::BwLimitApply => {
-            let rate = ui
-                .upgrade()
-                .map(|ui| ui.global::<TransfersG>().get_bwlimit().to_string())
+            let rate = read_ui(ui, |ui| ui.global::<TransfersG>().get_bwlimit().to_string())
+                .await
                 .unwrap_or_default();
             let rate = if rate.trim().is_empty() { "off".into() } else { rate.trim().to_string() };
             let client = ctx.mgr.client.read().await.clone();
@@ -1540,20 +1550,19 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::OptionsSave => {
-            let (transfers, checkers, tps, log_level) = ui
-                .upgrade()
-                .map(|ui| {
-                    let g = ui.global::<SettingsG>();
-                    let li = g.get_log_level_idx() as usize;
-                    let lv = g.get_log_levels().row_data(li).unwrap_or_default().to_string();
-                    (
-                        g.get_opt_transfers().to_string(),
-                        g.get_opt_checkers().to_string(),
-                        g.get_opt_tpslimit().to_string(),
-                        lv,
-                    )
-                })
-                .unwrap_or_default();
+            let (transfers, checkers, tps, log_level) = read_ui(ui, |ui| {
+                let g = ui.global::<SettingsG>();
+                let li = g.get_log_level_idx() as usize;
+                let lv = g.get_log_levels().row_data(li).unwrap_or_default().to_string();
+                (
+                    g.get_opt_transfers().to_string(),
+                    g.get_opt_checkers().to_string(),
+                    g.get_opt_tpslimit().to_string(),
+                    lv,
+                )
+            })
+            .await
+            .unwrap_or_default();
             let t: i64 = transfers.parse().unwrap_or(4);
             let c: i64 = checkers.parse().unwrap_or(8);
             let p: f64 = tps.parse().unwrap_or(0.0);
@@ -1577,12 +1586,16 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::PluginToggle { idx } => {
-            let row = ui
-                .upgrade()
-                .and_then(|ui| ui.global::<PluginsG>().get_rows().row_data(idx as usize));
-            if let Some(r) = row {
-                let id = r.id.to_string();
-                let enabled = !r.enabled;
+            let row = read_ui(ui, move |ui| {
+                ui.global::<PluginsG>()
+                    .get_rows()
+                    .row_data(idx as usize)
+                    .map(|r| (r.id.to_string(), r.enabled))
+            })
+            .await
+            .flatten();
+            if let Some((id, old_enabled)) = row {
+                let enabled = !old_enabled;
                 {
                     let mut cfg = ctx.cfg.lock().unwrap();
                     cfg.plugin_enabled.insert(id.clone(), enabled);
@@ -1736,16 +1749,15 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::IhImageDel { path } => {
-            let root_id = ui
-                .upgrade()
-                .map(|ui| {
-                    ui.global::<PluginsG>()
-                        .get_roots()
-                        .row_data(0)
-                        .map(|r| r.id.to_string())
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
+            let root_id = read_ui(ui, |ui| {
+                ui.global::<PluginsG>()
+                    .get_roots()
+                    .row_data(0)
+                    .map(|r| r.id.to_string())
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default();
             let body = json!({"rootId": root_id, "paths": [path]});
             let params = plugin_http_req("POST", "/files/delete", Some(&body), json!({}));
             match ctx
@@ -1767,33 +1779,38 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::SettingsSave => {
-            if let Some(ui) = ui.upgrade() {
-                let s = ui.global::<SettingsG>();
-                let mut cfg = ctx.cfg.lock().unwrap().clone();
-                cfg.rclone.mode = s.get_mode_idx() as u8;
-                cfg.rclone.exe = s.get_exe().to_string();
-                // 路径与内嵌不同则视为用户自定义
-                let embedded_path = extract_embedded_rclone().unwrap_or_default();
-                cfg.rclone.exe_custom = !cfg.rclone.exe.is_empty() && cfg.rclone.exe != embedded_path;
-                cfg.rclone.port = s.get_rc_port().parse().unwrap_or(5574);
-                cfg.rclone.user = s.get_rc_user().to_string();
-                cfg.rclone.pass = s.get_rc_pass().to_string();
-                cfg.rclone.url = s.get_rc_url().to_string();
-                cfg.theme_mode = s.get_theme_idx() as u8;
-                cfg.accent_idx = s.get_accent_idx() as u8;
-                cfg.autostart = s.get_autostart();
-                cfg.silent_start = s.get_silent();
-                cfg.http.enabled = s.get_http_enabled();
-                cfg.http.port = s.get_http_port().parse().unwrap_or(5273);
-                set_autostart(cfg.autostart, cfg.silent_start);
-                apply_theme(&ui, cfg.theme_mode);
-                ui.global::<ThemeG>().set_accent_idx(cfg.accent_idx as i32);
-                *ctx.cfg.lock().unwrap() = cfg.clone();
-                if let Err(e) = config::save(&cfg) {
-                    toast_ui(&ui, 2, format!("配置保存失败: {e}"));
-                } else {
-                    toast_ui(&ui, 1, "设置已保存（连接相关改动重启后生效）");
+            // 路径与内嵌不同则视为用户自定义（IO 放后台线程）
+            let embedded_path = extract_embedded_rclone().unwrap_or_default();
+            let save_result = read_ui(ui, {
+                let ctx = ctx.clone();
+                move |ui| -> Result<(), String> {
+                    let s = ui.global::<SettingsG>();
+                    let mut cfg = ctx.cfg.lock().unwrap().clone();
+                    cfg.rclone.mode = s.get_mode_idx() as u8;
+                    cfg.rclone.exe = s.get_exe().to_string();
+                    cfg.rclone.exe_custom = !cfg.rclone.exe.is_empty() && cfg.rclone.exe != embedded_path;
+                    cfg.rclone.port = s.get_rc_port().parse().unwrap_or(5574);
+                    cfg.rclone.user = s.get_rc_user().to_string();
+                    cfg.rclone.pass = s.get_rc_pass().to_string();
+                    cfg.rclone.url = s.get_rc_url().to_string();
+                    cfg.theme_mode = s.get_theme_idx() as u8;
+                    cfg.accent_idx = s.get_accent_idx() as u8;
+                    cfg.autostart = s.get_autostart();
+                    cfg.silent_start = s.get_silent();
+                    cfg.http.enabled = s.get_http_enabled();
+                    cfg.http.port = s.get_http_port().parse().unwrap_or(5273);
+                    set_autostart(cfg.autostart, cfg.silent_start);
+                    apply_theme(&ui, cfg.theme_mode);
+                    ui.global::<ThemeG>().set_accent_idx(cfg.accent_idx as i32);
+                    *ctx.cfg.lock().unwrap() = cfg.clone();
+                    config::save(&cfg).map_err(|e| e.to_string())
                 }
+            })
+            .await;
+            match save_result {
+                Some(Ok(())) => toast(ui, 1, "设置已保存（连接相关改动重启后生效）"),
+                Some(Err(e)) => toast(ui, 2, format!("配置保存失败: {e}")),
+                None => {}
             }
             ctx.http_restart.notify_one();
             false
@@ -1938,9 +1955,7 @@ async fn load_ih_config(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
 }
 
 async fn ih_save_config(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
-    let (roots, naming_idx, seq_pad, dedupe, public_template, obs_idx, trash_dir) = ui
-        .upgrade()
-        .map(|ui| {
+    let (roots, naming_idx, seq_pad, dedupe, public_template, obs_idx, trash_dir) = read_ui(ui, |ui| {
             let g = ui.global::<PluginsG>();
             let n = g.get_roots().row_count();
             let roots: Vec<Value> = (0..n)
@@ -1964,6 +1979,7 @@ async fn ih_save_config(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
                 g.get_trash_dir().to_string(),
             )
         })
+        .await
         .unwrap_or_default();
 
     let naming_mode = ["timestamp", "seq", "keep", "hash"]
@@ -2033,19 +2049,19 @@ fn find_wasm(id: &str) -> PathBuf {
 
 // ---------------- UI 读取辅助 ----------------
 
-fn ui_files_pos(ui: &Weak<MainWindow>) -> (String, String) {
-    ui.upgrade()
-        .map(|ui| {
-            let g = ui.global::<FilesG>();
-            let remotes = g.get_remotes();
-            let idx = g.get_remote_idx();
-            let remote = remotes
-                .row_data(idx.max(0) as usize)
-                .unwrap_or_default()
-                .to_string();
-            (remote, g.get_path().to_string())
-        })
-        .unwrap_or_default()
+async fn ui_files_pos(ui: &Weak<MainWindow>) -> (String, String) {
+    read_ui(ui, |ui| {
+        let g = ui.global::<FilesG>();
+        let remotes = g.get_remotes();
+        let idx = g.get_remote_idx();
+        let remote = remotes
+            .row_data(idx.max(0) as usize)
+            .unwrap_or_default()
+            .to_string();
+        (remote, g.get_path().to_string())
+    })
+    .await
+    .unwrap_or_default()
 }
 
 // ---------------- 回调接线 ----------------
