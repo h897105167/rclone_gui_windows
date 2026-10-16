@@ -1,4 +1,4 @@
-﻿// release 版不弹出控制台窗口（debug 保留便于调试）
+// release 版不弹出控制台窗口（debug 保留便于调试）
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 //! Rclone GUI（Windows 桌面版）：Rust + Slint + rclone RC + WASM 插件
 //!
@@ -35,13 +35,14 @@ enum Cmd {
     MountsRefresh,
     MountAdd,
     MountRemove { point: String },
-    MountPathNav { name: String },
-    ServePathNav { name: String },
+    /// 从历史记录里选择远程路径（scope: 0 挂载 / 1 服务）
+    HistPick { scope: i32, path: String },
     BrowseOpen { scope: i32 },
     BrowseGoto { name: String },
     BrowseOk,
     RemotesRefresh,
-    RemotesFilter,
+    /// 搜索文本变化（防抖后触发；scope: 0 远程 / 1 挂载 / 2 服务）
+    SearchApply { scope: i32 },
     RemoteAdd,
     RemoteEditLoad { name: String },
     RemoteDelete { name: String },
@@ -51,9 +52,15 @@ enum Cmd {
     ServesRefresh,
     ServeStart,
     ServeStop { id: String },
-    JobsRefresh,
+    /// 传输页：进入 / 切换子页 / 刷新
+    TransfersEnter,
+    TransfersTabChanged { tab: i32 },
+    HideDoneChanged,
+    /// 限速草稿输入（scope 由当前子页决定：0 远程 / 1 服务）
+    LimitText { idx: i32, field: i32, text: String },
+    LimitUnit { idx: i32, field: i32, unit: i32 },
+    LimitApply,
     JobStop { id: i64 },
-    BwLimitApply,
     OptionsLoad,
     OptionsSave,
     PluginsRescan,
@@ -83,6 +90,14 @@ struct Ctx {
     remotes_cache: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
     /// config/providers 结果缓存（后端类型参数模板）
     providers_cache: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    /// 活动挂载缓存（含挂载中的 pending 项），用于筛选与盘符重复检测
+    mounts_cache: Arc<std::sync::Mutex<Vec<MountRow>>>,
+    /// 正在挂载中的 (rclone fs, 挂载点)
+    pending_mounts: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// 运行中服务缓存，用于筛选
+    serves_cache: Arc<std::sync::Mutex<Vec<ServeRow>>>,
+    /// 最近一次已下发的全局限速 rate 字符串（避免重复调用 core/bwlimit）
+    last_bwlimit: Arc<std::sync::Mutex<String>>,
 }
 
 impl Ctx {
@@ -111,6 +126,94 @@ fn toast_ui(ui: &MainWindow, kind: i32, msg: impl Into<String>) {
 fn toast(ui: &Weak<MainWindow>, kind: i32, msg: impl Into<String>) {
     let msg = msg.into();
     let _ = ui.upgrade_in_event_loop(move |ui| toast_ui(&ui, kind, msg));
+}
+
+/// 搜索框防抖：记录每个 scope 最近一次输入时间，由 UI 定时器在闲置 300ms 后触发。
+/// scope: 0 远程 / 1 挂载 / 2 服务 / 3 传输-远程限速 / 4 传输-服务限速
+#[derive(Clone, Default)]
+struct SearchDebounce {
+    at: Arc<std::sync::Mutex<[Option<std::time::Instant>; 5]>>,
+}
+
+impl SearchDebounce {
+    fn bump(&self, scope: usize) {
+        if let Ok(mut a) = self.at.lock() {
+            a[scope] = Some(std::time::Instant::now());
+        }
+    }
+
+    /// 若已闲置超过 wait，则取走该 scope 的触发标记并返回 true（只触发一次）
+    fn due(&self, scope: usize, wait: std::time::Duration) -> bool {
+        if let Ok(mut a) = self.at.lock() {
+            if let Some(t) = a[scope] {
+                if t.elapsed() >= wait {
+                    a[scope] = None;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// 生成下一个默认服务名称 Serve_NN
+fn next_serve_name(cfg: &config::AppConfig) -> String {
+    let mut max_n = 0u32;
+    for s in &cfg.serve_names {
+        if let Some(rest) = s.name.strip_prefix("Serve_") {
+            if let Ok(n) = rest.parse::<u32>() {
+                max_n = max_n.max(n);
+            }
+        }
+    }
+    format!("Serve_{:02}", max_n + 1)
+}
+
+/// 按 (协议, fs, 地址) 查找或分配服务名称，并持久化映射
+fn ensure_serve_name(ctx: &Arc<Ctx>, stype: &str, fs: &str, addr: &str) -> String {
+    let mut cfg = ctx.cfg.lock().unwrap();
+    if let Some(s) = cfg
+        .serve_names
+        .iter()
+        .find(|s| s.stype == stype && s.fs == fs && s.addr == addr)
+    {
+        return s.name.clone();
+    }
+    let name = next_serve_name(&cfg);
+    cfg.serve_names.push(config::ServeName {
+        stype: stype.to_string(),
+        fs: fs.to_string(),
+        addr: addr.to_string(),
+        name: name.clone(),
+    });
+    let _ = config::save(&cfg);
+    name
+}
+
+/// 记录远程路径历史（去重、最新在前、最多 10 条），并同步到两个界面
+async fn push_history(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, path: &str) {
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return;
+    }
+    let history = {
+        let mut cfg = ctx.cfg.lock().unwrap();
+        cfg.path_history.retain(|p| p != &path);
+        cfg.path_history.insert(0, path);
+        cfg.path_history.truncate(10);
+        let _ = config::save(&cfg);
+        cfg.path_history.clone()
+    };
+    set_history(ui, &history);
+}
+
+fn set_history(ui: &Weak<MainWindow>, history: &[String]) {
+    let items: Vec<slint::SharedString> = history.iter().map(|s| s.as_str().into()).collect();
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let m = ModelRc::from(Rc::new(VecModel::from(items.clone())));
+        ui.global::<MountsG>().set_history(m.clone());
+        ui.global::<ServesG>().set_history(m);
+    });
 }
 
 fn reg_dword(path: &str, name: &str) -> Option<u32> {
@@ -266,6 +369,503 @@ async fn apply_remotes_filter(ui: &Weak<MainWindow>, full: &[(String, String, St
         ui.global::<RemotesG>()
             .set_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
     });
+}
+
+async fn apply_mounts_filter(ui: &Weak<MainWindow>, full: &[MountRow]) {
+    let q = read_ui(ui, |u| u.global::<MountsG>().get_search().to_string())
+        .await
+        .unwrap_or_default()
+        .to_lowercase();
+    let rows: Vec<MountRow> = full
+        .iter()
+        .filter(|r| {
+            q.is_empty()
+                || r.fs.to_lowercase().contains(&q)
+                || r.mount_point.to_lowercase().contains(&q)
+        })
+        .cloned()
+        .collect();
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.global::<MountsG>()
+            .set_mounts(ModelRc::from(Rc::new(VecModel::from(rows))));
+    });
+}
+
+async fn apply_serves_filter(ui: &Weak<MainWindow>, full: &[ServeRow]) {
+    let q = read_ui(ui, |u| u.global::<ServesG>().get_search().to_string())
+        .await
+        .unwrap_or_default()
+        .to_lowercase();
+    let rows: Vec<ServeRow> = full
+        .iter()
+        .filter(|r| {
+            q.is_empty()
+                || r.id.to_lowercase().contains(&q)
+                || r.name.to_lowercase().contains(&q)
+                || r.stype.to_lowercase().contains(&q)
+                || r.fs.to_lowercase().contains(&q)
+                || r.addr.to_lowercase().contains(&q)
+        })
+        .cloned()
+        .collect();
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.global::<ServesG>()
+            .set_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+    });
+}
+
+// ---------------- 传输页：限速 / 后台任务 ----------------
+
+/// 推断 fs 对应的远程名；本地路径（盘符 / 以 //?/ 开头的 Windows 路径）返回 None
+fn remote_name_of(fs: &str) -> Option<String> {
+    let fs = fs.strip_prefix("//?/").unwrap_or(fs);
+    match fs.find(':') {
+        Some(i) => {
+            let name = &fs[..i];
+            if name.is_empty()
+                || name.len() == 1
+                || name.contains('/')
+                || name.contains('\\')
+            {
+                None
+            } else {
+                Some(name.to_string())
+            }
+        }
+        None => None,
+    }
+}
+
+/// 速度格式化（单位随量级动态变化，最小 B；0 显示为 —）
+fn fmt_speed(v: f64) -> String {
+    if v <= 0.0 {
+        "—".into()
+    } else {
+        format!("{}/s", fmt_bytes(v))
+    }
+}
+
+/// 限速单位索引 → 倍率：0=B 1=KB 2=MB 3=GB
+fn limit_unit_mul(u: i32) -> f64 {
+    match u {
+        0 => 1.0,
+        1 => 1024.0,
+        2 => 1024.0 * 1024.0,
+        3 => 1024.0 * 1024.0 * 1024.0,
+        _ => 1024.0,
+    }
+}
+
+/// 解析限速草稿（数值 + 单位）为字节/秒；空或非正数返回 None（表示不限）
+fn parse_limit(text: &str, unit: i32) -> Option<f64> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let n: f64 = t.parse().ok()?;
+    if n <= 0.0 {
+        return None;
+    }
+    Some(n * limit_unit_mul(unit))
+}
+
+/// 字节/秒 → rclone bwlimit rate 片段；None / 非正表示 "off"
+fn byte_rate_str(v: Option<f64>) -> String {
+    match v {
+        Some(x) if x > 0.0 => format!("{}B", x.round() as i64),
+        _ => "off".into(),
+    }
+}
+
+/// 确保 cfg.remote_limits 与当前远程一一对应（新增缺失项、移除已删除项）
+fn sync_remote_limit_entries(cfg: &mut config::AppConfig, names: &[String]) {
+    for n in names {
+        if !cfg.remote_limits.iter().any(|e| &e.name == n) {
+            cfg.remote_limits.push(config::RemoteLimit {
+                name: n.clone(),
+                up: String::new(),
+                up_unit: 1,
+                down: String::new(),
+                down_unit: 1,
+            });
+        }
+    }
+    cfg.remote_limits.retain(|e| names.iter().any(|n| n == &e.name));
+}
+
+/// 构建「远程限速」列表
+async fn build_remote_limits(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    let client = ctx.mgr.client.read().await.clone();
+    let names = client.list_remotes().await.unwrap_or_default();
+    let stats = client.core_stats().await.ok();
+    let filter = read_ui(ui, |u| u.global::<TransfersG>().get_remote_search().to_string())
+        .await
+        .unwrap_or_default()
+        .to_lowercase();
+
+    let mut up: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut down: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    if let Some(s) = &stats {
+        for t in &s.transferring {
+            if let Some(r) = remote_name_of(&t.dst_fs) {
+                *up.entry(r).or_insert(0.0) += t.speed;
+            }
+            if let Some(r) = remote_name_of(&t.src_fs) {
+                *down.entry(r).or_insert(0.0) += t.speed;
+            }
+        }
+    }
+
+    let rows: Vec<RemoteLimitRow> = {
+        let mut cfg = ctx.cfg.lock().unwrap();
+        sync_remote_limit_entries(&mut cfg, &names);
+        cfg.remote_limits
+            .iter()
+            .filter(|e| filter.is_empty() || e.name.to_lowercase().contains(&filter))
+            .map(|e| RemoteLimitRow {
+                name: e.name.clone().into(),
+                up_speed: fmt_speed(*up.get(&e.name).unwrap_or(&0.0)).into(),
+                down_speed: fmt_speed(*down.get(&e.name).unwrap_or(&0.0)).into(),
+                up_limit: e.up.clone().into(),
+                up_unit: e.up_unit,
+                down_limit: e.down.clone().into(),
+                down_unit: e.down_unit,
+            })
+            .collect()
+    };
+
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.global::<TransfersG>()
+            .set_remote_limits(ModelRc::from(Rc::new(VecModel::from(rows))));
+    });
+}
+
+/// 构建「服务限速」列表
+async fn build_serve_limits(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    let client = ctx.mgr.client.read().await.clone();
+    let stats = client.core_stats().await.ok();
+    let serves = ctx.serves_cache.lock().unwrap().clone();
+    let filter = read_ui(ui, |u| u.global::<TransfersG>().get_serve_search().to_string())
+        .await
+        .unwrap_or_default()
+        .to_lowercase();
+
+    // 速度归属：与服务的 fs 前缀匹配的传输
+    let mut up: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut down: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    if let Some(s) = &stats {
+        for t in &s.transferring {
+            for sv in &serves {
+                if sv.fs.is_empty() {
+                    continue;
+                }
+                let key = sv.id.as_str().to_string();
+                if t.dst_fs.starts_with(sv.fs.as_str()) {
+                    *up.entry(key.clone()).or_insert(0.0) += t.speed;
+                }
+                if t.src_fs.starts_with(sv.fs.as_str()) {
+                    *down.entry(key).or_insert(0.0) += t.speed;
+                }
+            }
+        }
+    }
+
+    let rows: Vec<ServeLimitRow> = {
+        let mut cfg = ctx.cfg.lock().unwrap();
+        // 确保每个运行中服务都有对应限速条目
+        for sv in &serves {
+            let (st, fsp, ad, nm) = (
+                sv.stype.as_str(),
+                sv.fs.as_str(),
+                sv.addr.as_str(),
+                sv.name.as_str(),
+            );
+            if !cfg
+                .serve_limits
+                .iter()
+                .any(|e| e.stype == st && e.fs == fsp && e.addr == ad)
+            {
+                cfg.serve_limits.push(config::ServeLimit {
+                    stype: st.to_string(),
+                    fs: fsp.to_string(),
+                    addr: ad.to_string(),
+                    name: nm.to_string(),
+                    up: String::new(),
+                    up_unit: 1,
+                    down: String::new(),
+                    down_unit: 1,
+                });
+            } else if let Some(e) = cfg
+                .serve_limits
+                .iter_mut()
+                .find(|e| e.stype == st && e.fs == fsp && e.addr == ad)
+            {
+                e.name = nm.to_string();
+            }
+        }
+        serves
+            .iter()
+            .filter(|sv| {
+                filter.is_empty()
+                    || sv.id.as_str().to_lowercase().contains(&filter)
+                    || sv.name.as_str().to_lowercase().contains(&filter)
+            })
+            .map(|sv| {
+                let e = cfg
+                    .serve_limits
+                    .iter()
+                    .find(|e| e.stype == sv.stype.as_str() && e.fs == sv.fs.as_str() && e.addr == sv.addr.as_str());
+                let (up_l, up_u, down_l, down_u) = match e {
+                    Some(e) => (
+                        e.up.clone(),
+                        e.up_unit,
+                        e.down.clone(),
+                        e.down_unit,
+                    ),
+                    None => (String::new(), 1, String::new(), 1),
+                };
+                let id = sv.id.as_str().to_string();
+                ServeLimitRow {
+                    id: sv.id.as_str().into(),
+                    name: sv.name.as_str().into(),
+                    up_speed: fmt_speed(*up.get(&id).unwrap_or(&0.0)).into(),
+                    down_speed: fmt_speed(*down.get(&id).unwrap_or(&0.0)).into(),
+                    up_limit: up_l.into(),
+                    up_unit: up_u,
+                    down_limit: down_l.into(),
+                    down_unit: down_u,
+                }
+            })
+            .collect()
+    };
+
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.global::<TransfersG>()
+            .set_serve_limits(ModelRc::from(Rc::new(VecModel::from(rows))));
+    });
+}
+
+/// 构建「后台任务」列表（job/list + job/status + core/transferred 关联推导）
+async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    let client = ctx.mgr.client.read().await.clone();
+    let hide = read_ui(ui, |u| u.global::<TransfersG>().get_hide_done())
+        .await
+        .unwrap_or(false);
+    let ids = client.job_list().await.unwrap_or_default();
+
+    // group -> (文件名, srcFs, dstFs, 已完成字节)
+    let mut tmap: std::collections::HashMap<String, (String, String, String, f64)> =
+        std::collections::HashMap::new();
+    if let Ok(v) = client.core_transferred().await {
+        let arr = v
+            .get("transferred")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for it in arr {
+            let group = it.get("group").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let name = it.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let src = it.get("srcFs").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let dst = it.get("dstFs").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let bytes = it.get("bytes").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            tmap.insert(group, (name, src, dst, bytes));
+        }
+    }
+
+    // 运行中传输速度按 group 汇总
+    let stats = client.core_stats().await.ok();
+    let mut rmap: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    if let Some(s) = &stats {
+        for t in &s.transferring {
+            if !t.group.is_empty() {
+                *rmap.entry(t.group.clone()).or_insert(0.0) += t.speed;
+            }
+        }
+    }
+
+    let serves = ctx.serves_cache.lock().unwrap().clone();
+    let mut rows: Vec<TaskRow> = Vec::new();
+    for id in &ids {
+        let st = client.job_status(*id).await.unwrap_or(json!({}));
+        let finished = st.get("finished").and_then(|x| x.as_bool()).unwrap_or(false);
+        let success = st.get("success").and_then(|x| x.as_bool()).unwrap_or(false);
+        let duration = st.get("duration").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let group = format!("job/{}", id);
+        let (fname, src, dst, bytes) = tmap
+            .get(&group)
+            .cloned()
+            .unwrap_or((String::new(), String::new(), String::new(), 0.0));
+
+        let src_remote = remote_name_of(&src);
+        let dst_remote = remote_name_of(&dst);
+        let (op, remote) = if dst_remote.is_some() && src_remote.is_none() {
+            ("上传".to_string(), dst_remote.unwrap())
+        } else if src_remote.is_some() && dst_remote.is_none() {
+            ("下载".to_string(), src_remote.unwrap())
+        } else if let Some(r) = dst_remote.or(src_remote) {
+            (String::new(), r)
+        } else {
+            (String::new(), String::new())
+        };
+
+        let mut svc = String::new();
+        for sv in &serves {
+            if !sv.fs.is_empty()
+                && (src.starts_with(sv.fs.as_str()) || dst.starts_with(sv.fs.as_str()))
+            {
+                svc = sv.name.as_str().to_string();
+                break;
+            }
+        }
+
+        if hide && finished {
+            continue;
+        }
+        let status = if !finished {
+            "运行中"
+        } else if success {
+            "已完成"
+        } else {
+            "失败"
+        }
+        .to_string();
+        let speed = if !finished {
+            rmap.get(&group).map(|v| fmt_speed(*v)).unwrap_or_else(|| "—".into())
+        } else if duration > 0.0 {
+            fmt_speed(bytes / duration)
+        } else {
+            "—".into()
+        };
+        rows.push(TaskRow {
+            id: *id as i32,
+            op: op.into(),
+            remote: remote.into(),
+            path: fname.into(),
+            svc: svc.into(),
+            status: status.into(),
+            duration: fmt_duration(duration).into(),
+            speed: speed.into(),
+            done: finished,
+        });
+    }
+    rows.sort_by(|a, b| b.id.cmp(&a.id));
+
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.global::<TransfersG>()
+            .set_tasks(ModelRc::from(Rc::new(VecModel::from(rows))));
+    });
+}
+
+/// 展示当前生效的全局限速（空字符串表示不展示）
+fn set_effective(ui: &Weak<MainWindow>, text: String) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.global::<TransfersG>().set_effective(text.into());
+    });
+}
+
+/// 按当前活动传输计算 min(远程限速, 服务限速)，动态下发全局 tx:rx 限速
+async fn apply_effective_limit(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    let client = ctx.mgr.client.read().await.clone();
+    let Ok(stats) = client.core_stats().await else { return };
+    let serves = ctx.serves_cache.lock().unwrap().clone();
+
+    let (mut tx, mut rx): (Option<f64>, Option<f64>) = (None, None);
+    {
+        let cfg = ctx.cfg.lock().unwrap();
+        for t in &stats.transferring {
+            if let Some(rn) = remote_name_of(&t.dst_fs) {
+                if let Some(e) = cfg.remote_limits.iter().find(|e| e.name == rn) {
+                    if let Some(v) = parse_limit(&e.up, e.up_unit) {
+                        tx = Some(tx.map_or(v, |c| c.min(v)));
+                    }
+                }
+            }
+            if let Some(rn) = remote_name_of(&t.src_fs) {
+                if let Some(e) = cfg.remote_limits.iter().find(|e| e.name == rn) {
+                    if let Some(v) = parse_limit(&e.down, e.down_unit) {
+                        rx = Some(rx.map_or(v, |c| c.min(v)));
+                    }
+                }
+            }
+            for sv in &serves {
+                if sv.fs.is_empty() {
+                    continue;
+                }
+                if !(t.src_fs.starts_with(sv.fs.as_str()) || t.dst_fs.starts_with(sv.fs.as_str())) {
+                    continue;
+                }
+                if let Some(e) = cfg
+                    .serve_limits
+                    .iter()
+                    .find(|e| e.stype == sv.stype.as_str() && e.fs == sv.fs.as_str() && e.addr == sv.addr.as_str())
+                {
+                    if let Some(v) = parse_limit(&e.up, e.up_unit) {
+                        tx = Some(tx.map_or(v, |c| c.min(v)));
+                    }
+                    if let Some(v) = parse_limit(&e.down, e.down_unit) {
+                        rx = Some(rx.map_or(v, |c| c.min(v)));
+                    }
+                }
+            }
+        }
+    }
+
+    // 无活动传输 → 全局关闭限速
+    let (tx, rx) = if stats.transferring.is_empty() {
+        (None, None)
+    } else {
+        (tx, rx)
+    };
+    let rate = if tx.is_none() && rx.is_none() {
+        "off".to_string()
+    } else {
+        format!("{}:{}", byte_rate_str(tx), byte_rate_str(rx))
+    };
+    let changed = {
+        let mut last = ctx.last_bwlimit.lock().unwrap();
+        if *last == rate {
+            false
+        } else {
+            *last = rate.clone();
+            true
+        }
+    };
+    if changed {
+        let _ = client.bwlimit(&rate).await;
+    }
+
+    let disp = if tx.is_none() && rx.is_none() {
+        String::new()
+    } else {
+        format!(
+            "上传 {} · 下载 {}",
+            tx.map(fmt_bytes).unwrap_or_else(|| "不限".into()),
+            rx.map(fmt_bytes).unwrap_or_else(|| "不限".into())
+        )
+    };
+    set_effective(ui, disp);
+}
+
+/// 从当前子页读取限速行的标识键：远程=名称，服务=ID
+async fn limit_row_key(ui: &Weak<MainWindow>, idx: i32) -> (i32, String) {
+    read_ui(ui, move |u| {
+        let g = u.global::<TransfersG>();
+        let t = g.get_tab();
+        let key = if t == 0 {
+            g.get_remote_limits()
+                .row_data(idx as usize)
+                .map(|r| r.name.to_string())
+                .unwrap_or_default()
+        } else {
+            g.get_serve_limits()
+                .row_data(idx as usize)
+                .map(|r| r.id.to_string())
+                .unwrap_or_default()
+        };
+        (t, key)
+    })
+    .await
+    .unwrap_or((0, String::new()))
 }
 
 /// 从 config/providers 响应中提取指定类型的字段列表
@@ -505,42 +1105,6 @@ async fn list_display(ctx: &Arc<Ctx>, display: &str, dirs_only: bool) -> (Vec<(S
     }
 }
 
-/// 级联下拉导航：当前页面 new-fs + 选中项 → 新路径，并刷新下拉内容（仅文件夹）
-async fn nav_path_picker(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, mount_scope: bool, name: &str) {
-    let cur = read_ui(ui, move |ui| {
-        if mount_scope {
-            ui.global::<MountsG>().get_new_fs().to_string()
-        } else {
-            ui.global::<ServesG>().get_new_fs().to_string()
-        }
-    })
-    .await
-    .unwrap_or_default();
-    let base = cur.trim().trim_end_matches('/');
-    let is_root = base == "root:" || base == "root://" || base == "root" || base.is_empty();
-    let target = if is_root {
-        format!("root://{name}")
-    } else {
-        format!("{base}/{name}")
-    };
-    let (items, disp) = list_display(ctx, &target, true).await;
-    let rows: Vec<PathItem> = items
-        .into_iter()
-        .map(|(n, d)| PathItem { name: n.into(), is_dir: d })
-        .collect();
-    let _ = ui.upgrade_in_event_loop(move |ui| {
-        if mount_scope {
-            let g = ui.global::<MountsG>();
-            g.set_new_fs(disp.into());
-            g.set_path_items(ModelRc::from(Rc::new(VecModel::from(rows))));
-        } else {
-            let g = ui.global::<ServesG>();
-            g.set_new_fs(disp.into());
-            g.set_path_items(ModelRc::from(Rc::new(VecModel::from(rows))));
-        }
-    });
-}
-
 /// 从 UI 读取当前 FieldRow 列表（必须在后台线程通过 read_ui 调用）
 async fn read_fields_from_ui(ui: &Weak<MainWindow>) -> Vec<FieldRow> {
     read_ui(ui, |u| {
@@ -662,6 +1226,8 @@ fn main() {
         .set_cfg_path(config::config_path().display().to_string().into());
     ui.global::<MountsG>().set_winfsp_ok(winfsp_installed().0);
     ui.global::<MountsG>().set_winfsp_msg(winfsp_installed().1.into());
+    // 远程路径历史
+    set_history(&ui.as_weak(), &cfg.path_history);
 
     // 内置插件释放
     embed_plugins();
@@ -684,6 +1250,10 @@ fn main() {
         http_restart: Arc::new(tokio::sync::Notify::new()),
         remotes_cache: Arc::new(std::sync::Mutex::new(Vec::new())),
         providers_cache: Arc::new(std::sync::Mutex::new(None)),
+        mounts_cache: Arc::new(std::sync::Mutex::new(Vec::new())),
+        pending_mounts: Arc::new(std::sync::Mutex::new(Vec::new())),
+        serves_cache: Arc::new(std::sync::Mutex::new(Vec::new())),
+        last_bwlimit: Arc::new(std::sync::Mutex::new(String::new())),
     });
 
     {
@@ -699,7 +1269,8 @@ fn main() {
         });
     }
 
-    wire_callbacks(&ui, ctx, tx.clone());
+    let search_debounce = SearchDebounce::default();
+    wire_callbacks(&ui, ctx, tx.clone(), search_debounce.clone());
 
     // 窗口关闭 → 优雅退出（卸载挂载 / 停止服务 / 退出 rclone 进程）
     {
@@ -710,9 +1281,11 @@ fn main() {
         });
     }
 
-    // busy 状态帧驱动（Spinner 动画）
+    // busy 状态帧驱动（Spinner 动画）+ 搜索防抖派发
     {
         let ui_busy = ui.as_weak();
+        let tx_db = tx.clone();
+        let db = search_debounce.clone();
         let busy_timer = Box::leak(Box::new(slint::Timer::default()));
         busy_timer.start(
             slint::TimerMode::Repeated,
@@ -726,6 +1299,13 @@ fn main() {
                     if busy {
                         let f = u.global::<BusyG>().get_frame();
                         u.global::<BusyG>().set_frame((f + 1) % 10);
+                    }
+                }
+                // 搜索防抖：闲置 300ms 后触发筛选
+                let wait = std::time::Duration::from_millis(300);
+                for scope in 0..5 {
+                    if db.due(scope, wait) {
+                        let _ = tx_db.send(Cmd::SearchApply { scope: scope as i32 });
                     }
                 }
             },
@@ -831,40 +1411,61 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
         );
     }
 
-    // 1.5) 自动挂载 / 自动服务（rclone 连接成功时执行）
-    {
+    // 1.5) 先刷新界面列表（远程 / 挂载 / 服务），保证“已连接的远程”先显示出来
+    let ready = {
         let client = ctx.mgr.client.read().await.clone();
-        let ready = client
+        client
             .version()
             .await
             .map(|v| v.version.starts_with('v'))
-            .unwrap_or(false);
-        if ready {
-            let (mounts, serves) = {
-                let c = ctx.cfg.lock().unwrap();
-                (c.auto_mounts.clone(), c.auto_serves.clone())
-            };
-            for m in &mounts {
-                match client
-                    .mount(&m.fs, &m.point, json!({ "vfs_cache_mode": m.cache, "read_only": m.ro }))
-                    .await
-                {
-                    Ok(actual) => toast(&ui, 1, format!("已自动挂载 {} → {actual}", m.fs)),
-                    Err(e) => toast(&ui, 2, format!("自动挂载 {} 失败: {e}", m.fs)),
+            .unwrap_or(false)
+    };
+    if ready {
+        let _ = Box::pin(handle_cmd(&ctx, &ui, Cmd::RemotesRefresh)).await;
+        let _ = Box::pin(handle_cmd(&ctx, &ui, Cmd::MountsRefresh)).await;
+        let _ = Box::pin(handle_cmd(&ctx, &ui, Cmd::ServesRefresh)).await;
+    }
+
+    // 1.6) 后台执行自动挂载 / 自动服务（放在后台任务里，不阻塞命令循环）
+    if ready {
+        let (mounts, serves) = {
+            let c = ctx.cfg.lock().unwrap();
+            (c.auto_mounts.clone(), c.auto_serves.clone())
+        };
+        if !mounts.is_empty() || !serves.is_empty() {
+            let ctx2 = ctx.clone();
+            let ui2 = ui.clone();
+            tokio::spawn(async move {
+                let client = ctx2.mgr.client.read().await.clone();
+                for m in &mounts {
+                    ctx2.pending_mounts
+                        .lock()
+                        .unwrap()
+                        .push((m.fs.clone(), m.point.clone()));
+                    let _ = Box::pin(handle_cmd(&ctx2, &ui2, Cmd::MountsRefresh)).await;
+                    let res = client
+                        .mount(&m.fs, &m.point, json!({ "vfs_cache_mode": m.cache, "read_only": m.ro }))
+                        .await;
+                    ctx2.pending_mounts
+                        .lock()
+                        .unwrap()
+                        .retain(|(_, p)| p != &m.point);
+                    match res {
+                        Ok(actual) => toast(&ui2, 1, format!("已自动挂载 {} → {actual}", m.fs)),
+                        Err(e) => toast(&ui2, 2, format!("自动挂载 {} 失败: {e}", m.fs)),
+                    }
+                    let _ = Box::pin(handle_cmd(&ctx2, &ui2, Cmd::MountsRefresh)).await;
                 }
-            }
-            for s in &serves {
-                match client.serve_start(&s.stype, &s.fs, &s.addr, &s.user, &s.pass).await {
-                    Ok(id) => toast(&ui, 1, format!("已自动启动服务 {id}")),
-                    Err(e) => toast(&ui, 2, format!("自动启动服务失败: {e}")),
+                for s in &serves {
+                    match client.serve_start(&s.stype, &s.fs, &s.addr, &s.user, &s.pass).await {
+                        Ok(id) => toast(&ui2, 1, format!("已自动启动服务 {id}")),
+                        Err(e) => toast(&ui2, 2, format!("自动启动服务失败: {e}")),
+                    }
                 }
-            }
-            if !mounts.is_empty() {
-                let _ = Box::pin(handle_cmd(&ctx, &ui, Cmd::MountsRefresh)).await;
-            }
-            if !serves.is_empty() {
-                let _ = Box::pin(handle_cmd(&ctx, &ui, Cmd::ServesRefresh)).await;
-            }
+                if !serves.is_empty() {
+                    let _ = Box::pin(handle_cmd(&ctx2, &ui2, Cmd::ServesRefresh)).await;
+                }
+            });
         }
     }
 
@@ -913,6 +1514,11 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
             _ = interval.tick() => {
                 tick += 1;
                 poll_stats(&ctx, &ui).await;
+                // 传输页：后台任务列表 + 全局限速（每 2s）
+                if tick % 2 == 0 {
+                    build_tasks(&ctx, &ui).await;
+                    apply_effective_limit(&ctx, &ui).await;
+                }
                 // 主题跟随系统（每 3s 检查）
                 if tick % 3 == 0 {
                     let mode = ctx.cfg.lock().unwrap().theme_mode;
@@ -992,10 +1598,8 @@ async fn poll_stats(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
                     percent: t.percentage.clamp(0.0, 100.0) as i32,
                 })
                 .collect();
-            let model = ModelRc::from(Rc::new(VecModel::from(rows.clone())));
+            let model = ModelRc::from(Rc::new(VecModel::from(rows)));
             g.set_xfers(model);
-            ui.global::<TransfersG>()
-                .set_active(ModelRc::from(Rc::new(VecModel::from(rows))));
         },
     );
 }
@@ -1250,19 +1854,30 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
         Cmd::MountsRefresh => {
             let client = ctx.mgr.client.read().await.clone();
             let mounts = client.mounts().await.unwrap_or_default();
-            let _ = ui.upgrade_in_event_loop(
-                move |ui| {
-                    let rows: Vec<MountRow> = mounts
-                        .iter()
-                        .map(|m| MountRow {
-                            fs: m.fs.clone().into(),
-                            mount_point: m.mount_point.clone().into(),
-                        })
-                        .collect();
-                    ui.global::<MountsG>()
-                        .set_mounts(ModelRc::from(Rc::new(VecModel::from(rows))));
-                },
-            );
+            let mut rows: Vec<MountRow> = mounts
+                .iter()
+                .map(|m| MountRow {
+                    fs: m.fs.clone().into(),
+                    mount_point: m.mount_point.clone().into(),
+                    pending: false,
+                })
+                .collect();
+            // 合并“正在挂载中”的条目；已被真实列表收录的则自动摘掉
+            {
+                let mut pending = ctx.pending_mounts.lock().unwrap();
+                pending.retain(|(_, pt)| !rows.iter().any(|r| r.mount_point.eq_ignore_ascii_case(pt)));
+                for (fs, pt) in pending.iter() {
+                    if !rows.iter().any(|r| r.mount_point.eq_ignore_ascii_case(pt)) {
+                        rows.push(MountRow {
+                            fs: fs.clone().into(),
+                            mount_point: pt.clone().into(),
+                            pending: true,
+                        });
+                    }
+                }
+            }
+            *ctx.mounts_cache.lock().unwrap() = rows.clone();
+            apply_mounts_filter(ui, &rows).await;
             false
         }
         Cmd::MountAdd => {
@@ -1287,22 +1902,32 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 return false;
             }
             let point = normalize_mount_point(&point_raw);
+            // 盘符 / 挂载点重复检测（含正在挂载中的条目）
+            if point != "*" {
+                let dup = ctx
+                    .mounts_cache
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.mount_point.eq_ignore_ascii_case(&point));
+                if dup {
+                    toast(ui, 2, format!("挂载点 {point} 已被占用，请修改盘符"));
+                    return false;
+                }
+            }
             let client = ctx.mgr.client.read().await.clone();
             let opts = json!({
                 "vfs_cache_mode": cache,
                 "read_only": ro,
             });
-            let _ = ui.upgrade_in_event_loop(
-                |ui| {
-                    ui.global::<MountsG>().set_busy(true);
-                },
-            );
+            // 立即在“活动挂载”里插入一条 pending（spinner + 高亮）
+            ctx.pending_mounts.lock().unwrap().push((fs.clone(), point.clone()));
+            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<MountsG>().set_busy(true));
+            let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
             let res = client.mount(&fs, &point, opts).await;
-            let _ = ui.upgrade_in_event_loop(
-                |ui| {
-                    ui.global::<MountsG>().set_busy(false);
-                },
-            );
+            // 无论成败都先摘掉 pending
+            ctx.pending_mounts.lock().unwrap().retain(|(_, p)| p != &point);
+            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<MountsG>().set_busy(false));
             match res {
                 Ok(actual) => {
                     if auto {
@@ -1327,9 +1952,14 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                         }
                     }
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
-                    toast(ui, 1, format!("已挂载到 {actual}"));
+                    push_history(ctx, ui, &fs_disp).await;
+                    toast(ui, 1, format!("挂载成功：{actual}"));
                 }
-                Err(e) => toast(ui, 2, format!("挂载失败: {e}")),
+                Err(e) => {
+                    // 失败：刷新列表（pending 已摘除，条目自动消失）
+                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
+                    toast(ui, 2, format!("挂载失败：{e}"));
+                }
             }
             false
         }
@@ -1363,12 +1993,14 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             }
             false
         }
-        Cmd::MountPathNav { name } => {
-            nav_path_picker(ctx, ui, true, &name).await;
-            false
-        }
-        Cmd::ServePathNav { name } => {
-            nav_path_picker(ctx, ui, false, &name).await;
+        Cmd::HistPick { scope, path } => {
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                if scope == 0 {
+                    ui.global::<MountsG>().set_new_fs(path.into());
+                } else {
+                    ui.global::<ServesG>().set_new_fs(path.into());
+                }
+            });
             false
         }
         Cmd::BrowseOpen { scope } => {
@@ -1534,9 +2166,27 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             }
             false
         }
-        Cmd::RemotesFilter => {
-            let full = ctx.remotes_cache.lock().unwrap().clone();
-            apply_remotes_filter(ui, &full).await;
+        Cmd::SearchApply { scope } => {
+            match scope {
+                0 => {
+                    let full = ctx.remotes_cache.lock().unwrap().clone();
+                    apply_remotes_filter(ui, &full).await;
+                }
+                1 => {
+                    let full = ctx.mounts_cache.lock().unwrap().clone();
+                    apply_mounts_filter(ui, &full).await;
+                }
+                2 => {
+                    let full = ctx.serves_cache.lock().unwrap().clone();
+                    apply_serves_filter(ui, &full).await;
+                }
+                3 => {
+                    build_remote_limits(ctx, ui).await;
+                }
+                _ => {
+                    build_serve_limits(ctx, ui).await;
+                }
+            }
             false
         }
         Cmd::RemoteAdd => {
@@ -1721,11 +2371,6 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                                 .or_else(|| x.as_i64().map(|n| n.to_string()))
                         })
                         .unwrap_or_default();
-                    let ty = it
-                        .get("type")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
                     let params = it.get("params").cloned().unwrap_or(json!({}));
                     let getp = |keys: &[&str]| -> String {
                         for k in keys {
@@ -1738,22 +2383,26 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                         }
                         String::new()
                     };
+                    // 协议位于 params.type（顶层没有 type 字段），修复协议列空白
+                    let ty = getp(&["type", "Type"]);
+                    let fs = getp(&["fs", "Fs"]);
+                    let addr = getp(&["addr", "Addr", "listen", "Listen"]);
+                    let name = ensure_serve_name(ctx, &ty, &fs, &addr);
                     ServeRow {
                         id: id.into(),
+                        name: name.into(),
                         stype: ty.into(),
-                        fs: getp(&["fs", "Fs"]).into(),
-                        addr: getp(&["addr", "Addr", "listen", "Listen"]).into(),
+                        fs: fs.into(),
+                        addr: addr.into(),
                     }
                 })
                 .collect();
-            let _ = ui.upgrade_in_event_loop(move |ui| {
-                ui.global::<ServesG>()
-                    .set_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
-            });
+            *ctx.serves_cache.lock().unwrap() = rows.clone();
+            apply_serves_filter(ui, &rows).await;
             false
         }
         Cmd::ServeStart => {
-            let (stype, fs_disp, addr, user, pass, auto) = read_ui(ui, |ui| {
+            let (stype, fs_disp, addr, user, pass, auto, svc_name) = read_ui(ui, |ui| {
                 let g = ui.global::<ServesG>();
                 let ty = g
                     .get_types()
@@ -1767,6 +2416,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     g.get_user().to_string(),
                     g.get_pass().to_string(),
                     g.get_auto_run(),
+                    g.get_svc_name().to_string(),
                 )
             })
             .await
@@ -1788,23 +2438,45 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             let _ = ui.upgrade_in_event_loop(|ui| ui.global::<ServesG>().set_busy(false));
             match res {
                 Ok(id) => {
-                    if auto {
-                        let item = config::AutoServe {
+                    let addr_t = addr.trim().to_string();
+                    {
+                        let mut cfg = ctx.cfg.lock().unwrap();
+                        // 服务名称：优先用用户输入；否则复用已有映射；再否则生成默认 Serve_NN
+                        let svc_name = svc_name.trim().to_string();
+                        let name = if !svc_name.is_empty() {
+                            svc_name
+                        } else if let Some(s) = cfg
+                            .serve_names
+                            .iter()
+                            .find(|s| s.stype == stype && s.fs == fs && s.addr == addr_t)
+                        {
+                            s.name.clone()
+                        } else {
+                            next_serve_name(&cfg)
+                        };
+                        cfg.serve_names.retain(|s| !(s.stype == stype && s.fs == fs && s.addr == addr_t));
+                        cfg.serve_names.push(config::ServeName {
                             stype: stype.clone(),
                             fs: fs.clone(),
-                            addr: addr.trim().to_string(),
-                            user: user.clone(),
-                            pass: pass.clone(),
-                        };
-                        {
-                            let mut cfg = ctx.cfg.lock().unwrap();
+                            addr: addr_t.clone(),
+                            name: name.clone(),
+                        });
+                        if auto {
+                            let item = config::AutoServe {
+                                stype: stype.clone(),
+                                fs: fs.clone(),
+                                addr: addr_t.clone(),
+                                user: user.clone(),
+                                pass: pass.clone(),
+                            };
                             cfg.auto_serves
                                 .retain(|s| !(s.fs == item.fs && s.addr == item.addr && s.stype == item.stype));
                             cfg.auto_serves.push(item);
-                            let _ = config::save(&cfg);
                         }
+                        let _ = config::save(&cfg);
                     }
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ServesRefresh)).await;
+                    push_history(ctx, ui, &fs_disp).await;
                     toast(ui, 1, format!("服务已启动: {id}"));
                 }
                 Err(e) => toast(ui, 2, format!("启动失败: {e}")),
@@ -1871,81 +2543,130 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             }
             false
         }
-        Cmd::JobsRefresh => {
-            let client = ctx.mgr.client.read().await.clone();
-            let ids = client.job_list().await.unwrap_or_default();
-            let mut rows: Vec<JobRow> = Vec::new();
-            for id in &ids {
-                if let Ok(st) = client.job_status(*id).await {
-                    let finished = st
-                        .get("finished")
-                        .and_then(|x| x.as_bool())
-                        .unwrap_or(false);
-                    let success = st
-                        .get("success")
-                        .and_then(|x| x.as_bool())
-                        .unwrap_or(false);
-                    let error = st
-                        .get("error")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let duration = st.get("duration").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                    let status = if !finished {
-                        "运行中"
-                    } else if success {
-                        "已完成"
-                    } else {
-                        "失败"
+        Cmd::TransfersEnter => {
+            build_remote_limits(ctx, ui).await;
+            build_serve_limits(ctx, ui).await;
+            build_tasks(ctx, ui).await;
+            apply_effective_limit(ctx, ui).await;
+            false
+        }
+        Cmd::TransfersTabChanged { tab } => {
+            let _ = ui.upgrade_in_event_loop(move |ui| ui.global::<TransfersG>().set_tab(tab));
+            build_remote_limits(ctx, ui).await;
+            build_serve_limits(ctx, ui).await;
+            build_tasks(ctx, ui).await;
+            false
+        }
+        Cmd::HideDoneChanged => {
+            build_tasks(ctx, ui).await;
+            false
+        }
+        Cmd::LimitText { idx, field, text } => {
+            let (tab, key) = limit_row_key(ui, idx).await;
+            if !key.is_empty() {
+                if tab == 0 {
+                    let mut cfg = ctx.cfg.lock().unwrap();
+                    if let Some(e) = cfg.remote_limits.iter_mut().find(|e| e.name == key) {
+                        if field == 0 {
+                            e.up = text;
+                        } else {
+                            e.down = text;
+                        }
                     }
-                    .to_string();
-                    let progress = st
-                        .get("progress")
-                        .and_then(|p| {
-                            p.as_f64()
-                                .or_else(|| p.get("percent").and_then(|x| x.as_f64()))
-                        })
-                        .unwrap_or(0.0) as i32;
-                    let desc = if finished && !success && !error.is_empty() {
-                        format!("#{} · {}", id, error)
-                    } else {
-                        format!("任务 #{}", id)
-                    };
-                    rows.push(JobRow {
-                        id: *id as i32,
-                        desc: desc.into(),
-                        status: status.into(),
-                        progress,
-                        duration: fmt_duration(duration).into(),
-                    });
+                } else {
+                    let sk = ctx
+                        .serves_cache
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|s| s.id == key)
+                        .map(|s| {
+                            (
+                                s.stype.as_str().to_string(),
+                                s.fs.as_str().to_string(),
+                                s.addr.as_str().to_string(),
+                            )
+                        });
+                    if let Some((st, fs, ad)) = sk {
+                        let mut cfg = ctx.cfg.lock().unwrap();
+                        if let Some(e) = cfg
+                            .serve_limits
+                            .iter_mut()
+                            .find(|e| e.stype == st && e.fs == fs && e.addr == ad)
+                        {
+                            if field == 0 {
+                                e.up = text;
+                            } else {
+                                e.down = text;
+                            }
+                        }
+                    }
                 }
             }
-            let _ = ui.upgrade_in_event_loop(move |ui| {
-                ui.global::<TransfersG>()
-                    .set_jobs(ModelRc::from(Rc::new(VecModel::from(rows))));
-            });
+            false
+        }
+        Cmd::LimitUnit { idx, field, unit } => {
+            let (tab, key) = limit_row_key(ui, idx).await;
+            if !key.is_empty() {
+                if tab == 0 {
+                    let mut cfg = ctx.cfg.lock().unwrap();
+                    if let Some(e) = cfg.remote_limits.iter_mut().find(|e| e.name == key) {
+                        if field == 0 {
+                            e.up_unit = unit;
+                        } else {
+                            e.down_unit = unit;
+                        }
+                    }
+                } else {
+                    let sk = ctx
+                        .serves_cache
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|s| s.id == key)
+                        .map(|s| {
+                            (
+                                s.stype.as_str().to_string(),
+                                s.fs.as_str().to_string(),
+                                s.addr.as_str().to_string(),
+                            )
+                        });
+                    if let Some((st, fs, ad)) = sk {
+                        let mut cfg = ctx.cfg.lock().unwrap();
+                        if let Some(e) = cfg
+                            .serve_limits
+                            .iter_mut()
+                            .find(|e| e.stype == st && e.fs == fs && e.addr == ad)
+                        {
+                            if field == 0 {
+                                e.up_unit = unit;
+                            } else {
+                                e.down_unit = unit;
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        }
+        Cmd::LimitApply => {
+            {
+                let cfg = ctx.cfg.lock().unwrap();
+                let _ = config::save(&cfg);
+            }
+            apply_effective_limit(ctx, ui).await;
+            toast(ui, 1, "限速已应用");
             false
         }
         Cmd::JobStop { id } => {
             let client = ctx.mgr.client.read().await.clone();
             match client.job_stop(id).await {
                 Ok(()) => {
-                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::JobsRefresh)).await;
+                    build_tasks(ctx, ui).await;
+                    apply_effective_limit(ctx, ui).await;
                     toast(ui, 1, format!("任务 #{} 已停止", id));
                 }
                 Err(e) => toast(ui, 2, format!("停止失败: {e}")),
-            }
-            false
-        }
-        Cmd::BwLimitApply => {
-            let rate = read_ui(ui, |ui| ui.global::<TransfersG>().get_bwlimit().to_string())
-                .await
-                .unwrap_or_default();
-            let rate = if rate.trim().is_empty() { "off".into() } else { rate.trim().to_string() };
-            let client = ctx.mgr.client.read().await.clone();
-            match client.bwlimit(&rate).await {
-                Ok(applied) => toast(ui, 1, format!("限速已设为 {}", applied)),
-                Err(e) => toast(ui, 2, format!("限速设置失败: {e}")),
             }
             false
         }
@@ -2498,7 +3219,12 @@ async fn ui_files_pos(ui: &Weak<MainWindow>) -> (String, String) {
 
 // ---------------- 回调接线 ----------------
 
-fn wire_callbacks(ui: &MainWindow, ctx: Arc<Ctx>, tx: mpsc::UnboundedSender<Cmd>) {
+fn wire_callbacks(
+    ui: &MainWindow,
+    _ctx: Arc<Ctx>,
+    tx: mpsc::UnboundedSender<Cmd>,
+    debounce: SearchDebounce,
+) {
     ui.on_refresh_dashboard({
         let tx = tx.clone();
         move || {
@@ -2640,13 +3366,25 @@ fn wire_callbacks(ui: &MainWindow, ctx: Arc<Ctx>, tx: mpsc::UnboundedSender<Cmd>
     ui.on_mount_path_nav({
         let tx = tx.clone();
         move |name| {
-            let _ = tx.send(Cmd::MountPathNav { name: name.to_string() });
+            let _ = tx.send(Cmd::HistPick { scope: 0, path: name.to_string() });
         }
     });
     ui.on_serve_path_nav({
         let tx = tx.clone();
         move |name| {
-            let _ = tx.send(Cmd::ServePathNav { name: name.to_string() });
+            let _ = tx.send(Cmd::HistPick { scope: 1, path: name.to_string() });
+        }
+    });
+    ui.on_mounts_search({
+        let db = debounce.clone();
+        move |_| {
+            db.bump(1);
+        }
+    });
+    ui.on_serves_search({
+        let db = debounce.clone();
+        move |_| {
+            db.bump(2);
         }
     });
     ui.on_browse_open({
@@ -2676,7 +3414,7 @@ fn wire_callbacks(ui: &MainWindow, ctx: Arc<Ctx>, tx: mpsc::UnboundedSender<Cmd>
                 2 => { let _ = tx.send(Cmd::RemotesRefresh); }
                 3 => { let _ = tx.send(Cmd::MountsRefresh); }
                 4 => { let _ = tx.send(Cmd::ServesRefresh); }
-                5 => { let _ = tx.send(Cmd::JobsRefresh); }
+                5 => { let _ = tx.send(Cmd::TransfersEnter); }
                 7 => { let _ = tx.send(Cmd::OptionsLoad); }
                 _ => {}
             }
@@ -2689,9 +3427,9 @@ fn wire_callbacks(ui: &MainWindow, ctx: Arc<Ctx>, tx: mpsc::UnboundedSender<Cmd>
         }
     });
     ui.on_remotes_filter({
-        let tx = tx.clone();
+        let db = debounce.clone();
         move |_| {
-            let _ = tx.send(Cmd::RemotesFilter);
+            db.bump(0);
         }
     });
     ui.on_remote_add({
@@ -2763,13 +3501,57 @@ fn wire_callbacks(ui: &MainWindow, ctx: Arc<Ctx>, tx: mpsc::UnboundedSender<Cmd>
     ui.on_transfers_refresh({
         let tx = tx.clone();
         move || {
-            let _ = tx.send(Cmd::JobsRefresh);
+            let _ = tx.send(Cmd::TransfersEnter);
         }
     });
-    ui.on_bwlimit_apply({
+    ui.on_transfers_tab_changed({
+        let tx = tx.clone();
+        move |tab| {
+            let _ = tx.send(Cmd::TransfersTabChanged { tab });
+        }
+    });
+    ui.on_hide_done_changed({
         let tx = tx.clone();
         move || {
-            let _ = tx.send(Cmd::BwLimitApply);
+            let _ = tx.send(Cmd::HideDoneChanged);
+        }
+    });
+    ui.on_transfers_remote_search({
+        let db = debounce.clone();
+        move |_| {
+            db.bump(3);
+        }
+    });
+    ui.on_transfers_serve_search({
+        let db = debounce.clone();
+        move |_| {
+            db.bump(4);
+        }
+    });
+    ui.on_limit_text({
+        let tx = tx.clone();
+        move |i, f, t| {
+            let _ = tx.send(Cmd::LimitText {
+                idx: i,
+                field: f,
+                text: t.to_string(),
+            });
+        }
+    });
+    ui.on_limit_unit({
+        let tx = tx.clone();
+        move |i, f, u| {
+            let _ = tx.send(Cmd::LimitUnit {
+                idx: i,
+                field: f,
+                unit: u,
+            });
+        }
+    });
+    ui.on_limit_apply({
+        let tx = tx.clone();
+        move |_| {
+            let _ = tx.send(Cmd::LimitApply);
         }
     });
     ui.on_job_stop({

@@ -19,6 +19,7 @@ export struct FileRow {
 export struct MountRow {
     fs: string,
     mount-point: string,
+    pending: bool,
 }
 export struct PluginRow {
     id: string,
@@ -65,6 +66,7 @@ export struct FieldRow {
 }
 export struct ServeRow {
     id: string,
+    name: string,
     stype: string,
     fs: string,
     addr: string,
@@ -73,12 +75,35 @@ export struct PathItem {
     name: string,
     is-dir: bool,
 }
-export struct JobRow {
+export struct RemoteLimitRow {
+    name: string,
+    up-speed: string,
+    down-speed: string,
+    up-limit: string,
+    up-unit: int,
+    down-limit: string,
+    down-unit: int,
+}
+export struct ServeLimitRow {
+    id: string,
+    name: string,
+    up-speed: string,
+    down-speed: string,
+    up-limit: string,
+    up-unit: int,
+    down-limit: string,
+    down-unit: int,
+}
+export struct TaskRow {
     id: int,
-    desc: string,
+    op: string,
+    remote: string,
+    path: string,
+    svc: string,
     status: string,
-    progress: int,
     duration: string,
+    speed: string,
+    done: bool,
 }
 
 // ---------------- 全局状态 ----------------
@@ -135,8 +160,8 @@ export global FilesG {
 export global MountsG {
     in-out property <[MountRow]> mounts: [];
     in-out property <string> new-fs: "root://";
-    // 级联路径下拉内容（当前层级的文件夹）
-    in-out property <[PathItem]> path-items: [];
+    // 远程路径历史记录（最多 10 条，最新在前）
+    in-out property <[string]> history: [];
     in-out property <string> new-point: "*";
     in-out property <bool> ro: false;
     in-out property <[string]> caches: ["off", "minimal", "writes", "full"];
@@ -145,6 +170,7 @@ export global MountsG {
     in-out property <bool> winfsp-ok: false;
     in-out property <string> winfsp-msg: "";
     in-out property <bool> busy: false;
+    in-out property <string> search: "";
 }
 
 export global PluginsG {
@@ -187,21 +213,28 @@ export global ServesG {
     in-out property <[ServeRow]> rows: [];
     in-out property <[string]> types: ["webdav", "sftp", "http", "ftp", "dlna", "nfs", "docker"];
     in-out property <int> type-idx: 0;
+    in-out property <string> svc-name: "";
     in-out property <string> new-fs: "root://";
-    // 级联路径下拉内容（当前层级的文件夹）
-    in-out property <[PathItem]> path-items: [];
+    // 远程路径历史记录（最多 10 条，最新在前）
+    in-out property <[string]> history: [];
     in-out property <string> addr: "127.0.0.1:8080";
     in-out property <string> user: "";
     in-out property <string> pass: "";
     in-out property <bool> auto-run: true;
     in-out property <bool> busy: false;
+    in-out property <string> search: "";
 }
 
 export global TransfersG {
-    in-out property <[XferRow]> active: [];
-    in-out property <[JobRow]> jobs: [];
-    in-out property <string> bwlimit: "";
-    in-out property <bool> busy: false;
+    in-out property <[RemoteLimitRow]> remote-limits: [];
+    in-out property <[ServeLimitRow]> serve-limits: [];
+    in-out property <[TaskRow]> tasks: [];
+    in-out property <[string]> units: ["B", "KB", "MB", "GB"];
+    in-out property <int> tab: 0;            // 0=远程限速 1=服务限速 2=后台任务
+    in-out property <bool> hide-done: false;
+    in-out property <string> remote-search: "";
+    in-out property <string> serve-search: "";
+    in-out property <string> effective: "";  // 当前生效的全局限速（展示用）
 }
 
 export global SettingsG {
@@ -807,8 +840,8 @@ component RemotesView inherits Rectangle {
             LineEdit {
                 width: 220px;
                 text <=> RemotesG.filter;
-                placeholder-text: "筛选远程名称";
-                accepted(t) => { root.filter-changed(t); }
+                placeholder-text: "搜索远程名称";
+                edited(t) => { root.filter-changed(t); }
             }
             PillBtn { label: "刷新"; clicked => { root.refresh(); } }
             Rectangle {}
@@ -1047,13 +1080,21 @@ component MountsView inherits Rectangle {
     callback remove(string);
     callback browse;
     callback path-nav(string);
+    callback search-changed(string);
     VerticalLayout {
         padding: 24px;
         spacing: 12px;
         HorizontalLayout {
             height: 36px;
+            spacing: 8px;
             Text { text: "把远程仓库挂载为本地磁盘（需要 WinFsp）"; font-size: 13px; color: ThemeG.text-dim; vertical-alignment: center; }
             Rectangle {}
+            LineEdit {
+                width: 220px;
+                text <=> MountsG.search;
+                placeholder-text: "搜索本地/远程路径";
+                edited(t) => { root.search-changed(t); }
+            }
             IconBtn { label: "\u{E72C}"; clicked => { root.refresh(); } }
         }
         if !MountsG.winfsp-ok : Rectangle {
@@ -1087,7 +1128,7 @@ component MountsView inherits Rectangle {
                             LineEdit { text <=> MountsG.new-fs; placeholder-text: "root://"; horizontal-stretch: 1; }
                             dd-btn := IconBtn {
                                 label: "\u{E70D}";
-                                clicked => { dd-pop.show(); }
+                                clicked => { hist-pop.show(); }
                             }
                             IconBtn {
                                 label: "\u{E838}";
@@ -1138,7 +1179,6 @@ component MountsView inherits Rectangle {
                         }
                     }
                     Rectangle {}
-                    Spinner { running: MountsG.busy; }
                     VerticalLayout {
                         spacing: 3px;
                         width: 96px;
@@ -1158,60 +1198,79 @@ component MountsView inherits Rectangle {
                     font-size: 13px;
                     color: ThemeG.text-dim;
                 }
-                for m[i] in MountsG.mounts : Rectangle {
-                    height: 44px;
-                    background: ThemeG.panel-2;
-                    border-radius: ThemeG.radius-s;
+                // 表头（与下方表单项使用相同宽度与对齐）
+                if MountsG.mounts.length > 0 : Rectangle {
+                    height: 30px;
                     HorizontalLayout {
                         padding-left: 12px;
                         padding-right: 12px;
                         spacing: 10px;
-                        Text { text: m.mount-point; font-size: 15px; font-weight: 700; color: ThemeG.accent; width: 60px; vertical-alignment: center; }
-                        Text { text: m.fs; font-size: 13px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
-                        Rectangle {}
-                        PillBtn { label: "卸载"; danger: true; clicked => { root.remove(m.mount-point); } }
+                        Text { text: "本地路径"; width: 90px; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
+                        Text { text: "远程路径"; horizontal-stretch: 1; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
+                        Text { text: "操作"; width: 100px; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
+                    }
+                }
+                for m[i] in MountsG.mounts : Rectangle {
+                    height: 44px;
+                    background: m.pending ? ThemeG.accent-soft : ThemeG.panel-2;
+                    border-radius: ThemeG.radius-s;
+                    border-width: m.pending ? 1px : 0px;
+                    border-color: ThemeG.accent;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 10px;
+                        Text { text: m.mount-point; font-size: 15px; font-weight: 700; color: ThemeG.accent; width: 90px; horizontal-alignment: left; vertical-alignment: center; overflow: elide; }
+                        Text { text: m.fs; font-size: 13px; color: ThemeG.text; horizontal-stretch: 1; horizontal-alignment: left; vertical-alignment: center; overflow: elide; }
+                        HorizontalLayout {
+                            width: 100px;
+                            spacing: 6px;
+                            alignment: start;
+                            Spinner { running: m.pending; }
+                            PillBtn { label: "卸载"; danger: true; disabled: m.pending; clicked => { root.remove(m.mount-point); } }
+                        }
                     }
                 }
             }
         }
     }
-    // 级联路径下拉（锚定在"远程"输入框下方）
-    dd-pop := PopupWindow {
+    // 远程路径历史记录下拉（锚定在"远程路径"输入框下方）
+    hist-pop := PopupWindow {
         x: 40px;
         y: 118px;
-        width: 300px;
-        height: MountsG.path-items.length == 0 ? 60px : Math.min(MountsG.path-items.length * 30px + 12px, 260px);
+        width: 320px;
+        height: MountsG.history.length == 0 ? 60px : Math.min(MountsG.history.length * 30px + 12px, 260px);
         close-policy: PopupClosePolicy.close-on-click-outside;
         Rectangle {
             background: ThemeG.panel;
             border-radius: ThemeG.radius;
             border-width: 1px;
             border-color: ThemeG.border;
-            if MountsG.path-items.length == 0 : Text {
-                text: "（无子文件夹）";
+            if MountsG.history.length == 0 : Text {
+                text: "（暂无历史记录）";
                 font-size: 12px;
                 color: ThemeG.text-dim;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
-            if MountsG.path-items.length > 0 : ScrollView {
+            if MountsG.history.length > 0 : ScrollView {
                 VerticalLayout {
                     padding: 6px;
                     spacing: 2px;
-                    for it in MountsG.path-items : Rectangle {
+                    for h in MountsG.history : Rectangle {
                         height: 28px;
                         border-radius: ThemeG.radius-s;
                         HorizontalLayout {
                             padding-left: 8px;
                             padding-right: 8px;
                             spacing: 6px;
-                            Text { text: "\u{E8B7}"; font-size: 12px; color: ThemeG.accent; width: 16px; vertical-alignment: center; }
-                            Text { text: it.name; font-size: 12px; color: ThemeG.text; overflow: elide; vertical-alignment: center; }
+                            Text { text: "\u{E81C}"; font-family: "Segoe MDL2 Assets"; font-size: 12px; color: ThemeG.accent; width: 16px; vertical-alignment: center; }
+                            Text { text: h; font-size: 12px; color: ThemeG.text; overflow: elide; vertical-alignment: center; }
                         }
                         TouchArea {
                             clicked => {
-                                dd-pop.close();
-                                root.path-nav(it.name);
+                                hist-pop.close();
+                                root.path-nav(h);
                             }
                         }
                     }
@@ -1228,26 +1287,40 @@ component ServesView inherits Rectangle {
     callback stop(string);
     callback browse;
     callback path-nav(string);
+    callback search-changed(string);
     VerticalLayout {
         padding: 24px;
         spacing: 12px;
         HorizontalLayout {
             height: 36px;
+            spacing: 8px;
             Text { text: "网络服务（将远程以 WebDAV/SFTP 等方式共享到局域网）"; font-size: 13px; color: ThemeG.text-dim; vertical-alignment: center; }
             Rectangle {}
+            LineEdit {
+                width: 220px;
+                text <=> ServesG.search;
+                placeholder-text: "搜索 ID / 服务名称";
+                edited(t) => { root.search-changed(t); }
+            }
             IconBtn { label: "\u{E72C}"; clicked => { root.refresh(); } }
         }
         Card {
             title: "新建服务";
             VerticalLayout {
                 spacing: 10px;
-                // 第一行：协议 + 远程 + 监听地址
+                // 第一行：服务名称 + 协议 + 远程 + 监听地址
                 HorizontalLayout {
                     spacing: 12px;
                     height: 56px;
                     VerticalLayout {
                         spacing: 3px;
-                        width: 160px;
+                        width: 150px;
+                        FieldLabel { text: "服务名称"; }
+                        LineEdit { text <=> ServesG.svc-name; placeholder-text: "Serve_01"; }
+                    }
+                    VerticalLayout {
+                        spacing: 3px;
+                        width: 140px;
                         FieldLabel { text: "协议"; }
                         ComboBox {
                             model: ServesG.types;
@@ -1329,12 +1402,13 @@ component ServesView inherits Rectangle {
                         padding-right: 14px;
                         Rectangle {
                             horizontal-stretch: 1;
-                            Text { text: "ID"; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            Text { text: "服务名称"; font-size: 12px; color: ThemeG.text-dim; width: parent.width; horizontal-alignment: left; vertical-alignment: center; overflow: elide; }
                         }
-                        Text { text: "协议"; font-size: 12px; color: ThemeG.text-dim; width: 100px; vertical-alignment: center; }
-                        Text { text: "远程"; font-size: 12px; color: ThemeG.text-dim; width: 180px; vertical-alignment: center; }
-                        Text { text: "地址"; font-size: 12px; color: ThemeG.text-dim; width: 160px; vertical-alignment: center; }
-                        Text { text: "操作"; font-size: 12px; color: ThemeG.text-dim; width: 80px; vertical-alignment: center; }
+                        Text { text: "ID"; font-size: 12px; color: ThemeG.text-dim; width: 190px; horizontal-alignment: left; vertical-alignment: center; }
+                        Text { text: "协议"; font-size: 12px; color: ThemeG.text-dim; width: 90px; horizontal-alignment: left; vertical-alignment: center; }
+                        Text { text: "远程"; font-size: 12px; color: ThemeG.text-dim; width: 170px; horizontal-alignment: left; vertical-alignment: center; }
+                        Text { text: "地址"; font-size: 12px; color: ThemeG.text-dim; width: 150px; horizontal-alignment: left; vertical-alignment: center; }
+                        Text { text: "操作"; font-size: 12px; color: ThemeG.text-dim; width: 80px; horizontal-alignment: left; vertical-alignment: center; }
                     }
                 }
                 Rectangle {
@@ -1349,11 +1423,12 @@ component ServesView inherits Rectangle {
                                 padding-right: 14px;
                                 Rectangle {
                                     horizontal-stretch: 1;
-                                    Text { text: s.id; font-size: 12px; color: ThemeG.text; width: parent.width; overflow: elide; vertical-alignment: center; }
+                                    Text { text: s.name; font-size: 12px; color: ThemeG.text; width: parent.width; horizontal-alignment: left; vertical-alignment: center; overflow: elide; }
                                 }
-                                Text { text: s.stype; font-size: 12px; color: ThemeG.text-dim; width: 100px; vertical-alignment: center; }
-                                Text { text: s.fs; font-size: 12px; color: ThemeG.text; width: 180px; overflow: elide; vertical-alignment: center; }
-                                Text { text: s.addr; font-size: 12px; color: ThemeG.ok; width: 160px; vertical-alignment: center; }
+                                Text { text: s.id; font-size: 12px; color: ThemeG.text-dim; width: 190px; horizontal-alignment: left; vertical-alignment: center; overflow: elide; }
+                                Text { text: s.stype; font-size: 12px; color: ThemeG.text-dim; width: 90px; horizontal-alignment: left; vertical-alignment: center; }
+                                Text { text: s.fs; font-size: 12px; color: ThemeG.text; width: 170px; horizontal-alignment: left; vertical-alignment: center; overflow: elide; }
+                                Text { text: s.addr; font-size: 12px; color: ThemeG.ok; width: 150px; horizontal-alignment: left; vertical-alignment: center; }
                                 HorizontalLayout {
                                     width: 80px;
                                     VerticalLayout { alignment: center; PillBtn { label: "停止"; compact: true; danger: true; clicked => { root.stop(s.id); } } }
@@ -1371,43 +1446,43 @@ component ServesView inherits Rectangle {
             }
         }
     }
-    // 级联路径下拉（锚定在"远程"输入框下方）
+    // 远程路径历史记录下拉（锚定在"远程路径"输入框下方）
     sdd-pop := PopupWindow {
         x: 40px;
         y: 118px;
-        width: 300px;
-        height: ServesG.path-items.length == 0 ? 60px : Math.min(ServesG.path-items.length * 30px + 12px, 260px);
+        width: 320px;
+        height: ServesG.history.length == 0 ? 60px : Math.min(ServesG.history.length * 30px + 12px, 260px);
         close-policy: PopupClosePolicy.close-on-click-outside;
         Rectangle {
             background: ThemeG.panel;
             border-radius: ThemeG.radius;
             border-width: 1px;
             border-color: ThemeG.border;
-            if ServesG.path-items.length == 0 : Text {
-                text: "（无子文件夹）";
+            if ServesG.history.length == 0 : Text {
+                text: "（暂无历史记录）";
                 font-size: 12px;
                 color: ThemeG.text-dim;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
-            if ServesG.path-items.length > 0 : ScrollView {
+            if ServesG.history.length > 0 : ScrollView {
                 VerticalLayout {
                     padding: 6px;
                     spacing: 2px;
-                    for it in ServesG.path-items : Rectangle {
+                    for h in ServesG.history : Rectangle {
                         height: 28px;
                         border-radius: ThemeG.radius-s;
                         HorizontalLayout {
                             padding-left: 8px;
                             padding-right: 8px;
                             spacing: 6px;
-                            Text { text: "\u{E8B7}"; font-size: 12px; color: ThemeG.accent; width: 16px; vertical-alignment: center; }
-                            Text { text: it.name; font-size: 12px; color: ThemeG.text; overflow: elide; vertical-alignment: center; }
+                            Text { text: "\u{E81C}"; font-family: "Segoe MDL2 Assets"; font-size: 12px; color: ThemeG.accent; width: 16px; vertical-alignment: center; }
+                            Text { text: h; font-size: 12px; color: ThemeG.text; overflow: elide; vertical-alignment: center; }
                         }
                         TouchArea {
                             clicked => {
                                 sdd-pop.close();
-                                root.path-nav(it.name);
+                                root.path-nav(h);
                             }
                         }
                     }
@@ -1417,52 +1492,227 @@ component ServesView inherits Rectangle {
     }
 }
 
+// 传输页子页标签
+component SubTab inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback clicked;
+    width: 104px;
+    height: 34px;
+    border-radius: ThemeG.radius-s;
+    border-width: 1px;
+    border-color: root.active ? ThemeG.accent : ThemeG.border;
+    background: root.active ? ThemeG.accent-soft : (ta.has-hover ? ThemeG.hover : ThemeG.panel);
+    Text {
+        text: root.label;
+        font-size: 13px;
+        color: root.active ? ThemeG.accent : ThemeG.text-dim;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// 标签小胶囊（后台任务标签用）
+component TagPill inherits Rectangle {
+    in property <string> label;
+    in property <color> tint: ThemeG.accent;
+    height: 22px;
+    border-radius: 4px;
+    background: ThemeG.panel-2;
+    border-width: 1px;
+    border-color: root.tint;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        Text {
+            text: root.label;
+            font-size: 11px;
+            color: root.tint;
+            vertical-alignment: center;
+        }
+    }
+    @children
+}
+
 component TransfersView inherits Rectangle {
     background: transparent;
+    callback tab-changed(int);
     callback refresh;
-    callback bwlimit-apply;
+    callback hide-done-changed;
+    callback remote-search(string);
+    callback serve-search(string);
+    callback limit-text(int, int, string);   // (idx, field 0=上传 1=下载, text)
+    callback limit-unit(int, int, int);      // (idx, field 0=上传 1=下载, unit)
+    callback limit-apply(int);
     callback job-stop(int);
+
     VerticalLayout {
         padding: 24px;
-        spacing: 14px;
+        spacing: 12px;
         HorizontalLayout {
-            spacing: 12px;
-            height: 36px;
-            Rectangle {}
+            spacing: 8px;
+            height: 34px;
+            SubTab { label: "远程限速"; active: TransfersG.tab == 0; clicked => { root.tab-changed(0); } }
+            SubTab { label: "服务限速"; active: TransfersG.tab == 1; clicked => { root.tab-changed(1); } }
+            SubTab { label: "后台任务"; active: TransfersG.tab == 2; clicked => { root.tab-changed(2); } }
+            Rectangle { horizontal-stretch: 1; }
+            if TransfersG.tab == 2 : CheckBox {
+                text: "隐藏已完成任务";
+                checked <=> TransfersG.hide-done;
+                toggled => { root.hide-done-changed(); }
+            }
             IconBtn { label: "\u{E72C}"; clicked => { root.refresh(); } }
         }
-        HorizontalLayout {
-            spacing: 14px;
-            alignment: start;
-            Card {
-                title: "带宽限速";
-                width: 260px;
-                VerticalLayout {
-                    spacing: 8px;
-                    LineEdit {
-                        text <=> TransfersG.bwlimit;
-                        placeholder-text: "如 1M 或 off";
-                    }
-                    PillBtn { label: "应用限速"; primary: true; clicked => { root.bwlimit-apply(); } }
-                    FieldLabel { text: "off = 不限速；1M = 每秒 1 MiB"; }
-                }
+        if TransfersG.effective != "" : Text {
+            text: "当前生效的全局限速：" + TransfersG.effective;
+            font-size: 12px;
+            color: ThemeG.text-dim;
+        }
+
+        // ---------- 远程限速 ----------
+        if TransfersG.tab == 0 : VerticalLayout {
+            spacing: 10px;
+            LineEdit {
+                width: 280px;
+                text <=> TransfersG.remote-search;
+                placeholder-text: "搜索远程名称";
+                edited(t) => { root.remote-search(t); }
             }
             Card {
-                title: "活动传输（" + TransfersG.active.length + "）";
-                horizontal-stretch: 1;
+                title: "远程限速（" + TransfersG.remote-limits.length + "）";
+                pad: 0px;
+                fill: true;
+                vertical-stretch: 1;
                 VerticalLayout {
-                    spacing: 2px;
-                    if TransfersG.active.length == 0 : Text {
-                        text: "当前没有进行中的传输";
-                        font-size: 13px;
-                        color: ThemeG.text-dim;
+                    Rectangle {
+                        height: 36px;
+                        background: ThemeG.panel-2;
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 14px;
+                            spacing: 8px;
+                            Text { text: "远程名称"; horizontal-stretch: 1; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            Text { text: "上传速度↑"; width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            Text { text: "下载速度↓"; width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            Text { text: "上传限速"; width: 200px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            Text { text: "下载限速"; width: 200px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            Text { text: "操作"; width: 64px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        }
                     }
-                    for xf in TransfersG.active : XferLine { xf: xf; }
+                    Rectangle {
+                        vertical-stretch: 1;
+                        ListView {
+                            for r[i] in TransfersG.remote-limits : Rectangle {
+                                height: 42px;
+                                background: hit0.has-hover ? ThemeG.hover : transparent;
+                                hit0 := TouchArea { mouse-cursor: pointer; }
+                                HorizontalLayout {
+                                    padding-left: 14px;
+                                    padding-right: 14px;
+                                    spacing: 8px;
+                                    Text { text: r.name; horizontal-stretch: 1; horizontal-alignment: left; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
+                                    Text { text: r.up-speed; width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.accent; vertical-alignment: center; }
+                                    Text { text: r.down-speed; width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.accent; vertical-alignment: center; }
+                                    HorizontalLayout {
+                                        width: 200px;
+                                        spacing: 6px;
+                                        LineEdit { horizontal-stretch: 1; text: r.up-limit; placeholder-text: "不限"; edited(t) => { root.limit-text(i, 0, t); } }
+                                        ComboBox { width: 76px; model: TransfersG.units; current-index: r.up-unit; changed current-index => { root.limit-unit(i, 0, self.current-index); } }
+                                    }
+                                    HorizontalLayout {
+                                        width: 200px;
+                                        spacing: 6px;
+                                        LineEdit { horizontal-stretch: 1; text: r.down-limit; placeholder-text: "不限"; edited(t) => { root.limit-text(i, 1, t); } }
+                                        ComboBox { width: 76px; model: TransfersG.units; current-index: r.down-unit; changed current-index => { root.limit-unit(i, 1, self.current-index); } }
+                                    }
+                                    HorizontalLayout {
+                                        width: 64px;
+                                        VerticalLayout { alignment: center; PillBtn { label: "应用"; compact: true; primary: true; clicked => { root.limit-apply(i); } } }
+                                    }
+                                }
+                                Rectangle { y: parent.height - 1px; height: 1px; background: ThemeG.border; opacity: 0.5; }
+                            }
+                        }
+                    }
                 }
             }
         }
-        Card {
-            title: "后台任务（" + TransfersG.jobs.length + "）";
+
+        // ---------- 服务限速 ----------
+        if TransfersG.tab == 1 : VerticalLayout {
+            spacing: 10px;
+            LineEdit {
+                width: 280px;
+                text <=> TransfersG.serve-search;
+                placeholder-text: "搜索 ID / 服务名称";
+                edited(t) => { root.serve-search(t); }
+            }
+            Card {
+                title: "服务限速（" + TransfersG.serve-limits.length + "）";
+                pad: 0px;
+                fill: true;
+                vertical-stretch: 1;
+                VerticalLayout {
+                    Rectangle {
+                        height: 36px;
+                        background: ThemeG.panel-2;
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 14px;
+                            spacing: 8px;
+                            Text { text: "服务名称"; horizontal-stretch: 1; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            Text { text: "ID"; width: 110px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            Text { text: "上传速度↑"; width: 80px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            Text { text: "下载速度↓"; width: 80px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            Text { text: "上传限速"; width: 180px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            Text { text: "下载限速"; width: 180px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            Text { text: "操作"; width: 64px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        }
+                    }
+                    Rectangle {
+                        vertical-stretch: 1;
+                        ListView {
+                            for r[i] in TransfersG.serve-limits : Rectangle {
+                                height: 42px;
+                                background: hit1.has-hover ? ThemeG.hover : transparent;
+                                hit1 := TouchArea { mouse-cursor: pointer; }
+                                HorizontalLayout {
+                                    padding-left: 14px;
+                                    padding-right: 14px;
+                                    spacing: 8px;
+                                    Text { text: r.name; horizontal-stretch: 1; horizontal-alignment: left; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
+                                    Text { text: r.id; width: 110px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
+                                    Text { text: r.up-speed; width: 80px; horizontal-alignment: left; font-size: 12px; color: ThemeG.accent; vertical-alignment: center; }
+                                    Text { text: r.down-speed; width: 80px; horizontal-alignment: left; font-size: 12px; color: ThemeG.accent; vertical-alignment: center; }
+                                    HorizontalLayout {
+                                        width: 180px;
+                                        spacing: 6px;
+                                        LineEdit { horizontal-stretch: 1; text: r.up-limit; placeholder-text: "不限"; edited(t) => { root.limit-text(i, 0, t); } }
+                                        ComboBox { width: 72px; model: TransfersG.units; current-index: r.up-unit; changed current-index => { root.limit-unit(i, 0, self.current-index); } }
+                                    }
+                                    HorizontalLayout {
+                                        width: 180px;
+                                        spacing: 6px;
+                                        LineEdit { horizontal-stretch: 1; text: r.down-limit; placeholder-text: "不限"; edited(t) => { root.limit-text(i, 1, t); } }
+                                        ComboBox { width: 72px; model: TransfersG.units; current-index: r.down-unit; changed current-index => { root.limit-unit(i, 1, self.current-index); } }
+                                    }
+                                    HorizontalLayout {
+                                        width: 64px;
+                                        VerticalLayout { alignment: center; PillBtn { label: "应用"; compact: true; primary: true; clicked => { root.limit-apply(i); } } }
+                                    }
+                                }
+                                Rectangle { y: parent.height - 1px; height: 1px; background: ThemeG.border; opacity: 0.5; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------- 后台任务 ----------
+        if TransfersG.tab == 2 : Card {
+            title: "后台任务（" + TransfersG.tasks.length + "）";
             pad: 0px;
             fill: true;
             vertical-stretch: 1;
@@ -1473,44 +1723,47 @@ component TransfersView inherits Rectangle {
                     HorizontalLayout {
                         padding-left: 14px;
                         padding-right: 14px;
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            Text { text: "任务"; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                        }
-                        Text { text: "状态"; font-size: 12px; color: ThemeG.text-dim; width: 100px; vertical-alignment: center; }
-                        Text { text: "进度"; font-size: 12px; color: ThemeG.text-dim; width: 80px; vertical-alignment: center; }
-                        Text { text: "耗时"; font-size: 12px; color: ThemeG.text-dim; width: 100px; vertical-alignment: center; }
-                        Text { text: "操作"; font-size: 12px; color: ThemeG.text-dim; width: 80px; vertical-alignment: center; }
+                        spacing: 8px;
+                        Text { text: "任务ID"; width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: "标签"; horizontal-stretch: 1; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: "状态"; width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: "耗时"; width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: "速度"; width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: "操作"; width: 64px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                     }
                 }
                 Rectangle {
                     vertical-stretch: 1;
                     ListView {
-                        for j[i] in TransfersG.jobs : Rectangle {
-                            height: 40px;
-                            background: ta.has-hover ? ThemeG.hover : transparent;
-                            ta := TouchArea { mouse-cursor: pointer; }
+                        for t[i] in TransfersG.tasks : Rectangle {
+                            height: 42px;
+                            background: hit2.has-hover ? ThemeG.hover : transparent;
+                            hit2 := TouchArea { mouse-cursor: pointer; }
                             HorizontalLayout {
                                 padding-left: 14px;
                                 padding-right: 14px;
-                                Rectangle {
-                                    horizontal-stretch: 1;
-                                    Text { text: j.desc; font-size: 12px; color: ThemeG.text; width: parent.width; overflow: elide; vertical-alignment: center; }
-                                }
-                                Text { text: j.status; font-size: 12px; color: j.status == "运行中" ? ThemeG.accent : (j.status == "失败" ? ThemeG.err : ThemeG.text-dim); width: 100px; vertical-alignment: center; }
-                                Text { text: j.progress > 0 ? j.progress + " %" : "—"; font-size: 12px; color: ThemeG.text-dim; width: 80px; vertical-alignment: center; }
-                                Text { text: j.duration; font-size: 12px; color: ThemeG.text-dim; width: 100px; vertical-alignment: center; }
+                                spacing: 8px;
+                                Text { text: "#" + t.id; width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text; vertical-alignment: center; }
                                 HorizontalLayout {
-                                    width: 80px;
-                                    VerticalLayout { alignment: center; if j.status == "运行中" : PillBtn { label: "停止"; compact: true; danger: true; clicked => { root.job-stop(j.id); } } }
+                                    horizontal-stretch: 1;
+                                    spacing: 6px;
+                                    if t.op != "" : TagPill { label: t.op; tint: t.op == "上传" ? ThemeG.ok : ThemeG.accent; }
+                                    if t.remote != "" : TagPill {
+                                        label: t.remote;
+                                        tint: ThemeG.text-dim;
+                                        Tooltip { text: @markdown("\{t.path}"); }
+                                    }
+                                    if t.svc != "" : TagPill { label: t.svc; tint: ThemeG.warn; }
+                                }
+                                Text { text: t.status; width: 90px; horizontal-alignment: left; font-size: 12px; color: t.status == "运行中" ? ThemeG.accent : (t.status == "失败" ? ThemeG.err : ThemeG.text-dim); vertical-alignment: center; }
+                                Text { text: t.duration; width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                                Text { text: t.speed; width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.accent; vertical-alignment: center; }
+                                HorizontalLayout {
+                                    width: 64px;
+                                    VerticalLayout { alignment: center; if !t.done : PillBtn { label: "停止"; compact: true; danger: true; clicked => { root.job-stop(t.id); } } }
                                 }
                             }
-                            Rectangle {
-                                y: parent.height - 1px;
-                                height: 1px;
-                                background: ThemeG.border;
-                                opacity: 0.5;
-                            }
+                            Rectangle { y: parent.height - 1px; height: 1px; background: ThemeG.border; opacity: 0.5; }
                         }
                     }
                 }
@@ -1975,7 +2228,9 @@ export component MainWindow inherits Window {
     callback mount-add();
     callback mount-remove(string);
     callback mount-path-nav(string);
+    callback mounts-search(string);
     callback serve-path-nav(string);
+    callback serves-search(string);
     callback browse-open(int);
     callback browse-goto(string);
     callback browse-ok();
@@ -1991,7 +2246,13 @@ export component MainWindow inherits Window {
     callback serve-start();
     callback serve-stop(string);
     callback transfers-refresh();
-    callback bwlimit-apply();
+    callback transfers-tab-changed(int);
+    callback hide-done-changed();
+    callback transfers-remote-search(string);
+    callback transfers-serve-search(string);
+    callback limit-text(int, int, string);
+    callback limit-unit(int, int, int);
+    callback limit-apply(int);
     callback job-stop(int);
     callback plugins-rescan();
     callback ih-save-config();
@@ -2156,6 +2417,7 @@ export component MainWindow inherits Window {
                     remove(mp) => { root.mount-remove(mp); }
                     browse => { root.browse-open(0); }
                     path-nav(n) => { root.mount-path-nav(n); }
+                    search-changed(t) => { root.mounts-search(t); }
                 }
                 if NavG.idx == 4 : ServesView {
                     refresh => { root.serves-refresh(); }
@@ -2163,10 +2425,17 @@ export component MainWindow inherits Window {
                     stop(id) => { root.serve-stop(id); }
                     browse => { root.browse-open(1); }
                     path-nav(n) => { root.serve-path-nav(n); }
+                    search-changed(t) => { root.serves-search(t); }
                 }
                 if NavG.idx == 5 : TransfersView {
+                    tab-changed(i) => { root.transfers-tab-changed(i); }
                     refresh => { root.transfers-refresh(); }
-                    bwlimit-apply => { root.bwlimit-apply(); }
+                    hide-done-changed => { root.hide-done-changed(); }
+                    remote-search(t) => { root.transfers-remote-search(t); }
+                    serve-search(t) => { root.transfers-serve-search(t); }
+                    limit-text(i, f, t) => { root.limit-text(i, f, t); }
+                    limit-unit(i, f, u) => { root.limit-unit(i, f, u); }
+                    limit-apply(i) => { root.limit-apply(i); }
                     job-stop(id) => { root.job-stop(id); }
                 }
                 if NavG.idx == 6 : PluginsView {

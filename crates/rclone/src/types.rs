@@ -48,6 +48,12 @@ pub struct Transferring {
     pub percentage: f64,
     #[serde(rename = "group", default)]
     pub group: String,
+    /// 源文件系统（如 "teldrive:path" 或本地 "//?/C:/..."）；用于推导远程名与传输方向
+    #[serde(rename = "srcFs", default)]
+    pub src_fs: String,
+    /// 目标文件系统
+    #[serde(rename = "dstFs", default)]
+    pub dst_fs: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

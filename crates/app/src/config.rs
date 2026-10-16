@@ -87,6 +87,51 @@ pub struct AutoServe {
     pub pass: String,
 }
 
+/// 服务自定义名称映射（按 协议+远程+地址 匹配，便于跨重启稳定识别）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServeName {
+    pub stype: String,
+    pub fs: String,
+    pub addr: String,
+    pub name: String,
+}
+
+fn d_unit() -> i32 {
+    1
+}
+
+/// 远程限速项（up/down 为数值文本，unit 为倍率索引：0=B 1=KB 2=MB 3=GB）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RemoteLimit {
+    pub name: String,
+    #[serde(default)]
+    pub up: String,
+    #[serde(default = "d_unit")]
+    pub up_unit: i32,
+    #[serde(default)]
+    pub down: String,
+    #[serde(default = "d_unit")]
+    pub down_unit: i32,
+}
+
+/// 服务限速项（按 协议+远程+地址 匹配，跨重启稳定识别）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServeLimit {
+    pub stype: String,
+    pub fs: String,
+    pub addr: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub up: String,
+    #[serde(default = "d_unit")]
+    pub up_unit: i32,
+    #[serde(default)]
+    pub down: String,
+    #[serde(default = "d_unit")]
+    pub down_unit: i32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -112,6 +157,18 @@ pub struct AppConfig {
     /// 自动服务列表
     #[serde(default)]
     pub auto_serves: Vec<AutoServe>,
+    /// 远程路径历史（最近 10 条，最新在前）
+    #[serde(default)]
+    pub path_history: Vec<String>,
+    /// 服务自定义名称映射
+    #[serde(default)]
+    pub serve_names: Vec<ServeName>,
+    /// 远程限速列表
+    #[serde(default)]
+    pub remote_limits: Vec<RemoteLimit>,
+    /// 服务限速列表
+    #[serde(default)]
+    pub serve_limits: Vec<ServeLimit>,
 }
 
 impl Default for AppConfig {
