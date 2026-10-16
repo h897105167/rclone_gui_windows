@@ -12,6 +12,9 @@ pub struct RcloneCfg {
     pub mode: u8,
     #[serde(default)]
     pub exe: String,
+    /// 用户是否手动指定了 exe 路径（true 则不覆盖）
+    #[serde(default)]
+    pub exe_custom: bool,
     #[serde(default = "d_rc_port")]
     pub port: u16,
     #[serde(default = "d_rc_user")]

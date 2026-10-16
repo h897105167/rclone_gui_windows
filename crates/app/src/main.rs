@@ -476,12 +476,17 @@ fn main() {
         cfg.rclone.pass = generate_password();
         let _ = config::save(&cfg);
     }
-    if cfg.rclone.exe.is_empty() {
-        // 优先释放并试用内嵌 rclone.exe
-        let extracted = extract_embedded_rclone();
-        if let Ok(exe) = discover_exe(extracted.as_deref()) {
-            cfg.rclone.exe = exe.display().to_string();
+    // 内嵌 rclone 优先：如果内嵌可用且用户未手动指定路径，则使用内嵌版本
+    {
+        let embedded = extract_embedded_rclone();
+        if embedded.is_some() && !cfg.rclone.exe_custom {
+            cfg.rclone.exe = embedded.clone().unwrap();
             let _ = config::save(&cfg);
+        } else if cfg.rclone.exe.is_empty() {
+            if let Ok(exe) = discover_exe(embedded.as_deref()) {
+                cfg.rclone.exe = exe.display().to_string();
+                let _ = config::save(&cfg);
+            }
         }
     }
 
@@ -1767,6 +1772,9 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 let mut cfg = ctx.cfg.lock().unwrap().clone();
                 cfg.rclone.mode = s.get_mode_idx() as u8;
                 cfg.rclone.exe = s.get_exe().to_string();
+                // 路径与内嵌不同则视为用户自定义
+                let embedded_path = extract_embedded_rclone().unwrap_or_default();
+                cfg.rclone.exe_custom = !cfg.rclone.exe.is_empty() && cfg.rclone.exe != embedded_path;
                 cfg.rclone.port = s.get_rc_port().parse().unwrap_or(5574);
                 cfg.rclone.user = s.get_rc_user().to_string();
                 cfg.rclone.pass = s.get_rc_pass().to_string();
@@ -2419,6 +2427,7 @@ fn wire_callbacks(ui: &MainWindow, ctx: Arc<Ctx>, tx: mpsc::UnboundedSender<Cmd>
     });
     ui.on_pick_exe({
         let ui = ui.as_weak();
+        let _tx2 = tx.clone();
         move || {
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter("rclone", &["exe"])
