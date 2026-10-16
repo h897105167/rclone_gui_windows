@@ -40,6 +40,7 @@ enum Cmd {
     RemoteDelete { name: String },
     RemoteSave,
     RemoteCancel,
+    RemoteTypeChanged,
     ServesRefresh,
     ServeStart,
     ServeStop { id: String },
@@ -73,6 +74,8 @@ struct Ctx {
     http_restart: Arc<tokio::sync::Notify>,
     /// (name, type, usage) 全量远程缓存，筛选时避免重复请求
     remotes_cache: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+    /// config/providers 结果缓存（后端类型参数模板）
+    providers_cache: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
 }
 
 impl Ctx {
@@ -268,6 +271,158 @@ fn apply_remotes_filter(ui: &Weak<MainWindow>, full: &[(String, String, String)]
     });
 }
 
+/// 从 config/providers 响应中提取指定类型的字段列表
+fn build_fields_from_provider(providers: &Value, type_name: &str) -> (String, Vec<FieldRow>) {
+    let empty = (String::new(), Vec::new());
+    let list = match providers.get("providers").and_then(|p| p.as_array()) {
+        Some(l) => l,
+        None => return empty,
+    };
+    let provider = match list.iter().find(|p| {
+        p.get("Name")
+            .and_then(|n| n.as_str())
+            .map(|n| n == type_name)
+            .unwrap_or(false)
+    }) {
+        Some(p) => p,
+        None => return empty,
+    };
+    let desc = provider
+        .get("Description")
+        .and_then(|d| d.as_str())
+        .unwrap_or("")
+        .to_string();
+    let options = match provider.get("Options").and_then(|o| o.as_array()) {
+        Some(o) => o,
+        None => return (desc, Vec::new()),
+    };
+    let mut fields = Vec::new();
+    for opt in options {
+        let name = opt.get("Name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let help = opt.get("Help").and_then(|h| h.as_str()).unwrap_or_default().to_string();
+        let ty = opt.get("Type").and_then(|t| t.as_str()).unwrap_or("string");
+        let required = opt.get("Required").and_then(|r| r.as_bool()).unwrap_or(false);
+        let advanced = opt.get("Advanced").and_then(|a| a.as_bool()).unwrap_or(false);
+        let sensitive = opt.get("Sensitive").and_then(|s| s.as_bool()).unwrap_or(false);
+        let default = opt.get("Default").and_then(|d| match d {
+            Value::String(s) => Some(s.clone()),
+            Value::Bool(b) => Some(b.to_string()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }).unwrap_or_default();
+        let kind = if ty == "bool" {
+            "bool"
+        } else if sensitive || ty == "password" {
+            "password"
+        } else if ty == "int" || ty == "float" || ty == "Duration" || ty == "SizeSuffix" {
+            "number"
+        } else {
+            "text"
+        };
+        // 提取 label：Help 的第一句话或 Name
+        let label = if !help.is_empty() {
+            help.split('.').next().unwrap_or(&name).trim().to_string()
+        } else {
+            name.clone()
+        };
+        fields.push(FieldRow {
+            name: name.into(),
+            label: label.into(),
+            kind: kind.into(),
+            value: default.into(),
+            required,
+            help: help.into(),
+            is_advanced: advanced,
+            options: String::new().into(),
+        });
+    }
+    (desc, fields)
+}
+
+/// 把 FieldRow 列表转为 rclone config 参数 JSON
+fn fields_to_params(fields: &[FieldRow]) -> Value {
+    let mut map = serde_json::Map::new();
+    for f in fields {
+        let val = f.value.to_string();
+        if val.is_empty() && !f.required {
+            continue;
+        }
+        match f.kind.as_str() {
+            "bool" => {
+                if val == "true" {
+                    map.insert(f.name.to_string(), Value::Bool(true));
+                }
+            }
+            "number" => {
+                if let Ok(n) = val.parse::<i64>() {
+                    map.insert(f.name.to_string(), Value::Number(n.into()));
+                } else if !val.is_empty() {
+                    map.insert(f.name.to_string(), Value::String(val));
+                }
+            }
+            _ => {
+                if !val.is_empty() {
+                    map.insert(f.name.to_string(), Value::String(val));
+                }
+            }
+        }
+    }
+    Value::Object(map)
+}
+
+/// 用现有远程参数值填充 FieldRow 列表
+fn fill_fields_with_existing(fields: &mut [FieldRow], existing: &serde_json::Map<String, Value>) {
+    for f in fields.iter_mut() {
+        if let Some(v) = existing.get(f.name.as_str()) {
+            f.value = match v {
+                Value::String(s) => s.clone().into(),
+                Value::Bool(b) => b.to_string().into(),
+                Value::Number(n) => n.to_string().into(),
+                _ => v.to_string().into(),
+            };
+        }
+    }
+}
+
+/// 从 UI 读取当前 FieldRow 列表
+fn read_fields_from_ui(ui: &Weak<MainWindow>) -> Vec<FieldRow> {
+    ui.upgrade()
+        .map(|u| {
+            let m = u.global::<RemotesG>().get_edit_fields();
+            (0..m.row_count())
+                .filter_map(|i| m.row_data(i))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 获取 providers（优先缓存，否则网络请求）
+async fn get_providers(ctx: &Arc<Ctx>) -> Value {
+    {
+        let cache = ctx.providers_cache.lock().unwrap();
+        if let Some(v) = cache.as_ref() {
+            return v.clone();
+        }
+    }
+    let client = ctx.mgr.client.read().await.clone();
+    let v = client.config_providers().await.unwrap_or(json!({}));
+    *ctx.providers_cache.lock().unwrap() = Some(v.clone());
+    v
+}
+
+/// 更新编辑器字段列表和描述
+fn update_editor_fields(ui: &Weak<MainWindow>, providers: &Value, type_name: &str) {
+    let (desc, fields) = build_fields_from_provider(providers, type_name);
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let g = ui.global::<RemotesG>();
+        g.set_provider_desc(desc.into());
+        g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(fields))));
+    });
+}
+
 fn b64(data: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(data)
@@ -280,6 +435,27 @@ fn fmt_mtime(mod_time: &str) -> String {
     } else {
         mod_time.to_string()
     }
+}
+
+/// 释放内嵌 rclone.exe 到临时目录，返回路径
+fn extract_embedded_rclone() -> Option<String> {
+    let embedded = option_env!("RCLONE_EMBEDDED")?;
+    if embedded.is_empty() {
+        return None;
+    }
+    let bytes = std::fs::read(embedded).ok()?;
+    let dir = std::env::temp_dir().join("rclone-gui-embedded");
+    std::fs::create_dir_all(&dir).ok()?;
+    let dest = dir.join("rclone.exe");
+    if dest.exists() {
+        if let Ok(meta) = std::fs::metadata(&dest) {
+            if meta.len() as usize == bytes.len() {
+                return Some(dest.display().to_string());
+            }
+        }
+    }
+    std::fs::write(&dest, &bytes).ok()?;
+    Some(dest.display().to_string())
 }
 
 // ---------------- 主入口 ----------------
@@ -301,7 +477,9 @@ fn main() {
         let _ = config::save(&cfg);
     }
     if cfg.rclone.exe.is_empty() {
-        if let Ok(exe) = discover_exe(None) {
+        // 优先释放并试用内嵌 rclone.exe
+        let extracted = extract_embedded_rclone();
+        if let Ok(exe) = discover_exe(extracted.as_deref()) {
             cfg.rclone.exe = exe.display().to_string();
             let _ = config::save(&cfg);
         }
@@ -348,6 +526,7 @@ fn main() {
         cfg: cfg_arc.clone(),
         http_restart: Arc::new(tokio::sync::Notify::new()),
         remotes_cache: Arc::new(std::sync::Mutex::new(Vec::new())),
+        providers_cache: Arc::new(std::sync::Mutex::new(None)),
     });
 
     {
@@ -971,14 +1150,50 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::RemoteAdd => {
+            // 先显示编辑器，再异步加载 providers
             let _ = ui.upgrade_in_event_loop(move |ui| {
                 let g = ui.global::<RemotesG>();
                 g.set_edit_is_new(true);
                 g.set_edit_name("".into());
                 g.set_edit_params("".into());
                 g.set_type_idx(0);
+                g.set_show_advanced(false);
+                g.set_show_raw(false);
                 g.set_show_editor(true);
             });
+            // 异步获取 providers 并更新字段
+            let ui2 = ui.clone();
+            let ctx2 = ctx.clone();
+            tokio::spawn(async move {
+                let providers = get_providers(&ctx2).await;
+                // 更新类型列表
+                let list = providers.get("providers").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+                let mut names: Vec<String> = list.iter()
+                    .filter_map(|p| p.get("Name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                    .collect();
+                names.sort();
+                let first_type = names.first().cloned().unwrap_or_default();
+                let _ = ui2.upgrade_in_event_loop(move |ui| {
+                    let g = ui.global::<RemotesG>();
+                    g.set_types(ModelRc::from(Rc::new(VecModel::from(
+                        names.iter().map(|s| s.as_str().into()).collect::<Vec<slint::SharedString>>()
+                    ))));
+                    g.set_type_idx(0);
+                });
+                update_editor_fields(&ui2, &providers, &first_type);
+            });
+            false
+        }
+        Cmd::RemoteTypeChanged => {
+            let type_name = ui.upgrade()
+                .map(|ui| {
+                    let g = ui.global::<RemotesG>();
+                    let ti = g.get_type_idx().max(0) as usize;
+                    g.get_types().row_data(ti).unwrap_or_default().to_string()
+                })
+                .unwrap_or_default();
+            let providers = get_providers(&ctx).await;
+            update_editor_fields(ui, &providers, &type_name);
             false
         }
         Cmd::RemoteEditLoad { name } => {
@@ -1000,8 +1215,13 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                         .join("\n")
                 })
                 .unwrap_or_default();
+            let existing_params = entry.as_object().cloned().unwrap_or_default();
+            let providers = get_providers(&ctx).await;
+            let (desc, mut fields) = build_fields_from_provider(&providers, &ty);
+            fill_fields_with_existing(&mut fields, &existing_params);
             let _ = ui.upgrade_in_event_loop(move |ui| {
                 let g = ui.global::<RemotesG>();
+                // 确保类型列表包含当前类型
                 let mut types: Vec<slint::SharedString> =
                     (0..g.get_types().row_count()).filter_map(|i| g.get_types().row_data(i)).collect();
                 let idx = types.iter().position(|t| t.as_str() == ty);
@@ -1014,12 +1234,16 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 g.set_edit_is_new(false);
                 g.set_edit_name(name.into());
                 g.set_edit_params(params_text.into());
+                g.set_provider_desc(desc.into());
+                g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(fields))));
+                g.set_show_advanced(false);
+                g.set_show_raw(false);
                 g.set_show_editor(true);
             });
             false
         }
         Cmd::RemoteSave => {
-            let (name, type_str, params_text, is_new) = ui
+            let (name, type_str, params_text, is_new, show_raw) = ui
                 .upgrade()
                 .map(|ui| {
                     let g = ui.global::<RemotesG>();
@@ -1030,6 +1254,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                         ty,
                         g.get_edit_params().to_string(),
                         g.get_edit_is_new(),
+                        g.get_show_raw(),
                     )
                 })
                 .unwrap_or_default();
@@ -1037,7 +1262,17 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 toast(ui, 2, "名称不能为空，且不能包含空格或冒号");
                 return false;
             }
-            let params = serde_json::Value::Object(parse_kv_lines(&params_text));
+            // 优先使用模板字段，原始模式或字段为空时用 key=value
+            let params = if !show_raw {
+                let fields = read_fields_from_ui(ui);
+                if !fields.is_empty() {
+                    fields_to_params(&fields)
+                } else {
+                    serde_json::Value::Object(parse_kv_lines(&params_text))
+                }
+            } else {
+                serde_json::Value::Object(parse_kv_lines(&params_text))
+            };
             let client = ctx.mgr.client.read().await.clone();
             let res = if is_new {
                 client.config_create(&name, &type_str, params).await
@@ -2015,6 +2250,12 @@ fn wire_callbacks(ui: &MainWindow, ctx: Arc<Ctx>, tx: mpsc::UnboundedSender<Cmd>
         let tx = tx.clone();
         move || {
             let _ = tx.send(Cmd::RemoteCancel);
+        }
+    });
+    ui.on_remote_type_changed({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::RemoteTypeChanged);
         }
     });
     ui.on_serves_refresh({

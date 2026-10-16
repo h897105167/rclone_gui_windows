@@ -7,6 +7,17 @@ fn main() {
         slint_build::compile(&ui).expect("Slint UI 编译失败");
     }
 
+    // 嵌入 rclone.exe（内置模式）
+    let rclone_exe = PathBuf::from("../../vendor/rclone.exe");
+    if rclone_exe.exists() {
+        let abs = std::fs::canonicalize(&rclone_exe).unwrap_or(rclone_exe);
+        println!("cargo:rustc-env=RCLONE_EMBEDDED={}", abs.display());
+        println!("cargo:rerun-if-changed={}", abs.display());
+    } else {
+        println!("cargo:rustc-env=RCLONE_EMBEDDED=");
+        println!("cargo:warning=vendor/rclone.exe 未找到，内置模式不可用");
+    }
+
     // 嵌入 imagehost wasm（存在时）：优先 release，其次 debug
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
     let mut wasm_dir = None;

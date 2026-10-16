@@ -1,4 +1,4 @@
-﻿import { ThemeG } from "theme.slint";
+import { ThemeG } from "theme.slint";
 export { ThemeG }
 import { LineEdit, ComboBox, ListView, ScrollView, CheckBox, TextEdit } from "std-widgets.slint";
 
@@ -52,6 +52,16 @@ export struct RemoteRow {
     name: string,
     rtype: string,
     usage: string,
+}
+export struct FieldRow {
+    name: string,
+    label: string,
+    kind: string,       // "text" | "password" | "bool" | "number" | "select"
+    value: string,      // bool 为 "true"/"false"，select 为当前选中值
+    required: bool,
+    help: string,
+    is-advanced: bool,
+    options: string,    // select 类型的选项，逗号分隔
 }
 export struct ServeRow {
     id: string,
@@ -145,6 +155,11 @@ export global RemotesG {
     in-out property <[string]> types: ["local", "s3", "drive", "dropbox", "onedrive", "box", "gcs", "azureblob", "b2", "sftp", "webdav", "ftp", "smb", "alias", "crypt", "chunker", "union", "teldrive"];
     in-out property <int> type-idx: 0;
     in-out property <string> edit-params: "";
+    // 模板驱动字段
+    in-out property <[FieldRow]> edit-fields: [];
+    in-out property <string> provider-desc: "";
+    in-out property <bool> show-advanced: false;
+    in-out property <bool> show-raw: false;  // 显示原始 key=value 编辑器
 }
 
 export global ServesG {
@@ -580,6 +595,7 @@ component RemotesView inherits Rectangle {
     callback del-row(int);
     callback editor-save;
     callback editor-cancel;
+    callback type-changed;
     VerticalLayout {
         padding: 24px;
         spacing: 14px;
@@ -602,11 +618,13 @@ component RemotesView inherits Rectangle {
             title: RemotesG.edit-is-new ? "新建远程存储" : "编辑远程存储：" + RemotesG.edit-name;
             VerticalLayout {
                 spacing: 10px;
+                // 名称 + 类型
                 HorizontalLayout {
                     spacing: 12px;
                     height: 56px;
                     VerticalLayout {
                         spacing: 3px;
+                        horizontal-stretch: 1;
                         FieldLabel { text: "名称（英文，不含空格或冒号）"; }
                         LineEdit { text <=> RemotesG.edit-name; enabled: RemotesG.edit-is-new; }
                     }
@@ -618,14 +636,95 @@ component RemotesView inherits Rectangle {
                             model: RemotesG.types;
                             current-index <=> RemotesG.type-idx;
                             enabled: RemotesG.edit-is-new;
+                            selected(t) => { root.type-changed(); }
                         }
                     }
                 }
-                VerticalLayout {
+                // 类型描述
+                if RemotesG.provider-desc != "" : Text {
+                    text: RemotesG.provider-desc;
+                    font-size: 12px;
+                    color: ThemeG.text-dim;
+                    wrap: word-wrap;
+                }
+                // 参数字段（模板驱动）
+                if RemotesG.edit-fields.length > 0 && !RemotesG.show-raw : Rectangle {
+                    border-radius: ThemeG.radius-s;
+                    border-width: 1px;
+                    border-color: ThemeG.border;
+                    background: ThemeG.panel-2;
+                    height: 260px;
+                    ScrollView {
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 8px;
+                            for f[i] in RemotesG.edit-fields : VerticalLayout {
+                                spacing: 2px;
+                                if !f.is-advanced || RemotesG.show-advanced : HorizontalLayout {
+                                    spacing: 8px;
+                                    height: 30px;
+                                    // 标签
+                                    Text {
+                                        text: f.label + (f.required ? " *" : "");
+                                        font-size: 12px;
+                                        color: f.required ? ThemeG.text : ThemeG.text-dim;
+                                        width: 180px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                    // 输入控件
+                                    if f.kind == "bool" : CheckBox {
+                                        checked: f.value == "true";
+                                        toggled => {
+                                            RemotesG.edit-fields[i].value = self.checked ? "true" : "false";
+                                        }
+                                    }
+                                    if f.kind != "bool" : LineEdit {
+                                        horizontal-stretch: 1;
+                                        text: f.value;
+                                        placeholder-text: f.help;
+                                        input-type: f.kind == "password" ? InputType.password : InputType.text;
+                                        edited(t) => {
+                                            RemotesG.edit-fields[i].value = t;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // 高级选项 + 原始编辑器切换
+                HorizontalLayout {
+                    spacing: 12px;
+                    height: 28px;
+                    if RemotesG.edit-fields.length > 0 : TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { RemotesG.show-advanced = !RemotesG.show-advanced; }
+                        Text {
+                            text: RemotesG.show-advanced ? "▾ 隐藏高级选项" : "▸ 显示高级选项";
+                            font-size: 12px;
+                            color: ThemeG.accent;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Rectangle {}
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { RemotesG.show-raw = !RemotesG.show-raw; }
+                        Text {
+                            text: RemotesG.show-raw ? "切换到表单模式" : "切换到原始模式";
+                            font-size: 12px;
+                            color: ThemeG.accent;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                // 原始 key=value 编辑器（保留给高级用户）
+                if RemotesG.show-raw || RemotesG.edit-fields.length == 0 : VerticalLayout {
                     spacing: 3px;
                     FieldLabel { text: "参数（每行一个 key=value，保存时将覆盖已有同名参数）"; }
                     Rectangle {
-                        height: 120px;
+                        height: 140px;
                         background: ThemeG.panel-2;
                         border-radius: ThemeG.radius-s;
                         border-width: 1px;
@@ -633,6 +732,7 @@ component RemotesView inherits Rectangle {
                         TextEdit { text <=> RemotesG.edit-params; font-size: 12px; }
                     }
                 }
+                // 按钮
                 HorizontalLayout {
                     spacing: 8px;
                     PillBtn { label: "保存"; primary: true; clicked => { root.editor-save(); } }
@@ -738,11 +838,13 @@ component MountsView inherits Rectangle {
             title: "新建挂载";
             VerticalLayout {
                 spacing: 10px;
+                // 第一行：远程 + 挂载点
                 HorizontalLayout {
-                    spacing: 8px;
+                    spacing: 12px;
                     height: 56px;
                     VerticalLayout {
                         spacing: 3px;
+                        horizontal-stretch: 1;
                         FieldLabel { text: "远程（如 teldrive: 或 teldrive:sub/dir）"; }
                         LineEdit { text <=> MountsG.new-fs; placeholder-text: "选择或输入远程路径"; }
                     }
@@ -752,9 +854,14 @@ component MountsView inherits Rectangle {
                         FieldLabel { text: "挂载点（盘符 / * 自动分配）"; }
                         LineEdit { text <=> MountsG.new-point; }
                     }
+                }
+                // 第二行：缓存模式 + 只读 + 挂载按钮
+                HorizontalLayout {
+                    spacing: 12px;
+                    height: 56px;
                     VerticalLayout {
                         spacing: 3px;
-                        width: 140px;
+                        width: 160px;
                         FieldLabel { text: "缓存模式"; }
                         ComboBox {
                             model: MountsG.caches;
@@ -763,13 +870,16 @@ component MountsView inherits Rectangle {
                     }
                     VerticalLayout {
                         spacing: 3px;
-                        width: 90px;
+                        width: 100px;
                         FieldLabel { text: "只读"; }
                         HorizontalLayout {
+                            spacing: 6px;
+                            alignment: start;
                             CheckBox { checked <=> MountsG.ro; }
                             Rectangle {}
                         }
                     }
+                    Rectangle {}
                     VerticalLayout {
                         spacing: 3px;
                         width: 96px;
@@ -826,8 +936,9 @@ component ServesView inherits Rectangle {
             title: "新建服务";
             VerticalLayout {
                 spacing: 10px;
+                // 第一行：协议 + 远程 + 监听地址
                 HorizontalLayout {
-                    spacing: 8px;
+                    spacing: 12px;
                     height: 56px;
                     VerticalLayout {
                         spacing: 3px;
@@ -840,7 +951,7 @@ component ServesView inherits Rectangle {
                     }
                     VerticalLayout {
                         spacing: 3px;
-                        width: 200px;
+                        horizontal-stretch: 1;
                         FieldLabel { text: "远程（fs）"; }
                         ComboBox {
                             model: ServesG.remotes;
@@ -849,22 +960,28 @@ component ServesView inherits Rectangle {
                     }
                     VerticalLayout {
                         spacing: 3px;
-                        width: 160px;
+                        width: 200px;
                         FieldLabel { text: "监听地址"; }
                         LineEdit { text <=> ServesG.addr; }
                     }
+                }
+                // 第二行：用户 + 密码 + 启动按钮
+                HorizontalLayout {
+                    spacing: 12px;
+                    height: 56px;
                     VerticalLayout {
                         spacing: 3px;
-                        width: 130px;
+                        width: 140px;
                         FieldLabel { text: "用户（可选）"; }
                         LineEdit { text <=> ServesG.user; }
                     }
                     VerticalLayout {
                         spacing: 3px;
-                        width: 130px;
+                        width: 160px;
                         FieldLabel { text: "密码（可选）"; }
                         LineEdit { text <=> ServesG.pass; input-type: InputType.password; }
                     }
+                    Rectangle {}
                     VerticalLayout {
                         spacing: 3px;
                         width: 96px;
@@ -1446,6 +1563,7 @@ export component MainWindow inherits Window {
     callback remote-del(int);
     callback remote-editor-save();
     callback remote-editor-cancel();
+    callback remote-type-changed();
     callback serves-refresh();
     callback serve-start();
     callback serve-stop(string);
@@ -1607,6 +1725,7 @@ export component MainWindow inherits Window {
                     del-row(i) => { root.remote-del(i); }
                     editor-save => { root.remote-editor-save(); }
                     editor-cancel => { root.remote-editor-cancel(); }
+                    type-changed => { root.remote-type-changed(); }
                 }
                 if NavG.idx == 3 : MountsView {
                     refresh => { root.mounts-refresh(); }

@@ -32,7 +32,7 @@ pub fn generate_password() -> String {
         .collect()
 }
 
-/// 探测 rclone.exe：自定义路径 → PATH → 常见安装位置
+/// 探测 rclone.exe：自定义路径 → 内嵌（由调用方通过 custom 传入）→ PATH → 常见安装位置
 pub fn discover_exe(custom: Option<&str>) -> Result<PathBuf> {
     if let Some(p) = custom {
         if !p.trim().is_empty() {

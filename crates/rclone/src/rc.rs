@@ -116,6 +116,11 @@ impl RcClient {
         self.call("config/dump", &json!({})).await
     }
 
+    /// 获取所有后端类型及其参数定义
+    pub async fn config_providers(&self) -> Result<Value> {
+        self.call("config/providers", &json!({})).await
+    }
+
     /// 新建 remote：parameters 为键值对（type 单独传）
     pub async fn config_create(&self, name: &str, rtype: &str, parameters: Value) -> Result<()> {
         self.call(
