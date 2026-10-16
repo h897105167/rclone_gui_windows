@@ -69,6 +69,10 @@ export struct ServeRow {
     fs: string,
     addr: string,
 }
+export struct PathItem {
+    name: string,
+    is-dir: bool,
+}
 export struct JobRow {
     id: int,
     desc: string,
@@ -87,6 +91,20 @@ export global ToastG {
     in-out property <bool> show: false;
     in-out property <string> msg: "";
     in-out property <int> kind: 0; // 0 info 1 ok 2 err
+}
+
+// busy 状态帧驱动（Spinner 动画，Rust 侧定时器推进）
+export global BusyG {
+    in-out property <int> frame: 0;
+}
+
+// 远程路径浏览弹窗
+export global BrowseG {
+    in-out property <bool> show: false;
+    in-out property <int> scope: 0;      // 0 挂载 / 1 服务
+    in-out property <string> path: "root://";
+    in-out property <[PathItem]> entries: [];
+    in-out property <int> sel: -1;       // 当前高亮选中行
 }
 
 export global DashboardG {
@@ -116,11 +134,14 @@ export global FilesG {
 
 export global MountsG {
     in-out property <[MountRow]> mounts: [];
-    in-out property <string> new-fs: "";
+    in-out property <string> new-fs: "root://";
+    // 级联路径下拉内容（当前层级的文件夹）
+    in-out property <[PathItem]> path-items: [];
     in-out property <string> new-point: "*";
     in-out property <bool> ro: false;
     in-out property <[string]> caches: ["off", "minimal", "writes", "full"];
-    in-out property <int> cache-idx: 1;
+    in-out property <int> cache-idx: 2;
+    in-out property <bool> auto-mount: true;
     in-out property <bool> winfsp-ok: false;
     in-out property <string> winfsp-msg: "";
     in-out property <bool> busy: false;
@@ -166,11 +187,13 @@ export global ServesG {
     in-out property <[ServeRow]> rows: [];
     in-out property <[string]> types: ["webdav", "sftp", "http", "ftp", "dlna", "nfs", "docker"];
     in-out property <int> type-idx: 0;
-    in-out property <[string]> remotes: [];
-    in-out property <int> remote-idx: 0;
+    in-out property <string> new-fs: "root://";
+    // 级联路径下拉内容（当前层级的文件夹）
+    in-out property <[PathItem]> path-items: [];
     in-out property <string> addr: "127.0.0.1:8080";
     in-out property <string> user: "";
     in-out property <string> pass: "";
+    in-out property <bool> auto-run: true;
     in-out property <bool> busy: false;
 }
 
@@ -278,27 +301,121 @@ component PillBtn inherits Rectangle {
 component Card inherits Rectangle {
     in property <string> title: "";
     in property <length> pad: 16px;
+    // fill=true 时子元素可拉伸占满卡片（用于列表类卡片）
+    in property <bool> fill: false;
     background: ThemeG.panel;
     border-radius: ThemeG.radius;
     border-width: 1px;
     border-color: ThemeG.border;
     vertical-layout := VerticalLayout {
         padding: root.pad;
-        alignment: start;
-        if root.title != "": Text {
-            text: root.title;
-            font-size: 13px;
-            font-weight: 600;
-            color: ThemeG.text-dim;
+        alignment: root.fill ? LayoutAlignment.stretch : LayoutAlignment.start;
+        if root.title != "": Rectangle {
+            height: 36px;
+            HorizontalLayout {
+                padding-left: root.pad < 14px ? 14px : root.pad;
+                padding-right: root.pad < 14px ? 14px : root.pad;
+                Text {
+                    text: root.title;
+                    font-size: 14px;
+                    font-weight: 700;
+                    color: ThemeG.text;
+                    vertical-alignment: center;
+                }
+            }
         }
-        if root.title != "": Rectangle { height: 10px; }
+        if root.title != "" && root.pad > 0px : Rectangle { height: 8px; }
         @children
     }
+}
+
+// 忙碌指示器：帧动画由 BusyG.frame 驱动（Rust 侧定时器推进）
+component Spinner inherits Text {
+    in property <bool> running: false;
+    width: 18px;
+    height: 20px;
+    font-size: 15px;
+    color: ThemeG.accent;
+    vertical-alignment: center;
+    text: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][Math.mod(BusyG.frame, 10)];
+    visible: root.running;
 }
 
 component FieldLabel inherits Text {
     font-size: 12px;
     color: ThemeG.text-dim;
+}
+
+// 应用内确认弹窗：风格与整体 UI 一致、无系统提示音，锚定在触发元素（鼠标）附近
+component ConfirmPop inherits PopupWindow {
+    in property <string> title: "确认操作";
+    in property <string> msg;
+    in property <string> ok-label: "删除";
+    callback confirmed;
+    close-policy: PopupClosePolicy.close-on-click-outside;
+    // 不设置 width/height：弹出时自动取内容首选尺寸
+    card := Rectangle {
+        width: 320px;
+        background: ThemeG.panel;
+        border-radius: ThemeG.radius;
+        border-width: 1px;
+        border-color: ThemeG.border;
+        VerticalLayout {
+            padding: 16px;
+            spacing: 10px;
+            Text {
+                text: root.title;
+                font-size: 14px;
+                font-weight: 700;
+                color: ThemeG.text;
+            }
+            Text {
+                text: root.msg;
+                font-size: 13px;
+                color: ThemeG.text-dim;
+                wrap: word-wrap;
+            }
+            Rectangle { height: 2px; }
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+                PillBtn { label: "取消"; clicked => { root.close(); } }
+                PillBtn { label: root.ok-label; danger: true; clicked => { root.close(); root.confirmed(); } }
+            }
+        }
+    }
+}
+
+// 右键菜单项
+component MenuItemBtn inherits Rectangle {
+    in property <string> glyph;
+    in property <string> label;
+    in property <bool> danger: false;
+    callback clicked;
+    height: 32px;
+    border-radius: ThemeG.radius-s;
+    background: mta.has-hover ? ThemeG.hover : transparent;
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+        MdlIcon {
+            glyph: root.glyph;
+            width: 16px;
+            font-size: 12px;
+            color: root.danger ? ThemeG.err : ThemeG.text-dim;
+        }
+        Text {
+            text: root.label;
+            font-size: 13px;
+            color: root.danger ? ThemeG.err : ThemeG.text;
+            vertical-alignment: center;
+        }
+    }
+    mta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
 }
 
 component StatTile inherits Rectangle {
@@ -465,6 +582,12 @@ component FilesView inherits Rectangle {
     callback rename-row(int);
     callback copy-row(int);
     callback copy-link(int);
+    // 右键菜单 / 弹窗所需的待操作状态
+    property <int> op-idx: -1;
+    property <string> op-name: "";
+    property <bool> op-is-dir: false;
+    property <length> menu-ax;
+    property <length> menu-ay;
     VerticalLayout {
         padding: 24px;
         spacing: 12px;
@@ -503,22 +626,9 @@ component FilesView inherits Rectangle {
             PillBtn { label: "新建文件夹"; clicked => { root.mkdir(); } }
             IconBtn { label: "\u{E72C}"; clicked => { root.refresh(); } }
         }
-        if FilesG.sel >= 0 : HorizontalLayout {
-            height: 34px;
-            spacing: 8px;
-            Text { text: "重命名:"; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-            LineEdit {
-                width: 260px;
-                text <=> FilesG.rename-name;
-                accepted(t) => { root.rename-row(FilesG.sel); }
-            }
-            PillBtn { label: "确定"; primary: true; clicked => { root.rename-row(FilesG.sel); } }
-            PillBtn { label: "复制一份"; clicked => { root.copy-row(FilesG.sel); } }
-            if !FilesG.entries[FilesG.sel].is-dir : PillBtn { label: "复制直链"; clicked => { root.copy-link(FilesG.sel); } }
-            PillBtn { label: "删除"; danger: true; clicked => { root.del-row(FilesG.sel); } }
-        }
         Card {
             pad: 0px;
+            fill: true;
             vertical-stretch: 1;
             VerticalLayout {
                 Rectangle {
@@ -545,6 +655,18 @@ component FilesView inherits Rectangle {
                                 mouse-cursor: pointer;
                                 clicked => { FilesG.sel = i; FilesG.rename-name = row.name; }
                                 double-clicked => { root.open-row(i); }
+                                pointer-event(e) => {
+                                    if (e.button == PointerEventButton.right && e.kind == PointerEventKind.up) {
+                                        FilesG.sel = i;
+                                        FilesG.rename-name = row.name;
+                                        root.op-idx = i;
+                                        root.op-name = row.name;
+                                        root.op-is-dir = row.is-dir;
+                                        root.menu-ax = Math.max(0px, Math.min(self.absolute-position.x + self.mouse-x - root.absolute-position.x, root.width - 190px));
+                                        root.menu-ay = Math.min(self.absolute-position.y + self.mouse-y - root.absolute-position.y, 120px);
+                                        ctx.show();
+                                    }
+                                }
                             }
                             HorizontalLayout {
                                 padding-left: 14px;
@@ -584,6 +706,80 @@ component FilesView inherits Rectangle {
             }
         }
     }
+    // 右键菜单（原点击工具栏功能全部集成于此）
+    ctx := PopupWindow {
+        x: root.menu-ax;
+        y: root.menu-ay;
+        close-policy: PopupClosePolicy.close-on-click-outside;
+        ctxcard := Rectangle {
+            width: 170px;
+            background: ThemeG.panel;
+            border-radius: ThemeG.radius-s;
+            border-width: 1px;
+            border-color: ThemeG.border;
+            VerticalLayout {
+                padding: 4px;
+                spacing: 2px;
+                MenuItemBtn {
+                    glyph: "\u{E8AC}";
+                    label: "重命名";
+                    clicked => { ctx.close(); rnp.show(); }
+                }
+                MenuItemBtn {
+                    glyph: "\u{E8C8}";
+                    label: "复制一份";
+                    clicked => { ctx.close(); root.copy-row(root.op-idx); }
+                }
+                if !root.op-is-dir : MenuItemBtn {
+                    glyph: "\u{E71B}";
+                    label: "复制直链";
+                    clicked => { ctx.close(); root.copy-link(root.op-idx); }
+                }
+                MenuItemBtn {
+                    glyph: "\u{E74D}";
+                    label: "删除";
+                    danger: true;
+                    clicked => { ctx.close(); delp.show(); }
+                }
+            }
+        }
+    }
+    // 重命名弹窗
+    rnp := PopupWindow {
+        x: root.menu-ax;
+        y: root.menu-ay + 36px;
+        close-policy: PopupClosePolicy.close-on-click-outside;
+        rnpcard := Rectangle {
+            width: 400px;
+            background: ThemeG.panel;
+            border-radius: ThemeG.radius;
+            border-width: 1px;
+            border-color: ThemeG.border;
+            VerticalLayout {
+                padding: 14px;
+                spacing: 10px;
+                FieldLabel { text: "重命名 " + root.op-name; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit {
+                        width: 240px;
+                        text <=> FilesG.rename-name;
+                        accepted(t) => { rnp.close(); root.rename-row(root.op-idx); }
+                    }
+                    PillBtn { label: "确定"; primary: true; clicked => { rnp.close(); root.rename-row(root.op-idx); } }
+                    PillBtn { label: "取消"; clicked => { rnp.close(); } }
+                }
+            }
+        }
+    }
+    // 删除确认弹窗
+    delp := ConfirmPop {
+        title: "删除";
+        msg: "确认删除 " + root.op-name + (root.op-is-dir ? "（文件夹将整体删除）？" : "？");
+        x: root.menu-ax;
+        y: root.menu-ay;
+        confirmed => { root.del-row(root.op-idx); }
+    }
 }
 
 component RemotesView inherits Rectangle {
@@ -596,6 +792,11 @@ component RemotesView inherits Rectangle {
     callback editor-save;
     callback editor-cancel;
     callback type-changed;
+    // 删除确认弹窗所需的待操作状态
+    property <int> del-idx: -1;
+    property <string> del-name: "";
+    property <length> pop-ax;
+    property <length> pop-ay;
     VerticalLayout {
         padding: 24px;
         spacing: 14px;
@@ -660,32 +861,45 @@ component RemotesView inherits Rectangle {
                             spacing: 8px;
                             for f[i] in RemotesG.edit-fields : VerticalLayout {
                                 spacing: 2px;
-                                if !f.is-advanced || RemotesG.show-advanced : HorizontalLayout {
-                                    spacing: 8px;
-                                    height: 30px;
-                                    // 标签
-                                    Text {
-                                        text: f.label + (f.required ? " *" : "");
-                                        font-size: 12px;
-                                        color: f.required ? ThemeG.text : ThemeG.text-dim;
-                                        width: 180px;
-                                        vertical-alignment: center;
-                                        overflow: elide;
-                                    }
-                                    // 输入控件
-                                    if f.kind == "bool" : CheckBox {
-                                        checked: f.value == "true";
-                                        toggled => {
-                                            RemotesG.edit-fields[i].value = self.checked ? "true" : "false";
+                                if !f.is-advanced || RemotesG.show-advanced : VerticalLayout {
+                                    spacing: 4px;
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        height: 30px;
+                                        // 标签
+                                        Text {
+                                            text: f.label + (f.required ? " *" : "");
+                                            font-size: 12px;
+                                            color: f.required ? ThemeG.text : ThemeG.text-dim;
+                                            width: 180px;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+                                        // 输入控件
+                                        if f.kind == "bool" : CheckBox {
+                                            checked: f.value == "true";
+                                            toggled => {
+                                                RemotesG.edit-fields[i].value = self.checked ? "true" : "false";
+                                            }
+                                        }
+                                        if f.kind != "bool" : LineEdit {
+                                            horizontal-stretch: 1;
+                                            text: f.value;
+                                            input-type: f.kind == "password" ? InputType.password : InputType.text;
+                                            edited(t) => {
+                                                RemotesG.edit-fields[i].value = t;
+                                            }
                                         }
                                     }
-                                    if f.kind != "bool" : LineEdit {
-                                        horizontal-stretch: 1;
-                                        text: f.value;
-                                        placeholder-text: f.help;
-                                        input-type: f.kind == "password" ? InputType.password : InputType.text;
-                                        edited(t) => {
-                                            RemotesG.edit-fields[i].value = t;
+                                    // 帮助文本：置于输入框下方，超长自动换行
+                                    if f.kind != "bool" && f.help != "" : HorizontalLayout {
+                                        Rectangle { width: 188px; }
+                                        Text {
+                                            text: f.help;
+                                            font-size: 11px;
+                                            color: ThemeG.text-dim;
+                                            wrap: word-wrap;
+                                            horizontal-stretch: 1;
                                         }
                                     }
                                 }
@@ -745,6 +959,7 @@ component RemotesView inherits Rectangle {
         Card {
             title: "远程存储（" + RemotesG.rows.length + "）";
             pad: 0px;
+            fill: true;
             vertical-stretch: 1;
             VerticalLayout {
                 Rectangle {
@@ -788,7 +1003,18 @@ component RemotesView inherits Rectangle {
                                     }
                                     VerticalLayout {
                                         alignment: center;
-                                        PillBtn { label: "删除"; compact: true; danger: true; clicked => { root.del-row(i); } }
+                                        PillBtn {
+                                            label: "删除";
+                                            compact: true;
+                                            danger: true;
+                                            clicked => {
+                                                root.del-idx = i;
+                                                root.del-name = r.name;
+                                                root.pop-ax = Math.max(0px, Math.min(self.absolute-position.x - root.absolute-position.x + self.width / 2 - 160px, root.width - 324px));
+                                                root.pop-ay = self.absolute-position.y - root.absolute-position.y + self.height + 4px;
+                                                delp.show();
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -804,6 +1030,14 @@ component RemotesView inherits Rectangle {
             }
         }
     }
+    // 删除确认弹窗（锚定在删除按钮附近）
+    delp := ConfirmPop {
+        title: "删除远程";
+        msg: "确认删除远程存储 " + root.del-name + "？";
+        x: root.pop-ax;
+        y: root.pop-ay;
+        confirmed => { root.del-row(root.del-idx); }
+    }
 }
 
 component MountsView inherits Rectangle {
@@ -811,6 +1045,8 @@ component MountsView inherits Rectangle {
     callback refresh;
     callback add;
     callback remove(string);
+    callback browse;
+    callback path-nav(string);
     VerticalLayout {
         padding: 24px;
         spacing: 12px;
@@ -845,8 +1081,19 @@ component MountsView inherits Rectangle {
                     VerticalLayout {
                         spacing: 3px;
                         horizontal-stretch: 1;
-                        FieldLabel { text: "远程（如 teldrive: 或 teldrive:sub/dir）"; }
-                        LineEdit { text <=> MountsG.new-fs; placeholder-text: "选择或输入远程路径"; }
+                        FieldLabel { text: "远程路径（root://仓库/子目录）"; }
+                        HorizontalLayout {
+                            spacing: 4px;
+                            LineEdit { text <=> MountsG.new-fs; placeholder-text: "root://"; horizontal-stretch: 1; }
+                            dd-btn := IconBtn {
+                                label: "\u{E70D}";
+                                clicked => { dd-pop.show(); }
+                            }
+                            IconBtn {
+                                label: "\u{E838}";
+                                clicked => { root.browse(); }
+                            }
+                        }
                     }
                     VerticalLayout {
                         spacing: 3px;
@@ -855,7 +1102,7 @@ component MountsView inherits Rectangle {
                         LineEdit { text <=> MountsG.new-point; }
                     }
                 }
-                // 第二行：缓存模式 + 只读 + 挂载按钮
+                // 第二行：缓存模式 + 只读 + 自动挂载 + 挂载按钮
                 HorizontalLayout {
                     spacing: 12px;
                     height: 56px;
@@ -879,7 +1126,19 @@ component MountsView inherits Rectangle {
                             Rectangle {}
                         }
                     }
+                    VerticalLayout {
+                        spacing: 3px;
+                        width: 130px;
+                        FieldLabel { text: "自动挂载"; }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            alignment: start;
+                            CheckBox { checked <=> MountsG.auto-mount; }
+                            Rectangle {}
+                        }
+                    }
                     Rectangle {}
+                    Spinner { running: MountsG.busy; }
                     VerticalLayout {
                         spacing: 3px;
                         width: 96px;
@@ -887,7 +1146,7 @@ component MountsView inherits Rectangle {
                         PillBtn { label: "挂载"; primary: true; disabled: MountsG.busy; clicked => { root.add(); } }
                     }
                 }
-                FieldLabel { text: "目录挂载点在 Windows cmount 下不可用，请使用盘符（如 T:）或 * 自动分配"; }
+                FieldLabel { text: "勾选“自动挂载”并挂载成功后，下次启动软件将自动挂载；盘符挂载点如 T、T: 会自动规范为 T:\\"; }
             }
         }
         Card {
@@ -916,6 +1175,50 @@ component MountsView inherits Rectangle {
             }
         }
     }
+    // 级联路径下拉（锚定在"远程"输入框下方）
+    dd-pop := PopupWindow {
+        x: 40px;
+        y: 118px;
+        width: 300px;
+        height: MountsG.path-items.length == 0 ? 60px : Math.min(MountsG.path-items.length * 30px + 12px, 260px);
+        close-policy: PopupClosePolicy.close-on-click-outside;
+        Rectangle {
+            background: ThemeG.panel;
+            border-radius: ThemeG.radius;
+            border-width: 1px;
+            border-color: ThemeG.border;
+            if MountsG.path-items.length == 0 : Text {
+                text: "（无子文件夹）";
+                font-size: 12px;
+                color: ThemeG.text-dim;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            if MountsG.path-items.length > 0 : ScrollView {
+                VerticalLayout {
+                    padding: 6px;
+                    spacing: 2px;
+                    for it in MountsG.path-items : Rectangle {
+                        height: 28px;
+                        border-radius: ThemeG.radius-s;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 6px;
+                            Text { text: "\u{E8B7}"; font-size: 12px; color: ThemeG.accent; width: 16px; vertical-alignment: center; }
+                            Text { text: it.name; font-size: 12px; color: ThemeG.text; overflow: elide; vertical-alignment: center; }
+                        }
+                        TouchArea {
+                            clicked => {
+                                dd-pop.close();
+                                root.path-nav(it.name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 component ServesView inherits Rectangle {
@@ -923,6 +1226,8 @@ component ServesView inherits Rectangle {
     callback refresh;
     callback start;
     callback stop(string);
+    callback browse;
+    callback path-nav(string);
     VerticalLayout {
         padding: 24px;
         spacing: 12px;
@@ -942,7 +1247,7 @@ component ServesView inherits Rectangle {
                     height: 56px;
                     VerticalLayout {
                         spacing: 3px;
-                        width: 120px;
+                        width: 160px;
                         FieldLabel { text: "协议"; }
                         ComboBox {
                             model: ServesG.types;
@@ -952,10 +1257,18 @@ component ServesView inherits Rectangle {
                     VerticalLayout {
                         spacing: 3px;
                         horizontal-stretch: 1;
-                        FieldLabel { text: "远程（fs）"; }
-                        ComboBox {
-                            model: ServesG.remotes;
-                            current-index <=> ServesG.remote-idx;
+                        FieldLabel { text: "远程路径（root://仓库/子目录）"; }
+                        HorizontalLayout {
+                            spacing: 4px;
+                            LineEdit { text <=> ServesG.new-fs; placeholder-text: "root://"; horizontal-stretch: 1; }
+                            sdd-btn := IconBtn {
+                                label: "\u{E70D}";
+                                clicked => { sdd-pop.show(); }
+                            }
+                            IconBtn {
+                                label: "\u{E838}";
+                                clicked => { root.browse(); }
+                            }
                         }
                     }
                     VerticalLayout {
@@ -971,7 +1284,7 @@ component ServesView inherits Rectangle {
                     height: 56px;
                     VerticalLayout {
                         spacing: 3px;
-                        width: 140px;
+                        width: 160px;
                         FieldLabel { text: "用户（可选）"; }
                         LineEdit { text <=> ServesG.user; }
                     }
@@ -981,7 +1294,18 @@ component ServesView inherits Rectangle {
                         FieldLabel { text: "密码（可选）"; }
                         LineEdit { text <=> ServesG.pass; input-type: InputType.password; }
                     }
+                    VerticalLayout {
+                        spacing: 3px;
+                        width: 120px;
+                        FieldLabel { text: "自动启动"; }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            CheckBox { checked <=> ServesG.auto-run; }
+                            Rectangle {}
+                        }
+                    }
                     Rectangle {}
+                    Spinner { running: ServesG.busy; }
                     VerticalLayout {
                         spacing: 3px;
                         width: 96px;
@@ -994,6 +1318,7 @@ component ServesView inherits Rectangle {
         Card {
             title: "运行中服务（" + ServesG.rows.length + "）";
             pad: 0px;
+            fill: true;
             vertical-stretch: 1;
             VerticalLayout {
                 Rectangle {
@@ -1039,6 +1364,50 @@ component ServesView inherits Rectangle {
                                 height: 1px;
                                 background: ThemeG.border;
                                 opacity: 0.5;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 级联路径下拉（锚定在"远程"输入框下方）
+    sdd-pop := PopupWindow {
+        x: 40px;
+        y: 118px;
+        width: 300px;
+        height: ServesG.path-items.length == 0 ? 60px : Math.min(ServesG.path-items.length * 30px + 12px, 260px);
+        close-policy: PopupClosePolicy.close-on-click-outside;
+        Rectangle {
+            background: ThemeG.panel;
+            border-radius: ThemeG.radius;
+            border-width: 1px;
+            border-color: ThemeG.border;
+            if ServesG.path-items.length == 0 : Text {
+                text: "（无子文件夹）";
+                font-size: 12px;
+                color: ThemeG.text-dim;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            if ServesG.path-items.length > 0 : ScrollView {
+                VerticalLayout {
+                    padding: 6px;
+                    spacing: 2px;
+                    for it in ServesG.path-items : Rectangle {
+                        height: 28px;
+                        border-radius: ThemeG.radius-s;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 6px;
+                            Text { text: "\u{E8B7}"; font-size: 12px; color: ThemeG.accent; width: 16px; vertical-alignment: center; }
+                            Text { text: it.name; font-size: 12px; color: ThemeG.text; overflow: elide; vertical-alignment: center; }
+                        }
+                        TouchArea {
+                            clicked => {
+                                sdd-pop.close();
+                                root.path-nav(it.name);
                             }
                         }
                     }
@@ -1095,6 +1464,7 @@ component TransfersView inherits Rectangle {
         Card {
             title: "后台任务（" + TransfersG.jobs.length + "）";
             pad: 0px;
+            fill: true;
             vertical-stretch: 1;
             VerticalLayout {
                 Rectangle {
@@ -1163,6 +1533,13 @@ component PluginsView inherits Rectangle {
     callback image-del(int);
     callback copy-url(int);
     callback plugin-toggle(int);
+    // 确认弹窗所需的待操作状态
+    property <int> tok-idx: -1;
+    property <string> tok-name: "";
+    property <int> img-idx: -1;
+    property <string> img-path: "";
+    property <length> pop-ax;
+    property <length> pop-ay;
     ScrollView {
         VerticalLayout {
             padding: 24px;
@@ -1275,12 +1652,12 @@ component PluginsView inherits Rectangle {
                                     height: 32px;
                                     FieldLabel { text: "命名模式"; width: 70px; vertical-alignment: center; }
                                     ComboBox {
-                                        width: 130px;
+                                        width: 160px;
                                         model: PluginsG.naming;
                                         current-index <=> PluginsG.naming-idx;
                                     }
                                     FieldLabel { text: "序号补零"; width: 60px; vertical-alignment: center; }
-                                    LineEdit { width: 50px; text <=> PluginsG.seq-pad; }
+                                    LineEdit { width: 160px; text <=> PluginsG.seq-pad; }
                                     CheckBox { checked <=> PluginsG.dedupe; text: "SHA1 去重秒传"; }
                                 }
                                 HorizontalLayout {
@@ -1288,7 +1665,7 @@ component PluginsView inherits Rectangle {
                                     height: 32px;
                                     FieldLabel { text: "Obsidian 布局"; width: 90px; vertical-alignment: center; }
                                     ComboBox {
-                                        width: 120px;
+                                        width: 160px;
                                         model: PluginsG.obs;
                                         current-index <=> PluginsG.obs-idx;
                                     }
@@ -1326,7 +1703,17 @@ component PluginsView inherits Rectangle {
                                         Text { text: t.token; font-size: 11px; font-family: "Consolas"; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
                                         Rectangle {}
                                         IconBtn { label: "\u{E8C8}"; clicked => { root.copy-token(t.token); } }
-                                        IconBtn { label: "\u{E711}"; danger: true; clicked => { root.revoke-token(ti); } }
+                                        IconBtn {
+                                            label: "\u{E711}";
+                                            danger: true;
+                                            clicked => {
+                                                root.tok-idx = ti;
+                                                root.tok-name = t.name;
+                                                root.pop-ax = Math.max(0px, Math.min(self.absolute-position.x - root.absolute-position.x + self.width / 2 - 160px, root.width - 324px));
+                                                root.pop-ay = self.absolute-position.y - root.absolute-position.y + self.height + 4px;
+                                                tp.show();
+                                            }
+                                        }
                                     }
                                 }
                                 HorizontalLayout {
@@ -1366,7 +1753,17 @@ component PluginsView inherits Rectangle {
                                                 Text { text: im.size; font-size: 11px; color: ThemeG.text-dim; width: 70px; vertical-alignment: center; }
                                                 Text { text: im.uploaded; font-size: 11px; color: ThemeG.text-dim; width: 150px; vertical-alignment: center; }
                                                 IconBtn { label: "\u{E8C8}"; clicked => { root.copy-url(imi); } }
-                                                IconBtn { label: "\u{E74D}"; danger: true; clicked => { root.image-del(imi); } }
+                                                IconBtn {
+                                                    label: "\u{E74D}";
+                                                    danger: true;
+                                                    clicked => {
+                                                        root.img-idx = imi;
+                                                        root.img-path = im.path;
+                                                        root.pop-ax = Math.max(0px, Math.min(self.absolute-position.x - root.absolute-position.x + self.width / 2 - 160px, root.width - 324px));
+                                                        root.pop-ay = self.absolute-position.y - root.absolute-position.y + self.height + 4px;
+                                                        ip.show();
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -1377,6 +1774,23 @@ component PluginsView inherits Rectangle {
                 }
             }
         }
+    }
+    // 撤销令牌确认弹窗
+    tp := ConfirmPop {
+        title: "撤销令牌";
+        msg: "确认撤销令牌 " + root.tok-name + "？";
+        ok-label: "撤销";
+        x: root.pop-ax;
+        y: root.pop-ay;
+        confirmed => { root.revoke-token(root.tok-idx); }
+    }
+    // 删除图床文件确认弹窗
+    ip := ConfirmPop {
+        title: "删除文件";
+        msg: "确认删除 " + root.img-path + "？";
+        x: root.pop-ax;
+        y: root.pop-ay;
+        confirmed => { root.image-del(root.img-idx); }
     }
 }
 
@@ -1410,12 +1824,16 @@ component SettingsView inherits Rectangle {
                         FieldLabel { text: "rclone.exe"; width: 70px; vertical-alignment: center; }
                         LineEdit { text <=> SettingsG.exe; placeholder-text: "留空自动查找"; }
                         PillBtn { label: "浏览…"; compact: true; clicked => { root.pick-exe(); } }
+                    }
+                    if SettingsG.mode-idx == 0 : HorizontalLayout {
+                        spacing: 8px;
+                        height: 32px;
                         FieldLabel { text: "RC 端口"; width: 56px; vertical-alignment: center; }
-                        LineEdit { width: 80px; text <=> SettingsG.rc-port; }
+                        LineEdit { width: 160px; text <=> SettingsG.rc-port; }
                         FieldLabel { text: "RC 用户"; width: 56px; vertical-alignment: center; }
-                        LineEdit { width: 100px; text <=> SettingsG.rc-user; }
+                        LineEdit { width: 160px; text <=> SettingsG.rc-user; }
                         FieldLabel { text: "RC 密码"; width: 56px; vertical-alignment: center; }
-                        LineEdit { width: 140px; text <=> SettingsG.rc-pass; input-type: InputType.password; }
+                        LineEdit { width: 160px; text <=> SettingsG.rc-pass; input-type: InputType.password; }
                     }
                     if SettingsG.mode-idx == 1 : HorizontalLayout {
                         spacing: 8px;
@@ -1423,9 +1841,9 @@ component SettingsView inherits Rectangle {
                         FieldLabel { text: "RC 地址"; width: 70px; vertical-alignment: center; }
                         LineEdit { width: 240px; text <=> SettingsG.rc-url; placeholder-text: "http://127.0.0.1:5572"; }
                         FieldLabel { text: "RC 用户"; width: 56px; vertical-alignment: center; }
-                        LineEdit { width: 100px; text <=> SettingsG.rc-user; }
+                        LineEdit { width: 160px; text <=> SettingsG.rc-user; }
                         FieldLabel { text: "RC 密码"; width: 56px; vertical-alignment: center; }
-                        LineEdit { width: 140px; text <=> SettingsG.rc-pass; input-type: InputType.password; }
+                        LineEdit { width: 160px; text <=> SettingsG.rc-pass; input-type: InputType.password; }
                     }
                 }
             }
@@ -1441,7 +1859,7 @@ component SettingsView inherits Rectangle {
                             height: 32px;
                             FieldLabel { text: "主题"; width: 46px; vertical-alignment: center; }
                             ComboBox {
-                                width: 130px;
+                                width: 160px;
                                 model: SettingsG.themes;
                                 current-index <=> SettingsG.theme-idx;
                                 changed current-index => { root.save(); }
@@ -1483,7 +1901,7 @@ component SettingsView inherits Rectangle {
                             height: 32px;
                             CheckBox { checked <=> SettingsG.http-enabled; text: "启用"; toggled => { root.save(); } }
                             FieldLabel { text: "端口"; width: 34px; vertical-alignment: center; }
-                            LineEdit { width: 80px; text <=> SettingsG.http-port; }
+                            LineEdit { width: 160px; text <=> SettingsG.http-port; }
                         }
                         FieldLabel { text: "上传 API：POST /api/plugin/imagehost/upload"; }
                         FieldLabel { text: "直链代理：GET /i/{rootId}/{path}"; }
@@ -1498,17 +1916,17 @@ component SettingsView inherits Rectangle {
                             spacing: 8px;
                             height: 32px;
                             FieldLabel { text: "Transfers"; width: 60px; vertical-alignment: center; }
-                            LineEdit { width: 56px; text <=> SettingsG.opt-transfers; }
+                            LineEdit { width: 160px; text <=> SettingsG.opt-transfers; }
                             FieldLabel { text: "Checkers"; width: 60px; vertical-alignment: center; }
-                            LineEdit { width: 56px; text <=> SettingsG.opt-checkers; }
+                            LineEdit { width: 160px; text <=> SettingsG.opt-checkers; }
                         }
                         HorizontalLayout {
                             spacing: 8px;
                             height: 32px;
                             FieldLabel { text: "TPSLimit"; width: 60px; vertical-alignment: center; }
-                            LineEdit { width: 56px; text <=> SettingsG.opt-tpslimit; }
+                            LineEdit { width: 160px; text <=> SettingsG.opt-tpslimit; }
                             FieldLabel { text: "Log Level"; width: 60px; vertical-alignment: center; }
-                            ComboBox { width: 100px; model: SettingsG.log-levels; current-index <=> SettingsG.log-level-idx; }
+                            ComboBox { width: 160px; model: SettingsG.log-levels; current-index <=> SettingsG.log-level-idx; }
                         }
                         HorizontalLayout {
                             spacing: 8px;
@@ -1556,6 +1974,11 @@ export component MainWindow inherits Window {
     callback mounts-refresh();
     callback mount-add();
     callback mount-remove(string);
+    callback mount-path-nav(string);
+    callback serve-path-nav(string);
+    callback browse-open(int);
+    callback browse-goto(string);
+    callback browse-ok();
     callback remotes-refresh();
     callback remotes-filter(string);
     callback remote-add();
@@ -1731,11 +2154,15 @@ export component MainWindow inherits Window {
                     refresh => { root.mounts-refresh(); }
                     add => { root.mount-add(); }
                     remove(mp) => { root.mount-remove(mp); }
+                    browse => { root.browse-open(0); }
+                    path-nav(n) => { root.mount-path-nav(n); }
                 }
                 if NavG.idx == 4 : ServesView {
                     refresh => { root.serves-refresh(); }
                     start => { root.serve-start(); }
                     stop(id) => { root.serve-stop(id); }
+                    browse => { root.browse-open(1); }
+                    path-nav(n) => { root.serve-path-nav(n); }
                 }
                 if NavG.idx == 5 : TransfersView {
                     refresh => { root.transfers-refresh(); }
@@ -1805,6 +2232,99 @@ export component MainWindow inherits Window {
                 font-size: 13px;
                 color: ToastG.kind == 2 ? ThemeG.err : (ToastG.kind == 1 ? ThemeG.ok : white);
                 vertical-alignment: center;
+            }
+        }
+    }
+
+    // 远程路径浏览弹窗
+    if BrowseG.show : Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: #00000066;
+        TouchArea {}  // 拦截底层点击
+        Rectangle {
+            x: parent.width / 2 - self.width / 2;
+            y: parent.height / 2 - self.height / 2;
+            width: 520px;
+            height: 480px;
+            background: ThemeG.bg;
+            border-radius: ThemeG.radius;
+            border-width: 1px;
+            border-color: ThemeG.border;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 10px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 32px;
+                    Text { text: "浏览远程路径"; font-size: 14px; font-weight: 700; color: ThemeG.text; vertical-alignment: center; }
+                    Rectangle {}
+                    IconBtn {
+                        label: "\u{E72B}";  // 上级
+                        clicked => { root.browse-goto(".."); }
+                    }
+                }
+                Rectangle {
+                    height: 30px;
+                    background: ThemeG.panel-2;
+                    border-radius: ThemeG.radius-s;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        Text { text: BrowseG.path; font-size: 12px; color: ThemeG.text-dim; overflow: elide; vertical-alignment: center; }
+                    }
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: ThemeG.radius;
+                    border-width: 1px;
+                    border-color: ThemeG.border;
+                    clip: true;
+                    if BrowseG.entries.length == 0 : Text {
+                        text: "（空）";
+                        font-size: 13px;
+                        color: ThemeG.text-dim;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    if BrowseG.entries.length > 0 : ListView {
+                        for e[i] in BrowseG.entries : Rectangle {
+                            height: 32px;
+                            background: BrowseG.sel == i ? ThemeG.accent.with-alpha(0.25) : (rta.has-hover ? ThemeG.hover : transparent);
+                            rta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { BrowseG.sel = i; }
+                            }
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 8px;
+                                Text { text: e.is-dir ? "\u{E8B7}" : "\u{E8A5}"; font-size: 13px; color: e.is-dir ? ThemeG.accent : ThemeG.text-dim; width: 18px; vertical-alignment: center; }
+                                Text { text: e.name; font-size: 13px; color: ThemeG.text; overflow: elide; vertical-alignment: center; }
+                                Rectangle {}
+                                if e.is-dir : IconBtn {
+                                    label: "\u{E838}";
+                                    clicked => { root.browse-goto(e.name); }
+                                }
+                            }
+                            Rectangle {
+                                y: parent.height - 1px;
+                                height: 1px;
+                                background: ThemeG.border;
+                                opacity: 0.4;
+                            }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    height: 36px;
+                    spacing: 8px;
+                    alignment: end;
+                    PillBtn { label: "取消"; clicked => { BrowseG.show = false; } }
+                    PillBtn { label: "确定"; primary: true; clicked => { root.browse-ok(); } }
+                }
             }
         }
     }

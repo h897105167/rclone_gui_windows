@@ -61,6 +61,32 @@ impl Default for HttpCfg {
     }
 }
 
+/// 自动挂载项（勾选"自动挂载"后保存，下次启动自动执行）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AutoMount {
+    pub fs: String,
+    pub point: String,
+    #[serde(default)]
+    pub ro: bool,
+    #[serde(default = "d_cache")]
+    pub cache: String,
+}
+fn d_cache() -> String {
+    "writes".into()
+}
+
+/// 自动服务项（勾选"自动启动"后保存，下次启动自动执行）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AutoServe {
+    pub stype: String,
+    pub fs: String,
+    pub addr: String,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub pass: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -80,6 +106,12 @@ pub struct AppConfig {
     /// 插件启用表
     #[serde(default)]
     pub plugin_enabled: std::collections::HashMap<String, bool>,
+    /// 自动挂载列表
+    #[serde(default)]
+    pub auto_mounts: Vec<AutoMount>,
+    /// 自动服务列表
+    #[serde(default)]
+    pub auto_serves: Vec<AutoServe>,
 }
 
 impl Default for AppConfig {
@@ -116,7 +148,9 @@ pub fn write_atomic(file: &PathBuf, data: &[u8]) -> Result<()> {
 pub fn load() -> AppConfig {
     let p = config_path();
     if let Ok(raw) = std::fs::read(&p) {
-        if let Ok(cfg) = serde_json::from_slice::<AppConfig>(&raw) {
+        // 容忍 UTF-8 BOM（外部工具编辑配置文件时可能引入）
+        let raw: &[u8] = if raw.starts_with(&[0xEF, 0xBB, 0xBF]) { &raw[3..] } else { &raw };
+        if let Ok(cfg) = serde_json::from_slice::<AppConfig>(raw) {
             return cfg;
         }
     }

@@ -1,4 +1,6 @@
-﻿//! Rclone GUI（Windows 桌面版）：Rust + Slint + rclone RC + WASM 插件
+﻿// release 版不弹出控制台窗口（debug 保留便于调试）
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+//! Rclone GUI（Windows 桌面版）：Rust + Slint + rclone RC + WASM 插件
 //!
 //! 架构：主线程跑 Slint UI；后台 std 线程内 tokio runtime 负责
 //! rclone 生命周期 / 内嵌 HTTP / 统计轮询 / UI 命令处理；托盘独立线程。
@@ -33,6 +35,11 @@ enum Cmd {
     MountsRefresh,
     MountAdd,
     MountRemove { point: String },
+    MountPathNav { name: String },
+    ServePathNav { name: String },
+    BrowseOpen { scope: i32 },
+    BrowseGoto { name: String },
+    BrowseOk,
     RemotesRefresh,
     RemotesFilter,
     RemoteAdd,
@@ -195,15 +202,6 @@ fn winfsp_installed() -> (bool, String) {
         false,
         "未检测到 WinFsp。挂载功能需要安装 WinFsp：https://winfsp.dev/rel/ 安装后重启本程序。".into(),
     )
-}
-
-fn confirm_dialog(msg: String) -> bool {
-    rfd::MessageDialog::new()
-        .set_title("确认")
-        .set_description(&msg)
-        .set_buttons(rfd::MessageButtons::OkCancel)
-        .show()
-        == rfd::MessageDialogResult::Ok
 }
 
 fn join_path(dir: &str, name: &str) -> String {
@@ -403,6 +401,146 @@ where
     rx.await.ok()
 }
 
+/// 显示路径（"root://name/sub"）→ rclone fs（"name:sub"）；手输的 "name:sub" 原样返回
+fn display_to_fs(d: &str) -> String {
+    let d = d.trim();
+    if let Some(rest) = d.strip_prefix("root://") {
+        let rest = rest.trim_matches('/');
+        if rest.is_empty() {
+            return String::new();
+        }
+        match rest.find('/') {
+            Some(i) => format!("{}:{}", &rest[..i], &rest[i + 1..]),
+            None => format!("{}:", rest),
+        }
+    } else {
+        d.to_string()
+    }
+}
+
+/// rclone fs（"name:sub"）→ 显示路径（"root://name/sub"）
+#[allow(dead_code)]
+fn fs_to_display(fs: &str) -> String {
+    match fs.find(':') {
+        Some(i) => format!("root://{}/{}", &fs[..i], fs[i + 1..].trim_matches('/')),
+        None => format!("root://{}", fs),
+    }
+}
+
+/// 拆分显示路径 → (rclone fs, remote 子路径)；根返回 None
+fn split_display(d: &str) -> Option<(String, String)> {
+    let rest = d.trim().strip_prefix("root://")?.trim_matches('/');
+    if rest.is_empty() {
+        return None;
+    }
+    match rest.find('/') {
+        Some(i) => Some((format!("{}:", &rest[..i]), rest[i + 1..].to_string())),
+        None => Some((format!("{}:", rest), String::new())),
+    }
+}
+
+/// 显示路径的上级；已是根则返回 None
+fn display_parent(d: &str) -> Option<String> {
+    let d = d.trim().trim_end_matches('/');
+    let rest = d.strip_prefix("root://")?;
+    match rest.rfind('/') {
+        Some(_) => Some(format!("root://{}", rest.rsplit_once('/').unwrap().0)),
+        None => Some("root://".into()),
+    }
+}
+
+/// 挂载点规范化：单个字母或 "X:" 补全为 "X:\"，避免 rclone 把 "T" 当相对目录挂到软件目录下
+fn normalize_mount_point(p: &str) -> String {
+    let t = p.trim();
+    let b = t.as_bytes();
+    if b.len() == 1 && b[0].is_ascii_alphabetic() {
+        return format!("{}:\\", b[0].to_ascii_uppercase() as char);
+    }
+    if b.len() == 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        return format!("{}:\\", b[0].to_ascii_uppercase() as char);
+    }
+    if b.len() == 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') && b[0].is_ascii_alphabetic() {
+        return format!("{}:\\", b[0].to_ascii_uppercase() as char);
+    }
+    t.to_string()
+}
+
+/// 列出显示路径的内容；dirs_only=true 只保留文件夹
+/// 根路径 "root://" 列出所有仓库名
+async fn list_display(ctx: &Arc<Ctx>, display: &str, dirs_only: bool) -> (Vec<(String, bool)>, String) {
+    let d = display.trim();
+    let rest = d.trim_end_matches('/').strip_prefix("root://").unwrap_or("");
+    if rest.is_empty() {
+        // 根：列出仓库
+        let client = ctx.mgr.client.read().await.clone();
+        let names = ctx
+            .remotes_cache
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(n, _, _)| n.clone())
+            .collect::<Vec<_>>();
+        let names = if names.is_empty() {
+            client.list_remotes().await.unwrap_or_default()
+        } else {
+            names
+        };
+        return (names.into_iter().map(|n| (n, true)).collect(), "root://".into());
+    }
+    let Some((fs, remote)) = split_display(d) else {
+        return (vec![], "root://".into());
+    };
+    let client = ctx.mgr.client.read().await.clone();
+    let r = if remote.is_empty() { "".to_string() } else { remote.clone() };
+    match client.list(&fs, &r, None).await {
+        Ok(entries) => {
+            let items: Vec<(String, bool)> = entries
+                .into_iter()
+                .filter(|e| !dirs_only || e.is_dir)
+                .map(|e| (e.name, e.is_dir))
+                .collect();
+            (items, format!("root://{}", rest))
+        }
+        Err(_) => (vec![], format!("root://{}", rest)),
+    }
+}
+
+/// 级联下拉导航：当前页面 new-fs + 选中项 → 新路径，并刷新下拉内容（仅文件夹）
+async fn nav_path_picker(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, mount_scope: bool, name: &str) {
+    let cur = read_ui(ui, move |ui| {
+        if mount_scope {
+            ui.global::<MountsG>().get_new_fs().to_string()
+        } else {
+            ui.global::<ServesG>().get_new_fs().to_string()
+        }
+    })
+    .await
+    .unwrap_or_default();
+    let base = cur.trim().trim_end_matches('/');
+    let is_root = base == "root:" || base == "root://" || base == "root" || base.is_empty();
+    let target = if is_root {
+        format!("root://{name}")
+    } else {
+        format!("{base}/{name}")
+    };
+    let (items, disp) = list_display(ctx, &target, true).await;
+    let rows: Vec<PathItem> = items
+        .into_iter()
+        .map(|(n, d)| PathItem { name: n.into(), is_dir: d })
+        .collect();
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        if mount_scope {
+            let g = ui.global::<MountsG>();
+            g.set_new_fs(disp.into());
+            g.set_path_items(ModelRc::from(Rc::new(VecModel::from(rows))));
+        } else {
+            let g = ui.global::<ServesG>();
+            g.set_new_fs(disp.into());
+            g.set_path_items(ModelRc::from(Rc::new(VecModel::from(rows))));
+        }
+    });
+}
+
 /// 从 UI 读取当前 FieldRow 列表（必须在后台线程通过 read_ui 调用）
 async fn read_fields_from_ui(ui: &Weak<MainWindow>) -> Vec<FieldRow> {
     read_ui(ui, |u| {
@@ -563,6 +701,37 @@ fn main() {
 
     wire_callbacks(&ui, ctx, tx.clone());
 
+    // 窗口关闭 → 优雅退出（卸载挂载 / 停止服务 / 退出 rclone 进程）
+    {
+        let tx_c = tx.clone();
+        ui.window().on_close_requested(move || {
+            let _ = tx_c.send(Cmd::Quit);
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
+
+    // busy 状态帧驱动（Spinner 动画）
+    {
+        let ui_busy = ui.as_weak();
+        let busy_timer = Box::leak(Box::new(slint::Timer::default()));
+        busy_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(100),
+            move || {
+                if let Some(u) = ui_busy.upgrade() {
+                    let busy = u.global::<MountsG>().get_busy()
+                        || u.global::<ServesG>().get_busy()
+                        || u.global::<RemotesG>().get_loading()
+                        || u.global::<FilesG>().get_loading();
+                    if busy {
+                        let f = u.global::<BusyG>().get_frame();
+                        u.global::<BusyG>().set_frame((f + 1) % 10);
+                    }
+                }
+            },
+        );
+    }
+
     // 托盘
     spawn_tray(ui.as_weak(), tx.clone());
 
@@ -660,6 +829,43 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
                 g.set_url(url.into());
             },
         );
+    }
+
+    // 1.5) 自动挂载 / 自动服务（rclone 连接成功时执行）
+    {
+        let client = ctx.mgr.client.read().await.clone();
+        let ready = client
+            .version()
+            .await
+            .map(|v| v.version.starts_with('v'))
+            .unwrap_or(false);
+        if ready {
+            let (mounts, serves) = {
+                let c = ctx.cfg.lock().unwrap();
+                (c.auto_mounts.clone(), c.auto_serves.clone())
+            };
+            for m in &mounts {
+                match client
+                    .mount(&m.fs, &m.point, json!({ "vfs_cache_mode": m.cache, "read_only": m.ro }))
+                    .await
+                {
+                    Ok(actual) => toast(&ui, 1, format!("已自动挂载 {} → {actual}", m.fs)),
+                    Err(e) => toast(&ui, 2, format!("自动挂载 {} 失败: {e}", m.fs)),
+                }
+            }
+            for s in &serves {
+                match client.serve_start(&s.stype, &s.fs, &s.addr, &s.user, &s.pass).await {
+                    Ok(id) => toast(&ui, 1, format!("已自动启动服务 {id}")),
+                    Err(e) => toast(&ui, 2, format!("自动启动服务失败: {e}")),
+                }
+            }
+            if !mounts.is_empty() {
+                let _ = Box::pin(handle_cmd(&ctx, &ui, Cmd::MountsRefresh)).await;
+            }
+            if !serves.is_empty() {
+                let _ = Box::pin(handle_cmd(&ctx, &ui, Cmd::ServesRefresh)).await;
+            }
+        }
     }
 
     // 2) 内嵌 HTTP
@@ -798,7 +1004,25 @@ async fn poll_stats(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
 async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
     match cmd {
         Cmd::Quit => {
-            let _ = ctx.mgr.stop().await;
+            // 优雅退出 rclone：core/quit 会自动卸载挂载、停止服务
+            let managed = ctx.cfg.lock().unwrap().rclone.mode == 0;
+            if managed {
+                let client = ctx.mgr.client.read().await.clone();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    client.core_quit(),
+                )
+                .await;
+                // 最多再等 4s 让进程自行退出
+                for _ in 0..20 {
+                    if !ctx.mgr.is_managed_running().await {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+            // 兜底杀进程（attach 模式无子进程，无操作）
+            ctx.mgr.stop().await;
             let _ = slint::quit_event_loop();
             true
         }
@@ -1042,7 +1266,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::MountAdd => {
-            let (fs, point, ro, cache) = read_ui(ui, |ui| {
+            let (fs_disp, point_raw, ro, cache, auto) = read_ui(ui, |ui| {
                 let m = ui.global::<MountsG>();
                 let fs = m.get_new_fs().to_string();
                 let point = m.get_new_point().to_string();
@@ -1052,14 +1276,17 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     .row_data(m.get_cache_idx().max(0) as usize)
                     .unwrap_or("minimal".into())
                     .to_string();
-                (fs, point, ro, cache)
+                let auto = m.get_auto_mount();
+                (fs, point, ro, cache, auto)
             })
             .await
             .unwrap_or_default();
-            if fs.trim().is_empty() {
-                toast(ui, 2, "请填写远程路径（如 teldrive:）");
+            let fs = display_to_fs(&fs_disp);
+            if fs.is_empty() {
+                toast(ui, 2, "请选择或输入远程路径（如 teldrive:）");
                 return false;
             }
+            let point = normalize_mount_point(&point_raw);
             let client = ctx.mgr.client.read().await.clone();
             let opts = json!({
                 "vfs_cache_mode": cache,
@@ -1078,6 +1305,27 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             );
             match res {
                 Ok(actual) => {
+                    if auto {
+                        // 保存自动挂载（按挂载点去重）
+                        let item = config::AutoMount {
+                            fs: fs.clone(),
+                            point: actual.clone(),
+                            ro,
+                            cache: cache.clone(),
+                        };
+                        let mut save_err = None;
+                        {
+                            let mut cfg = ctx.cfg.lock().unwrap();
+                            cfg.auto_mounts.retain(|m| m.point != item.point);
+                            cfg.auto_mounts.push(item);
+                            if let Err(e) = config::save(&cfg) {
+                                save_err = Some(e.to_string());
+                            }
+                        }
+                        if let Some(e) = save_err {
+                            toast(ui, 2, format!("自动挂载配置保存失败: {e}"));
+                        }
+                    }
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
                     toast(ui, 1, format!("已挂载到 {actual}"));
                 }
@@ -1087,13 +1335,137 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
         }
         Cmd::MountRemove { point } => {
             let client = ctx.mgr.client.read().await.clone();
-            match client.unmount(&point).await {
+            let _ = ui.upgrade_in_event_loop(
+                |ui| {
+                    ui.global::<MountsG>().set_busy(true);
+                },
+            );
+            let res = client.unmount(&point).await;
+            let _ = ui.upgrade_in_event_loop(
+                |ui| {
+                    ui.global::<MountsG>().set_busy(false);
+                },
+            );
+            match res {
                 Ok(_) => {
+                    // 同步移除自动挂载项
+                    {
+                        let mut cfg = ctx.cfg.lock().unwrap();
+                        if cfg.auto_mounts.iter().any(|m| m.point == point) {
+                            cfg.auto_mounts.retain(|m| m.point != point);
+                            let _ = config::save(&cfg);
+                        }
+                    }
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
                     toast(ui, 1, format!("已卸载 {point}"));
                 }
                 Err(e) => toast(ui, 2, format!("卸载失败: {e}")),
             }
+            false
+        }
+        Cmd::MountPathNav { name } => {
+            nav_path_picker(ctx, ui, true, &name).await;
+            false
+        }
+        Cmd::ServePathNav { name } => {
+            nav_path_picker(ctx, ui, false, &name).await;
+            false
+        }
+        Cmd::BrowseOpen { scope } => {
+            let cur = read_ui(ui, move |ui| {
+                if scope == 0 {
+                    ui.global::<MountsG>().get_new_fs().to_string()
+                } else {
+                    ui.global::<ServesG>().get_new_fs().to_string()
+                }
+            })
+            .await
+            .unwrap_or_default();
+            let start = if cur.trim().is_empty() { "root://".to_string() } else { cur };
+            let (items, disp) = list_display(ctx, &start, false).await;
+            let rows: Vec<PathItem> = items
+                .into_iter()
+                .map(|(n, d)| PathItem { name: n.into(), is_dir: d })
+                .collect();
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                let g = ui.global::<BrowseG>();
+                g.set_scope(scope);
+                g.set_path(disp.into());
+                g.set_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
+                g.set_sel(-1);
+                g.set_show(true);
+            });
+            false
+        }
+        Cmd::BrowseGoto { name } => {
+            let path = read_ui(ui, |ui| ui.global::<BrowseG>().get_path().to_string())
+                .await
+                .unwrap_or_default();
+            let base = path.trim().trim_end_matches('/');
+            let target = if name == ".." {
+                match display_parent(&path) {
+                    Some(p) => p,
+                    None => return false,
+                }
+            } else if base == "root:" || base == "root://" || base == "root" || base.is_empty() {
+                format!("root://{name}")
+            } else {
+                format!("{base}/{name}")
+            };
+            let (items, disp) = list_display(ctx, &target, false).await;
+            let rows: Vec<PathItem> = items
+                .into_iter()
+                .map(|(n, d)| PathItem { name: n.into(), is_dir: d })
+                .collect();
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                let g = ui.global::<BrowseG>();
+                g.set_path(disp.into());
+                g.set_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
+                g.set_sel(-1);
+            });
+            false
+        }
+        Cmd::BrowseOk => {
+            let (scope, path, sel, entries) = read_ui(ui, |ui| {
+                let g = ui.global::<BrowseG>();
+                let mut entries = vec![];
+                let m = g.get_entries();
+                for i in 0..m.row_count() {
+                    if let Some(e) = m.row_data(i) {
+                        entries.push((e.name.to_string(), e.is_dir));
+                    }
+                }
+                (g.get_scope(), g.get_path().to_string(), g.get_sel(), entries)
+            })
+            .await
+            .unwrap_or_default();
+            let base = path.trim().trim_end_matches('/');
+            let is_root = base == "root:" || base == "root://" || base == "root" || base.is_empty();
+            let picked = if sel >= 0 { entries.get(sel as usize) } else { None };
+            let final_disp = match picked {
+                Some((n, _)) => {
+                    if is_root {
+                        format!("root://{n}")
+                    } else {
+                        format!("{base}/{n}")
+                    }
+                }
+                None => {
+                    if is_root {
+                        "root://".to_string()
+                    } else {
+                        base.to_string()
+                    }
+                }
+            };
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                if scope == 0 {
+                    ui.global::<MountsG>().set_new_fs(final_disp.clone().into());
+                } else {
+                    ui.global::<ServesG>().set_new_fs(final_disp.clone().into());
+                }
+                ui.global::<BrowseG>().set_show(false);
+            });
             false
         }
         Cmd::RemotesRefresh => {
@@ -1309,9 +1681,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::RemoteDelete { name } => {
-            if !confirm_dialog(format!("确认删除远程存储 {}？", name)) {
-                return false;
-            }
+            // 确认已在 UI 层（ConfirmPop）完成
             let client = ctx.mgr.client.read().await.clone();
             match client.config_delete(&name).await {
                 Ok(()) => {
@@ -1330,7 +1700,6 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
         }
         Cmd::ServesRefresh => {
             let client = ctx.mgr.client.read().await.clone();
-            let remotes = client.list_remotes().await.unwrap_or_default();
             let v = client.serve_list().await.unwrap_or(json!({}));
             let items = v
                 .get("list")
@@ -1339,6 +1708,10 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 .unwrap_or_default();
             let rows: Vec<ServeRow> = items
                 .iter()
+                .filter(|it| {
+                    // 只显示运行中的服务（已停止的不留在列表里）
+                    it.get("running").and_then(|x| x.as_bool()).unwrap_or(true)
+                })
                 .map(|it| {
                     let id = it
                         .get("id")
@@ -1374,39 +1747,33 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 })
                 .collect();
             let _ = ui.upgrade_in_event_loop(move |ui| {
-                ui.global::<ServesG>().set_remotes(ModelRc::from(Rc::new(VecModel::from(
-                    remotes.iter().map(|r| r.clone().into()).collect::<Vec<slint::SharedString>>(),
-                ))));
                 ui.global::<ServesG>()
                     .set_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
             });
             false
         }
         Cmd::ServeStart => {
-            let (stype, fs, addr, user, pass) = read_ui(ui, |ui| {
+            let (stype, fs_disp, addr, user, pass, auto) = read_ui(ui, |ui| {
                 let g = ui.global::<ServesG>();
                 let ty = g
                     .get_types()
                     .row_data(g.get_type_idx().max(0) as usize)
                     .unwrap_or_default()
                     .to_string();
-                let fs = g
-                    .get_remotes()
-                    .row_data(g.get_remote_idx().max(0) as usize)
-                    .unwrap_or_default()
-                    .to_string();
                 (
                     ty,
-                    fs,
+                    g.get_new_fs().to_string(),
                     g.get_addr().to_string(),
                     g.get_user().to_string(),
                     g.get_pass().to_string(),
+                    g.get_auto_run(),
                 )
             })
             .await
             .unwrap_or_default();
+            let fs = display_to_fs(&fs_disp);
             if fs.is_empty() {
-                toast(ui, 2, "请先在「远程」页创建远程存储");
+                toast(ui, 2, "请选择或输入远程路径");
                 return false;
             }
             if addr.trim().is_empty() {
@@ -1416,11 +1783,27 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             let _ = ui.upgrade_in_event_loop(|ui| ui.global::<ServesG>().set_busy(true));
             let client = ctx.mgr.client.read().await.clone();
             let res = client
-                .serve_start(&stype, &format!("{fs}:"), &addr, &user, &pass)
+                .serve_start(&stype, &fs, &addr, &user, &pass)
                 .await;
             let _ = ui.upgrade_in_event_loop(|ui| ui.global::<ServesG>().set_busy(false));
             match res {
                 Ok(id) => {
+                    if auto {
+                        let item = config::AutoServe {
+                            stype: stype.clone(),
+                            fs: fs.clone(),
+                            addr: addr.trim().to_string(),
+                            user: user.clone(),
+                            pass: pass.clone(),
+                        };
+                        {
+                            let mut cfg = ctx.cfg.lock().unwrap();
+                            cfg.auto_serves
+                                .retain(|s| !(s.fs == item.fs && s.addr == item.addr && s.stype == item.stype));
+                            cfg.auto_serves.push(item);
+                            let _ = config::save(&cfg);
+                        }
+                    }
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ServesRefresh)).await;
                     toast(ui, 1, format!("服务已启动: {id}"));
                 }
@@ -1430,8 +1813,57 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
         }
         Cmd::ServeStop { id } => {
             let client = ctx.mgr.client.read().await.clone();
-            match client.serve_stop(&id).await {
+            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<ServesG>().set_busy(true));
+            let res = client.serve_stop(&id).await;
+            // 取该服务的 fs/addr，用于移除自动启动项
+            let mut match_key: Option<(String, String, String)> = None;
+            if res.is_ok() {
+                if let Ok(v) = client.serve_list().await {
+                    if let Some(items) = v.get("list").and_then(|x| x.as_array()) {
+                        for it in items {
+                            let iid = it
+                                .get("id")
+                                .and_then(|x| {
+                                    x.as_str().map(|s| s.to_string())
+                                        .or_else(|| x.as_i64().map(|n| n.to_string()))
+                                })
+                                .unwrap_or_default();
+                            if iid == id {
+                                let params = it.get("params").cloned().unwrap_or(json!({}));
+                                let getp = |keys: &[&str]| -> String {
+                                    for k in keys {
+                                        if let Some(s) = params.get(*k).and_then(|x| x.as_str()) {
+                                            return s.to_string();
+                                        }
+                                        if let Some(s) = it.get(*k).and_then(|x| x.as_str()) {
+                                            return s.to_string();
+                                        }
+                                    }
+                                    String::new()
+                                };
+                                match_key = Some((
+                                    it.get("type").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                                    getp(&["fs", "Fs"]),
+                                    getp(&["addr", "Addr", "listen", "Listen"]),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<ServesG>().set_busy(false));
+            match res {
                 Ok(()) => {
+                    if let Some((stype, fs, addr)) = match_key {
+                        let mut cfg = ctx.cfg.lock().unwrap();
+                        let before = cfg.auto_serves.len();
+                        cfg.auto_serves
+                            .retain(|s| !(s.stype == stype && s.fs == fs && s.addr == addr));
+                        if cfg.auto_serves.len() != before {
+                            let _ = config::save(&cfg);
+                        }
+                    }
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ServesRefresh)).await;
                     toast(ui, 1, format!("已停止 {id}"));
                 }
@@ -2133,17 +2565,15 @@ fn wire_callbacks(ui: &MainWindow, ctx: Arc<Ctx>, tx: mpsc::UnboundedSender<Cmd>
         let tx = tx.clone();
         let ui = ui.as_weak();
         move |i| {
+            // 确认已在 UI 层（ConfirmPop）完成
             let row = ui
                 .upgrade()
                 .and_then(|ui| ui.global::<FilesG>().get_entries().row_data(i as usize));
             let Some(row) = row else { return };
-            let hint = if row.is_dir { "（文件夹将整体删除）" } else { "" };
-            if confirm_dialog(format!("确认删除 {}？{}", row.name, hint)) {
-                let _ = tx.send(Cmd::FilesDel {
-                    name: row.name.to_string(),
-                    is_dir: row.is_dir,
-                });
-            }
+            let _ = tx.send(Cmd::FilesDel {
+                name: row.name.to_string(),
+                is_dir: row.is_dir,
+            });
         }
     });
     ui.on_files_rename({
@@ -2205,6 +2635,36 @@ fn wire_callbacks(ui: &MainWindow, ctx: Arc<Ctx>, tx: mpsc::UnboundedSender<Cmd>
         let tx = tx.clone();
         move |point| {
             let _ = tx.send(Cmd::MountRemove { point: point.to_string() });
+        }
+    });
+    ui.on_mount_path_nav({
+        let tx = tx.clone();
+        move |name| {
+            let _ = tx.send(Cmd::MountPathNav { name: name.to_string() });
+        }
+    });
+    ui.on_serve_path_nav({
+        let tx = tx.clone();
+        move |name| {
+            let _ = tx.send(Cmd::ServePathNav { name: name.to_string() });
+        }
+    });
+    ui.on_browse_open({
+        let tx = tx.clone();
+        move |scope| {
+            let _ = tx.send(Cmd::BrowseOpen { scope });
+        }
+    });
+    ui.on_browse_goto({
+        let tx = tx.clone();
+        move |name| {
+            let _ = tx.send(Cmd::BrowseGoto { name: name.to_string() });
+        }
+    });
+    ui.on_browse_ok({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::BrowseOk);
         }
     });
     ui.on_nav_select({
@@ -2376,13 +2836,12 @@ fn wire_callbacks(ui: &MainWindow, ctx: Arc<Ctx>, tx: mpsc::UnboundedSender<Cmd>
         let tx = tx.clone();
         let ui = ui.as_weak();
         move |i| {
+            // 确认已在 UI 层（ConfirmPop）完成
             let t = ui
                 .upgrade()
                 .and_then(|ui| ui.global::<PluginsG>().get_tokens().row_data(i as usize));
             let Some(t) = t else { return };
-            if confirm_dialog(format!("确认撤销令牌 {}？", t.name)) {
-                let _ = tx.send(Cmd::IhRevokeToken { id: t.id.to_string() });
-            }
+            let _ = tx.send(Cmd::IhRevokeToken { id: t.id.to_string() });
         }
     });
     ui.on_ih_images_refresh({
@@ -2395,14 +2854,13 @@ fn wire_callbacks(ui: &MainWindow, ctx: Arc<Ctx>, tx: mpsc::UnboundedSender<Cmd>
         let tx = tx.clone();
         let ui = ui.as_weak();
         move |i| {
+            // 确认已在 UI 层（ConfirmPop）完成
             let path = ui
                 .upgrade()
                 .and_then(|ui| ui.global::<PluginsG>().get_images().row_data(i as usize))
                 .map(|r| r.path.to_string())
                 .unwrap_or_default();
-            if confirm_dialog(format!("确认删除 {path}？")) {
-                let _ = tx.send(Cmd::IhImageDel { path });
-            }
+            let _ = tx.send(Cmd::IhImageDel { path });
         }
     });
     ui.on_ih_copy_url({

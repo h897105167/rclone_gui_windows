@@ -88,6 +88,11 @@ impl RcClient {
         Ok(serde_json::from_value(v).unwrap_or_default())
     }
 
+    /// 优雅退出 rclone（会自动卸载挂载、停止服务）
+    pub async fn core_quit(&self) -> Result<()> {
+        self.call("core/quit", &json!({})).await.map(drop)
+    }
+
     pub async fn core_stats(&self) -> Result<CoreStats> {
         let v = self.call("core/stats", &json!({})).await?;
         Ok(serde_json::from_value(v).unwrap_or_default())
