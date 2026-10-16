@@ -101,6 +101,8 @@ struct Ctx {
     serves_cache: Arc<std::sync::Mutex<Vec<ServeRow>>>,
     /// 最近一次已下发的全局限速 rate 字符串（避免重复调用 core/bwlimit）
     last_bwlimit: Arc<std::sync::Mutex<String>>,
+    /// 周期任务防重入：上一次未完成则跳过，避免挂起任务无限堆积（内存泄漏）
+    tick_busy: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Ctx {
@@ -1051,6 +1053,7 @@ fn main() {
         pending_mounts: Arc::new(std::sync::Mutex::new(Vec::new())),
         serves_cache: Arc::new(std::sync::Mutex::new(Vec::new())),
         last_bwlimit: Arc::new(std::sync::Mutex::new(String::new())),
+        tick_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     {
@@ -1280,18 +1283,24 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
         tokio::select! {
             _ = interval.tick() => {
                 tick += 1;
-                {
+                // 防重入：上一轮周期任务未完成则跳过本轮，避免 rclone 慢/挂时挂起任务无限堆积
+                if !ctx.tick_busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     let ctx2 = ctx.clone();
                     let ui2 = ui.clone();
-                    tokio::spawn(async move { poll_stats(&ctx2, &ui2).await; });
-                }
-                // 传输页：后台任务列表 + 全局限速（每 2s）
-                if tick % 2 == 0 {
-                    let ctx2 = ctx.clone();
-                    let ui2 = ui.clone();
+                    let t = tick;
                     tokio::spawn(async move {
-                        build_tasks(&ctx2, &ui2).await;
-                        apply_global_limit(&ctx2, &ui2).await;
+                        // 整体 30s 超时：rclone 挂起时快速放弃（drop future 即取消底层 reqwest 请求），
+                        // 避免 tick_busy 被 reqwest 默认 600s 超时长期持有导致仪表盘停更
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                            poll_stats(&ctx2, &ui2).await;
+                            // 传输页：后台任务列表 + 全局限速（每 2s）
+                            if t % 2 == 0 {
+                                build_tasks(&ctx2, &ui2).await;
+                                apply_global_limit(&ctx2, &ui2).await;
+                            }
+                        })
+                        .await;
+                        ctx2.tick_busy.store(false, std::sync::atomic::Ordering::SeqCst);
                     });
                 }
                 // 主题跟随系统（每 3s 检查）
@@ -1516,11 +1525,21 @@ async fn spawn_http(ctx: &Arc<Ctx>, port: u16, ui: Weak<MainWindow>) {
 
 async fn poll_stats(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let client = ctx.mgr.client.read().await.clone();
-    let Ok(stats) = client.core_stats().await else { return };
+    let Ok(Ok(stats)) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.core_stats(),
+    )
+    .await
+    else {
+        return;
+    };
     let speed = stats.speed;
     let bytes = stats.bytes;
     let transferring = stats.transferring;
-    let mounts = client.mounts().await.map(|m| m.len()).unwrap_or(0);
+    let mounts = tokio::time::timeout(std::time::Duration::from_secs(10), client.mounts())
+        .await
+        .map(|r| r.map(|m| m.len()).unwrap_or(0))
+        .unwrap_or(0);
     let _ = ui.upgrade_in_event_loop(
         move |ui| {
             let g = ui.global::<DashboardG>();
