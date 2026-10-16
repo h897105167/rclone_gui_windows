@@ -345,17 +345,6 @@ fn parse_kv_lines(text: &str) -> serde_json::Map<String, Value> {
     m
 }
 
-fn fmt_duration(secs: f64) -> String {
-    let s = secs.round() as u64;
-    if s >= 3600 {
-        format!("{}h {}m", s / 3600, (s % 3600) / 60)
-    } else if s >= 60 {
-        format!("{}m {}s", s / 60, s % 60)
-    } else {
-        format!("{}s", s)
-    }
-}
-
 async fn apply_remotes_filter(ui: &Weak<MainWindow>, full: &[(String, String, String)]) {
     let filter = read_ui(ui, |u| u.global::<RemotesG>().get_filter().to_string())
         .await
@@ -494,9 +483,10 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     })
     .await
     .unwrap_or((false, String::new()));
-    let ids = client.job_list().await.unwrap_or_default();
-
-    // group -> (文件名, srcFs, dstFs, 已完成字节)
+    // rclone 的 job 系统永久累积所有历史 job（包括 about/list 等内部操作），可达数万条。
+    // job_list 返回全部 id 的 JSON 响应本身就很大，job_status 还会嵌套历史 job 输出，导致内存暴涨。
+    // 改为完全不用 job_list/job_status：core/transferred 返回实际传输文件（group=job/xxx），
+    // core/stats.transferring 提供运行中速度，两者结合即可构建任务列表。
     let mut tmap: std::collections::HashMap<String, (String, String, String, f64)> =
         std::collections::HashMap::new();
     if let Ok(v) = client.core_transferred().await {
@@ -544,16 +534,13 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
 
     let serves = ctx.serves_cache.lock().unwrap().clone();
     let mut rows: Vec<TaskRow> = Vec::new();
-    for id in &ids {
-        let st = client.job_status(*id).await.unwrap_or(json!({}));
-        let finished = st.get("finished").and_then(|x| x.as_bool()).unwrap_or(false);
-        let success = st.get("success").and_then(|x| x.as_bool()).unwrap_or(false);
-        let duration = st.get("duration").and_then(|x| x.as_f64()).unwrap_or(0.0);
-        let group = format!("job/{}", id);
-        let (fname, src, dst, bytes) = tmap
-            .get(&group)
-            .cloned()
-            .unwrap_or((String::new(), String::new(), String::new(), 0.0));
+    // 从 core/transferred 构建任务列表（只包含实际传输的文件，不含内部操作 job）
+    for (group, (fname, src, dst, bytes)) in &tmap {
+        // group 格式: "job/12345"，提取数字 id
+        let id = group
+            .strip_prefix("job/")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0) as i32;
 
         let src_remote = remote_name_of(&src);
         let dst_remote = remote_name_of(&dst);
@@ -569,42 +556,35 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
 
         let mut svc = String::new();
         for sv in &serves {
-            if !sv.fs.is_empty()
-                && (src.starts_with(sv.fs.as_str()) || dst.starts_with(sv.fs.as_str()))
-            {
+            if !sv.fs.is_empty() && (src.starts_with(sv.fs.as_str()) || dst.starts_with(sv.fs.as_str())) {
                 svc = sv.name.as_str().to_string();
                 break;
             }
         }
 
-        if hide && finished {
+        let running = rmap.contains_key(group);
+        if hide && !running {
             continue;
         }
-        let status = if !finished {
-            "运行中"
-        } else if success {
-            "已完成"
-        } else {
-            "失败"
-        }
-        .to_string();
-        let speed = if !finished {
-            rmap.get(&group).map(|v| fmt_speed(*v)).unwrap_or_else(|| "—".into())
-        } else if duration > 0.0 {
-            fmt_speed(bytes / duration)
+        let status = if running { "运行中" } else { "已完成" }.to_string();
+        let speed = if running {
+            rmap.get(group).map(|v| fmt_speed(*v)).unwrap_or_else(|| "—".into())
+        } else if *bytes > 0.0 {
+            // 无 duration 信息，无法计算历史速度
+            "—".into()
         } else {
             "—".into()
         };
         rows.push(TaskRow {
-            id: *id as i32,
+            id,
             op: op.into(),
             remote: remote.into(),
-            path: fname.into(),
+            path: fname.clone().into(),
             svc: svc.into(),
             status: status.into(),
-            duration: fmt_duration(duration).into(),
+            duration: "—".into(),
             speed: speed.into(),
-            done: finished,
+            done: !running,
         });
     }
     rows.sort_by(|a, b| b.id.cmp(&a.id));
@@ -1293,9 +1273,12 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
                         // 避免 tick_busy 被 reqwest 默认 600s 超时长期持有导致仪表盘停更
                         let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
                             poll_stats(&ctx2, &ui2).await;
-                            // 传输页：后台任务列表 + 全局限速（每 2s）
-                            if t % 2 == 0 {
+                            // 传输页：后台任务列表 + 全局限速（每 10s，core_transferred 响应大，不宜频繁）
+                            if t % 10 == 0 {
                                 build_tasks(&ctx2, &ui2).await;
+                            }
+                            // 限速每 2s（响应小，可频繁）
+                            if t % 2 == 0 {
                                 apply_global_limit(&ctx2, &ui2).await;
                             }
                         })

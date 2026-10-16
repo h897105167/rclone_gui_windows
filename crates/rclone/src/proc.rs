@@ -131,6 +131,15 @@ impl RcloneManager {
                 user,
                 "--rc-pass",
                 pass,
+                "-vv",
+                "--buffer-size",
+                "4M",
+                "--transfers",
+                "2",
+                "--checkers",
+                "2",
+                "--fs-cache-expire-duration",
+                "5m",
             ])
             .stdout(log)
             .stderr(err)
