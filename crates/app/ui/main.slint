@@ -16,6 +16,18 @@ export struct FileRow {
     size: string,
     mtime: string,
 }
+/// 路径面包屑的一级：首项是远程名，之后每级目录
+export struct CrumbRow {
+    name: string,
+    /// 点击后跳转到的路径（相对远程根；远程本身为空串）
+    path: string,
+    /// 是否为当前目录（最右一级）
+    is-current: bool,
+}
+/// 「移动到…」对话框里的一行（只列目录）
+export struct MoveDir {
+    name: string,
+}
 export struct MountRow {
     fs: string,
     mount-point: string,
@@ -194,6 +206,18 @@ export global FilesG {
     in-out property <int> seq: 0;
     in-out property <int> sel: -1;
     in-out property <string> rename-name: "";
+    // 路径面包屑（首项是远程名，之后每一级目录）
+    in-out property <[CrumbRow]> crumbs: [];
+    // ---------------- 「移动到…」对话框 ----------------
+    in-out property <[MoveDir]> move-dirs: [];
+    /// 当前浏览到的目标目录（相对远程根）
+    in-out property <string> move-path: "";
+    /// 待移动的项（仅用于显示）
+    in-out property <string> move-name: "";
+    in-out property <bool> move-is-dir: false;
+    in-out property <bool> move-busy: false;
+    /// 浏览请求序号：迟到的旧结果按序号丢弃
+    in-out property <int> move-seq: 0;
 }
 
 export global MountsG {
@@ -837,12 +861,24 @@ component FilesView inherits Rectangle {
     callback rename-row(int);
     callback copy-row(int);
     callback copy-link(int);
+    // 面包屑：跳到某一级
+    callback crumb-nav(string);
+    // 下载到指定目录
+    callback download-row(int);
+    // 移动到…（浏览远程目录）
+    callback move-list(string);
+    callback move-enter(string);
+    callback move-up;
+    callback move-root;
+    callback move-confirm;
     // 右键菜单 / 弹窗所需的待操作状态
     property <int> op-idx: -1;
     property <string> op-name: "";
     property <bool> op-is-dir: false;
     property <length> menu-ax;
     property <length> menu-ay;
+    property <length> dlg-ax;
+    property <length> dlg-ay;
     VerticalLayout {
         padding: 24px;
         spacing: 12px;
@@ -860,20 +896,41 @@ component FilesView inherits Rectangle {
             }
             Rectangle { width: 4px; }
             IconBtn { label: "\u{E74A}"; clicked => { root.go-up(); } }
+            // 路径面包屑：每一级可点，点击退回该级（像资源管理器）。
+            // 路径很长时向右溢出、左侧被裁掉：HorizontalLayout 的 end 对齐
+            // 允许负起点，所以**当前目录始终可见**（见 i-slint-core/layout.rs）。
             Rectangle {
                 background: ThemeG.panel;
                 border-radius: ThemeG.radius-s;
                 border-width: 1px;
                 border-color: ThemeG.border;
+                clip: true;
                 HorizontalLayout {
                     padding-left: 10px;
                     padding-right: 10px;
-                    Text {
-                        text: FilesG.remote-idx >= 0 && FilesG.remotes.length > 0 ? FilesG.remotes[FilesG.remote-idx] + "/" + FilesG.path : "/";
-                        font-size: 13px;
-                        color: ThemeG.text;
-                        vertical-alignment: center;
-                        overflow: elide;
+                    spacing: 2px;
+                    alignment: end;
+                    for c[i] in FilesG.crumbs : HorizontalLayout {
+                        spacing: 2px;
+                        crumb-ta := TouchArea {
+                            width: crumb-text.preferred-width + 8px;
+                            mouse-cursor: pointer;
+                            clicked => { root.crumb-nav(c.path); }
+                            crumb-text := Text {
+                                x: 4px;
+                                height: parent.height;
+                                text: c.name;
+                                font-size: 13px;
+                                color: crumb-ta.has-hover ? ThemeG.accent : (c.is-current ? ThemeG.text : ThemeG.text-dim);
+                                vertical-alignment: center;
+                            }
+                        }
+                        if i < FilesG.crumbs.length - 1 : Text {
+                            text: "/";
+                            font-size: 13px;
+                            color: ThemeG.text-dim;
+                            vertical-alignment: center;
+                        }
                     }
                 }
             }
@@ -986,6 +1043,25 @@ component FilesView inherits Rectangle {
             VerticalLayout {
                 padding: 4px;
                 spacing: 2px;
+                if !root.op-is-dir : MenuItemBtn {
+                    glyph: "\u{E896}";
+                    label: "下载到…";
+                    clicked => { ctx.close(); root.download-row(root.op-idx); }
+                }
+                MenuItemBtn {
+                    glyph: "\u{E8B7}";
+                    label: root.op-is-dir ? "移动文件夹…" : "移动文件…";
+                    clicked => {
+                        ctx.close();
+                        FilesG.move-name = root.op-name;
+                        FilesG.move-is-dir = root.op-is-dir;
+                        FilesG.move-path = FilesG.path;
+                        root.dlg-ax = Math.max(0px, (root.width - 560px) / 2);
+                        root.dlg-ay = 80px;
+                        mvp.show();
+                        root.move-list(FilesG.path);
+                    }
+                }
                 MenuItemBtn {
                     glyph: "\u{E8AC}";
                     label: "重命名";
@@ -1034,6 +1110,108 @@ component FilesView inherits Rectangle {
                     }
                     PillBtn { label: "确定"; primary: true; clicked => { rnp.close(); root.rename-row(root.op-idx); } }
                     PillBtn { label: "取消"; clicked => { rnp.close(); } }
+                }
+            }
+        }
+    }
+    // 「移动到…」对话框：在同一远程内浏览目标目录
+    mvp := PopupWindow {
+        x: root.dlg-ax;
+        y: root.dlg-ay;
+        close-policy: PopupClosePolicy.close-on-click-outside;
+        Rectangle {
+            width: 560px;
+            background: ThemeG.panel;
+            border-radius: ThemeG.radius;
+            border-width: 1px;
+            border-color: ThemeG.border;
+            VerticalLayout {
+                padding: 14px;
+                spacing: 10px;
+                Text {
+                    text: (FilesG.move-is-dir ? "移动文件夹「" : "移动文件「") + FilesG.move-name + "」到：";
+                    font-size: 13px;
+                    color: ThemeG.text;
+                    overflow: elide;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 30px;
+                    PillBtn { label: "↑ 上级"; compact: true; clicked => { root.move-up(); } }
+                    PillBtn { label: "根目录"; compact: true; clicked => { root.move-root(); } }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                // 当前浏览到的目标目录
+                Rectangle {
+                    height: 30px;
+                    background: ThemeG.panel-2;
+                    border-radius: ThemeG.radius-s;
+                    border-width: 1px;
+                    border-color: ThemeG.border;
+                    clip: true;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        Text {
+                            text: "/" + FilesG.move-path;
+                            font-size: 12px;
+                            color: ThemeG.text-dim;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+                Rectangle {
+                    height: 240px;
+                    background: ThemeG.panel-2;
+                    border-radius: ThemeG.radius-s;
+                    border-width: 1px;
+                    border-color: ThemeG.border;
+                    VerticalLayout {
+                        if FilesG.move-dirs.length == 0 : Text {
+                            text: FilesG.move-busy ? "加载中…" : "（没有子文件夹）";
+                            font-size: 12px;
+                            color: ThemeG.text-dim;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        ListView {
+                            for d[i] in FilesG.move-dirs : Rectangle {
+                                height: 30px;
+                                background: mvta.has-hover ? ThemeG.hover : transparent;
+                                mvta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.move-enter(d.name); }
+                                }
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 8px;
+                                    MdlIcon { glyph: "\u{E8B7}"; font-size: 13px; color: ThemeG.accent; width: 16px; }
+                                    Text {
+                                        text: d.name;
+                                        font-size: 12px;
+                                        color: ThemeG.text;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    PillBtn { label: "取消"; clicked => { mvp.close(); } }
+                    PillBtn {
+                        label: "移动到此处";
+                        primary: true;
+                        disabled: FilesG.move-busy;
+                        clicked => { mvp.close(); root.move-confirm(); }
+                    }
                 }
             }
         }
@@ -3062,6 +3240,13 @@ export component MainWindow inherits Window {
     callback files-rename(int);
     callback files-copy(int);
     callback files-copy-link(int);
+    callback files-crumb-nav(string);
+    callback files-download(int);
+    callback files-move-list(string);
+    callback files-move-enter(string);
+    callback files-move-up();
+    callback files-move-root();
+    callback files-move-confirm();
     callback mounts-refresh();
     callback mount-add();
     callback mount-remove(string);
@@ -3302,6 +3487,13 @@ export component MainWindow inherits Window {
                     rename-row(i) => { root.files-rename(i); }
                     copy-row(i) => { root.files-copy(i); }
                     copy-link(i) => { root.files-copy-link(i); }
+                    crumb-nav(p) => { root.files-crumb-nav(p); }
+                    download-row(i) => { root.files-download(i); }
+                    move-list(p) => { root.files-move-list(p); }
+                    move-enter(n) => { root.files-move-enter(n); }
+                    move-up => { root.files-move-up(); }
+                    move-root => { root.files-move-root(); }
+                    move-confirm => { root.files-move-confirm(); }
                 }
                 if NavG.idx == 2 : RemotesView {
                     viewport-h: root.height;
