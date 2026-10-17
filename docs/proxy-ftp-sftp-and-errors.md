@@ -64,16 +64,41 @@ ftp 那两行的第二个 `CONNECT` 是被动模式的数据连接（端口由 P
    `input too short when revealing password - is it obscured?`（脚本里用
    `rclone obscure` 生成）。
 
-## 四、产品侧处置（本轮已做）
+## 四、产品侧处置
 
-真正按类型改写原生键需要同步改造回滚、冲突检测与 reconcile，属于较大的改动，
-本轮**没有**硬做；但绝不能继续「谎报已生效」，因此：
+### 4.1 上一轮的临时措辞（已移除）
 
-- `proxy::type_honors_override()` + `INERT_TYPE_HINT`：给 ftp / sftp 分配代理时，
-  提示里明确写「此时代理不会真正生效（已实测）」；
-- 远程页「代理配置」说明段落也补了这条限制，并指向本文；
-- 后续若要真正支持，按这张表落地即可：
-  `ftp/sftp + http 协议 → http_proxy=<完整URL>`、`ftp/sftp + socks5 → socks_proxy=<host:port>`。
+`type_honors_override()` / `INERT_TYPE_HINT` 曾用于提示「ftp / sftp 不会生效」。
+2026-10-18 随下面的正式支持一起删除 —— 再保留会让用户以为仍然做不到。
+
+### 4.2 正式支持（2026-10-18 会话 6）
+
+按类型选键，逻辑集中在 `crates/profile/src/proxy.rs`：
+
+| 远程类型 | 协议 | 键 | 值 |
+|---|---|---|---|
+| 其它 | 任意 | `override.http_proxy` | 完整 URL（含 scheme） |
+| ftp / sftp | http / https | `http_proxy` | 完整 URL |
+| ftp / sftp | socks5 / socks5h | `socks_proxy` | 裸 `[user[:pass]@]host:port` |
+
+规则（用户 2026-10-18 决定）：
+
+1. **原生键只补空缺**：ftp / sftp 上若用户已写了 `http_proxy` 或 `socks_proxy`，
+   RCGUI 不覆盖、不代管，只提示「你在 rclone 里已经设置了……」并计入「跳过」。
+2. **socks_proxy 优先**：两个原生键同时存在时 rclone 用 socks；RCGUI 写
+   `http_proxy` 前会检测并说明，不会写一个「看起来成功、实际不生效」的值。
+3. **回滚记住键**：绑定新增 `applied_key`，切协议/切类型时先还原旧键，再写新键。
+4. **凭据限制**：原生 `socks_proxy` 不做 URL 解码，因此用户名不能含 `:`、
+   账号密码不能含 `@`（模型层直接拒绝并给中文说明）；`http_proxy` 的 Basic
+   认证由 rclone 用 `Userinfo.String()` 生成，含特殊字符时可能认证失败
+   （rclone 侧行为，RCGUI 未改）。
+5. `socks5` 与 `socks5h` 在原生键上**等价**：x/net/proxy 总是把域名交给代理解析。
+
+未实测（本轮只做单测与编译验证）：
+
+- ftp / sftp 在 RCGUI 内的真实穿透端到端复测（上一轮只验证到 rclone 层面）；
+- `https://` 指向「TLS 到代理」的原生 `http_proxy`（rclone 源码支持，未实测）；
+- 含特殊字符的凭据在原生 `http_proxy` 上的认证行为。
 
 ## 五、代理失败的错误文案（实测样本）
 
@@ -105,7 +130,8 @@ RC 侧拿到的形状：
 
 1. **删除代理配置后没有回滚 rclone**（严重）。确认框承诺「这些远程的代理会被恢复
    成原状」，但实现里先 `save_from_cfg` 删掉了绑定，再想从档案里读回
-   `original_override` 已经读不到，`plan_set` 判定「不是本程序管的」→ 一个字节都不写。
+   `original_override` 已经读不到，当时的 `plan_set` 判定「不是本程序管的」→ 一个字节都不写。
    现象：rclone.conf 里永久留着一个已被删除的代理地址。修法：删除前先把受影响的
    绑定克隆出来，回滚用克隆记录。
-2. **给 ftp / sftp 下发代理静默无效**（见第四节，改为显式提示）。
+2. **给 ftp / sftp 下发代理静默无效**（当时改为显式提示；2026-10-18 已按第四节
+   改写成原生键，提示随 `INERT_TYPE_HINT` 一起删除）。
