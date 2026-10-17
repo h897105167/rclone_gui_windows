@@ -146,8 +146,8 @@ rclone rcd --config "$iso\rclone.conf" --log-file "$iso\..\rcd.log" --log-level 
 | remote 类型 | 代理方式 | 状态 |
 |---|---|---|
 | HTTP 传输类（webdav / s3 / drive / onedrive / b2 / azureblob / gcs / http / teldrive …） | `override.http_proxy` = `http://…` `https://…` `socks5://…` `socks5h://…` | ✅ 已验证 |
-| `ftp` | 原生 `http_proxy`（URL）/ `socks_proxy`（host:port） | ✅ 已验证写入，**未验证真实 FTP 穿透** |
-| `sftp` | 原生 `http_proxy` / `socks_proxy` | ✅ 已验证写入，**未验证真实 SSH 穿透** |
+| `ftp` | 原生 `http_proxy`（URL）/ `socks_proxy`（host:port） | ✅ 已在 RCGUI 内按类型改写（2026-10-18）；穿透见 `docs/proxy-ftp-sftp-and-errors.md` |
+| `sftp` | 原生 `http_proxy` / `socks_proxy` | ✅ 同上 |
 | `local`（及其它无网络后端） | 可写入但无意义 | ⚠️ 应报「该类型不需要代理」 |
 
 ---
@@ -168,7 +168,9 @@ rclone rcd --config "$iso\rclone.conf" --log-file "$iso\..\rcd.log" --log-level 
 
 ## 六、对实现的直接影响（务必照此写）
 
-1. 数据模型只存**一个**代理字段语义：`override.http_proxy`，协议只用于拼 scheme 前缀。
+1. ~~数据模型只存**一个**代理字段语义：`override.http_proxy`，协议只用于拼 scheme 前缀。~~
+   **2026-10-18 已被取代**：ftp / sftp 改用原生 `http_proxy` / `socks_proxy`，
+   绑定记录 `applied_key` 记住写的是哪个键；见 `docs/proxy-ftp-sftp-and-errors.md` §4.2。
 2. 生成的 URL 必须由「URL 构造库」拼，保证用户名密码百分号编码（含 `@` `:` 等），
    IPv6 主机要加方括号。
 3. 协议白名单硬编码 4 项：`http` / `https` / `socks5` / `socks5h`；
@@ -184,6 +186,10 @@ rclone rcd --config "$iso\rclone.conf" --log-file "$iso\..\rcd.log" --log-level 
 ---
 
 ## 七、实现结果（2026-10-17 完成）
+
+> **2026-10-18 补充**：本节的 `plan_set` / `remember_original` 已被 `plan_apply` 取代
+> （ftp/sftp 原生键 + 「只补空缺」策略），见 `docs/proxy-ftp-sftp-and-errors.md` §4.2。
+> 下面保留当时的实现记录，不再作为当前代码的描述。
 
 ### 7.1 改动清单
 
