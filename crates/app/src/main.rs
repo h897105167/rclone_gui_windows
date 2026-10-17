@@ -147,6 +147,9 @@ struct Ctx {
     remotes_cache: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
     /// config/providers 结果缓存（后端类型参数模板）
     providers_cache: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    /// 最近一次拉取 providers 失败的原因（空 = 成功）。用于在类型下拉为空时
+    /// 告诉用户「为什么选不了类型」，而不是只给一个空下拉框。
+    providers_err: Arc<std::sync::Mutex<Option<String>>>,
     /// 活动挂载缓存（含挂载中的 pending 项），用于筛选与盘符重复检测
     mounts_cache: Arc<std::sync::Mutex<Vec<MountRow>>>,
     /// 正在挂载中的 (rclone fs, 挂载点)
@@ -1283,7 +1286,13 @@ async fn read_fields_from_ui(ui: &Weak<MainWindow>) -> Vec<FieldRow> {
     .unwrap_or_default()
 }
 
-/// 获取 providers（优先缓存，否则网络请求）
+/// 获取 providers（优先内存缓存 → 网络 → 磁盘缓存）。
+///
+/// **失败不能静默成空**：`config/providers` 拿不到时，类型下拉会是空的，
+/// 用户看到「新建远程」里一个类型都选不了，却完全不知道原因（实测反馈）。
+/// 因此这里：
+/// 1. 把失败原因记进 `providers_err`，供 UI 提示；
+/// 2. 回落到上次成功时的磁盘缓存，离线也能继续建远程。
 async fn get_providers(ctx: &Arc<Ctx>) -> Value {
     {
         let cache = ctx.providers_cache.lock().unwrap();
@@ -1292,10 +1301,59 @@ async fn get_providers(ctx: &Arc<Ctx>) -> Value {
         }
     }
     let client = ctx.rc.client().await;
-    let v = client.config_providers().await.unwrap_or(json!({}));
-    *ctx.providers_cache.lock().unwrap() = Some(v.clone());
-    v
+    match client.config_providers().await {
+        Ok(v) => {
+            *ctx.providers_cache.lock().unwrap() = Some(v.clone());
+            *ctx.providers_err.lock().unwrap() = None;
+            save_providers_cache(&v);
+            v
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            *ctx.providers_err.lock().unwrap() = Some(msg);
+            match load_providers_cache() {
+                Some(v) => {
+                    *ctx.providers_cache.lock().unwrap() = Some(v.clone());
+                    v
+                }
+                None => json!({}),
+            }
+        }
+    }
 }
+
+/// 上次成功拿到的 `config/providers` 落盘位置。
+fn providers_cache_path() -> std::path::PathBuf {
+    config::data_dir().join("providers_cache.json")
+}
+
+/// 连不上 rclone、也没有磁盘缓存时的兜底类型列表。
+///
+/// 目的只有一个：**不要让「新建远程」死在一个空下拉框上**。这些类型名
+/// 与 rclone 的 backend 名一致；选中后参数表单为空，用户可以用编辑器里的
+/// 「切换到原始模式」直接写参数 JSON，或连上 rclone 后重新选择该类型。
+const FALLBACK_REMOTE_TYPES: &[&str] = &[
+    "alias", "azureblob", "b2", "crypt", "drive", "ftp", "gcs", "http", "local",
+    "onedrive", "s3", "sftp", "smb", "union", "webdav",
+];
+
+/// 把 provider 列表存盘（仅用于离线兜底；失败不影响主流程）。
+fn save_providers_cache(v: &Value) {
+    if v.get("providers").and_then(|p| p.as_array()).map(|a| a.is_empty()).unwrap_or(true) {
+        return; // 空结果不值得覆盖掉一份好的缓存
+    }
+    let _ = std::fs::write(providers_cache_path(), v.to_string());
+}
+
+fn load_providers_cache() -> Option<Value> {
+    let text = std::fs::read_to_string(providers_cache_path()).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    if v.get("providers").and_then(|p| p.as_array()).map(|a| a.is_empty()).unwrap_or(true) {
+        return None;
+    }
+    Some(v)
+}
+
 
 /// 更新编辑器字段列表和描述
 fn update_editor_fields(ui: &Weak<MainWindow>, providers: &Value, type_name: &str) {
@@ -1394,6 +1452,7 @@ fn main() {
         http_restart: Arc::new(tokio::sync::Notify::new()),
         remotes_cache: Arc::new(std::sync::Mutex::new(Vec::new())),
         providers_cache: Arc::new(std::sync::Mutex::new(None)),
+        providers_err: Arc::new(std::sync::Mutex::new(None)),
         mounts_cache: Arc::new(std::sync::Mutex::new(Vec::new())),
         pending_mounts: Arc::new(std::sync::Mutex::new(Vec::new())),
         cancelled_mounts: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -3936,6 +3995,13 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     .filter_map(|p| p.get("Name").and_then(|n| n.as_str()).map(|s| s.to_string()))
                     .collect();
                 names.sort();
+                // 拿不到 provider 列表时不能只给一个空下拉框（实测用户会卡在
+                // 「类型没有选项，无法新建远程」）。用内置常见类型兜底，
+                // 并把失败原因说清楚；有磁盘缓存时上面已经回落到缓存了。
+                let from_fallback = names.is_empty();
+                if from_fallback {
+                    names = FALLBACK_REMOTE_TYPES.iter().map(|s| s.to_string()).collect();
+                }
                 let first_type = names.first().cloned().unwrap_or_default();
                 let _ = ui2.upgrade_in_event_loop(move |ui| {
                     let g = ui.global::<RemotesG>();
@@ -3944,6 +4010,22 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     ))));
                     g.set_type_idx(0);
                 });
+                if from_fallback {
+                    let why = ctx2
+                        .providers_err
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| "rclone 未返回后端类型列表".to_string());
+                    toast(
+                        &ui2,
+                        2,
+                        format!(
+                            "无法从 rclone 获取远程类型（{why}），已先列出常见类型；\
+                             参数表单需要连接后才能加载。请到「设置」点「连接/握手」或「重新握手」。"
+                        ),
+                    );
+                }
                 update_editor_fields(&ui2, &providers, &first_type);
             });
             false
