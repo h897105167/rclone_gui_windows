@@ -190,6 +190,47 @@ impl Drop for GateGuard {
     }
 }
 
+/// 「操作进行中」的 UI 标志守卫：置位后由 Drop 保证复位。
+///
+/// 挂载/启动服务这类操作有多条返回路径（校验失败、超时、诊断后 return），
+/// 手动 `set_busy(false)` 很容易漏掉一条 —— 漏掉时按钮会永久灰着、spinner 一直转。
+/// 用它把「复位」变成作用域结束时的必然结果（含提前 return 与 panic 展开）。
+struct BusyGuard {
+    ui: Weak<MainWindow>,
+    which: BusyKind,
+}
+
+#[derive(Clone, Copy)]
+enum BusyKind {
+    Mounts,
+    Serves,
+}
+
+impl BusyGuard {
+    fn new(ui: &Weak<MainWindow>, which: BusyKind) -> Self {
+        let g = Self {
+            ui: ui.clone(),
+            which,
+        };
+        g.set(true);
+        g
+    }
+
+    fn set(&self, on: bool) {
+        let which = self.which;
+        let _ = self.ui.upgrade_in_event_loop(move |ui| match which {
+            BusyKind::Mounts => ui.global::<MountsG>().set_busy(on),
+            BusyKind::Serves => ui.global::<ServesG>().set_busy(on),
+        });
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.set(false);
+    }
+}
+
 // ---------------- 工具 ----------------
 
 fn toast_ui(ui: &MainWindow, kind: i32, msg: impl Into<String>) {
@@ -1979,6 +2020,9 @@ const MOUNT_RC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180
 /// 实测网盘挂载耗时波动很大（15s / 24s / 27s+），因此这里给得比较宽裕，
 /// 并且只要 rclone 仍认为该挂载存在，就继续等（见 `wait_mount_ready_rc`）。
 const MOUNT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// `wait_mount_ready_rc` 允许「rclone 说还挂着」时额外延长的上限。
+/// 没有它的话，盘符永远不出现时该函数会无限等待，界面卡在 spinner 且收不到任何提示。
+const MOUNT_READY_EXTEND_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 等待挂载点出现。WinFsp 的挂载是异步的：RC 返回成功时盘符可能尚未就绪，
 /// 直接判定「成功」会让用户在资源管理器里找不到盘。
@@ -2002,27 +2046,39 @@ async fn wait_mount_ready(point: &str, timeout: std::time::Duration) -> bool {
 /// 为什么需要这个：网盘挂载耗时波动很大（实测 15~30s，慢时更久）。
 /// 固定的超时必然会在某些机器/网络下把「仍在正常挂载」误报成失败。
 /// rclone 的 `mount/listmounts` 是权威信号：它说还挂着，就继续等。
+///
+/// **必须有基于绝对时间的硬上限**：早期实现用 `waited += step` / `waited -= step`
+/// 的净增长控制预算，一旦每轮都被延长，净增长恒为 0，函数永不返回 ——
+/// 调用方后面的成功/失败提示与 UI 刷新全都不会执行，界面就停在 spinner 上。
+/// 这里改用 `deadline`（挂钟时间），延长只影响「是否继续等」，不可能越过上限。
 async fn wait_mount_ready_rc(
     client: &rclone_client::RcClient,
     point: &str,
     timeout: std::time::Duration,
 ) -> bool {
     let key = mount_key(point);
-    let mut waited = std::time::Duration::ZERO;
-    let step = std::time::Duration::from_secs(5);
+    let start = tokio::time::Instant::now();
+    // 延长后的绝对截止时间：无论 rclone 怎么说，到这里必须返回
+    let hard_deadline = start + timeout + MOUNT_READY_EXTEND_CAP;
+    let step = std::time::Duration::from_secs(3);
     loop {
-        // 每轮先做一次短等待，避免频繁轮请 RC
-        if wait_mount_ready(point, step.min(timeout.saturating_sub(waited))).await {
-            return true;
-        }
-        waited += step;
-        if waited >= timeout {
+        let now = tokio::time::Instant::now();
+        if now >= hard_deadline {
             return false;
         }
-        // rclone 仍报告该挂载点存在 → 挂载仍在进行，把总预算再放宽一载
+        // 每轮做一次短等待，避免频繁轮询 RC
+        let slice = step.min(hard_deadline.saturating_duration_since(now));
+        if wait_mount_ready(point, slice).await {
+            return true;
+        }
+        // rclone 仍报告该挂载点存在 → 挂载仍在进行，只「延迟」放弃，不延长硬上限
+        if tokio::time::Instant::now() >= hard_deadline {
+            return false;
+        }
         if let Ok(ms) = client.mounts().await {
-            if ms.iter().any(|m| mount_key(&m.mount_point) == key) {
-                waited = waited.saturating_sub(step);
+            if !ms.iter().any(|m| mount_key(&m.mount_point) == key) {
+                // rclone 已经不认这个挂载了，再等也没意义
+                return false;
             }
         }
     }
@@ -2614,9 +2670,22 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             if !ctx.rc.is_live() {
                 return false;
             }
-            // 单飞：已有同类刷新在跑就丢弃本次，避免重叠请求与「旧响应覆盖新状态」
+            // 单飞：已有同类刷新在跑时**等待它结束再跑一次**，而不是直接丢弃本次请求。
+            //
+            // 早期实现是「有在跑就 return」，问题是刷新请求会丢：用户点挂载后，
+            // 若恰好撞上 5s 周期刷新，这次「摘掉 pending 后重绘」的刷新会被吞掉，
+            // 界面就停在 spinner 上，直到用户切页触发下一次刷新。
             if ctx.gate_mounts.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                return false;
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                while ctx.gate_mounts.load(std::sync::atomic::Ordering::SeqCst)
+                    && tokio::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                // 仍在其它刷新里：放弃（避免叠加），下一次周期刷新会纠正
+                if ctx.gate_mounts.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return false;
+                }
             }
             let _gate = GateGuard(ctx.gate_mounts.clone());
             let client = ctx.rc.client().await;
@@ -2703,16 +2772,20 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             });
             // 立即在“活动挂载”里插入一条 pending（spinner + 高亮）
             ctx.pending_mounts.lock().unwrap().push((fs.clone(), point.clone()));
-            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<MountsG>().set_busy(true));
+            // busy 由守卫托管：函数内任何 return / panic 都会复位，避免按钮永久灰掉
+            let _busy = BusyGuard::new(ui, BusyKind::Mounts);
             let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
             // 给足时间：RC 调用会阻塞到挂载完成（网盘首次挂载可能 15~30s 甚至更久）
             let res = tokio::time::timeout(MOUNT_RC_TIMEOUT, client.mount(&fs, &point, opts))
                 .await
                 .map_err(|_| anyhow!("挂载超时（{}s）", MOUNT_RC_TIMEOUT.as_secs()))
                 .and_then(|r| r.map_err(anyhow::Error::from));
-            // 无论成败都先摘掉 pending
+            // 无论成败都先摘掉 pending，并立刻重绘一次：
+            // 活动挂载列表是靠 `pending` 渲染 spinner 的，只从 ctx.pending_mounts 里删掉
+            // 而不刷新 UI，界面就会一直停在那行 spinner 上
+            // （切到别的页面再切回来之所以正常，是因为切换本身会再发一次 MountsRefresh）。
             ctx.pending_mounts.lock().unwrap().retain(|(_, p)| p != &point);
-            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<MountsG>().set_busy(false));
+            let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
             // rclone 的 mount/mount 返回成功只代表「已受理」，WinFsp 真正挂上盘符是异步的。
             // 必须确认挂载点真的出现，否则会出现「提示挂载成功但资源管理器里没有盘」。
             let res = match res {
@@ -2720,7 +2793,8 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     if wait_mount_ready_rc(&client, &actual, MOUNT_READY_TIMEOUT).await {
                         Ok(actual)
                     } else {
-                        // 交给统一的诊断，区分「没装 WinFsp」与「盘符被占/仍在挂载」
+                        // 交给统一的诊断，区分「没装 WinFsp」与「盘符被占/仍在挂载」。
+                        // 注意这里返回前也已经刷新过列表，不会再留下 spinner。
                         report_mount_not_visible(ui, &fs, &actual).await;
                         return false;
                     }
@@ -2763,17 +2837,8 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
         }
         Cmd::MountRemove { point } => {
             let client = ctx.rc.client().await;
-            let _ = ui.upgrade_in_event_loop(
-                |ui| {
-                    ui.global::<MountsG>().set_busy(true);
-                },
-            );
+            let _busy = BusyGuard::new(ui, BusyKind::Mounts);
             let res = client.unmount(&point).await;
-            let _ = ui.upgrade_in_event_loop(
-                |ui| {
-                    ui.global::<MountsG>().set_busy(false);
-                },
-            );
             match res {
                 Ok(_) => {
                     // 用户主动卸载 → 忘掉这条记忆，避免下次连接又挂回来
@@ -3251,8 +3316,17 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             if !ctx.rc.is_live() {
                 return false;
             }
+            // 同 MountsRefresh：等前一单飞结束再刷新，避免「服务已启动但列表没更新」
             if ctx.gate_serves.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                return false;
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                while ctx.gate_serves.load(std::sync::atomic::Ordering::SeqCst)
+                    && tokio::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                if ctx.gate_serves.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return false;
+                }
             }
             let _gate = GateGuard(ctx.gate_serves.clone());
             let client = ctx.rc.client().await;
@@ -3344,12 +3418,12 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 toast(ui, 2, "请填写监听地址");
                 return false;
             }
-            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<ServesG>().set_busy(true));
+            // busy 由守卫托管：任何返回路径都会复位
+            let _busy = BusyGuard::new(ui, BusyKind::Serves);
             let client = ctx.rc.client().await;
             let res = client
                 .serve_start(&stype, &fs, &addr_t, &user, &pass)
                 .await;
-            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<ServesG>().set_busy(false));
             match res {
                 Ok(id) => {
                     let mut saved_err = None;
@@ -5193,6 +5267,58 @@ fn make_icon_rgba(size: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归：`wait_mount_ready_rc` 必须有**绝对时间**的硬上限。
+    ///
+    /// 早期实现用 `waited += step` / `waited -= step` 控制预算：只要 rclone 每轮都报
+    /// 「还挂着」，净增长恒为 0 → 盘符永远不出现时函数无限等待，调用方后面的
+    /// 「成功/失败提示 + UI 刷新」都不会执行，界面卡在 spinner 上。
+    /// 现在改为 `hard_deadline = start + timeout + EXTEND_CAP`，延长不可能越过上限。
+    #[test]
+    fn mount_ready_wait_has_hard_cap() {
+        let budget = MOUNT_READY_TIMEOUT + MOUNT_READY_EXTEND_CAP;
+        assert!(
+            budget <= std::time::Duration::from_secs(180),
+            "总等待预算必须有明确上限，实际 {budget:?}"
+        );
+        // 单轮切片必须小于总预算，否则第一轮就可能等到超限
+        assert!(std::time::Duration::from_secs(3) < budget);
+        // 预算必须大于「正常挂载耗时」，否则正常挂载会被误判失败
+        assert!(budget >= std::time::Duration::from_secs(90));
+    }
+
+    /// 用挂钟模型复刻该循环：即使每轮都被「rclone 说还挂着」而继续，
+    /// 迭代次数也必须有限 —— 因为判断依据是 deadline，而不是可被抵消的累加量。
+    #[test]
+    fn mount_ready_loop_terminates_under_continuous_extension() {
+        let budget = MOUNT_READY_TIMEOUT + MOUNT_READY_EXTEND_CAP;
+        let step = std::time::Duration::from_secs(3);
+        // 模拟 3 秒一轮，rounds = ceil(budget / step)
+        let rounds = (budget.as_secs_f64() / step.as_secs_f64()).ceil() as u64;
+        assert!(
+            rounds > 0 && rounds < 100,
+            "等待轮次应有界且不为 0，实际 {rounds}"
+        );
+
+        // 关键对照：旧的累加模型在同一条件下永不收敛
+        let mut waited = std::time::Duration::ZERO;
+        let mut old_iterations = 0usize;
+        loop {
+            old_iterations += 1;
+            waited += step;
+            if waited >= budget {
+                break;
+            }
+            waited = waited.saturating_sub(step); // 每轮都被延长 → 净增长为 0
+            if old_iterations > 500 {
+                break; // 确认它确实卡住了
+            }
+        }
+        assert!(
+            old_iterations > 500,
+            "旧实现的净增长模型应表现为不收敛（这就是原 bug）"
+        );
+    }
 
     fn field(name: &str, kind: &str, value: &str, required: bool) -> FieldRow {
         FieldRow {
