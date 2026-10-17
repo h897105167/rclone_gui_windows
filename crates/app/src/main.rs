@@ -47,8 +47,12 @@ enum Cmd {
     FilesCopyLink { name: String },
     /// 面包屑跳转：直接列出目标路径（成功后才更新界面）
     FilesJump { path: String, seq: i32 },
-    /// 下载到用户选定的本地目录（同名时自动加序号，不覆盖）
-    FilesDownloadToDir { name: String, dir: PathBuf },
+    /// 下载到用户选定的本地目录（文件同名自动加序号；文件夹递归复制）
+    FilesDownloadToDir {
+        name: String,
+        dir: PathBuf,
+        is_dir: bool,
+    },
     /// 「移动到…」：列出目标目录下的子文件夹
     FilesMoveList { path: String, seq: i32 },
     /// 「移动到…」：把当前项移到目标目录
@@ -726,7 +730,13 @@ fn collect_crumbs(model: &ModelRc<CrumbRow>) -> Vec<CrumbRow> {
 /// 把完整面包屑链按当前路径框宽度折叠后写回 UI（内容没变就不重设，避免布局抖动）。
 fn apply_crumbs(ui: &MainWindow, all: Vec<CrumbRow>) {
     let g = ui.global::<FilesG>();
-    let (shown, hidden) = fit_crumbs(&all, g.get_path_box_width());
+    let width = g.get_path_box_width();
+    let (shown, hidden) = if width > 0.0 {
+        fit_crumbs(&all, width)
+    } else {
+        // 首帧还不知道路径框多宽：先全部显示，宁可溢出也不要只剩当前目录
+        (all.clone(), Vec::new())
+    };
     if collect_crumbs(&g.get_crumb_all()) != all {
         g.set_crumb_all(crumb_model(all));
     }
@@ -770,6 +780,24 @@ fn unique_local_path(dir: &Path, name: &str) -> PathBuf {
             format!("{base} ({i}){ext}")
         };
         let p = dir.join(cand);
+        if !p.exists() {
+            return p;
+        }
+    }
+    first
+}
+
+/// 本地目录下不冲突的目录名：`name`、`name (1)`、`name (2)`…
+///
+/// 文件夹下载要和现有目录合并吗？**不**：`sync/copy` 会覆盖同名文件，
+/// 与其冒覆盖风险，不如新建一个带序号的目录。
+fn unique_local_dir(dir: &Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    for i in 1..=999 {
+        let p = dir.join(format!("{name} ({i})"));
         if !p.exists() {
             return p;
         }
@@ -3555,12 +3583,43 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             }
             false
         }
-        Cmd::FilesDownloadToDir { name, dir } => {
+        Cmd::FilesDownloadToDir { name, dir, is_dir } => {
             let (remote, path) = ui_files_pos(ui).await;
             if remote.is_empty() {
                 return false;
             }
-            // 文件夹选择器没有原生「是否覆盖」确认，同名时自动加序号
+            if is_dir {
+                // 文件夹：递归复制到「所选目录/文件夹名」；同名时另起带序号的目录
+                let target = unique_local_dir(&dir, &name);
+                if let Err(e) = std::fs::create_dir_all(&target) {
+                    toast(ui, 2, format!("无法创建本地目录 {}: {e}", target.display()));
+                    return false;
+                }
+                let src_fs = format!("{remote}:{}", join_path(&path, &name));
+                let dst_fs = local_fs(&target);
+                let ctx2 = ctx.clone();
+                let ui2 = ui.clone();
+                toast(ui, 0, format!("正在下载文件夹 {name}…"));
+                // 大目录可能复制很久：后台线程执行，不阻塞命令队列
+                std::thread::spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(_) => return,
+                    };
+                    rt.block_on(async move {
+                        let client = ctx2.rc.client().await;
+                        match client.sync_copy(&src_fs, &dst_fs, true).await {
+                            Ok(_) => toast(&ui2, 1, format!("已下载到 {}", target.display())),
+                            Err(e) => toast(&ui2, 2, format!("下载失败: {e}")),
+                        }
+                    });
+                });
+                return false;
+            }
+            // 文件：文件夹选择器没有原生「是否覆盖」确认，同名时自动加序号
             let local = unique_local_path(&dir, &name);
             let dst_name = local
                 .file_name()
@@ -6467,16 +6526,16 @@ fn wire_callbacks(
         let tx = tx.clone();
         let ui = ui.as_weak();
         move |i| {
-            let name = ui
+            let row = ui
                 .upgrade()
                 .and_then(|ui| ui.global::<FilesG>().get_entries().row_data(i as usize))
-                .map(|r| r.name.to_string());
-            let Some(name) = name else { return };
+                .map(|r| (r.name.to_string(), r.is_dir));
+            let Some((name, is_dir)) = row else { return };
             if let Some(dir) = rfd::FileDialog::new()
                 .set_title("选择下载目录")
                 .pick_folder()
             {
-                let _ = tx.send(Cmd::FilesDownloadToDir { name, dir });
+                let _ = tx.send(Cmd::FilesDownloadToDir { name, dir, is_dir });
             }
         }
     });
@@ -7966,6 +8025,36 @@ mod tests {
                 .unwrap()
                 .to_string_lossy(),
             "README (1)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 文件夹下载同样不合并、不覆盖：同名时新建带序号目录。
+    #[test]
+    fn unique_local_dir_avoids_merge() {
+        let dir = std::env::temp_dir().join(format!("rcgui-dldir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = unique_local_dir(&dir, "photos");
+        assert_eq!(first.file_name().unwrap().to_string_lossy(), "photos");
+        std::fs::create_dir_all(&first).unwrap();
+
+        let second = unique_local_dir(&dir, "photos");
+        assert_eq!(
+            second.file_name().unwrap().to_string_lossy(),
+            "photos (1)"
+        );
+
+        // 同名的普通文件也算占用
+        std::fs::write(dir.join("notes"), b"x").unwrap();
+        assert_eq!(
+            unique_local_dir(&dir, "notes")
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            "notes (1)"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

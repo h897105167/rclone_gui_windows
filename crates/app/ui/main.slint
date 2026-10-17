@@ -1065,6 +1065,14 @@ component FilesView inherits Rectangle {
             }
         }
     }
+    // 路径框宽度补报：首帧布局可能早于 `changed width` 的注册，只靠它会
+    // 一直拿到 0（表现就是路径只剩当前目录）。定时把真实宽度报给 Rust；
+    // `apply_crumbs` 会比对内容，没变化就不重设模型。
+    Timer {
+        interval: 500ms;
+        running: true;
+        triggered => { root.crumb-refit(pathbox.width); }
+    }
     // 右键菜单（原点击工具栏功能全部集成于此）
     ctx := PopupWindow {
         x: root.menu-ax;
@@ -1079,7 +1087,7 @@ component FilesView inherits Rectangle {
             VerticalLayout {
                 padding: 4px;
                 spacing: 2px;
-                if !root.op-is-dir : MenuItemBtn {
+                MenuItemBtn {
                     glyph: "\u{E896}";
                     label: "下载到…";
                     clicked => { ctx.close(); root.download-row(root.op-idx); }
