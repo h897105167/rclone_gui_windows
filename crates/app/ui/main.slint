@@ -23,6 +23,8 @@ export struct CrumbRow {
     path: string,
     /// 是否为当前目录（最右一级）
     is-current: bool,
+    /// 是否是折叠标记「…」（点击展开被折叠的祖先）
+    is-ellipsis: bool,
 }
 /// 「移动到…」对话框里的一行（只列目录）
 export struct MoveDir {
@@ -207,7 +209,14 @@ export global FilesG {
     in-out property <int> sel: -1;
     in-out property <string> rename-name: "";
     // 路径面包屑（首项是远程名，之后每一级目录）
+    //  crumbs       = 实际显示的（可能含「…」折叠项）
+    //  crumb-all    = 完整链（窗口宽度变化时据此重新折叠）
+    //  crumb-hidden = 被折叠的祖先（「…」弹出菜单里列出）
     in-out property <[CrumbRow]> crumbs: [];
+    in-out property <[CrumbRow]> crumb-all: [];
+    in-out property <[CrumbRow]> crumb-hidden: [];
+    /// 路径框的实际宽度（由 Slint 侧布局回填，用于按可用宽度折叠）
+    in-out property <length> path-box-width: 0px;
     // ---------------- 「移动到…」对话框 ----------------
     in-out property <[MoveDir]> move-dirs: [];
     /// 当前浏览到的目标目录（相对远程根）
@@ -863,6 +872,8 @@ component FilesView inherits Rectangle {
     callback copy-link(int);
     // 面包屑：跳到某一级
     callback crumb-nav(string);
+    // 路径框宽度变化：按可用宽度重新折叠祖先
+    callback crumb-refit(length);
     // 下载到指定目录
     callback download-row(int);
     // 移动到…（浏览远程目录）
@@ -897,14 +908,18 @@ component FilesView inherits Rectangle {
             Rectangle { width: 4px; }
             IconBtn { label: "\u{E74A}"; clicked => { root.go-up(); } }
             // 路径面包屑：每一级可点，点击退回该级（像资源管理器）。
-            // 左对齐；超长时向右溢出并被裁掉（当前目录可能被挡住，
-            // 用「↑ 上级」或面包屑仍可回退）。
-            Rectangle {
+            // 宽度不够时由 Rust 侧按估算文字宽度把左侧祖先折叠成「…」，
+            // 最右的当前目录始终保留；点「…」列出被折叠的祖先。
+            pathbox := Rectangle {
+                horizontal-stretch: 1;
+                min-width: 120px;
                 background: ThemeG.panel;
                 border-radius: ThemeG.radius-s;
                 border-width: 1px;
                 border-color: ThemeG.border;
                 clip: true;
+                // 窗口缩放时宽度会变，重新折叠；Slint 只负责把宽度报给 Rust
+                changed width => { root.crumb-refit(pathbox.width); }
                 HorizontalLayout {
                     width: parent.width;
                     height: parent.height;
@@ -914,7 +929,25 @@ component FilesView inherits Rectangle {
                     alignment: start;
                     for c[i] in FilesG.crumbs : HorizontalLayout {
                         spacing: 2px;
-                        crumb-ta := TouchArea {
+                        if c.is-ellipsis : ell-ta := TouchArea {
+                            width: ell-text.preferred-width + 10px;
+                            mouse-cursor: pointer;
+                            clicked => {
+                                // 弹出被折叠的祖先列表，定位到「…」下方
+                                root.menu-ax = Math.max(0px, Math.min(self.absolute-position.x - root.absolute-position.x, root.width - 230px));
+                                root.menu-ay = self.absolute-position.y - root.absolute-position.y + self.height;
+                                cpm.show();
+                            }
+                            ell-text := Text {
+                                x: 5px;
+                                height: parent.height;
+                                text: c.name;
+                                font-size: 13px;
+                                color: ell-ta.has-hover ? ThemeG.accent : ThemeG.text-dim;
+                                vertical-alignment: center;
+                            }
+                        }
+                        if !c.is-ellipsis : crumb-ta := TouchArea {
                             width: crumb-text.preferred-width + 8px;
                             mouse-cursor: pointer;
                             clicked => { root.crumb-nav(c.path); }
@@ -936,7 +969,8 @@ component FilesView inherits Rectangle {
                     }
                 }
             }
-            Rectangle {}
+            // 让路径框吃满中间剩余宽度（唯一 stretch 项，宽度不随面包屑内容变化）
+            Rectangle { horizontal-stretch: 0; }
             PillBtn { label: "新建文件夹"; clicked => { root.mkdir(); } }
             IconBtn { label: "\u{E72C}"; clicked => { root.refresh(); } }
         }
@@ -1084,6 +1118,28 @@ component FilesView inherits Rectangle {
                     label: "删除";
                     danger: true;
                     clicked => { ctx.close(); delp.show(); }
+                }
+            }
+        }
+    }
+    // 面包屑折叠菜单：列出被折叠的祖先，点哪一级就跳到哪一级
+    cpm := PopupWindow {
+        x: root.menu-ax;
+        y: root.menu-ay;
+        close-policy: PopupClosePolicy.close-on-click-outside;
+        Rectangle {
+            width: 220px;
+            background: ThemeG.panel;
+            border-radius: ThemeG.radius-s;
+            border-width: 1px;
+            border-color: ThemeG.border;
+            VerticalLayout {
+                padding: 4px;
+                spacing: 2px;
+                for h in FilesG.crumb-hidden : MenuItemBtn {
+                    glyph: "\u{E8B7}";
+                    label: h.name;
+                    clicked => { cpm.close(); root.crumb-nav(h.path); }
                 }
             }
         }
@@ -3243,6 +3299,7 @@ export component MainWindow inherits Window {
     callback files-copy(int);
     callback files-copy-link(int);
     callback files-crumb-nav(string);
+    callback files-crumb-refit(length);
     callback files-download(int);
     callback files-move-list(string);
     callback files-move-enter(string);
@@ -3490,6 +3547,7 @@ export component MainWindow inherits Window {
                     copy-row(i) => { root.files-copy(i); }
                     copy-link(i) => { root.files-copy-link(i); }
                     crumb-nav(p) => { root.files-crumb-nav(p); }
+                    crumb-refit(w) => { root.files-crumb-refit(w); }
                     download-row(i) => { root.files-download(i); }
                     move-list(p) => { root.files-move-list(p); }
                     move-enter(n) => { root.files-move-enter(n); }
