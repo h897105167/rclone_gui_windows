@@ -600,6 +600,59 @@ fn byte_rate_str(v: Option<f64>) -> String {
     }
 }
 
+/// 判断一条传输是否来自某个 serve，返回服务名（无法确证时返回空）。
+///
+/// **为什么不能用 fs 前缀匹配**：`serve/list` 里根目录服务的 `fs` 就是 `teldrive:`，
+/// 而 `core/transferred` 的 `srcFs`/`dstFs` 也是 `teldrive:`。用 `starts_with` 判断，
+/// 任何来自该远程的任务都会被算作「来自 serve」，而且会命中列表里第一个服务
+/// （表现为所有任务都带同一个、且是列表最上方的那个服务标签）。
+///
+/// rclone 本身**不把传输归因到 serve**：`core/transferred` 只有 `group`
+/// （`global_stats` 或 `job/N`），没有 serve 关联信息。因此这里只在能确证时打标签：
+/// 服务挂了**子路径**（`fs = teldrive:some/sub`）时，任务路径落在该前缀下才算命中；
+/// 根目录服务（`fs = teldrive:`）无法与普通传输区分，一律不标。
+fn match_serve_for_task(
+    serves: &[ServeRow],
+    src: &str,
+    dst: &str,
+) -> slint::SharedString {
+    // 只考虑带子路径的服务，并按子路径从长到短匹配（更具体的优先）
+    let mut candidates: Vec<(&str, &str)> = serves
+        .iter()
+        .filter_map(|sv| {
+            let fs = sv.fs.as_str();
+            // 去掉结尾的 ':' 得到 "remote" 或 "remote:sub/path"
+            let body = fs.strip_suffix(':').unwrap_or(fs);
+            // 只有形如 remote:sub 的才具备可判定的路径前缀
+            let (_, sub) = body.split_once(':')?;
+            let sub = sub.trim_matches('/');
+            if sub.is_empty() {
+                return None; // 根目录服务：无法与普通传输区分
+            }
+            Some((sv.name.as_str(), sub))
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+    for (name, sub) in candidates {
+        // 任务的 fs 形如 "remote:sub/..."，只要其子路径以服务的子路径开头即命中
+        let hit = |fs: &str| -> bool {
+            let body = fs.strip_suffix(':').unwrap_or(fs);
+            match body.split_once(':') {
+                Some((_, path)) => {
+                    let p = path.trim_matches('/');
+                    p == sub || p.starts_with(&format!("{sub}/"))
+                }
+                None => false,
+            }
+        };
+        if hit(src) || hit(dst) {
+            return name.into();
+        }
+    }
+    String::new().into()
+}
+
 /// 构建「后台任务」列表（job/list + job/status + core/transferred 关联推导）
 async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let client = ctx.rc.client().await;
@@ -683,13 +736,7 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             (String::new(), String::new())
         };
 
-        let mut svc = String::new();
-        for sv in &serves {
-            if !sv.fs.is_empty() && (src.starts_with(sv.fs.as_str()) || dst.starts_with(sv.fs.as_str())) {
-                svc = sv.name.as_str().to_string();
-                break;
-            }
-        }
+        let svc = match_serve_for_task(&serves, &src, &dst);
 
         let running = rmap.contains_key(group);
         if hide && !running {
@@ -5459,6 +5506,67 @@ mod tests {
         let mut list: Vec<String> = vec![mount_key("Z:")];
         list.retain(|k| k != &mount_key("Z:\\"));
         assert!(list.is_empty(), "重新挂载前应清掉该盘符的取消标记");
+    }
+
+    /// 回归：根目录服务不能给所有传输都打上「来自该服务」的标签。
+    ///
+    /// 曾经的实现用 `fs.starts_with(serve.fs)` 判断，而根目录服务的 fs 是 `teldrive:`，
+    /// 任务的 srcFs 也是 `teldrive:` → 任何该远程的传输都被判定为来自服务，
+    /// 且取列表里第一个匹配项（表现为所有任务都是同一个、最上方的服务标签）。
+    #[test]
+    fn root_serve_does_not_tag_unrelated_transfers() {
+        let root_serve = ServeRow {
+            id: "webdav-1".into(),
+            name: "Serve_01".into(),
+            stype: "webdav".into(),
+            fs: "teldrive:".into(), // 根目录服务
+            addr: "127.0.0.1:8080".into(),
+        };
+        let serves = vec![root_serve];
+        // 普通复制/同步任务，与 serve 无关
+        let svc = match_serve_for_task(&serves, "teldrive:", "/local/dir");
+        assert!(
+            svc.is_empty(),
+            "根目录服务不应给普通传输打标签，实际得到 {svc:?}"
+        );
+        // 上传同理
+        let svc = match_serve_for_task(&serves, "/local/file.png", "teldrive:图床/a.png");
+        assert!(svc.is_empty(), "根目录服务不应给上传打标签");
+    }
+
+    /// 带子路径的服务应能正确匹配，且更具体的子路径优先。
+    #[test]
+    fn subpath_serve_matches_by_path_prefix() {
+        let serves = vec![
+            ServeRow {
+                id: "s1".into(),
+                name: "Media".into(),
+                stype: "webdav".into(),
+                fs: "teldrive:media".into(),
+                addr: "127.0.0.1:9001".into(),
+            },
+            ServeRow {
+                id: "s2".into(),
+                name: "MediaMovies".into(),
+                stype: "http".into(),
+                fs: "teldrive:media/movies".into(),
+                addr: "127.0.0.1:9002".into(),
+            },
+        ];
+        // 落在 media/movies 下 → 命中更具体的那个
+        assert_eq!(
+            match_serve_for_task(&serves, "teldrive:media/movies/a.mkv", ""),
+            "MediaMovies"
+        );
+        // 落在 media 下但不是 movies → 命中较短的
+        assert_eq!(
+            match_serve_for_task(&serves, "teldrive:media/songs/b.mp3", ""),
+            "Media"
+        );
+        // 完全无关的路径 → 不打标签
+        assert!(match_serve_for_task(&serves, "teldrive:other/c.txt", "").is_empty());
+        // 不能误匹配前缀相同的兄弟目录："media2" 不是 "media" 的子路径
+        assert!(match_serve_for_task(&serves, "teldrive:media2/d.txt", "").is_empty());
     }
 
     fn field(name: &str, kind: &str, value: &str, required: bool) -> FieldRow {
