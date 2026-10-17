@@ -381,6 +381,32 @@ impl RcClient {
         .map(drop)
     }
 
+    /// 递归移动目录（`sync/move`）。
+    ///
+    /// 与 [`Self::movefile`] 不同，这里接收**完整 fs 串**（`remote:path`）：
+    /// rclone 会先尝试服务端目录重命名（`DirMove`），不行再逐个文件移动。
+    /// `create_empty_src_dirs` 让空目录也能在目标侧建出来（否则空文件夹会「消失」）；
+    /// `delete_empty_src_dirs` 在移动完成后删掉空的源目录。
+    pub async fn sync_move(
+        &self,
+        src_fs: &str,
+        dst_fs: &str,
+        create_empty_src_dirs: bool,
+        delete_empty_src_dirs: bool,
+    ) -> RcResult<()> {
+        self.call(
+            "sync/move",
+            &json!({
+                "srcFs": src_fs,
+                "dstFs": dst_fs,
+                "createEmptySrcDirs": create_empty_src_dirs,
+                "deleteEmptySrcDirs": delete_empty_src_dirs,
+            }),
+        )
+        .await
+        .map(drop)
+    }
+
     pub async fn about(&self, fs: &str) -> RcResult<Value> {
         self.call("operations/about", &json!({ "fs": fs })).await
     }
@@ -437,46 +463,42 @@ impl RcClient {
 
     // ---------- sync ----------
 
+    /// 递归复制目录（`sync/copy`）。
+    ///
+    /// 参数是**完整 fs 串**（`remote:path`）。RC 的 `sync/*` 系列没有
+    /// `srcRemote` / `dstRemote`，路径必须拼进 fs 串里。
     pub async fn sync_copy(
         &self,
         src_fs: &str,
-        src_remote: &str,
         dst_fs: &str,
-        dst_remote: &str,
+        create_empty_src_dirs: bool,
     ) -> RcResult<()> {
         self.call(
             "sync/copy",
-            &json!({ "srcFs": src_fs, "srcRemote": src_remote, "dstFs": dst_fs, "dstRemote": dst_remote }),
+            &json!({
+                "srcFs": src_fs,
+                "dstFs": dst_fs,
+                "createEmptySrcDirs": create_empty_src_dirs,
+            }),
         )
         .await
         .map(drop)
     }
 
+    /// 递归镜像目录（`sync/sync`，会删除目标侧多余文件）。
     pub async fn sync_sync(
         &self,
         src_fs: &str,
-        src_remote: &str,
         dst_fs: &str,
-        dst_remote: &str,
+        create_empty_src_dirs: bool,
     ) -> RcResult<()> {
         self.call(
             "sync/sync",
-            &json!({ "srcFs": src_fs, "srcRemote": src_remote, "dstFs": dst_fs, "dstRemote": dst_remote }),
-        )
-        .await
-        .map(drop)
-    }
-
-    pub async fn sync_move(
-        &self,
-        src_fs: &str,
-        src_remote: &str,
-        dst_fs: &str,
-        dst_remote: &str,
-    ) -> RcResult<()> {
-        self.call(
-            "sync/move",
-            &json!({ "srcFs": src_fs, "srcRemote": src_remote, "dstFs": dst_fs, "dstRemote": dst_remote }),
+            &json!({
+                "srcFs": src_fs,
+                "dstFs": dst_fs,
+                "createEmptySrcDirs": create_empty_src_dirs,
+            }),
         )
         .await
         .map(drop)

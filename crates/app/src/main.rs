@@ -16,7 +16,7 @@ mod reconcile;
 mod script;
 
 use anyhow::anyhow;
-use rcgui_rc::{ConnStatus, Handshake, RcState};
+use rcgui_rc::{ConnStatus, Handshake, ListEntry, RcState};
 use rclone_client::{local_fs, RcloneManager};
 use serde_json::{json, Value};
 use slint::{ComponentHandle, Model, ModelRc, VecModel, Weak};
@@ -45,6 +45,18 @@ enum Cmd {
     FilesRename { from: String, to: String },
     FilesCopy { name: String },
     FilesCopyLink { name: String },
+    /// 面包屑跳转：直接列出目标路径（成功后才更新界面）
+    FilesJump { path: String, seq: i32 },
+    /// 下载到用户选定的本地目录（同名时自动加序号，不覆盖）
+    FilesDownloadToDir { name: String, dir: PathBuf },
+    /// 「移动到…」：列出目标目录下的子文件夹
+    FilesMoveList { path: String, seq: i32 },
+    /// 「移动到…」：把当前项移到目标目录
+    FilesMove {
+        name: String,
+        is_dir: bool,
+        dest: String,
+    },
     MountsRefresh,
     MountAdd,
     MountRemove { point: String },
@@ -562,6 +574,87 @@ fn split_name(name: &str) -> (String, String) {
         Some(i) if i > 0 => (name[..i].to_string(), name[i..].to_string()),
         _ => (name.to_string(), String::new()),
     }
+}
+
+/// 上一级路径（已在根目录时返回空串）。
+fn parent_path(path: &str) -> String {
+    match path.rfind('/') {
+        Some(i) => path[..i].to_string(),
+        None => String::new(),
+    }
+}
+
+/// 路径面包屑：首项是远程名，之后每一级目录。
+///
+/// 首项的 `path` 为空串（远程根）；`is_current` 只标在最右一级上。
+fn file_crumbs(remote: &str, path: &str) -> Vec<CrumbRow> {
+    let mut out = Vec::new();
+    if remote.is_empty() {
+        return out;
+    }
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    out.push(CrumbRow {
+        name: remote.into(),
+        path: "".into(),
+        is_current: parts.is_empty(),
+    });
+    let mut acc = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        if !acc.is_empty() {
+            acc.push('/');
+        }
+        acc.push_str(part);
+        out.push(CrumbRow {
+            name: (*part).into(),
+            path: acc.clone().into(),
+            is_current: i + 1 == parts.len(),
+        });
+    }
+    out
+}
+
+/// 把 `operations/list` 的结果转成表格行（目录在前，同类按名字排序）。
+fn file_rows(entries: &[ListEntry]) -> Vec<FileRow> {
+    let mut rows: Vec<FileRow> = entries
+        .iter()
+        .map(|e| FileRow {
+            name: e.name.clone().into(),
+            is_dir: e.is_dir,
+            size: fmt_bytes(e.size as f64).into(),
+            mtime: fmt_mtime(&e.mod_time).into(),
+        })
+        .collect();
+    rows.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+    rows
+}
+
+/// 本地目录下不冲突的落盘路径：`name`、`name (1)`、`name (2)`…
+///
+/// 右键「下载到…」用文件夹选择器，没有「是否覆盖」的原生确认框，
+/// 因此这里一律避开已存在的文件，宁可多一个副本也不悄悄覆盖。
+fn unique_local_path(dir: &Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (base, ext) = split_name(name);
+    for i in 1..=999 {
+        let cand = if ext.is_empty() {
+            format!("{base} ({i})")
+        } else {
+            format!("{base} ({i}){ext}")
+        };
+        let p = dir.join(cand);
+        if !p.exists() {
+            return p;
+        }
+    }
+    first
+}
+
+/// `path` 是否等于 `ancestor` 或位于其内部（用于阻止把文件夹移进自己）。
+fn is_same_or_inside(path: &str, ancestor: &str) -> bool {
+    path == ancestor || path.starts_with(&format!("{ancestor}/"))
 }
 
 fn parse_kv_lines(text: &str) -> serde_json::Map<String, Value> {
@@ -3137,6 +3230,63 @@ async fn apply_bundle_to_rclone(
 }
 
 /// 返回 true 表示退出
+/// 文件页导航的统一实现：列出 `target`，**成功后才**更新路径、面包屑与列表。
+///
+/// 「进入子目录 / 返回上级 / 点面包屑」都走这里，避免三份几乎相同的代码各自出错；
+/// 过期请求（seq 不一致）只清 loading，绝不覆盖界面。
+async fn files_navigate(
+    ctx: &Arc<Ctx>,
+    ui: &Weak<MainWindow>,
+    target: String,
+    seq: i32,
+    fail_prefix: String,
+) {
+    let (remote, _) = ui_files_pos(ui).await;
+    if remote.is_empty() {
+        return;
+    }
+    let proxy_ep = remote_proxy_endpoint(ctx, &remote);
+    let client = ctx.rc.client().await;
+    let fs = format!("{remote}:");
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        client.list(&fs, &target, None),
+    )
+    .await
+    .map_err(|_| anyhow!("请求超时"))
+    .and_then(|r| r.map_err(anyhow::Error::from));
+
+    let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq())
+        .await
+        .unwrap_or(-2);
+    if seq >= 0 && cur_seq != seq {
+        let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
+        return;
+    }
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let g = ui.global::<FilesG>();
+        g.set_loading(false);
+        match res {
+            Ok(entries) => {
+                // 成功后才更新路径，避免网络慢时拼出不存在的路径
+                g.set_path(target.clone().into());
+                g.set_crumbs(ModelRc::from(Rc::new(VecModel::from(file_crumbs(
+                    &remote, &target,
+                )))));
+                g.set_entries(ModelRc::from(Rc::new(VecModel::from(file_rows(&entries)))));
+            }
+            Err(e) => {
+                let msg = crate::proxy::annotate_error(
+                    &format!("{fail_prefix}: {e}"),
+                    proxy_ep.as_deref(),
+                );
+                toast_ui(&ui, 2, msg);
+            }
+        }
+        g.set_sel(-1);
+    });
+}
+
 async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
     match cmd {
         Cmd::Quit => {
@@ -3224,17 +3374,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     let g = ui.global::<FilesG>();
                     match res {
                         Ok(entries) => {
-                            let mut rows: Vec<FileRow> = entries
-                                .iter()
-                                .map(|e| FileRow {
-                                    name: e.name.clone().into(),
-                                    is_dir: e.is_dir,
-                                    size: fmt_bytes(e.size as f64).into(),
-                                    mtime: fmt_mtime(&e.mod_time).into(),
-                                })
-                                .collect();
-                            rows.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
-                            g.set_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
+                            g.set_entries(ModelRc::from(Rc::new(VecModel::from(file_rows(&entries)))));
                         }
                         Err(e) => {
                             g.set_entries(ModelRc::from(Rc::new(VecModel::from(Vec::<FileRow>::new()))));
@@ -3245,6 +3385,10 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                             toast_ui(&ui, 2, msg);
                         }
                     }
+                    // 切换远程时 Slint 会把 path 清空，这里按当前值重建面包屑
+                    g.set_crumbs(ModelRc::from(Rc::new(VecModel::from(file_crumbs(
+                        &remote, &path,
+                    )))));
                     g.set_sel(-1);
                     g.set_loading(false);
                 },
@@ -3252,113 +3396,28 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::FilesEnter { name, seq } => {
-            let (remote, path) = ui_files_pos(ui).await;
-            if remote.is_empty() {
-                return false;
-            }
-            let proxy_ep = remote_proxy_endpoint(ctx, &remote);
+            let (_, path) = ui_files_pos(ui).await;
             let target = join_path(&path, &name);
-            let client = ctx.rc.client().await;
-            let fs = format!("{remote}:");
-            let res = tokio::time::timeout(
-                std::time::Duration::from_secs(15),
-                client.list(&fs, &target, None),
-            )
-            .await
-            .map_err(|_| anyhow!("请求超时"))
-            .and_then(|r| r.map_err(anyhow::Error::from));
-            // 请求期间用户可能已切换远程或发起新操作，丢弃过期结果
-            let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq()).await.unwrap_or(-2);
-            if seq >= 0 && cur_seq != seq {
-                let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
-                return false;
-            }
-            let _ = ui.upgrade_in_event_loop(
-                move |ui| {
-                    let g = ui.global::<FilesG>();
-                    g.set_loading(false);
-                    match res {
-                        Ok(entries) => {
-                            let mut rows: Vec<FileRow> = entries
-                                .iter()
-                                .map(|e| FileRow {
-                                    name: e.name.clone().into(),
-                                    is_dir: e.is_dir,
-                                    size: fmt_bytes(e.size as f64).into(),
-                                    mtime: fmt_mtime(&e.mod_time).into(),
-                                })
-                                .collect();
-                            rows.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
-                            // 成功进入后才更新路径，避免网络慢时拼出不存在的路径
-                            g.set_path(target.clone().into());
-                            g.set_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
-                        }
-                        Err(e) => {
-                            let msg = crate::proxy::annotate_error(
-                                &format!("无法进入 {name}: {e}"),
-                                proxy_ep.as_deref(),
-                            );
-                            toast_ui(&ui, 2, msg);
-                        }
-                    }
-                    g.set_sel(-1);
-                },
-            );
+            let fail = format!("无法进入 {name}");
+            files_navigate(ctx, ui, target, seq, fail).await;
+            false
+        }
+        Cmd::FilesJump { path, seq } => {
+            files_navigate(ctx, ui, path, seq, "无法打开该路径".into()).await;
             false
         }
         Cmd::FilesUp { seq } => {
-            let (remote, path) = ui_files_pos(ui).await;
-            if remote.is_empty() {
-                return false;
-            }
-            let parent = match path.rfind('/') {
-                Some(idx) => path[..idx].to_string(),
-                None => String::new(),
-            };
-            let client = ctx.rc.client().await;
-            let fs = format!("{remote}:");
-            let res = tokio::time::timeout(
-                std::time::Duration::from_secs(15),
-                client.list(&fs, &parent, None),
-            )
-            .await
-            .map_err(|_| anyhow!("请求超时"))
-            .and_then(|r| r.map_err(anyhow::Error::from));
-            let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq()).await.unwrap_or(-2);
-            if seq >= 0 && cur_seq != seq {
-                let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
-                return false;
-            }
-            let _ = ui.upgrade_in_event_loop(
-                move |ui| {
-                    let g = ui.global::<FilesG>();
-                    g.set_loading(false);
-                    match res {
-                        Ok(entries) => {
-                            let mut rows: Vec<FileRow> = entries
-                                .iter()
-                                .map(|e| FileRow {
-                                    name: e.name.clone().into(),
-                                    is_dir: e.is_dir,
-                                    size: fmt_bytes(e.size as f64).into(),
-                                    mtime: fmt_mtime(&e.mod_time).into(),
-                                })
-                                .collect();
-                            rows.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
-                            g.set_path(parent.clone().into());
-                            g.set_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
-                        }
-                        Err(e) => {
-                            toast_ui(&ui, 2, format!("返回上级失败: {e}"));
-                        }
-                    }
-                    g.set_sel(-1);
-                },
-            );
+            let (_, path) = ui_files_pos(ui).await;
+            files_navigate(ctx, ui, parent_path(&path), seq, "返回上级失败".into()).await;
             false
         }
         Cmd::FilesDownload { name, local } => {
             let (remote, path) = ui_files_pos(ui).await;
+            // 「另存为」里用户可能改了文件名，必须按最终选择落盘
+            let dst_name = local
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| name.clone());
             let client = ctx.rc.client().await;
             let fs = local_fs(local.parent().unwrap_or(Path::new(".")));
             let res = client
@@ -3366,12 +3425,184 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     &format!("{remote}:"),
                     &join_path(&path, &name),
                     &fs,
-                    &name,
+                    &dst_name,
                 )
                 .await;
             match res {
-                Ok(_) => toast(ui, 1, format!("已下载 {name}")),
+                Ok(_) => toast(ui, 1, format!("已下载到 {}", local.display())),
                 Err(e) => toast(ui, 2, format!("下载失败: {e}")),
+            }
+            false
+        }
+        Cmd::FilesDownloadToDir { name, dir } => {
+            let (remote, path) = ui_files_pos(ui).await;
+            if remote.is_empty() {
+                return false;
+            }
+            // 文件夹选择器没有原生「是否覆盖」确认，同名时自动加序号
+            let local = unique_local_path(&dir, &name);
+            let dst_name = local
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| name.clone());
+            let client = ctx.rc.client().await;
+            let fs = local_fs(local.parent().unwrap_or(Path::new(".")));
+            let res = client
+                .copyfile(
+                    &format!("{remote}:"),
+                    &join_path(&path, &name),
+                    &fs,
+                    &dst_name,
+                )
+                .await;
+            match res {
+                Ok(_) => toast(ui, 1, format!("已下载到 {}", local.display())),
+                Err(e) => toast(ui, 2, format!("下载失败: {e}")),
+            }
+            false
+        }
+        Cmd::FilesMoveList { path, seq } => {
+            let (remote, _) = ui_files_pos(ui).await;
+            if remote.is_empty() {
+                return false;
+            }
+            let client = ctx.rc.client().await;
+            let fs = format!("{remote}:");
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                client.list(&fs, &path, None),
+            )
+            .await
+            .map_err(|_| anyhow!("请求超时"))
+            .and_then(|r| r.map_err(anyhow::Error::from));
+            let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_move_seq())
+                .await
+                .unwrap_or(-2);
+            if seq >= 0 && cur_seq != seq {
+                let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_move_busy(false));
+                return false;
+            }
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                let g = ui.global::<FilesG>();
+                g.set_move_busy(false);
+                match res {
+                    Ok(entries) => {
+                        let mut dirs: Vec<MoveDir> = entries
+                            .iter()
+                            .filter(|e| e.is_dir)
+                            .map(|e| MoveDir {
+                                name: e.name.clone().into(),
+                            })
+                            .collect();
+                        dirs.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+                        g.set_move_dirs(ModelRc::from(Rc::new(VecModel::from(dirs))));
+                        g.set_move_path(path.clone().into());
+                    }
+                    Err(e) => toast_ui(&ui, 2, format!("读取目标目录失败: {e}")),
+                }
+            });
+            false
+        }
+        Cmd::FilesMove {
+            name,
+            is_dir,
+            dest,
+        } => {
+            let (remote, path) = ui_files_pos(ui).await;
+            if remote.is_empty() || name.is_empty() {
+                return false;
+            }
+            let src = join_path(&path, &name);
+            if dest == path {
+                toast(ui, 2, "目标就是当前目录，无需移动");
+                return false;
+            }
+            if is_dir && is_same_or_inside(&dest, &src) {
+                toast(ui, 2, "不能把文件夹移动到它自己或它的子目录里");
+                return false;
+            }
+            let client = ctx.rc.client().await;
+            let fs = format!("{remote}:");
+            // 目标目录已有同名项时拒绝，绝不悄悄覆盖用户数据
+            match client.list(&fs, &dest, None).await {
+                Ok(entries) => {
+                    if entries.iter().any(|e| e.name.eq_ignore_ascii_case(&name)) {
+                        toast(
+                            ui,
+                            2,
+                            format!(
+                                "目标目录已有同名{}，请先改名或换一个目录",
+                                if is_dir { "文件夹" } else { "文件" }
+                            ),
+                        );
+                        return false;
+                    }
+                }
+                Err(e) => {
+                    toast(ui, 2, format!("无法检查目标目录: {e}"));
+                    return false;
+                }
+            }
+            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(true));
+            let dst = join_path(&dest, &name);
+            let where_ = if dest.is_empty() {
+                "/".to_string()
+            } else {
+                dest.clone()
+            };
+            if is_dir {
+                // 目录移动可能很久（要遍历/搬大量文件）：放到后台任务，
+                // 否则命令队列会被占住，连「退出」都要等它结束。
+                let ctx2 = ctx.clone();
+                let ui2 = ui.clone();
+                let src_fs = format!("{remote}:{src}");
+                let dst_fs = format!("{remote}:{dst}");
+                // 用「独立线程 + current_thread runtime」而不是 tokio::spawn：
+                // 目录移动完成后要复用 `handle_cmd` 刷新列表，而它整体不是 Send。
+                std::thread::spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(_) => return,
+                    };
+                    rt.block_on(async move {
+                        let client = ctx2.rc.client().await;
+                        let res = client.sync_move(&src_fs, &dst_fs, true, true).await;
+                        let _ =
+                            ui2.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
+                        match res {
+                            Ok(_) => {
+                                let _ = Box::pin(handle_cmd(
+                                    &ctx2,
+                                    &ui2,
+                                    Cmd::FilesRefresh { seq: -1 },
+                                ))
+                                .await;
+                                toast(&ui2, 1, format!("已移动到 {where_}"));
+                            }
+                            Err(e) => toast(&ui2, 2, format!("移动失败: {e}")),
+                        }
+                    });
+                });
+                return false;
+            }
+            // 文件移动通常很快，直接等待，失败可立即提示
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                client.movefile(&fs, &src, &fs, &dst),
+            )
+            .await
+            .map_err(|_| anyhow!("移动超时"))
+            .and_then(|r| r.map_err(anyhow::Error::from));
+            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
+            match res {
+                Ok(_) => {
+                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
+                    toast(ui, 1, format!("已移动到 {where_}"));
+                }
+                Err(e) => toast(ui, 2, format!("移动失败: {e}")),
             }
             false
         }
@@ -6084,6 +6315,101 @@ fn wire_callbacks(
             let _ = tx.send(Cmd::FilesCopyLink { name });
         }
     });
+    ui.on_files_crumb_nav({
+        let tx = tx.clone();
+        let ui = ui.as_weak();
+        move |path| {
+            let Some(ui) = ui.upgrade() else { return };
+            let g = ui.global::<FilesG>();
+            if g.get_loading() {
+                return;
+            }
+            g.set_loading(true);
+            g.set_seq(g.get_seq() + 1);
+            let _ = tx.send(Cmd::FilesJump {
+                path: path.to_string(),
+                seq: g.get_seq(),
+            });
+        }
+    });
+    ui.on_files_download({
+        let tx = tx.clone();
+        let ui = ui.as_weak();
+        move |i| {
+            let name = ui
+                .upgrade()
+                .and_then(|ui| ui.global::<FilesG>().get_entries().row_data(i as usize))
+                .map(|r| r.name.to_string());
+            let Some(name) = name else { return };
+            if let Some(dir) = rfd::FileDialog::new()
+                .set_title("选择下载目录")
+                .pick_folder()
+            {
+                let _ = tx.send(Cmd::FilesDownloadToDir { name, dir });
+            }
+        }
+    });
+    // 「移动到…」的浏览：进入子目录 / 上级 / 根目录共用一段逻辑
+    let move_go = {
+        let tx = tx.clone();
+        let ui = ui.as_weak();
+        move |path: String| {
+            let Some(ui) = ui.upgrade() else { return };
+            let g = ui.global::<FilesG>();
+            g.set_move_busy(true);
+            g.set_move_seq(g.get_move_seq() + 1);
+            let _ = tx.send(Cmd::FilesMoveList {
+                path,
+                seq: g.get_move_seq(),
+            });
+        }
+    };
+    ui.on_files_move_list({
+        let move_go = move_go.clone();
+        move |path| move_go(path.to_string())
+    });
+    ui.on_files_move_enter({
+        let move_go = move_go.clone();
+        let ui = ui.as_weak();
+        move |name| {
+            let path = ui
+                .upgrade()
+                .map(|ui| {
+                    let g = ui.global::<FilesG>();
+                    join_path(&g.get_move_path(), &name)
+                })
+                .unwrap_or_default();
+            move_go(path);
+        }
+    });
+    ui.on_files_move_up({
+        let move_go = move_go.clone();
+        let ui = ui.as_weak();
+        move || {
+            let path = ui
+                .upgrade()
+                .map(|ui| parent_path(&ui.global::<FilesG>().get_move_path()))
+                .unwrap_or_default();
+            move_go(path);
+        }
+    });
+    ui.on_files_move_root({
+        let move_go = move_go.clone();
+        move || move_go(String::new())
+    });
+    ui.on_files_move_confirm({
+        let tx = tx.clone();
+        let ui = ui.as_weak();
+        move || {
+            let Some(ui) = ui.upgrade() else { return };
+            let g = ui.global::<FilesG>();
+            let _ = tx.send(Cmd::FilesMove {
+                name: g.get_move_name().to_string(),
+                is_dir: g.get_move_is_dir(),
+                dest: g.get_move_path().to_string(),
+            });
+        }
+    });
     ui.on_mounts_refresh({
         let tx = tx.clone();
         move || {
@@ -7360,5 +7686,87 @@ mod tests {
         use crate::http::normalize_rel_path;
         assert_eq!(normalize_rel_path(".."), "");
         assert_eq!(normalize_rel_path("../../"), "");
+    }
+
+    // ---------------- 文件页：面包屑 / 下载 / 移动 ----------------
+
+    /// 面包屑首项是远程名，逐级累积路径；只有最右一级标 current。
+    #[test]
+    fn file_crumbs_build_ancestor_chain() {
+        let c = file_crumbs("drive", "a/b");
+        assert_eq!(c.len(), 3);
+        assert_eq!(
+            (c[0].name.as_str(), c[0].path.as_str(), c[0].is_current),
+            ("drive", "", false)
+        );
+        assert_eq!(
+            (c[1].name.as_str(), c[1].path.as_str(), c[1].is_current),
+            ("a", "a", false)
+        );
+        assert_eq!(
+            (c[2].name.as_str(), c[2].path.as_str(), c[2].is_current),
+            ("b", "a/b", true)
+        );
+
+        // 根目录：只有远程一项，且就是当前项
+        let root = file_crumbs("drive", "");
+        assert_eq!(root.len(), 1);
+        assert!(root[0].is_current);
+        assert_eq!(root[0].path.as_str(), "");
+
+        // 多余斜杠不会产生空的一级
+        assert_eq!(file_crumbs("drive", "/a//b/").len(), 3);
+        // 没有远程时返回空（界面显示空路径框）
+        assert!(file_crumbs("", "a").is_empty());
+    }
+
+    #[test]
+    fn parent_path_handles_root_and_nested() {
+        assert_eq!(parent_path("a/b/c"), "a/b");
+        assert_eq!(parent_path("a"), "");
+        assert_eq!(parent_path(""), "");
+    }
+
+    /// 文件夹不能移动到它自己或它的子目录里。
+    #[test]
+    fn move_target_cannot_be_inside_source() {
+        assert!(is_same_or_inside("a", "a"));
+        assert!(is_same_or_inside("a/b", "a"));
+        assert!(is_same_or_inside("a/b/c", "a"));
+        assert!(!is_same_or_inside("ab", "a"), "前缀相同但不是子目录");
+        assert!(!is_same_or_inside("a", "a/b"));
+        assert!(!is_same_or_inside("", "a"));
+    }
+
+    /// 下载到目录时同名文件自动加序号，绝不覆盖。
+    #[test]
+    fn unique_local_path_avoids_overwrite() {
+        let dir = std::env::temp_dir().join(format!("rcgui-dl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = unique_local_path(&dir, "a.txt");
+        assert_eq!(first.file_name().unwrap().to_string_lossy(), "a.txt");
+        std::fs::write(&first, b"x").unwrap();
+
+        let second = unique_local_path(&dir, "a.txt");
+        assert_eq!(second.file_name().unwrap().to_string_lossy(), "a (1).txt");
+        std::fs::write(&second, b"y").unwrap();
+
+        let third = unique_local_path(&dir, "a.txt");
+        assert_eq!(third.file_name().unwrap().to_string_lossy(), "a (2).txt");
+
+        // 无扩展名同样处理
+        let noext = unique_local_path(&dir, "README");
+        std::fs::write(&noext, b"z").unwrap();
+        assert_eq!(
+            unique_local_path(&dir, "README")
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            "README (1)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
