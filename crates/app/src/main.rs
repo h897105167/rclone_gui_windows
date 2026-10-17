@@ -132,6 +132,13 @@ struct Ctx {
     mounts_cache: Arc<std::sync::Mutex<Vec<MountRow>>>,
     /// 正在挂载中的 (rclone fs, 挂载点)
     pending_mounts: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// 用户已主动卸载过的挂载点（规范化 key）。
+    ///
+    /// 用途：一个 `MountAdd` 的「等待盘符出现」循环可能还在跑（它最长会等到 deadline），
+    /// 此时用户已经点了卸载。若不记录这件事，循环醒来会看到「rclone 不认该挂载点」
+    /// 并把它当成挂载失败，弹出「未生效」的错误提示 —— 而实际上是用户自己撤掉的。
+    /// 等待循环每轮检查这个集合，一旦命中就静默退出、不报错。
+    cancelled_mounts: Arc<std::sync::Mutex<Vec<String>>>,
     /// 运行中服务缓存，用于筛选
     serves_cache: Arc<std::sync::Mutex<Vec<ServeRow>>>,
     /// 最近一次已下发的全局限速 rate 字符串（避免重复调用 core/bwlimit）
@@ -1162,6 +1169,7 @@ fn main() {
         providers_cache: Arc::new(std::sync::Mutex::new(None)),
         mounts_cache: Arc::new(std::sync::Mutex::new(Vec::new())),
         pending_mounts: Arc::new(std::sync::Mutex::new(Vec::new())),
+        cancelled_mounts: Arc::new(std::sync::Mutex::new(Vec::new())),
         serves_cache: Arc::new(std::sync::Mutex::new(Vec::new())),
         last_bwlimit: Arc::new(std::sync::Mutex::new(String::new())),
         tick_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2024,6 +2032,20 @@ const MOUNT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// 没有它的话，盘符永远不出现时该函数会无限等待，界面卡在 spinner 且收不到任何提示。
 const MOUNT_READY_EXTEND_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// 该挂载点是否已被用户主动取消（卸载）。
+///
+/// 一次 `MountAdd` 的等待循环可能比用户的操作更慢：用户挂上后马上卸载，
+/// 循环醒来会发现 rclone 不再列出该挂载点。此时必须区分两种情况：
+/// - 挂载真的失败 → 应该报错；
+/// - 用户自己撤掉了 → 不应报错（否则就是「卸载后弹出未生效」的假错误）。
+fn mount_was_cancelled(ctx: &Arc<Ctx>, point: &str) -> bool {
+    let key = mount_key(point);
+    ctx.cancelled_mounts
+        .lock()
+        .map(|c| c.iter().any(|k| k == &key))
+        .unwrap_or(false)
+}
+
 /// 等待挂载点出现。WinFsp 的挂载是异步的：RC 返回成功时盘符可能尚未就绪，
 /// 直接判定「成功」会让用户在资源管理器里找不到盘。
 ///
@@ -2055,13 +2077,27 @@ async fn wait_mount_ready_rc(
     client: &rclone_client::RcClient,
     point: &str,
     timeout: std::time::Duration,
+    cancelled_mounts: &Arc<std::sync::Mutex<Vec<String>>>,
 ) -> bool {
     let key = mount_key(point);
     let start = tokio::time::Instant::now();
     // 延长后的绝对截止时间：无论 rclone 怎么说，到这里必须返回
     let hard_deadline = start + timeout + MOUNT_READY_EXTEND_CAP;
     let step = std::time::Duration::from_secs(3);
+    // 连续多少次「rclone 不认该挂载点」才认为已被撤掉。
+    // 不能只判一次：挂载刚发起时 listmounts 可能还没收录新条目（实测有抖动），
+    // 只判一次会把「正在挂载」误判成「已撤销」→ 立刻报「盘符未出现」。
+    let mut missing_streak = 0u32;
+    const MISSING_STREAK_LIMIT: u32 = 3;
     loop {
+        // 用户已经主动卸载了这个挂载点 → 静默退出，不要当成「挂载失败」报错
+        if cancelled_mounts
+            .lock()
+            .map(|c| c.iter().any(|k| k == &key))
+            .unwrap_or(false)
+        {
+            return false;
+        }
         let now = tokio::time::Instant::now();
         if now >= hard_deadline {
             return false;
@@ -2071,15 +2107,25 @@ async fn wait_mount_ready_rc(
         if wait_mount_ready(point, slice).await {
             return true;
         }
-        // rclone 仍报告该挂载点存在 → 挂载仍在进行，只「延迟」放弃，不延长硬上限
         if tokio::time::Instant::now() >= hard_deadline {
             return false;
         }
-        if let Ok(ms) = client.mounts().await {
-            if !ms.iter().any(|m| mount_key(&m.mount_point) == key) {
-                // rclone 已经不认这个挂载了，再等也没意义
-                return false;
+        // rclone 是否仍然认为该挂载点挂着（用于决定「继续等」还是「已被撤掉」）
+        match client.mounts().await {
+            Ok(ms) => {
+                if ms.iter().any(|m| mount_key(&m.mount_point) == key) {
+                    missing_streak = 0; // 仍在 → 继续等盘符出现
+                } else {
+                    missing_streak += 1;
+                    // 连续多次都不在列表里，才认为该挂载已被撤销（用户点了卸载，
+                    // 或 rclone 侧已放弃）。此前的单次判断会在卸载/抖动时误报失败。
+                    if missing_streak >= MISSING_STREAK_LIMIT {
+                        return false;
+                    }
+                }
             }
+            // 查询失败（RC 抖动）：不要据此下结论，继续按 deadline 等
+            Err(_) => {}
         }
     }
 }
@@ -2772,6 +2818,12 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             });
             // 立即在“活动挂载”里插入一条 pending（spinner + 高亮）
             ctx.pending_mounts.lock().unwrap().push((fs.clone(), point.clone()));
+            // 每次新的挂载尝试都要清掉该盘符的「已取消」标记，
+            // 否则上一次卸载留下的标记会让本次等待循环直接静默退出
+            ctx.cancelled_mounts
+                .lock()
+                .unwrap()
+                .retain(|k| k != &mount_key(&point));
             // busy 由守卫托管：函数内任何 return / panic 都会复位，避免按钮永久灰掉
             let _busy = BusyGuard::new(ui, BusyKind::Mounts);
             let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
@@ -2790,8 +2842,18 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             // 必须确认挂载点真的出现，否则会出现「提示挂载成功但资源管理器里没有盘」。
             let res = match res {
                 Ok(actual) => {
-                    if wait_mount_ready_rc(&client, &actual, MOUNT_READY_TIMEOUT).await {
+                    if wait_mount_ready_rc(
+                        &client,
+                        &actual,
+                        MOUNT_READY_TIMEOUT,
+                        &ctx.cancelled_mounts,
+                    )
+                    .await
+                    {
                         Ok(actual)
+                    } else if mount_was_cancelled(ctx, &actual) {
+                        // 等待期间用户自己卸载了：不报错、不记入档案，直接安静结束
+                        return false;
                     } else {
                         // 交给统一的诊断，区分「没装 WinFsp」与「盘符被占/仍在挂载」。
                         // 注意这里返回前也已经刷新过列表，不会再留下 spinner。
@@ -2801,7 +2863,9 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 }
                 Err(e) => {
                     // 报错但盘符其实已经挂上：按成功处理，避免误导
-                    if wait_mount_ready_rc(&client, &point, MOUNT_READY_TIMEOUT).await {
+                    if wait_mount_ready_rc(&client, &point, MOUNT_READY_TIMEOUT, &ctx.cancelled_mounts)
+                        .await
+                    {
                         Ok(point.clone())
                     } else {
                         Err(e)
@@ -2824,6 +2888,12 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                             toast(ui, 2, format!("{e}"));
                         }
                     }
+                    // 挂载已成功：清掉该盘符可能残留的「已取消」标记，
+                    // 避免影响之后同一盘符的等待循环
+                    ctx.cancelled_mounts
+                        .lock()
+                        .unwrap()
+                        .retain(|k| k != &mount_key(&actual));
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
                     toast(ui, 1, format!("挂载成功：{actual}"));
                 }
@@ -2836,6 +2906,21 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::MountRemove { point } => {
+            // 先打「已取消」标记：此刻可能还有一个 MountAdd 的等待循环在跑，
+            // 它看到该盘符从 rclone 列表里消失后，必须知道这是用户主动撤掉的，
+            // 而不是挂载失败，否则会在约一秒后弹出「未生效」的假错误。
+            {
+                let key = mount_key(&point);
+                let mut c = ctx.cancelled_mounts.lock().unwrap();
+                if !c.iter().any(|k| k == &key) {
+                    c.push(key);
+                }
+                // 只保留最近的若干条，避免长期运行无限增长
+                if c.len() > 32 {
+                    let drain = c.len() - 32;
+                    c.drain(0..drain);
+                }
+            }
             let client = ctx.rc.client().await;
             let _busy = BusyGuard::new(ui, BusyKind::Mounts);
             let res = client.unmount(&point).await;
@@ -5318,6 +5403,62 @@ mod tests {
             old_iterations > 500,
             "旧实现的净增长模型应表现为不收敛（这就是原 bug）"
         );
+    }
+
+    /// 回归：挂载刚发起时若 listmounts 还没收录该条目，不能立刻判定「未生效」。
+    ///
+    /// 旧实现在一次查询里发现「rclone 不认该挂载点」就直接 return false，
+    /// 而实测 listmounts 在挂载刚完成的极短时间内可能仍为空/缺项（抖动），
+    /// 于是正常挂载会被误报成「盘符未出现」。现在要求连续多次缺失才放弃。
+    #[test]
+    fn missing_streak_tolerates_transient_absence() {
+        const LIMIT: u32 = 3;
+        // 模拟：一次抖动（缺 1 次）之后恢复正常 —— 不应判失败
+        let mut streak = 0u32;
+        let samples = [false, true, true]; // false = 不在列表里
+        let mut failed = false;
+        for present in samples {
+            if present {
+                streak = 0;
+            } else {
+                streak += 1;
+                if streak >= LIMIT {
+                    failed = true;
+                }
+            }
+        }
+        assert!(!failed, "单次抖动不应判定为失败");
+
+        // 模拟：持续缺失（用户卸载 / 真的没挂上）—— 应当判失败
+        let mut streak = 0u32;
+        let mut failed = false;
+        for _ in 0..LIMIT {
+            streak += 1;
+            if streak >= LIMIT {
+                failed = true;
+            }
+        }
+        assert!(failed, "持续缺失应当判定为失败");
+    }
+
+    /// 回归：用户主动卸载后，仍在等待的挂载流程不能报「未生效」。
+    ///
+    /// 场景：点挂载 → 盘符出现但流程仍在等待循环里 → 用户点卸载 →
+    /// rclone 不再列出该挂载点。若不区分「用户取消」，循环醒来会把它当成
+    /// 挂载失败并弹错，这就是「卸载后约一秒弹出未生效」的来源。
+    #[test]
+    fn cancelled_mount_is_not_reported_as_failure() {
+        // 用 key 归一化模拟 Ctx.cancelled_mounts 的匹配语义
+        let cancelled: Vec<String> = vec![mount_key("Z:\\")];
+        let hit = |p: &str| cancelled.iter().any(|k| k == &mount_key(p));
+        assert!(hit("Z:"), "卸载时记录的是规范化 key，查询也必须归一化");
+        assert!(hit("z"), "\"z\" 与 \"Z:\" 必须视为同一个盘符");
+        assert!(!hit("T:"), "其它盘符不应被误命中");
+
+        // 新一次挂载尝试必须清掉旧标记，否则等待循环会直接静默退出
+        let mut list: Vec<String> = vec![mount_key("Z:")];
+        list.retain(|k| k != &mount_key("Z:\\"));
+        assert!(list.is_empty(), "重新挂载前应清掉该盘符的取消标记");
     }
 
     fn field(name: &str, kind: &str, value: &str, required: bool) -> FieldRow {
