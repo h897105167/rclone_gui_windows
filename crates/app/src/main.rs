@@ -597,6 +597,7 @@ fn file_crumbs(remote: &str, path: &str) -> Vec<CrumbRow> {
         name: remote.into(),
         path: "".into(),
         is_current: parts.is_empty(),
+        is_ellipsis: false,
     });
     let mut acc = String::new();
     for (i, part) in parts.iter().enumerate() {
@@ -608,9 +609,133 @@ fn file_crumbs(remote: &str, path: &str) -> Vec<CrumbRow> {
             name: (*part).into(),
             path: acc.clone().into(),
             is_current: i + 1 == parts.len(),
+            is_ellipsis: false,
         });
     }
     out
+}
+
+/// 估算一段文字在 13px 字号下的宽度（像素）。
+///
+/// Slint 的 `preferred-width` 只能在 .slint 里读，Rust 侧没有字体度量接口；
+/// 这里按字符类别估算：ASCII/拉丁约 7.2px，CJK/全角约 13.2px，空格 3.6px。
+/// 结果只用来决定「折叠几个祖先」，宁可估宽一点（多折一个）也不要溢出。
+fn crumb_text_width(s: &str) -> f32 {
+    s.chars()
+        .map(|c| {
+            if c == ' ' {
+                3.6
+            } else if (c as u32) < 0x2E80 {
+                7.2
+            } else {
+                13.2
+            }
+        })
+        .sum()
+}
+
+/// 一级面包屑占用的宽度（左右各 4px 内边距 + 文字）。
+fn crumb_row_width(c: &CrumbRow) -> f32 {
+    8.0 + crumb_text_width(c.name.as_str())
+}
+
+/// 按可用宽度折叠祖先，返回 `(显示的项, 被折叠的项)`。
+///
+/// 规则（像资源管理器）：
+/// 1. 全部放得下 → 原样显示；
+/// 2. 放不下 → 保留远程根 + 「…」 + 从右边能放下的目录（当前目录必留）；
+/// 3. 连「根 + … + 当前」都放不下 → 去掉根，只保留「…」+ 后缀；
+/// 4. 连「…」都放不下 → 只显示当前目录。
+fn fit_crumbs(all: &[CrumbRow], avail: f32) -> (Vec<CrumbRow>, Vec<CrumbRow>) {
+    if all.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    // 路径框左右各 10px 内边距，再留 4px 给估算误差
+    let budget = (avail - 24.0).max(40.0);
+    let total: f32 = all.iter().map(crumb_row_width).sum::<f32>()
+        + (all.len().saturating_sub(1) as f32) * 9.0;
+    if total <= budget {
+        return (all.to_vec(), Vec::new());
+    }
+
+    let ell = CrumbRow {
+        name: "…".into(),
+        path: "".into(),
+        is_current: false,
+        is_ellipsis: true,
+    };
+    let last = all.len() - 1;
+    let ell_w = crumb_row_width(&ell) + 9.0;
+    let root_w = crumb_row_width(&all[0]) + 9.0;
+    let last_w = crumb_row_width(&all[last]);
+
+    // 连「…」+ 当前都放不下：只显示当前目录
+    if ell_w + last_w > budget {
+        return (vec![all[last].clone()], all[..last].to_vec());
+    }
+
+    let mut suffix_start = last;
+    let mut suffix_w = last_w;
+    let keep_root = root_w + ell_w + last_w <= budget;
+    if keep_root {
+        while suffix_start > 1 {
+            let w = crumb_row_width(&all[suffix_start - 1]) + 9.0;
+            if root_w + ell_w + suffix_w + w > budget {
+                break;
+            }
+            suffix_start -= 1;
+            suffix_w += w;
+        }
+    } else {
+        while suffix_start > 0 {
+            let w = crumb_row_width(&all[suffix_start - 1]) + 9.0;
+            if ell_w + suffix_w + w > budget {
+                break;
+            }
+            suffix_start -= 1;
+            suffix_w += w;
+        }
+    }
+
+    let hidden = if keep_root {
+        all[1..suffix_start].to_vec()
+    } else {
+        all[..suffix_start].to_vec()
+    };
+    let mut shown = Vec::new();
+    if keep_root {
+        shown.push(all[0].clone());
+    }
+    if !hidden.is_empty() {
+        shown.push(ell);
+    }
+    shown.extend_from_slice(&all[suffix_start..]);
+    (shown, hidden)
+}
+
+fn crumb_model(rows: Vec<CrumbRow>) -> ModelRc<CrumbRow> {
+    ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
+fn collect_crumbs(model: &ModelRc<CrumbRow>) -> Vec<CrumbRow> {
+    (0..model.row_count())
+        .filter_map(|i| model.row_data(i))
+        .collect()
+}
+
+/// 把完整面包屑链按当前路径框宽度折叠后写回 UI（内容没变就不重设，避免布局抖动）。
+fn apply_crumbs(ui: &MainWindow, all: Vec<CrumbRow>) {
+    let g = ui.global::<FilesG>();
+    let (shown, hidden) = fit_crumbs(&all, g.get_path_box_width());
+    if collect_crumbs(&g.get_crumb_all()) != all {
+        g.set_crumb_all(crumb_model(all));
+    }
+    if collect_crumbs(&g.get_crumbs()) != shown {
+        g.set_crumbs(crumb_model(shown));
+    }
+    if collect_crumbs(&g.get_crumb_hidden()) != hidden {
+        g.set_crumb_hidden(crumb_model(hidden));
+    }
 }
 
 /// 把 `operations/list` 的结果转成表格行（目录在前，同类按名字排序）。
@@ -3270,9 +3395,7 @@ async fn files_navigate(
             Ok(entries) => {
                 // 成功后才更新路径，避免网络慢时拼出不存在的路径
                 g.set_path(target.clone().into());
-                g.set_crumbs(ModelRc::from(Rc::new(VecModel::from(file_crumbs(
-                    &remote, &target,
-                )))));
+                apply_crumbs(&ui, file_crumbs(&remote, &target));
                 g.set_entries(ModelRc::from(Rc::new(VecModel::from(file_rows(&entries)))));
             }
             Err(e) => {
@@ -3386,9 +3509,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                         }
                     }
                     // 切换远程时 Slint 会把 path 清空，这里按当前值重建面包屑
-                    g.set_crumbs(ModelRc::from(Rc::new(VecModel::from(file_crumbs(
-                        &remote, &path,
-                    )))));
+                    apply_crumbs(&ui, file_crumbs(&remote, &path));
                     g.set_sel(-1);
                     g.set_loading(false);
                 },
@@ -6332,6 +6453,16 @@ fn wire_callbacks(
             });
         }
     });
+    ui.on_files_crumb_refit({
+        let ui = ui.as_weak();
+        move |w| {
+            let Some(ui) = ui.upgrade() else { return };
+            let g = ui.global::<FilesG>();
+            g.set_path_box_width(w);
+            let all = collect_crumbs(&g.get_crumb_all());
+            apply_crumbs(&ui, all);
+        }
+    });
     ui.on_files_download({
         let tx = tx.clone();
         let ui = ui.as_weak();
@@ -7718,6 +7849,76 @@ mod tests {
         assert_eq!(file_crumbs("drive", "/a//b/").len(), 3);
         // 没有远程时返回空（界面显示空路径框）
         assert!(file_crumbs("", "a").is_empty());
+    }
+
+    /// 宽度足够时全部显示，不做折叠。
+    #[test]
+    fn fit_crumbs_shows_all_when_wide() {
+        let all = file_crumbs("drive", "a/b/c");
+        let (shown, hidden) = fit_crumbs(&all, 2000.0);
+        assert_eq!(shown.len(), all.len());
+        assert!(hidden.is_empty());
+        assert!(shown.iter().all(|c| !c.is_ellipsis));
+    }
+
+    /// 宽度不足：保留「远程根 + … + 当前」，中间祖先进隐藏列表。
+    #[test]
+    fn fit_crumbs_keeps_root_ellipsis_and_current() {
+        let all = file_crumbs("drive", "a/b/c");
+        let last = all.len() - 1;
+        let ell = CrumbRow {
+            name: "…".into(),
+            path: "".into(),
+            is_current: false,
+            is_ellipsis: true,
+        };
+        let avail = crumb_row_width(&all[0])
+            + 9.0
+            + crumb_row_width(&ell)
+            + 9.0
+            + crumb_row_width(&all[last])
+            + 24.0
+            + 1.0;
+        let (shown, hidden) = fit_crumbs(&all, avail);
+        assert_eq!(shown.len(), 3, "应为 根 + … + 当前");
+        assert_eq!(shown[0].name.as_str(), "drive");
+        assert!(shown[1].is_ellipsis);
+        assert_eq!(shown[2].name.as_str(), "c");
+        assert_eq!(hidden.len(), 2, "a、b 应被折叠");
+        assert_eq!(hidden[0].name.as_str(), "a");
+        assert_eq!(hidden[1].name.as_str(), "b");
+    }
+
+    /// 极窄时当前目录也必须在；连省略号都放不下就只显示当前。
+    #[test]
+    fn fit_crumbs_never_hides_current() {
+        let all = file_crumbs("drive", "a/b/c");
+        let (shown, hidden) = fit_crumbs(&all, 60.0);
+        assert_eq!(
+            shown.last().map(|c| c.name.to_string()),
+            Some("c".to_string()),
+            "当前目录必须留在最右"
+        );
+        assert!(shown.len() <= 2, "极窄时只保留省略号 + 当前");
+        assert!(!hidden.is_empty());
+
+        let (shown, _) = fit_crumbs(&all, 0.0);
+        assert_eq!(
+            shown.last().map(|c| c.name.to_string()),
+            Some("c".to_string()),
+            "零宽度时也必须保留当前目录"
+        );
+        assert!(shown.len() <= 2, "零宽度时最多只剩「… + 当前」");
+    }
+
+    /// 只有远程根一级时，无论多窄都显示它。
+    #[test]
+    fn fit_crumbs_single_crumb_is_kept() {
+        let all = file_crumbs("drive", "");
+        let (shown, hidden) = fit_crumbs(&all, 10.0);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].name.as_str(), "drive");
+        assert!(hidden.is_empty());
     }
 
     #[test]
