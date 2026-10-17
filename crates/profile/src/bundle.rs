@@ -110,6 +110,11 @@ impl RcguiConf {
     ///
     /// 剥离后再扫一遍剩余键（对应 rclone 关于「config redacted 结果应再次检查」的提醒）：
     /// 万一某个后端把凭据放在没被标记的字段里，关键词规则仍会命中。
+    ///
+    /// 代理凭据同样纳入本策略（`profile.proxies[].user/pass`）：
+    /// 实测 rclone 把代理密码以**百分号编码的明文**写进 `rclone.conf`，
+    /// 连 obscure 都不是，所以默认导出必须剥离，且剥离后要在档案里标出来，
+    /// 让导入方知道「这条代理配置需要重新填凭据」。
     pub fn apply_secret_policy(
         &mut self,
         include_secrets: bool,
@@ -133,12 +138,30 @@ impl RcguiConf {
                 stripped_any += 1;
             }
         }
-        self.sensitive = include_secrets && self.remotes.iter().any(|r| !r.params.is_empty());
+        // ---- 代理凭据 ----
+        let mut stripped_proxies = 0usize;
+        for p in &mut self.profile.proxies {
+            if include_secrets {
+                continue;
+            }
+            if !p.user.is_empty() || !p.pass.is_empty() {
+                stripped_proxies += 1;
+            }
+            p.user = String::new();
+            p.pass = String::new();
+        }
+        self.sensitive = include_secrets
+            && (self.remotes.iter().any(|r| !r.params.is_empty())
+                || self
+                    .profile
+                    .proxies
+                    .iter()
+                    .any(|p| !p.user.is_empty() || !p.pass.is_empty()));
         self.warnings.retain(|w| !w.contains("已排除"));
         if include_secrets && self.sensitive {
             self.warnings.push(
-                "该文件包含远程凭据（OAuth token / 密码）。rclone 的 obscure 只是可逆混淆、\
-                 并非加密，请存放在受控位置"
+                "该文件包含远程凭据（OAuth token / 密码）与代理账号。rclone 的 obscure 只是可逆混淆、\
+                 并非加密；代理密码更是以明文（百分号编码）保存，请存放在受控位置"
                     .to_string(),
             );
         }
@@ -146,6 +169,11 @@ impl RcguiConf {
             self.warnings.push(format!(
                 "已排除 {stripped_any} 个远程的凭据字段；这些远程在导入后标记为「凭据未随包导出」（可能需要重新认证）\
                  （表示凭据未随包导出，不代表其认证状态已被验证）"
+            ));
+        }
+        if stripped_proxies > 0 {
+            self.warnings.push(format!(
+                "已排除 {stripped_proxies} 条代理配置的账号密码；导入后需要重新填写才能连接代理"
             ));
         }
     }
@@ -683,5 +711,92 @@ mod secret_policy_tests {
         c.apply_secret_policy(false, None);
         assert_eq!(c.remotes[0].params.len(), 1, "无元数据时关键词规则仍须剥离 token");
         assert!(c.remotes[0].needs_auth);
+    }
+
+    fn proxy_with_creds() -> crate::ProxyProfile {
+        crate::ProxyProfile {
+            id: "p1".into(),
+            name: "公司代理".into(),
+            protocol: crate::ProxyProtocol::Http,
+            host: "10.0.0.1".into(),
+            port: 8080,
+            user: "alice".into(),
+            pass: "hunter2".into(),
+        }
+    }
+
+    /// 代理密码是**明文**（实测 rclone 连 obscure 都不做），默认导出必须剥离。
+    #[test]
+    fn default_export_strips_proxy_credentials() {
+        let mut c = RcguiConf::default();
+        c.profile.proxies.push(proxy_with_creds());
+        c.apply_secret_policy(false, None);
+        let p = &c.profile.proxies[0];
+        assert_eq!(p.user, "", "代理用户名必须被剥离");
+        assert_eq!(p.pass, "", "代理密码必须被剥离");
+        // 其余字段要保留，否则导入后用户还要重填地址
+        assert_eq!(p.host, "10.0.0.1");
+        assert_eq!(p.port, 8080);
+        assert_eq!(p.name, "公司代理");
+        assert!(c
+            .warnings
+            .iter()
+            .any(|w| w.contains("代理配置的账号密码")));
+        // 没勾「包含凭据」时不应把文件标成敏感
+        assert!(!c.sensitive);
+    }
+
+    #[test]
+    fn opt_in_keeps_proxy_credentials_and_flags_sensitive() {
+        let mut c = RcguiConf::default();
+        c.profile.proxies.push(proxy_with_creds());
+        c.apply_secret_policy(true, None);
+        assert_eq!(c.profile.proxies[0].pass, "hunter2");
+        assert!(c.sensitive, "含代理凭据的包必须标为敏感");
+        assert!(c.warnings.iter().any(|w| w.contains("并非加密")));
+        assert!(c.warnings.iter().any(|w| w.contains("代理密码更是以明文")));
+    }
+
+    /// 没有代理的包，行为必须与改动前完全一致（不能因为加了代理提示而多出 warning）。
+    #[test]
+    fn no_proxy_means_no_proxy_warnings() {
+        let mut c = RcguiConf::default();
+        c.remotes.push(remote("local", &[("nounc", "true")]));
+        c.apply_secret_policy(false, None);
+        assert!(!c
+            .warnings
+            .iter()
+            .any(|w| w.contains("代理配置的账号密码")));
+        assert!(!c.sensitive);
+    }
+
+    /// 代理密码为空、只有用户名时也算凭据，同样要剥离。
+    #[test]
+    fn proxy_with_username_only_is_still_stripped() {
+        let mut c = RcguiConf::default();
+        let mut p = proxy_with_creds();
+        p.pass = String::new();
+        c.profile.proxies.push(p);
+        c.apply_secret_policy(false, None);
+        assert_eq!(c.profile.proxies[0].user, "");
+        assert!(c
+            .warnings
+            .iter()
+            .any(|w| w.contains("代理配置的账号密码")));
+    }
+
+    /// 代理凭据剥离必须幂等（重复调用不会叠加 warning 或误伤）。
+    #[test]
+    fn proxy_strip_is_idempotent() {
+        let mut c = RcguiConf::default();
+        c.profile.proxies.push(proxy_with_creds());
+        c.apply_secret_policy(false, None);
+        c.apply_secret_policy(false, None);
+        let warned = c
+            .warnings
+            .iter()
+            .filter(|w| w.contains("代理配置的账号密码"))
+            .count();
+        assert_eq!(warned, 0, "第二次调用时已无凭据可剥离，不应再报警告");
     }
 }

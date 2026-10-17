@@ -204,6 +204,38 @@ impl RcClient {
             .map(drop)
     }
 
+    /// 读取单个 remote 的全部键值。
+    ///
+    /// **代理功能必须用这个而不是 `config/dump`**：`dump` 会返回所有远程的
+    /// OAuth token 与密码，为了读一个 `override.http_proxy` 而拉全量凭据没有必要，
+    /// 也容易在日志/错误里泄露。
+    pub async fn config_get(&self, name: &str) -> RcResult<serde_json::Map<String, Value>> {
+        let v = self.call("config/get", &json!({ "name": name })).await?;
+        Ok(v.as_object().cloned().unwrap_or_default())
+    }
+
+    /// 删除 remote 上的若干键。返回**实际被删除**的键名。
+    ///
+    /// rclone 的行为（v1.75.4 实测）：
+    /// - 键不存在时不报错，返回 `{"removed": null}`；
+    /// - 因此调用方不能靠「有没有报错」判断「原来是否存在」，要看返回的 `removed`。
+    pub async fn config_unset(&self, name: &str, keys: &[&str]) -> RcResult<Vec<String>> {
+        let v = self
+            .call(
+                "config/unset",
+                &json!({ "name": name, "keys": keys }),
+            )
+            .await?;
+        Ok(v.get("removed")
+            .and_then(|r| r.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     pub async fn config_delete(&self, name: &str) -> RcResult<()> {
         self.call("config/delete", &json!({ "name": name }))
             .await

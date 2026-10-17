@@ -36,6 +36,21 @@ pub fn store() -> Store {
     Store::new(profile_path())
 }
 
+/// 注册「写入遇到拒绝访问时」的自愈钩子。启动时调用一次。
+///
+/// 背景：程序曾以管理员身份运行过时，它创建的数据目录 ACL 里没有普通用户的
+/// 显式 ACE（只有 SYSTEM / Administrators / Local Account），此后非提升进程
+/// 写入必定报 `拒绝访问 (os error 5)`。用户看到的现象是「配置明明没问题却存不进去」。
+///
+/// 这里把 `config::repair_data_dir_permissions` 交给 profile crate，
+/// 让它发现权限错误时能请求修复并自动重试。
+pub fn install_permission_healer() {
+    rcgui_profile::Store::set_permission_healer(|| {
+        crate::config::repair_data_dir_permissions()
+            .map_err(rcgui_profile::StoreError::Io)
+    });
+}
+
 /// 一次性提示（迁移完成 / 档案版本过新等），由 UI 启动后取走并 toast。
 static NOTICES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -66,7 +81,8 @@ pub fn load_doc(legacy: &AppConfig) -> Option<ProfileDoc> {
             let empty = doc.mounts.is_empty()
                 && doc.serves.is_empty()
                 && doc.serve_names.is_empty()
-                && doc.connections.is_empty();
+                && doc.connections.is_empty()
+                && doc.proxies.is_empty();
             if !empty {
                 match s.save(&doc) {
                     Ok(()) => notice(format!(
@@ -90,6 +106,8 @@ pub fn apply_doc(doc: &ProfileDoc, cfg: &mut AppConfig) {
     cfg.auto_mounts = doc.mounts.iter().map(mount_to_auto).collect();
     cfg.auto_serves = doc.serves.iter().map(serve_to_auto).collect();
     cfg.serve_names = doc.serve_names.iter().map(name_to_auto).collect();
+    cfg.proxies = doc.proxies.clone();
+    cfg.proxy_bindings = doc.remote_proxies.clone();
 }
 
 /// 生成「当前档案文档」（导出用）：内存中的 cfg + 磁盘上已有的 meta/remotes。
@@ -114,6 +132,9 @@ pub fn replace_from_bundle(
     doc.mounts = conf.profile.mounts.clone();
     doc.serves = conf.profile.serves.clone();
     doc.serve_names = conf.profile.serve_names.clone();
+    // 代理配置与绑定：以导入文件为准（导出时凭据可能已被剥离，导入后需要重填）
+    doc.proxies = conf.profile.proxies.clone();
+    doc.remote_proxies = conf.profile.remote_proxies.clone();
     // 远程元信息以导入文件为准，但保留本地独有的条目：
     // 导入不应该让用户「已经连上的远程」从列表里消失。
     let mut notes = conf.profile.remotes.clone();
@@ -142,6 +163,8 @@ pub fn save_from_cfg(cfg: &AppConfig) -> Result<()> {
     doc.mounts = cfg.auto_mounts.iter().map(auto_to_mount).collect();
     doc.serves = cfg.auto_serves.iter().map(auto_to_serve).collect();
     doc.serve_names = cfg.serve_names.iter().map(auto_to_name).collect();
+    doc.proxies = cfg.proxies.clone();
+    doc.remote_proxies = cfg.proxy_bindings.clone();
     doc.connections = connections_from_cfg(cfg, &doc);
     if doc.active_connection.is_none() {
         doc.active_connection = doc.connections.first().map(|c| c.id.clone());
@@ -255,6 +278,8 @@ fn cfg_to_doc(cfg: &AppConfig, existing: Option<&ProfileDoc>) -> ProfileDoc {
         mounts: cfg.auto_mounts.iter().map(auto_to_mount).collect(),
         serves: cfg.auto_serves.iter().map(auto_to_serve).collect(),
         serve_names: cfg.serve_names.iter().map(auto_to_name).collect(),
+        proxies: cfg.proxies.clone(),
+        remote_proxies: cfg.proxy_bindings.clone(),
         ..base
     };
     doc.connections = connections_from_cfg(cfg, &doc);

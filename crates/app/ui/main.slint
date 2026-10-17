@@ -68,6 +68,26 @@ export struct RemoteRow {
     name: string,
     rtype: string,
     usage: string,
+    /// 「代理」列显示的文本：「不代理」或代理目标（不含凭据）；悬空引用显示「配置已删除」
+    proxy-label: string,
+    /// 已保存绑定但尚未下发到 rclone（未连接 / 下发失败）
+    proxy-pending: bool,
+    /// 引用的代理配置已被删除，需要用户重新选择
+    proxy-conflict: bool,
+    /// 当前绑定的下拉框索引：0 = 不代理，n = proxy-options 的第 n 项
+    proxy-index: int,
+}
+/// 代理配置卡片里的一行（**不含密码**）
+export struct ProxyRow {
+    id: string,
+    name: string,
+    protocol: string,
+    /// 形如 http://host:port，永远不含账号密码
+    target: string,
+    /// 「有凭据」/「无」
+    auth: string,
+    /// 正在使用它的远程名，逗号分隔；无则为「—」
+    used-by: string,
 }
 export struct FieldRow {
     name: string,
@@ -101,19 +121,40 @@ export struct TaskRow {
     speed: string,
     done: bool,
 }
+/// 一条历史消息（toast 的留档）。
+export struct LogRow {
+    /// "0" 信息 / "1" 成功 / "2" 错误（用来选颜色）
+    kind: string,
+    /// HH:MM:SS
+    time: string,
+    msg: string,
+}
 
 // ---------------- 全局状态 ----------------
 
 export global NavG {
     in-out property <int> idx: 0;
-    // 启动预热进行中（侧边栏"远程"图标显示 spinner，不遮挡输入）
+    // 启动预热进行中（连接握手 + 首次拉取远程/挂载/服务）
     in-out property <bool> starting: false;
+    // 侧边栏「远程」图标是否显示 spinner：
+    // 启动预热或远程页正在做任何异步操作（刷新、应用导入、下发代理）时为 true。
+    // 这样用户在任何耗时操作时都能看到反馈，而不是只在程序启动时。
+    out property <bool> remotes-busy: starting || RemotesG.loading;
 }
 
 export global ToastG {
     in-out property <bool> show: false;
     in-out property <string> msg: "";
     in-out property <int> kind: 0; // 0 info 1 ok 2 err
+    /// 历史消息（最新在前）。所有 toast 都会追加到这里，
+    /// 让用户能在「仪表盘 → 历史记录」里回看刚刚发生过什么
+    /// （toast 只显示 2.6 秒，很容易错过）。
+    in-out property <[LogRow]> history: [];
+    /// 历史里是否包含错误（用于把标题染红，提醒有失败项）。
+    /// 用 in-out 而不是 out：out 属性没有 setter，Rust 侧改不了。
+    in-out property <bool> has-errors: false;
+    /// 底部「错误」按钮弹出的错误面板是否可见。
+    in-out property <bool> error-panel: false;
 }
 
 // 远程路径浏览弹窗
@@ -196,6 +237,8 @@ export global PluginsG {
 export global RemotesG {
     in-out property <[RemoteRow]> rows: [];
     in-out property <string> filter: "";
+    /// 远程列表正在执行异步操作（刷新 / 应用导入 / 下发代理）。
+    /// 驱动远程页与侧边栏「远程」图标的 spinner。
     in-out property <bool> loading: false;
     // 编辑器
     in-out property <bool> show-editor: false;
@@ -209,6 +252,27 @@ export global RemotesG {
     in-out property <string> provider-desc: "";
     in-out property <bool> show-advanced: false;
     in-out property <bool> show-raw: false;  // 显示原始 key=value 编辑器
+    // ---------------- 代理配置 ----------------
+    /// 第 0 项固定是「不代理」，之后是已保存的配置
+    in-out property <[string]> proxy-options: ["不代理"];
+    /// 与 proxy-options 一一对应的说明（悬停提示）
+    in-out property <[string]> proxy-option-hints: [];
+    in-out property <[ProxyRow]> proxy-rows: [];
+    in-out property <bool> proxy-show-editor: false;
+    in-out property <bool> proxy-edit-is-new: true;
+    in-out property <string> proxy-edit-id: "";
+    in-out property <string> proxy-edit-name: "";
+    in-out property <[string]> proxy-protocols: ["HTTP", "HTTPS", "SOCKS5", "SOCKS5H"];
+    in-out property <int> proxy-edit-proto: 0;
+    in-out property <string> proxy-edit-host: "";
+    in-out property <string> proxy-edit-port: "8080";
+    in-out property <string> proxy-edit-user: "";
+    in-out property <string> proxy-edit-pass: "";
+    /// 删除确认：会影响哪些远程
+    in-out property <string> proxy-del-id: "";
+    in-out property <string> proxy-del-name: "";
+    in-out property <string> proxy-del-affected: "";
+    in-out property <bool> proxy-del-show: false;
 }
 
 export global ServesG {
@@ -462,7 +526,15 @@ component ConfirmPop inherits PopupWindow {
     callback confirmed;
     callback cancelled;
     close-policy: PopupClosePolicy.close-on-click-outside;
-    // 不设置 width/height：弹出时自动取内容首选尺寸
+    // PopupWindow 必须显式给出宽高。
+    //
+    // 踩过的坑：只写 `card.width` 而完全不给高度时，弹出层的可用区域可能塌成
+    // 一条窄缝 —— 文字还能看见一部分（那是 card 溢出绘制的结果），
+    // 但按钮落在窗口之外，**鼠标移上去不会变手形、点了也没反应**，
+    // 看起来就像「被别的控件遮住了」。
+    // 这里给 card 一个明确高度，并让 PopupWindow 跟着 card 走。
+    width: 360px;
+    height: card.preferred-height;
     card := Rectangle {
         width: 320px;
         background: ThemeG.panel;
@@ -673,6 +745,77 @@ component DashboardView inherits Rectangle {
                             height: 20px;
                             Text { text: "RC 地址"; font-size: 12px; color: ThemeG.text-dim; width: 64px; vertical-alignment: center; }
                             Text { text: DashboardG.url; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
+                        }
+                    }
+                }
+            }
+            // 历史记录：把每一次 toast（成功/失败/提示）留档。
+            // toast 只显示 2.6 秒，操作失败时经常来不及看清；这里可回看、可清空。
+            Card {
+                title: "历史记录";
+                VerticalLayout {
+                    spacing: 8px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        height: 26px;
+                        Text {
+                            text: ToastG.history.length == 0
+                                ? "暂无记录"
+                                : "共 " + ToastG.history.length + " 条"
+                                  + (ToastG.has-errors ? " · 含错误" : "");
+                            font-size: 12px;
+                            color: ToastG.has-errors ? ThemeG.err : ThemeG.text-dim;
+                            vertical-alignment: center;
+                        }
+                        Rectangle {}
+                        // 右上角：清空。PillBtn 用自定义 disabled 属性（不是标准 enabled）
+                        PillBtn {
+                            label: "清空";
+                            compact: true;
+                            disabled: ToastG.history.length == 0;
+                            clicked => {
+                                ToastG.history = [];
+                                ToastG.has-errors = false;
+                            }
+                        }
+                    }
+                    Rectangle {
+                        height: 168px;
+                        border-radius: ThemeG.radius-s;
+                        background: ThemeG.panel-2;
+                        border-width: 1px;
+                        border-color: ThemeG.border;
+                        ScrollView {
+                            VerticalLayout {
+                                padding: 8px;
+                                spacing: 3px;
+                                for l in ToastG.history : HorizontalLayout {
+                                    spacing: 8px;
+                                    Text {
+                                        text: l.time;
+                                        font-size: 11px;
+                                        color: ThemeG.text-dim;
+                                        width: 60px;
+                                        vertical-alignment: top;
+                                    }
+                                    // 左侧色条：绿=成功 / 红=错误 / 灰=信息
+                                    Rectangle {
+                                        width: 3px;
+                                        background: l.kind == "2" ? ThemeG.err
+                                            : (l.kind == "1" ? ThemeG.ok : ThemeG.text-dim);
+                                        border-radius: 2px;
+                                    }
+                                    Text {
+                                        text: l.msg;
+                                        font-size: 12px;
+                                        color: l.kind == "2" ? ThemeG.err
+                                            : (l.kind == "1" ? ThemeG.ok : ThemeG.text);
+                                        horizontal-stretch: 1;
+                                        wrap: word-wrap;
+                                        vertical-alignment: top;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -912,12 +1055,28 @@ component RemotesView inherits Rectangle {
     callback editor-save;
     callback editor-cancel;
     callback type-changed;
+    // 代理
+    callback proxy-changed(string, int);
+    callback proxy-add();
+    callback proxy-edit(string);
+    callback proxy-save();
+    callback proxy-cancel();
+    callback proxy-del(string);
+    callback proxy-del-confirm(string);
+    callback proxy-refresh();
     // 删除确认弹窗所需的待操作状态
     property <int> del-idx: -1;
     property <string> del-name: "";
     property <length> pop-ax;
     property <length> pop-ay;
+    // 整页滚动（与 MountsView 一致）：
+    // 远程页内容会随「编辑器展开 / 代理表单展开 / 远程变多」持续变高，
+    // 一旦总高超出窗口，固定布局就会把靠下的卡片压扁甚至裁掉（面板底部看不见、
+    // 按钮被切掉、ScrollView 也拿不到可滚动的高度）。
+    // 让整页滚动后，每张卡片都按内容自然高度排版，滚一下就能看到全部。
+    ScrollView {
     VerticalLayout {
+        width: root.width;
         padding: 24px;
         spacing: 14px;
         // 工具条
@@ -931,6 +1090,21 @@ component RemotesView inherits Rectangle {
                 edited(t) => { root.filter-changed(t); }
             }
             PillBtn { label: "刷新"; clicked => { root.refresh(); } }
+            // 忙碌指示：任何异步操作（刷新 / 应用导入 / 下发代理）期间可见，
+            // 让用户知道「正在做什么」，而不是点完没反应。
+            if RemotesG.loading : HorizontalLayout {
+                spacing: 6px;
+                VerticalLayout {
+                    alignment: center;
+                    Spinner { width: 18px; height: 18px; running: true; }
+                }
+                Text {
+                    text: "处理中…";
+                    font-size: 12px;
+                    color: ThemeG.text-dim;
+                    vertical-alignment: center;
+                }
+            }
             Rectangle {}
             PillBtn { label: "＋ 新建远程"; primary: true; clicked => { root.add(); } }
         }
@@ -1076,11 +1250,13 @@ component RemotesView inherits Rectangle {
             }
         }
         // 列表
+        // 整页滚动下不能用 `fill: true` / `vertical-stretch: 1`（那是给固定布局
+        // 「撑满剩余空间」用的）：在 ScrollView 里它们会让高度计算变成循环依赖。
+        // 改为按行数估算固定高度，超出由页面滚动承载。
         Card {
             title: "远程存储（" + RemotesG.rows.length + "）";
             pad: 0px;
-            fill: true;
-            vertical-stretch: 1;
+            height: Math.max(160px, Math.min(420px, 72px + RemotesG.rows.length * 41px));
             VerticalLayout {
                 Rectangle {
                     height: 36px;
@@ -1092,8 +1268,9 @@ component RemotesView inherits Rectangle {
                             horizontal-stretch: 1;
                             Text { text: "名称"; width: 100%; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
                         }
-                        Text { text: "类型"; font-size: 12px; color: ThemeG.text-dim; width: 120px; vertical-alignment: center; }
-                        Text { text: "用量"; font-size: 12px; color: ThemeG.text-dim; width: 160px; vertical-alignment: center; }
+                        Text { text: "类型"; font-size: 12px; color: ThemeG.text-dim; width: 110px; vertical-alignment: center; }
+                        Text { text: "用量"; font-size: 12px; color: ThemeG.text-dim; width: 140px; vertical-alignment: center; }
+                        Text { text: "代理"; font-size: 12px; color: ThemeG.text-dim; width: 240px; vertical-alignment: center; }
                         Text { text: "操作"; font-size: 12px; color: ThemeG.text-dim; width: 150px; vertical-alignment: center; }
                     }
                 }
@@ -1144,8 +1321,55 @@ component RemotesView inherits Rectangle {
                                         }
                                     }
                                 }
-                                Text { text: r.rtype; font-size: 13px; color: ThemeG.text-dim; width: 120px; vertical-alignment: center; overflow: elide; }
-                                Text { text: r.usage; font-size: 12px; color: ThemeG.ok; width: 160px; vertical-alignment: center; overflow: elide; }
+                                Text { text: r.rtype; font-size: 13px; color: ThemeG.text-dim; width: 110px; vertical-alignment: center; overflow: elide; }
+                                Text { text: r.usage; font-size: 12px; color: ThemeG.ok; width: 140px; vertical-alignment: center; overflow: elide; }
+                                // 代理列：状态徽标 + 目标 + 下拉框
+                                // 「不代理」不等于强制直连，悬停说明写在下拉的 tooltip 里
+                                HorizontalLayout {
+                                    width: 240px;
+                                    spacing: 6px;
+                                    alignment: start;
+                                    if r.proxy-conflict : Rectangle {
+                                        height: 18px;
+                                        width: 52px;
+                                        border-radius: ThemeG.radius-s;
+                                        background: ThemeG.panel-2;
+                                        border-width: 1px;
+                                        border-color: ThemeG.warn;
+                                        Text {
+                                            text: "待修复";
+                                            font-size: 10px;
+                                            color: ThemeG.warn;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    if !r.proxy-conflict && r.proxy-pending : Rectangle {
+                                        height: 18px;
+                                        width: 52px;
+                                        border-radius: ThemeG.radius-s;
+                                        background: ThemeG.panel-2;
+                                        border-width: 1px;
+                                        border-color: ThemeG.border;
+                                        Text {
+                                            text: "待应用";
+                                            font-size: 10px;
+                                            color: ThemeG.text-dim;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        horizontal-stretch: 1;
+                                        ComboBox {
+                                            model: RemotesG.proxy-options;
+                                            // 索引由 Rust 侧算好（见 proxy-index），Slint 不做绑定解析
+                                            current-index: r.proxy-index;
+                                            selected(t) => { root.proxy-changed(r.name, self.current-index); }
+                                        }
+                                    }
+                                }
                                 HorizontalLayout {
                                     width: 150px;
                                     spacing: 6px;
@@ -1182,7 +1406,191 @@ component RemotesView inherits Rectangle {
                 }
             }
         }
-    }
+        // ---------------- 代理配置管理 ----------------
+        // 布局要点（踩过的坑）：
+        // - 不要设 `vertical-stretch: 0`，也不要给内部 ScrollView：
+        //   远程页已整体滚动，这张卡片按内容自然展开即可。
+        // - 之前给它限高 + 内部 ScrollView，结果卡片参与外层高度分配被压扁，
+        //   ScrollView 拿不到高度，底部按钮直接被裁掉、完全点不到。
+        Card {
+            title: "代理配置（" + RemotesG.proxy-rows.length + "）";
+            VerticalLayout {
+                spacing: 8px;
+                // 说明：必须写清三件事，否则用户会误判功能边界
+                Text {
+                    text: "按远程分配代理。「不代理」= 不设置 RCGUI 的远程级代理，rclone 仍可能继承系统的 HTTP_PROXY / HTTPS_PROXY 环境变量，不等于强制直连。代理只在远程建立连接时生效：正在运行的挂载/服务需要重新挂载或重启才会使用新代理。";
+                    font-size: 11px;
+                    color: ThemeG.text-dim;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 30px;
+                    PillBtn { label: "＋ 新建代理配置"; primary: true; clicked => { root.proxy-add(); } }
+                    PillBtn { label: "刷新"; clicked => { root.proxy-refresh(); } }
+                    Rectangle {}
+                }
+                // 编辑表单：分三行，避免控件在同一行争宽度。
+                //
+                // ⚠️ 关键约束：Fluent 的 `LineEdit` / `ComboBox` **自带 min-width: 160px**。
+                // 因此任何承载它们的列都至少要 160px 宽，否则控件会比分配到的空间更宽，
+                // 直接**溢出到卡片外面**（本次代理配置右侧超出就是这么来的）。
+                // 下面每个固定列都 >= 160px，弹性列给 min-width 兜底。
+                if RemotesG.proxy-show-editor : VerticalLayout {
+                    spacing: 12px;
+                    // 第 1 行：名称（弹性）+ 协议（固定 170px ≥ 160）
+                    HorizontalLayout {
+                        spacing: 12px;
+                        height: 54px;
+                        VerticalLayout {
+                            spacing: 4px;
+                            horizontal-stretch: 1;
+                            min-width: 180px;
+                            FieldLabel { text: "名称"; }
+                            LineEdit { text <=> RemotesG.proxy-edit-name; }
+                        }
+                        VerticalLayout {
+                            spacing: 4px;
+                            width: 170px;
+                            FieldLabel { text: "协议"; }
+                            ComboBox {
+                                model: RemotesG.proxy-protocols;
+                                current-index <=> RemotesG.proxy-edit-proto;
+                            }
+                        }
+                    }
+                    // 第 2 行：地址（弹性）+ 端口（固定 170px ≥ 160）
+                    HorizontalLayout {
+                        spacing: 12px;
+                        height: 54px;
+                        VerticalLayout {
+                            spacing: 4px;
+                            horizontal-stretch: 1;
+                            min-width: 220px;
+                            FieldLabel { text: "地址（主机名或 IP，IPv6 不要加方括号）"; }
+                            LineEdit { text <=> RemotesG.proxy-edit-host; placeholder-text: "127.0.0.1 或 proxy.corp.local"; }
+                        }
+                        VerticalLayout {
+                            spacing: 4px;
+                            width: 170px;
+                            FieldLabel { text: "端口"; }
+                            LineEdit { text <=> RemotesG.proxy-edit-port; input-type: InputType.number; }
+                        }
+                    }
+                    // 第 3 行：用户名 + 密码（各占一半）
+                    HorizontalLayout {
+                        spacing: 12px;
+                        height: 54px;
+                        VerticalLayout {
+                            spacing: 4px;
+                            horizontal-stretch: 1;
+                            min-width: 170px;
+                            FieldLabel { text: "用户名（可选）"; }
+                            LineEdit { text <=> RemotesG.proxy-edit-user; }
+                        }
+                        VerticalLayout {
+                            spacing: 4px;
+                            horizontal-stretch: 1;
+                            min-width: 170px;
+                            FieldLabel { text: "密码（可选）"; }
+                            LineEdit { text <=> RemotesG.proxy-edit-pass; input-type: InputType.password; }
+                        }
+                    }
+                    Text {
+                        text: "凭据会以明文（百分号编码）写入 rclone.conf，不是加密；导出 rcgui.conf 时默认不包含，导入后需要重新填写。";
+                        font-size: 11px;
+                        color: ThemeG.warn;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        height: 32px;
+                        PillBtn { label: "保存"; primary: true; clicked => { root.proxy-save(); } }
+                        PillBtn { label: "取消"; clicked => { root.proxy-cancel(); } }
+                        Rectangle {}
+                    }
+                }
+                // 配置列表：表头与数据行使用**完全相同**的列宽，避免错位。
+                // 「目标」列是唯一弹性列，其余固定宽度。
+                // 注意：Slint 不允许同一元素同时写 width 和 min-width，
+                // 因此固定列只给 width（它不会被压到 0，弹性列会先让出空间）。
+                if RemotesG.proxy-rows.length > 0 : Rectangle {
+                    height: 34px;
+                    background: ThemeG.panel-2;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 4px;
+                        Text { text: "名称"; width: 140px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: "协议"; width: 76px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: "目标"; horizontal-stretch: 1; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
+                        Text { text: "凭据"; width: 64px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: "使用中的远程"; width: 160px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
+                        Text { text: "操作"; width: 130px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                    }
+                }
+                if RemotesG.proxy-rows.length > 0 : VerticalLayout {
+                    for p[i] in RemotesG.proxy-rows : Rectangle {
+                        height: 34px;
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            spacing: 4px;
+                            Text { text: p.name; width: 140px; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
+                            Text { text: p.protocol; width: 76px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            Text { text: p.target; horizontal-stretch: 1; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
+                            Text { text: p.auth; width: 64px; font-size: 12px; color: ThemeG.warn; vertical-alignment: center; }
+                            Text { text: p.used-by; width: 160px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
+                            HorizontalLayout {
+                                width: 130px;
+                                spacing: 6px;
+                                alignment: start;
+                                PillBtn { label: "编辑"; compact: true; clicked => { root.proxy-edit(p.id); } }
+                                PillBtn { label: "删除"; compact: true; danger: true; clicked => { root.proxy-del(p.id); } }
+                            }
+                        }
+                    }
+                }
+                // 删除确认：被 remote 使用时必须提示关联，而不是默默删掉
+                if RemotesG.proxy-del-show : Rectangle {
+                    border-radius: ThemeG.radius-s;
+                    background: ThemeG.panel-2;
+                    border-width: 1px;
+                    border-color: ThemeG.err;
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+                        Text {
+                            text: "删除代理配置「" + RemotesG.proxy-del-name + "」？";
+                            font-size: 13px;
+                            color: ThemeG.text;
+                            wrap: word-wrap;
+                        }
+                        if RemotesG.proxy-del-affected != "" : Text {
+                            text: RemotesG.proxy-del-affected + "。这些远程的代理会被恢复成原状（我们不会删除你原本设置的值）。";
+                            font-size: 12px;
+                            color: ThemeG.warn;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: "若该远程有正在运行的挂载或服务，需要重新挂载/重启才会丢掉旧代理。";
+                            font-size: 11px;
+                            color: ThemeG.text-dim;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            height: 30px;
+                            PillBtn { label: "确认删除"; danger: true; clicked => { RemotesG.proxy-del-show = false; root.proxy-del-confirm(RemotesG.proxy-del-id); } }
+                            PillBtn { label: "取消"; clicked => { RemotesG.proxy-del-show = false; } }
+                            Rectangle {}
+                        }
+                    }
+                }
+            }               // 卡片 VerticalLayout
+        }                   // Card
+    }                       // 页面 VerticalLayout
+    }                       // ScrollView（整页滚动）
     // 删除确认弹窗（锚定在删除按钮附近）
     delp := ConfirmPop {
         title: "删除远程";
@@ -2138,7 +2546,13 @@ component SettingsView inherits Rectangle {
                     HorizontalLayout {
                         spacing: 8px;
                         height: 26px;
+                        // Slint 的两个对齐不要混：
+                        // - `alignment` = 主轴（水平）对齐，写成 center 会把整行内容居中；
+                        // - `cross-axis-alignment` = 交叉轴（垂直）对齐，用它做垂直居中。
+                        // 8px 的小圆点在默认（stretch）下会被拉伸、贴顶，所以取 center。
+                        cross-axis-alignment: center;
                         FieldLabel { text: "状态"; width: 46px; vertical-alignment: center; }
+                        // 圆点用固定尺寸，避免被交叉轴拉伸成竖条
                         Rectangle {
                             width: 8px;
                             height: 8px;
@@ -2446,6 +2860,75 @@ component SettingsView inherits Rectangle {
 
 // ---------------- 自定义标题栏（无边框窗口） ----------------
 
+/// 应用标记：圆角方块 + 云朵 + 终端提示符。
+///
+/// 为什么用矢量而不是图片：
+/// - 需要**跟随强调色**变化（图片做不到，除非准备多套）；
+/// - 需要多个尺寸（标题栏 18px、托盘 32px 等），矢量在任意尺寸都清晰。
+///
+/// 实现约束（Slint 1.x 踩坑记录）：
+/// - `Rectangle` **没有** `transform` 属性，不能旋转，所以「>」不能靠旋转矩形画；
+/// - `Path` 的 `MoveTo/LineTo` 坐标是 float，且在其内部不能用 `self.width`
+///   做比例运算（会形成绑定循环）。因此全部改用**固定尺寸 + 父级引用的比例**
+///   的简单叠加，并在小尺寸下牺牲细节。
+///
+/// 最终造型：强调色圆角底 + 白色云（两圆一底座）+ 云内深色终端窗口。
+component AppMark inherits Rectangle {
+    in property <length> size: 18px;
+    /// 主色；默认跟随强调色
+    in property <brush> tint: ThemeG.accent;
+    width: root.size;
+    height: root.size;
+    background: root.tint;
+    border-radius: root.size * 0.24;
+
+    // 云朵：左圆 + 右大圆 + 底部横条，叠出云形轮廓
+    Rectangle {
+        x: root.size * 0.14;
+        y: root.size * 0.32;
+        width: root.size * 0.42;
+        height: root.size * 0.42;
+        border-radius: self.width / 2;
+        background: white;
+    }
+    Rectangle {
+        x: root.size * 0.38;
+        y: root.size * 0.20;
+        width: root.size * 0.50;
+        height: root.size * 0.50;
+        border-radius: self.width / 2;
+        background: white;
+    }
+    Rectangle {
+        x: root.size * 0.14;
+        y: root.size * 0.52;
+        width: root.size * 0.74;
+        height: root.size * 0.22;
+        border-radius: self.height / 2;
+        background: white;
+    }
+    // 云内的终端窗口：用主色「挖」出来
+    Rectangle {
+        x: root.size * 0.30;
+        y: root.size * 0.44;
+        width: root.size * 0.46;
+        height: root.size * 0.34;
+        border-radius: root.size * 0.07;
+        background: root.tint;
+        // 终端内容：用 Text 画 ">_"（比 Path 稳，且任意尺寸可读）。
+        // font-size 必须引用**外层** root.size，不能用 self.width：
+        // 那会让 font-size -> preferred-width -> width -> font-size 形成循环。
+        Text {
+            text: ">_";
+            font-size: root.size * 0.26;
+            font-weight: 700;
+            color: white;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
 /// 标题栏上的窗口按钮（最小化 / 最大化 / 关闭）
 component WinBtn inherits Rectangle {
     in property <string> glyph: "";
@@ -2494,20 +2977,15 @@ component TitleBar inherits Rectangle {
     HorizontalLayout {
         padding-left: 14px;
         spacing: 8px;
-        Rectangle {
-            width: 18px;
-            height: 18px;
-            background: ThemeG.primary;
-            border-radius: 5px;
-            Text {
-                text: "R";
-                color: white;
-                font-size: 11px;
-                font-weight: 800;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-        }
+        // ⚠️ 注意 Slint 里两个「对齐」是完全不同的东西：
+        // - `alignment` 是**主轴**（这里=水平）对齐。写成 center 会把图标和标题
+        //   推到标题栏中间 —— 这正是之前「图标不在左侧」的原因。
+        // - `cross-axis-alignment` 才是**交叉轴**（这里=垂直）对齐，用它做垂直居中。
+        // 所以：主轴保持默认（stretch → 内容留在左侧），交叉轴取 center。
+        cross-axis-alignment: center;
+        // 应用图标：用矢量方式画（与托盘/窗口图标同一套造型），
+        // 颜色跟随强调色，缩放与主题切换都不会糊。
+        AppMark { size: 18px; }
         Text {
             text: "RCGUI";
             font-size: 12px;
@@ -2573,6 +3051,15 @@ export component MainWindow inherits Window {
     callback remote-editor-save();
     callback remote-editor-cancel();
     callback remote-type-changed();
+    // 代理
+    callback proxy-changed(string, int);
+    callback proxy-add();
+    callback proxy-edit(string);
+    callback proxy-save();
+    callback proxy-cancel();
+    callback proxy-del(string);
+    callback proxy-del-confirm(string);
+    callback proxy-refresh();
     callback serves-refresh();
     callback serve-start();
     callback serve-stop(string);
@@ -2677,11 +3164,12 @@ export component MainWindow inherits Window {
                                 color: NavG.idx == i ? ThemeG.accent : ThemeG.text-dim;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
-                                // 启动预热中：远程图标整个位置替换为大 spinner
-                                visible: !(i == 2 && NavG.starting);
+                                // 远程页忙碌（启动预热 / 刷新 / 应用导入 / 下发代理）：
+                                // 图标位换成 spinner
+                                visible: !(i == 2 && NavG.remotes-busy);
                             }
-                            // 启动预热中：spinner 占满整个图标位
-                            if i == 2 && NavG.starting : Rectangle {
+                            // 远程页忙碌：spinner 占满整个图标位
+                            if i == 2 && NavG.remotes-busy : Rectangle {
                                 x: 0;
                                 y: 0;
                                 width: 100%;
@@ -2795,6 +3283,14 @@ export component MainWindow inherits Window {
                     editor-save => { root.remote-editor-save(); }
                     editor-cancel => { root.remote-editor-cancel(); }
                     type-changed => { root.remote-type-changed(); }
+                    proxy-changed(name, idx) => { root.proxy-changed(name, idx); }
+                    proxy-add => { root.proxy-add(); }
+                    proxy-edit(id) => { root.proxy-edit(id); }
+                    proxy-save => { root.proxy-save(); }
+                    proxy-cancel => { root.proxy-cancel(); }
+                    proxy-del(id) => { root.proxy-del(id); }
+                    proxy-del-confirm(id) => { root.proxy-del-confirm(id); }
+                    proxy-refresh => { root.proxy-refresh(); }
                 }
                 if NavG.idx == 3 : MountsView {
                     refresh => { root.mounts-refresh(); }
@@ -2867,9 +3363,31 @@ export component MainWindow inherits Window {
                     spacing: 16px;
                     Text { text: DashboardG.url; font-size: 11px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
                     Rectangle {}
-                    Text { text: "传输 " + DashboardG.transfers; font-size: 11px; color: ThemeG.text-dim; vertical-alignment: center; }
-                    Text { text: "挂载 " + DashboardG.mounts; font-size: 11px; color: ThemeG.text-dim; vertical-alignment: center; }
-                    Text { text: "错误 " + DashboardG.errors; font-size: 11px; color: DashboardG.errors > 0 ? ThemeG.err : ThemeG.text-dim; vertical-alignment: center; }
+                    // 状态栏三项都可点击（鼠标变手形以提示可点）：
+                    // - 传输 / 挂载 → 跳到对应导航页
+                    // - 错误       → 从底部弹出错误面板
+                    // 注意：TouchArea 必须明确给出宽高，否则命中区域为 0，点了没反应。
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        width: 68px;
+                        height: 22px;
+                        clicked => { NavG.idx = 5; }   // 传输
+                        Text { text: "传输 " + DashboardG.transfers; font-size: 11px; color: ThemeG.text-dim; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        width: 68px;
+                        height: 22px;
+                        clicked => { NavG.idx = 3; }   // 挂载
+                        Text { text: "挂载 " + DashboardG.mounts; font-size: 11px; color: ThemeG.text-dim; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        width: 68px;
+                        height: 22px;
+                        clicked => { ToastG.error-panel = !ToastG.error-panel; }
+                        Text { text: "错误 " + DashboardG.errors; font-size: 11px; color: DashboardG.errors > 0 ? ThemeG.err : ThemeG.text-dim; horizontal-alignment: center; vertical-alignment: center; }
+                    }
                 }
                 Rectangle {
                     y: 0;
@@ -2881,10 +3399,96 @@ export component MainWindow inherits Window {
     }
     }
 
+    // 错误面板：点底部「错误」从下方滑出。
+    // 只显示 kind == "2"（错误）的历史，避免把成功提示也混进来。
+    if ToastG.error-panel : Rectangle {
+        x: 0;
+        y: parent.height - self.height;
+        width: parent.width;
+        height: 260px;
+        background: ThemeG.panel;
+        border-width: 1px;
+        border-color: ThemeG.err;
+        // 顶部圆角只在视觉上近似（Slint 不支持单边圆角，这里给整体小圆角）
+        border-radius: ThemeG.radius;
+        VerticalLayout {
+            padding: 14px;
+            spacing: 8px;
+            HorizontalLayout {
+                spacing: 8px;
+                height: 26px;
+                Text {
+                    text: "错误记录";
+                    font-size: 14px;
+                    font-weight: 700;
+                    color: ThemeG.err;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: "（共 " + ToastG.history.length + " 条历史中的错误）";
+                    font-size: 11px;
+                    color: ThemeG.text-dim;
+                    vertical-alignment: center;
+                }
+                Rectangle {}
+                PillBtn {
+                    label: "清空";
+                    compact: true;
+                    clicked => {
+                        ToastG.history = [];
+                        ToastG.has-errors = false;
+                        ToastG.error-panel = false;
+                    }
+                }
+                PillBtn {
+                    label: "关闭";
+                    compact: true;
+                    clicked => { ToastG.error-panel = false; }
+                }
+            }
+            Rectangle {
+                vertical-stretch: 1;
+                border-radius: ThemeG.radius-s;
+                background: ThemeG.panel-2;
+                border-width: 1px;
+                border-color: ThemeG.border;
+                ScrollView {
+                    VerticalLayout {
+                        padding: 8px;
+                        spacing: 4px;
+                        // 历史里只要错误项（kind == "2"）。
+                        // Slint 的 `for` 没有 filter，所以非错误项渲染成 0 高度并隐藏。
+                        // 行高用固定值：在 `height` 里引用同级的 `eline` 会有求值顺序问题。
+                        for l in ToastG.history : Rectangle {
+                            height: l.kind == "2" ? 20px : 0px;
+                            visible: l.kind == "2";
+                            HorizontalLayout {
+                                spacing: 8px;
+                                eline := Text {
+                                    text: l.time + "   " + l.msg;
+                                    font-size: 12px;
+                                    color: ThemeG.err;
+                                    horizontal-stretch: 1;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                        if !ToastG.has-errors : Text {
+                            text: "暂无错误记录";
+                            font-size: 12px;
+                            color: ThemeG.text-dim;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Toast
     if ToastG.show : Rectangle {
         x: parent.width / 2 - self.width / 2;
-        y: parent.height - 64px;
+        // 错误面板打开时上移，避免被面板盖住
+        y: parent.height - (ToastG.error-panel ? 284px : 64px);
         width: tmsg.preferred-width + 36px;
         height: 38px;
         border-radius: 19px;
