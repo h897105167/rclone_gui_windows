@@ -3,3 +3,4 @@
 crates/app/data
 *.log
 .env
+

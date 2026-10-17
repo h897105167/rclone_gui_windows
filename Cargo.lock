@@ -3376,25 +3376,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
-name = "is-docker"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "928bae27f42bc99b60d9ac7334e3a21d10ad8f1835a4e12ec3ec0464765ed1b3"
-dependencies = [
- "once_cell",
-]
-
-[[package]]
-name = "is-wsl"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "173609498df190136aa7dea1a91db051746d339e18476eed5ca40521f02d7aa5"
-dependencies = [
- "is-docker",
- "once_cell",
-]
-
-[[package]]
 name = "itertools"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4496,16 +4477,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "open"
-version = "5.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa576c76302b7b808eecc68061e67336c47833ef9d22caa74dda10fa9675eebc"
-dependencies = [
- "is-wsl",
- "libc",
-]
-
-[[package]]
 name = "openssl"
 version = "0.10.81"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4836,8 +4807,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "crc32fast",
+ "flate2",
+ "semver",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "wasmtime",
  "wasmtime-wasi",
@@ -5209,6 +5184,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcgui-profile"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rcgui-rc"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rclone-gui"
 version = "0.1.0"
 dependencies = [
@@ -5219,14 +5213,16 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "image",
- "open",
  "plugin_host",
  "rand 0.8.8",
+ "rcgui-profile",
+ "rcgui-rc",
  "rclone_client",
  "rfd",
  "serde",
  "serde_json",
  "sha1",
+ "sha2",
  "slint",
  "slint-build",
  "tokio",
@@ -5243,7 +5239,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rand 0.8.8",
- "reqwest",
+ "rcgui-rc",
  "serde",
  "serde_json",
  "tokio",
@@ -5915,6 +5911,7 @@ dependencies = [
  "const-field-offset",
  "i-slint-backend-linuxkms",
  "i-slint-backend-selector",
+ "i-slint-backend-winit",
  "i-slint-common",
  "i-slint-core",
  "i-slint-core-macros",

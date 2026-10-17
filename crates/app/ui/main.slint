@@ -1,6 +1,6 @@
 import { ThemeG } from "theme.slint";
 export { ThemeG }
-import { LineEdit, ComboBox, ListView, ScrollView, CheckBox, TextEdit } from "std-widgets.slint";
+import { LineEdit, ComboBox, ListView, ScrollView, CheckBox, TextEdit, Palette } from "std-widgets.slint";
 
 // ---------------- 数据结构 ----------------
 
@@ -28,6 +28,19 @@ export struct PluginRow {
     desc: string,
     loaded: bool,
     enabled: bool,
+    // ---- 插件包（plugin package）扩展字段 ----
+    // 类型： "wasm"（本进程内 WASM 插件）| "package"（外部程序插件包）
+    kind: string,
+    author: string,
+    entry: string,
+    // 完整性校验是否通过
+    verified: bool,
+    // 是否有专属配置界面（目前仅 imagehost 为 true）
+    has-config: bool,
+    // 状态提示（校验失败原因等）
+    status: string,
+    // 目录路径，便于用户定位
+    path: string,
 }
 export struct RootRow {
     id: string,
@@ -50,6 +63,8 @@ export struct ImageRow {
     uploaded: string,
 }
 export struct RemoteRow {
+    /// 该远程的凭据未随包导出（来自档案 needs_auth；无档案记录时恒为 false）
+    needs-auth: bool,
     name: string,
     rtype: string,
     usage: string,
@@ -101,11 +116,6 @@ export global ToastG {
     in-out property <int> kind: 0; // 0 info 1 ok 2 err
 }
 
-// busy 状态帧驱动（Spinner 动画，Rust 侧定时器推进）
-export global BusyG {
-    in-out property <int> frame: 0;
-}
-
 // 远程路径浏览弹窗
 export global BrowseG {
     in-out property <bool> show: false;
@@ -120,6 +130,8 @@ export global DashboardG {
     in-out property <string> os-info: "—";
     in-out property <bool> running: false;
     in-out property <bool> managed: true;
+    // 曾经连上、现在已断开：界面上显示的是上次快照（指南 §3 要求区分「运行中」与「陈旧」）
+    in-out property <bool> stale: false;
     in-out property <string> url: "";
     in-out property <int> remotes: 0;
     in-out property <string> speed: "0 B/s";
@@ -145,14 +157,16 @@ export global FilesG {
 
 export global MountsG {
     in-out property <[MountRow]> mounts: [];
-    in-out property <string> new-fs: "root://";
+    // 仓库（远程）列表 + 选中项；子路径相对仓库根
+    in-out property <[string]> remotes: [];
+    in-out property <int> remote-idx: 0;
+    in-out property <string> sub-path: "";
     // 远程路径历史记录（最多 10 条，最新在前）
     in-out property <[string]> history: [];
     in-out property <string> new-point: "*";
     in-out property <bool> ro: false;
     in-out property <[string]> caches: ["off", "minimal", "writes", "full"];
     in-out property <int> cache-idx: 2;
-    in-out property <bool> auto-mount: true;
     in-out property <bool> winfsp-ok: false;
     in-out property <string> winfsp-msg: "";
     in-out property <bool> busy: false;
@@ -162,6 +176,8 @@ export global MountsG {
 export global PluginsG {
     in-out property <[PluginRow]> rows: [];
     in-out property <bool> loaded: false;
+    // 插件目录（显示给用户，便于手动放置）
+    in-out property <string> dir: "";
     // 当前展开的插件索引（-1 全部收起）
     in-out property <int> expanded: -1;
     in-out property <[RootRow]> roots: [];
@@ -200,13 +216,15 @@ export global ServesG {
     in-out property <[string]> types: ["webdav", "sftp", "http", "ftp", "dlna", "nfs", "docker"];
     in-out property <int> type-idx: 0;
     in-out property <string> svc-name: "";
-    in-out property <string> new-fs: "root://";
+    // 仓库（远程）列表 + 选中项；子路径相对仓库根
+    in-out property <[string]> remotes: [];
+    in-out property <int> remote-idx: 0;
+    in-out property <string> sub-path: "";
     // 远程路径历史记录（最多 10 条，最新在前）
     in-out property <[string]> history: [];
     in-out property <string> addr: "127.0.0.1:8080";
     in-out property <string> user: "";
     in-out property <string> pass: "";
-    in-out property <bool> auto-run: true;
     in-out property <bool> busy: false;
     in-out property <string> search: "";
 }
@@ -228,11 +246,9 @@ export global TransfersG {
 }
 
 export global SettingsG {
-    in-out property <[string]> modes: ["托管模式（自动启动 rclone rcd）", "连接已有实例（attach）"];
-    in-out property <int> mode-idx: 0;
-    in-out property <string> exe: "";
-    in-out property <string> rc-port: "5574";
     in-out property <string> rc-user: "gui";
+    /// 启动时自动连接该 endpoint（只连 API，不启动 rclone 进程）
+    in-out property <bool> connect-on-start: true;
     in-out property <string> rc-pass: "";
     in-out property <string> rc-url: "http://127.0.0.1:5572";
     in-out property <[string]> themes: ["跟随系统", "浅色", "深色"];
@@ -241,6 +257,12 @@ export global SettingsG {
     in-out property <int> accent-idx: 0;
     in-out property <bool> autostart: false;
     in-out property <bool> silent: false;
+    /// 「以管理员身份运行」：反映当前进程真实权限（由 Rust 在启动时读取令牌）
+    in-out property <bool> run-as-admin: false;
+    /// 切换权限前确认弹窗的正文（“软件将重启”）
+    in-out property <string> admin-confirm-msg: "";
+    /// 页面内确认弹层是否显示
+    in-out property <bool> admin-confirm-show: false;
     in-out property <bool> http-enabled: true;
     in-out property <string> http-port: "5273";
     in-out property <string> cfg-path: "";
@@ -249,6 +271,32 @@ export global SettingsG {
     in-out property <string> opt-tpslimit: "";
     in-out property <[string]> log-levels: ["DEBUG", "INFO", "NOTICE", "ERROR"];
     in-out property <int> log-level-idx: 1;
+
+    // ---------- 连接状态区（阶段 3） ----------
+    // status 文案由 Rust 侧按 ConnStatus 给出：未连接 / 已连接 / 已断开（显示的是上次快照）
+    in-out property <string> conn-status: "未连接";
+    in-out property <bool> conn-live: false;
+    in-out property <bool> conn-stale: false;
+    in-out property <bool> conn-busy: false;
+    in-out property <string> conn-endpoint: "";
+    in-out property <string> conn-version: "—";
+    in-out property <string> conn-config-path: "—";
+    in-out property <string> conn-last-refresh: "—";
+    in-out property <string> conn-error: "";
+
+    // ---------- 档案导入 / 导出（阶段 5A） ----------
+    /// 已有「导入预览」结果、可以点「应用导入」时置 true（两步流程 = 一次确认）
+    in-out property <bool> conf-pending: false;
+    /// 导出时是否携带凭据：默认 false（默认排除所有可识别凭据）
+    in-out property <bool> conf-include-secrets: false;
+    /// 导出含凭据时的确认弹窗开关（仅影响本次导出，不保存任何授权状态）
+    in-out property <bool> conf-confirm-show: false;
+    in-out property <string> conf-confirm-msg: "";
+    /// 恢复脚本预览（完整正文）与保存位置
+    in-out property <string> script-preview: "";
+    in-out property <string> script-path: "";
+    /// 最近一次预览/应用的摘要文本（不含任何凭据内容）
+    in-out property <string> conf-info: "默认不含凭据（勾选后才写入）；导入需先预览，应用前自动备份当前档案。";
 }
 
 // ---------------- 通用组件 ----------------
@@ -352,16 +400,53 @@ component Card inherits Rectangle {
     }
 }
 
-// 忙碌指示器：帧动画由 BusyG.frame 驱动（Rust 侧定时器推进）
-component Spinner inherits Text {
+// 忙碌指示器：由 Slint 内建动画时钟 animation-tick() 驱动，无需外部定时器推进。
+// 旋转的缺口圆弧，比单帧字符更像"正在旋转"的指示器。
+component Spinner inherits Rectangle {
     in property <bool> running: false;
-    width: 18px;
+    // 允许调用方通过 width/height 覆盖尺寸
+    width: 20px;
     height: 20px;
-    font-size: 15px;
-    color: ThemeG.accent;
-    vertical-alignment: center;
-    text: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][Math.mod(BusyG.frame, 10)];
+    // 动画相位：1s 一圈；仅在 running 时读取 animation-tick()，
+    // 这样静止的 Spinner 不会持续请求重绘。
+    private property <float> phase: root.running ? mod(animation-tick(), 1s) / 1s : 0;
+    // 以下均为 100x100 viewbox 内的坐标
+    private property <float> r: 40;
+    // stroke-width 是元素空间的逻辑长度（不随 viewbox 缩放）
+    private property <length> sw: 2.5px;
     visible: root.running;
+    // 轨道浅环，让旋转的头部更易辨认
+    Path {
+        viewbox-width: 100;
+        viewbox-height: 100;
+        width: 100%;
+        height: 100%;
+        stroke-width: root.sw;
+        stroke: ThemeG.border;
+        MoveTo { x: 50; y: 10; }
+        ArcTo { radius-x: 40; radius-y: 40; x: 50; y: 90; sweep: true; large-arc: false; }
+    }
+    // 旋转头部：约 1/4 圈弧长，起始角随时间前进
+    Path {
+        viewbox-width: 100;
+        viewbox-height: 100;
+        width: 100%;
+        height: 100%;
+        stroke-width: root.sw;
+        stroke: ThemeG.accent;
+        MoveTo {
+            x: 50 + root.r * sin(360deg * root.phase);
+            y: 50 - root.r * cos(360deg * root.phase);
+        }
+        ArcTo {
+            radius-x: root.r;
+            radius-y: root.r;
+            x: 50 + root.r * sin(360deg * (root.phase + 0.25));
+            y: 50 - root.r * cos(360deg * (root.phase + 0.25));
+            sweep: true;
+            large-arc: false;
+        }
+    }
 }
 
 component FieldLabel inherits Text {
@@ -375,6 +460,7 @@ component ConfirmPop inherits PopupWindow {
     in property <string> msg;
     in property <string> ok-label: "删除";
     callback confirmed;
+    callback cancelled;
     close-policy: PopupClosePolicy.close-on-click-outside;
     // 不设置 width/height：弹出时自动取内容首选尺寸
     card := Rectangle {
@@ -402,7 +488,7 @@ component ConfirmPop inherits PopupWindow {
             HorizontalLayout {
                 spacing: 8px;
                 alignment: end;
-                PillBtn { label: "取消"; clicked => { root.close(); } }
+                PillBtn { label: "取消"; clicked => { root.close(); root.cancelled(); } }
                 PillBtn { label: root.ok-label; danger: true; clicked => { root.close(); root.confirmed(); } }
             }
         }
@@ -531,9 +617,9 @@ component DashboardView inherits Rectangle {
                 height: 96px;
                 StatTile {
                     label: "rclone 状态";
-                    value: DashboardG.running ? "运行中" : "已停止";
-                    sub: DashboardG.running ? (DashboardG.managed ? "托管 · " + DashboardG.url : "外部 · " + DashboardG.url) : "未连接";
-                    tint: DashboardG.running ? ThemeG.ok : ThemeG.err;
+                    value: DashboardG.running ? "运行中" : (DashboardG.stale ? "已断开" : "未连接");
+                    sub: DashboardG.running ? (DashboardG.managed ? "托管 · " + DashboardG.url : "外部 · " + DashboardG.url) : (DashboardG.stale ? "显示上次快照 · " + DashboardG.url : "未连接");
+                    tint: DashboardG.running ? ThemeG.ok : (DashboardG.stale ? ThemeG.warn : ThemeG.err);
                 }
                 StatTile {
                     label: "传输速度";
@@ -1004,7 +1090,7 @@ component RemotesView inherits Rectangle {
                         padding-right: 14px;
                         Rectangle {
                             horizontal-stretch: 1;
-                            Text { text: "名称"; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            Text { text: "名称"; width: 100%; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
                         }
                         Text { text: "类型"; font-size: 12px; color: ThemeG.text-dim; width: 120px; vertical-alignment: center; }
                         Text { text: "用量"; font-size: 12px; color: ThemeG.text-dim; width: 160px; vertical-alignment: center; }
@@ -1021,12 +1107,45 @@ component RemotesView inherits Rectangle {
                             HorizontalLayout {
                                 padding-left: 14px;
                                 padding-right: 14px;
+                                // 名称列（含「凭据未随包导出」徽标，徽标不占独立列，避免打乱表头对齐）
                                 Rectangle {
                                     horizontal-stretch: 1;
-                                    Text { text: r.name; font-size: 13px; color: ThemeG.text; width: parent.width; overflow: elide; vertical-alignment: center; }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: r.name;
+                                            font-size: 13px;
+                                            color: ThemeG.text;
+                                            horizontal-stretch: 1;
+                                            overflow: elide;
+                                            vertical-alignment: center;
+                                        }
+                                        // 徽标：垂直居中；悬停补充含义
+                                        if r.needs-auth : VerticalLayout {
+                                            alignment: center;
+                                            Rectangle {
+                                                height: 20px;
+                                                width: 132px;
+                                                border-radius: ThemeG.radius-s;
+                                                background: ThemeG.panel-2;
+                                                border-width: 1px;
+                                                border-color: ThemeG.border;
+                                                HorizontalLayout {
+                                                    alignment: center;
+                                                    Text {
+                                                        text: bah.has-hover ? "可能需要重新认证" : "凭据未随包导出";
+                                                        font-size: 11px;
+                                                        color: ThemeG.warn;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                                bah := TouchArea { mouse-cursor: help; }
+                                            }
+                                        }
+                                    }
                                 }
-                                Text { text: r.rtype; font-size: 13px; color: ThemeG.text-dim; width: 120px; vertical-alignment: center; }
-                                Text { text: r.usage; font-size: 12px; color: ThemeG.ok; width: 160px; vertical-alignment: center; }
+                                Text { text: r.rtype; font-size: 13px; color: ThemeG.text-dim; width: 120px; vertical-alignment: center; overflow: elide; }
+                                Text { text: r.usage; font-size: 12px; color: ThemeG.ok; width: 160px; vertical-alignment: center; overflow: elide; }
                                 HorizontalLayout {
                                     width: 150px;
                                     spacing: 6px;
@@ -1082,7 +1201,9 @@ component MountsView inherits Rectangle {
     callback browse;
     callback path-nav(string);
     callback search-changed(string);
+    ScrollView {
     VerticalLayout {
+        width: root.width;
         padding: 24px;
         spacing: 12px;
         HorizontalLayout {
@@ -1116,21 +1237,26 @@ component MountsView inherits Rectangle {
             title: "新建挂载";
             VerticalLayout {
                 spacing: 10px;
-                // 第一行：远程 + 挂载点
+                // 第一行：仓库 + 子路径 + 挂载点
                 HorizontalLayout {
                     spacing: 12px;
                     height: 56px;
                     VerticalLayout {
                         spacing: 3px;
+                        width: 180px;
+                        FieldLabel { text: "仓库（远程）"; }
+                        ComboBox {
+                            model: MountsG.remotes;
+                            current-index <=> MountsG.remote-idx;
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 3px;
                         horizontal-stretch: 1;
-                        FieldLabel { text: "远程路径（root://仓库/子目录）"; }
+                        FieldLabel { text: "仓库内子路径（留空 = 仓库根目录）"; }
                         HorizontalLayout {
                             spacing: 4px;
-                            LineEdit { text <=> MountsG.new-fs; placeholder-text: "root://"; horizontal-stretch: 1; }
-                            dd-btn := IconBtn {
-                                label: "\u{E70D}";
-                                clicked => { hist-pop.show(); }
-                            }
+                            LineEdit { text <=> MountsG.sub-path; placeholder-text: "例如 movies/2024，留空为根"; horizontal-stretch: 1; }
                             IconBtn {
                                 label: "\u{E838}";
                                 clicked => { root.browse(); }
@@ -1139,8 +1265,8 @@ component MountsView inherits Rectangle {
                     }
                     VerticalLayout {
                         spacing: 3px;
-                        width: 160px;
-                        FieldLabel { text: "挂载点（盘符 / * 自动分配）"; }
+                        width: 180px;
+                        FieldLabel { text: "挂载点（盘符 / * 自动）"; }
                         LineEdit { text <=> MountsG.new-point; }
                     }
                 }
@@ -1168,17 +1294,6 @@ component MountsView inherits Rectangle {
                             Rectangle {}
                         }
                     }
-                    VerticalLayout {
-                        spacing: 3px;
-                        width: 130px;
-                        FieldLabel { text: "自动挂载"; }
-                        HorizontalLayout {
-                            spacing: 6px;
-                            alignment: start;
-                            CheckBox { checked <=> MountsG.auto-mount; }
-                            Rectangle {}
-                        }
-                    }
                     Rectangle {}
                     VerticalLayout {
                         spacing: 3px;
@@ -1187,9 +1302,10 @@ component MountsView inherits Rectangle {
                         PillBtn { label: "挂载"; primary: true; disabled: MountsG.busy; clicked => { root.add(); } }
                     }
                 }
-                FieldLabel { text: "勾选“自动挂载”并挂载成功后，下次启动软件将自动挂载；盘符挂载点如 T、T: 会自动规范为 T:\\"; }
+                FieldLabel { text: "挂载是即时操作：只在点击「挂载」时通过 rclone RC 执行，不会在下次启动时自动执行。"; }
             }
         }
+        // 挂载预设列表已移除：挂载是即时操作，配置通过 rcgui.conf 导入后直接应用到本地 rclone
         Card {
             title: "活动挂载（" + MountsG.mounts.length + "）";
             VerticalLayout {
@@ -1208,7 +1324,7 @@ component MountsView inherits Rectangle {
                         spacing: 10px;
                         Text { text: "本地路径"; width: 90px; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
                         Text { text: "远程路径"; horizontal-stretch: 1; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
-                        Text { text: "操作"; width: 100px; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
+                        Text { text: "操作"; width: 140px; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
                     }
                 }
                 for m[i] in MountsG.mounts : Rectangle {
@@ -1224,60 +1340,18 @@ component MountsView inherits Rectangle {
                         Text { text: m.mount-point; font-size: 15px; font-weight: 700; color: ThemeG.accent; width: 90px; horizontal-alignment: left; vertical-alignment: center; overflow: elide; }
                         Text { text: m.fs; font-size: 13px; color: ThemeG.text; horizontal-stretch: 1; horizontal-alignment: left; vertical-alignment: center; overflow: elide; }
                         HorizontalLayout {
-                            width: 100px;
+                            width: 140px;
                             spacing: 6px;
                             alignment: start;
-                            Spinner { running: m.pending; }
-                            PillBtn { label: "卸载"; danger: true; disabled: m.pending; clicked => { root.remove(m.mount-point); } }
+                            // 用 if 而非 visible：visible:false 仍占布局空间，会把按钮挤出列宽
+                            if m.pending : VerticalLayout { alignment: center; Spinner { running: true; } }
+                            VerticalLayout { alignment: center; PillBtn { label: "卸载"; compact: true; danger: true; disabled: m.pending; clicked => { root.remove(m.mount-point); } } }
                         }
                     }
                 }
             }
         }
     }
-    // 远程路径历史记录下拉（锚定在"远程路径"输入框下方）
-    hist-pop := PopupWindow {
-        x: 40px;
-        y: 118px;
-        width: 320px;
-        height: MountsG.history.length == 0 ? 60px : Math.min(MountsG.history.length * 30px + 12px, 260px);
-        close-policy: PopupClosePolicy.close-on-click-outside;
-        Rectangle {
-            background: ThemeG.panel;
-            border-radius: ThemeG.radius;
-            border-width: 1px;
-            border-color: ThemeG.border;
-            if MountsG.history.length == 0 : Text {
-                text: "（暂无历史记录）";
-                font-size: 12px;
-                color: ThemeG.text-dim;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-            if MountsG.history.length > 0 : ScrollView {
-                VerticalLayout {
-                    padding: 6px;
-                    spacing: 2px;
-                    for h in MountsG.history : Rectangle {
-                        height: 28px;
-                        border-radius: ThemeG.radius-s;
-                        HorizontalLayout {
-                            padding-left: 8px;
-                            padding-right: 8px;
-                            spacing: 6px;
-                            Text { text: "\u{E81C}"; font-family: "Segoe MDL2 Assets"; font-size: 12px; color: ThemeG.accent; width: 16px; vertical-alignment: center; }
-                            Text { text: h; font-size: 12px; color: ThemeG.text; overflow: elide; vertical-alignment: center; }
-                        }
-                        TouchArea {
-                            clicked => {
-                                hist-pop.close();
-                                root.path-nav(h);
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -1289,7 +1363,9 @@ component ServesView inherits Rectangle {
     callback browse;
     callback path-nav(string);
     callback search-changed(string);
+    ScrollView {
     VerticalLayout {
+        width: root.width;
         padding: 24px;
         spacing: 12px;
         HorizontalLayout {
@@ -1309,19 +1385,21 @@ component ServesView inherits Rectangle {
             title: "新建服务";
             VerticalLayout {
                 spacing: 10px;
-                // 第一行：服务名称 + 协议 + 远程 + 监听地址
+                // 第一行：服务名称 + 协议 + 仓库
+                // 注意：Fluent 的 LineEdit/ComboBox 有 min-width: 160px，
+                // 因此这里给每个字段留足 >=160px，否则会被挤压重叠。
                 HorizontalLayout {
                     spacing: 12px;
                     height: 56px;
                     VerticalLayout {
                         spacing: 3px;
-                        width: 150px;
+                        width: 180px;
                         FieldLabel { text: "服务名称"; }
                         LineEdit { text <=> ServesG.svc-name; placeholder-text: "Serve_01"; }
                     }
                     VerticalLayout {
                         spacing: 3px;
-                        width: 140px;
+                        width: 180px;
                         FieldLabel { text: "协议"; }
                         ComboBox {
                             model: ServesG.types;
@@ -1330,15 +1408,26 @@ component ServesView inherits Rectangle {
                     }
                     VerticalLayout {
                         spacing: 3px;
+                        width: 200px;
+                        FieldLabel { text: "仓库（远程）"; }
+                        ComboBox {
+                            model: ServesG.remotes;
+                            current-index <=> ServesG.remote-idx;
+                        }
+                    }
+                    Rectangle {}
+                }
+                // 第二行：子路径 + 监听地址
+                HorizontalLayout {
+                    spacing: 12px;
+                    height: 56px;
+                    VerticalLayout {
+                        spacing: 3px;
                         horizontal-stretch: 1;
-                        FieldLabel { text: "远程路径（root://仓库/子目录）"; }
+                        FieldLabel { text: "子路径（留空 = 根）"; }
                         HorizontalLayout {
                             spacing: 4px;
-                            LineEdit { text <=> ServesG.new-fs; placeholder-text: "root://"; horizontal-stretch: 1; }
-                            sdd-btn := IconBtn {
-                                label: "\u{E70D}";
-                                clicked => { sdd-pop.show(); }
-                            }
+                            LineEdit { text <=> ServesG.sub-path; placeholder-text: "share/docs"; horizontal-stretch: 1; }
                             IconBtn {
                                 label: "\u{E838}";
                                 clicked => { root.browse(); }
@@ -1347,12 +1436,12 @@ component ServesView inherits Rectangle {
                     }
                     VerticalLayout {
                         spacing: 3px;
-                        width: 200px;
+                        width: 220px;
                         FieldLabel { text: "监听地址"; }
                         LineEdit { text <=> ServesG.addr; }
                     }
                 }
-                // 第二行：用户 + 密码 + 启动按钮
+                // 第三行：用户 + 密码 + 启动按钮
                 HorizontalLayout {
                     spacing: 12px;
                     height: 56px;
@@ -1368,16 +1457,6 @@ component ServesView inherits Rectangle {
                         FieldLabel { text: "密码（可选）"; }
                         LineEdit { text <=> ServesG.pass; input-type: InputType.password; }
                     }
-                    VerticalLayout {
-                        spacing: 3px;
-                        width: 120px;
-                        FieldLabel { text: "自动启动"; }
-                        HorizontalLayout {
-                            spacing: 6px;
-                            CheckBox { checked <=> ServesG.auto-run; }
-                            Rectangle {}
-                        }
-                    }
                     Rectangle {}
                     Spinner { running: ServesG.busy; }
                     VerticalLayout {
@@ -1387,8 +1466,10 @@ component ServesView inherits Rectangle {
                         PillBtn { label: "启动"; primary: true; disabled: ServesG.busy; clicked => { root.start(); } }
                     }
                 }
+                FieldLabel { text: "启动是即时操作：只在点击「启动」时通过 rclone RC 执行，不会在下次启动时自动执行。"; }
             }
         }
+        // 服务预设列表已移除：服务是即时操作，配置通过 rcgui.conf 导入后直接应用到本地 rclone
         Card {
             title: "运行中服务（" + ServesG.rows.length + "）";
             pad: 0px;
@@ -1409,7 +1490,7 @@ component ServesView inherits Rectangle {
                         Text { text: "协议"; font-size: 12px; color: ThemeG.text-dim; width: 90px; horizontal-alignment: left; vertical-alignment: center; }
                         Text { text: "远程"; font-size: 12px; color: ThemeG.text-dim; width: 170px; horizontal-alignment: left; vertical-alignment: center; }
                         Text { text: "地址"; font-size: 12px; color: ThemeG.text-dim; width: 150px; horizontal-alignment: left; vertical-alignment: center; }
-                        Text { text: "操作"; font-size: 12px; color: ThemeG.text-dim; width: 80px; horizontal-alignment: left; vertical-alignment: center; }
+                        Text { text: "操作"; font-size: 12px; color: ThemeG.text-dim; width: 90px; horizontal-alignment: left; vertical-alignment: center; }
                     }
                 }
                 Rectangle {
@@ -1431,7 +1512,7 @@ component ServesView inherits Rectangle {
                                 Text { text: s.fs; font-size: 12px; color: ThemeG.text; width: 170px; horizontal-alignment: left; vertical-alignment: center; overflow: elide; }
                                 Text { text: s.addr; font-size: 12px; color: ThemeG.ok; width: 150px; horizontal-alignment: left; vertical-alignment: center; }
                                 HorizontalLayout {
-                                    width: 80px;
+                                    width: 90px;
                                     VerticalLayout { alignment: center; PillBtn { label: "停止"; compact: true; danger: true; clicked => { root.stop(s.id); } } }
                                 }
                             }
@@ -1447,49 +1528,6 @@ component ServesView inherits Rectangle {
             }
         }
     }
-    // 远程路径历史记录下拉（锚定在"远程路径"输入框下方）
-    sdd-pop := PopupWindow {
-        x: 40px;
-        y: 118px;
-        width: 320px;
-        height: ServesG.history.length == 0 ? 60px : Math.min(ServesG.history.length * 30px + 12px, 260px);
-        close-policy: PopupClosePolicy.close-on-click-outside;
-        Rectangle {
-            background: ThemeG.panel;
-            border-radius: ThemeG.radius;
-            border-width: 1px;
-            border-color: ThemeG.border;
-            if ServesG.history.length == 0 : Text {
-                text: "（暂无历史记录）";
-                font-size: 12px;
-                color: ThemeG.text-dim;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-            if ServesG.history.length > 0 : ScrollView {
-                VerticalLayout {
-                    padding: 6px;
-                    spacing: 2px;
-                    for h in ServesG.history : Rectangle {
-                        height: 28px;
-                        border-radius: ThemeG.radius-s;
-                        HorizontalLayout {
-                            padding-left: 8px;
-                            padding-right: 8px;
-                            spacing: 6px;
-                            Text { text: "\u{E81C}"; font-family: "Segoe MDL2 Assets"; font-size: 12px; color: ThemeG.accent; width: 16px; vertical-alignment: center; }
-                            Text { text: h; font-size: 12px; color: ThemeG.text; overflow: elide; vertical-alignment: center; }
-                        }
-                        TouchArea {
-                            clicked => {
-                                sdd-pop.close();
-                                root.path-nav(h);
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -1562,28 +1600,32 @@ component TransfersView inherits Rectangle {
                     Text { text: "下载 ↓ " + TransfersG.down-speed; font-size: 13px; color: ThemeG.ok; vertical-alignment: center; }
                     Rectangle { horizontal-stretch: 1; }
                 }
+                // 限速：分两行，避免与内置控件 min-width:160px 冲突导致挤压
                 HorizontalLayout {
                     spacing: 8px;
                     Text { text: "上传限速"; width: 64px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                     LineEdit {
-                        width: 140px;
+                        width: 180px;
                         text <=> TransfersG.up-limit;
                         placeholder-text: "不限";
                     }
                     ComboBox {
-                        width: 76px;
+                        width: 160px;
                         model: TransfersG.units;
                         current-index <=> TransfersG.up-unit;
                     }
-                    Rectangle { width: 16px; }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
                     Text { text: "下载限速"; width: 64px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                     LineEdit {
-                        width: 140px;
+                        width: 180px;
                         text <=> TransfersG.down-limit;
                         placeholder-text: "不限";
                     }
                     ComboBox {
-                        width: 76px;
+                        width: 160px;
                         model: TransfersG.units;
                         current-index <=> TransfersG.down-unit;
                     }
@@ -1627,9 +1669,12 @@ component TransfersView inherits Rectangle {
                                 padding-right: 14px;
                                 spacing: 8px;
                                 Text { text: "#" + t.id; width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text; vertical-alignment: center; }
-                                HorizontalLayout {
+                                Rectangle {
                                     horizontal-stretch: 1;
-                                    spacing: 6px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        HorizontalLayout {
+                                            spacing: 6px;
                                     if t.op != "" : TagPill { label: t.op; tint: t.op == "上传" ? ThemeG.ok : ThemeG.accent; }
                                     if t.remote != "" : TagPill {
                                         label: t.remote;
@@ -1637,6 +1682,8 @@ component TransfersView inherits Rectangle {
                                         Tooltip { text: @markdown("\{t.path}"); }
                                     }
                                     if t.svc != "" : TagPill { label: t.svc; tint: ThemeG.warn; }
+                                        }
+                                    }
                                 }
                                 Text { text: t.status; width: 90px; horizontal-alignment: left; font-size: 12px; color: t.status == "运行中" ? ThemeG.accent : (t.status == "失败" ? ThemeG.err : ThemeG.text-dim); vertical-alignment: center; }
                                 Text { text: t.duration; width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
@@ -1669,6 +1716,9 @@ component PluginsView inherits Rectangle {
     callback image-del(int);
     callback copy-url(int);
     callback plugin-toggle(int);
+    callback add-from-file;
+    callback add-from-dir;
+    callback open-dir;
     // 确认弹窗所需的待操作状态
     property <int> tok-idx: -1;
     property <string> tok-name: "";
@@ -1680,9 +1730,37 @@ component PluginsView inherits Rectangle {
         VerticalLayout {
             padding: 24px;
             spacing: 12px;
+            // ---- 顶部操作栏：添加插件 + 刷新 ----
+            Card {
+                VerticalLayout {
+                    spacing: 10px;
+                    HorizontalLayout {
+                        height: 32px;
+                        spacing: 10px;
+                        Text {
+                            text: "插件目录：" + PluginsG.dir;
+                            font-size: 12px;
+                            color: ThemeG.text-dim;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Rectangle {}
+                        PillBtn { label: "从文件添加"; primary: true; compact: true; clicked => { root.add-from-file(); } }
+                        PillBtn { label: "从文件夹添加"; compact: true; clicked => { root.add-from-dir(); } }
+                        PillBtn { label: "打开目录"; compact: true; clicked => { root.open-dir(); } }
+                        PillBtn { label: "刷新"; compact: true; clicked => { root.rescan(); } }
+                    }
+                    Text {
+                        text: "支持 .zip 插件包或已解压的插件文件夹；放入插件目录后点「刷新」即可识别。新插件默认未启用，需手动勾选才会运行其入口文件。";
+                        font-size: 11px;
+                        color: ThemeG.text-dim;
+                        wrap: word-wrap;
+                    }
+                }
+            }
             HorizontalLayout {
-                height: 36px;
-                Text { text: "插件（WASM，放入插件目录即自动加载；点击插件栏展开 / 收起）"; font-size: 13px; color: ThemeG.text-dim; vertical-alignment: center; }
+                height: 24px;
+                Text { text: "已安装插件（点击插件栏展开 / 收起）"; font-size: 13px; color: ThemeG.text-dim; vertical-alignment: center; }
                 Rectangle {}
                 IconBtn { label: "\u{E72C}"; clicked => { root.rescan(); } }
             }
@@ -1710,13 +1788,34 @@ component PluginsView inherits Rectangle {
                             padding-right: 12px;
                             spacing: 12px;
                             MdlIcon {
-                                glyph: "\u{EA86}";
+                                glyph: p.kind == "package" ? "\u{E8B7}" : "\u{EA86}";
                                 width: 22px;
                                 font-size: 17px;
                                 color: p.enabled ? ThemeG.accent : ThemeG.text-dim;
                             }
                             Text { text: p.name; font-size: 14px; font-weight: 600; color: p.enabled ? ThemeG.text : ThemeG.text-dim; vertical-alignment: center; }
                             Text { text: "v" + p.version; font-size: 11px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            // 类型 / 校验状态徽标
+                            Rectangle {
+                                height: 20px;
+                                width: p.kind == "package" ? 52px : 44px;
+                                border-radius: 10px;
+                                background: p.kind == "package" ? ThemeG.panel-2 : ThemeG.accent-soft;
+                                Text {
+                                    text: p.kind == "package" ? "插件包" : "WASM";
+                                    font-size: 10px;
+                                    color: p.kind == "package" ? ThemeG.text-dim : ThemeG.accent;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            if p.kind == "package" && !p.verified : Rectangle {
+                                height: 20px;
+                                width: 52px;
+                                border-radius: 10px;
+                                background: ThemeG.err;
+                                Text { text: "校验失败"; font-size: 10px; color: white; horizontal-alignment: center; vertical-alignment: center; }
+                            }
                             Rectangle {
                                 horizontal-stretch: 1;
                                 Text { text: p.desc; font-size: 12px; color: ThemeG.text-dim; width: parent.width; overflow: elide; vertical-alignment: center; }
@@ -1729,6 +1828,7 @@ component PluginsView inherits Rectangle {
                             }
                             CheckBox {
                                 checked: p.enabled;
+                                enabled: p.verified;
                                 toggled => { root.plugin-toggle(i); }
                             }
                         }
@@ -1740,10 +1840,58 @@ component PluginsView inherits Rectangle {
                         padding-bottom: 16px;
                         spacing: 14px;
                         Rectangle { height: 1px; background: ThemeG.border; }
-                        if p.id != "imagehost" : Text {
-                            text: "该插件没有配置面板";
-                            font-size: 12px;
-                            color: ThemeG.text-dim;
+                        if p.id != "imagehost" : VerticalLayout {
+                            spacing: 6px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text { text: "ID"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
+                                Text { text: p.id; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
+                            }
+                            if p.author != "" : HorizontalLayout {
+                                spacing: 8px;
+                                Text { text: "作者"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
+                                Text { text: p.author; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
+                            }
+                            if p.entry != "" : HorizontalLayout {
+                                spacing: 8px;
+                                Text { text: "入口文件"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
+                                Text { text: p.entry; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text { text: "完整性"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
+                                Text {
+                                    text: p.verified ? "校验通过" : "校验失败";
+                                    font-size: 12px;
+                                    color: p.verified ? ThemeG.ok : ThemeG.err;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            if !p.verified && p.status != "" : Rectangle {
+                                background: ThemeG.panel-2;
+                                border-radius: ThemeG.radius-s;
+                                height: pstat.preferred-height + 16px;
+                                pstat := Text {
+                                    text: p.status;
+                                    font-size: 11px;
+                                    color: ThemeG.err;
+                                    wrap: word-wrap;
+                                    x: 10px;
+                                    width: parent.width - 20px;
+                                    y: 8px;
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text { text: "位置"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
+                                Text { text: p.path; font-size: 11px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
+                            }
+                            if p.kind == "package" : Text {
+                                text: "启用 = 执行上面的入口文件（.msi 会以静默方式安装）。停用不会卸载已安装的程序。";
+                                font-size: 11px;
+                                color: ThemeG.text-dim;
+                                wrap: word-wrap;
+                            }
                         }
                         if p.id == "imagehost" : VerticalLayout {
                             spacing: 14px;
@@ -1936,6 +2084,22 @@ component SettingsView inherits Rectangle {
     callback test;
     callback pick-exe;
     callback options-save;
+    // 连接动作（阶段 3）：只影响 RC 连接，不启停 rclone 进程
+    callback conn-connect;
+    callback conn-disconnect;
+    callback conn-reconnect;
+    // 档案导入导出（阶段 5A）
+    callback conf-export;
+    callback conf-import-preview;
+    callback conf-import-apply;
+    callback conf-export-confirmed;
+    callback conf-export-cancelled;
+    callback script-generate;
+    callback script-copy;
+    // 「以管理员身份运行」：复选框切换后由 Rust 判断是否需要重启并打开确认弹层
+    callback admin-toggle;
+    callback admin-restart;
+    callback admin-cancel;
     ScrollView {
         VerticalLayout {
             padding: 24px;
@@ -1947,39 +2111,160 @@ component SettingsView inherits Rectangle {
                     HorizontalLayout {
                         spacing: 8px;
                         height: 32px;
-                        FieldLabel { text: "模式"; width: 46px; vertical-alignment: center; }
-                        ComboBox {
-                            width: 280px;
-                            model: SettingsG.modes;
-                            current-index <=> SettingsG.mode-idx;
+                        FieldLabel { text: "RC 地址"; width: 70px; vertical-alignment: center; }
+                        LineEdit { width: 300px; text <=> SettingsG.rc-url; placeholder-text: "http://127.0.0.1:5572"; }
+                        FieldLabel { text: "RC 用户"; width: 56px; vertical-alignment: center; }
+                        LineEdit { width: 150px; text <=> SettingsG.rc-user; }
+                        FieldLabel { text: "RC 密码"; width: 56px; vertical-alignment: center; }
+                        LineEdit { width: 150px; text <=> SettingsG.rc-pass; input-type: InputType.password; }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        height: 26px;
+                        CheckBox {
+                            checked <=> SettingsG.connect-on-start;
+                            text: "启动时连接该地址（只连 API，不启动 rclone）";
+                            toggled => { root.save(); }
+                        }
+                        Text {
+                            text: "RCGUI 不启动、不停止、不重启 rclone";
+                            font-size: 12px;
+                            color: ThemeG.text-dim;
+                            vertical-alignment: center;
                         }
                     }
-                    if SettingsG.mode-idx == 0 : HorizontalLayout {
+                    Rectangle { height: 1px; background: ThemeG.border; }
+                    // 连接状态（阶段 3）：区分「运行中 / 已断开（显示上次快照）/ 未连接」
+                    HorizontalLayout {
                         spacing: 8px;
-                        height: 32px;
-                        FieldLabel { text: "rclone.exe"; width: 70px; vertical-alignment: center; }
-                        LineEdit { text <=> SettingsG.exe; placeholder-text: "留空自动查找"; }
-                        PillBtn { label: "浏览…"; compact: true; clicked => { root.pick-exe(); } }
+                        height: 26px;
+                        FieldLabel { text: "状态"; width: 46px; vertical-alignment: center; }
+                        Rectangle {
+                            width: 8px;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: SettingsG.conn-live ? ThemeG.ok : (SettingsG.conn-stale ? ThemeG.warn : ThemeG.err);
+                        }
+                        Text {
+                            text: SettingsG.conn-status;
+                            font-size: 13px;
+                            color: SettingsG.conn-live ? ThemeG.ok : (SettingsG.conn-stale ? ThemeG.warn : ThemeG.text-dim);
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: SettingsG.conn-endpoint;
+                            font-size: 12px;
+                            color: ThemeG.text-dim;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
                     }
-                    if SettingsG.mode-idx == 0 : HorizontalLayout {
+                    HorizontalLayout {
                         spacing: 8px;
-                        height: 32px;
-                        FieldLabel { text: "RC 端口"; width: 56px; vertical-alignment: center; }
-                        LineEdit { width: 160px; text <=> SettingsG.rc-port; }
-                        FieldLabel { text: "RC 用户"; width: 56px; vertical-alignment: center; }
-                        LineEdit { width: 160px; text <=> SettingsG.rc-user; }
-                        FieldLabel { text: "RC 密码"; width: 56px; vertical-alignment: center; }
-                        LineEdit { width: 160px; text <=> SettingsG.rc-pass; input-type: InputType.password; }
+                        height: 20px;
+                        Text { text: "版本 " + SettingsG.conn-version; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: "· 配置文件 " + SettingsG.conn-config-path; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
                     }
-                    if SettingsG.mode-idx == 1 : HorizontalLayout {
+                    Text {
+                        text: "上次刷新 " + SettingsG.conn-last-refresh;
+                        font-size: 12px;
+                        color: ThemeG.text-dim;
+                        vertical-alignment: center;
+                    }
+                    if SettingsG.conn-error != "" : Text {
+                        text: SettingsG.conn-error;
+                        font-size: 12px;
+                        color: ThemeG.err;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
                         spacing: 8px;
                         height: 32px;
-                        FieldLabel { text: "RC 地址"; width: 70px; vertical-alignment: center; }
-                        LineEdit { width: 240px; text <=> SettingsG.rc-url; placeholder-text: "http://127.0.0.1:5572"; }
-                        FieldLabel { text: "RC 用户"; width: 56px; vertical-alignment: center; }
-                        LineEdit { width: 160px; text <=> SettingsG.rc-user; }
-                        FieldLabel { text: "RC 密码"; width: 56px; vertical-alignment: center; }
-                        LineEdit { width: 160px; text <=> SettingsG.rc-pass; input-type: InputType.password; }
+                        PillBtn { label: "连接 / 握手"; primary: true; disabled: SettingsG.conn-busy; clicked => { root.conn-connect(); } }
+                        PillBtn { label: "断开"; disabled: SettingsG.conn-busy || !SettingsG.conn-live; clicked => { root.conn-disconnect(); } }
+                        PillBtn { label: "重新握手"; disabled: SettingsG.conn-busy; clicked => { root.conn-reconnect(); } }
+                        Text { text: SettingsG.conn-busy ? "正在握手…" : ""; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                    }
+                }
+            }
+            Card {
+                title: "档案导入 / 导出（rcgui.conf）";
+                VerticalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: SettingsG.conf-info;
+                        font-size: 12px;
+                        color: ThemeG.text-dim;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        height: 32px;
+                        PillBtn {
+                            label: "导出 rcgui.conf";
+                            primary: true;
+                            clicked => {
+                                // 勾选「包含凭据」时先要一次明确确认；未勾选直接导出
+                                if (SettingsG.conf-include-secrets) {
+                                    SettingsG.conf-confirm-msg = "文件将以明文包含远程凭据（OAuth token / 密码）。rclone 的 obscure 只是可逆混淆，不是加密。确认导出？";
+                                    cexp.show();
+                                } else {
+                                    root.conf-export();
+                                }
+                            }
+                        }
+                        CheckBox {
+                            checked <=> SettingsG.conf-include-secrets;
+                            text: "导出时包含凭据";
+                        }
+                        PillBtn { label: "导入预览"; clicked => { root.conf-import-preview(); } }
+                        PillBtn { label: "应用导入"; disabled: !SettingsG.conf-pending; clicked => { root.conf-import-apply(); } }
+                        Text {
+                            text: SettingsG.conf-pending ? "已预览，可应用" : "";
+                            font-size: 12px;
+                            color: ThemeG.warn;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+            Card {
+                title: "开机恢复脚本（PowerShell）";
+                VerticalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "只连接已运行且启用 RC 的 rclone：先健康检查，连不上就明确退出；不启动、不停止 rclone，不注册开机项，不内置 RC 密码。生成后不会自动执行。";
+                        font-size: 12px;
+                        color: ThemeG.text-dim;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        height: 32px;
+                        PillBtn { label: "生成恢复脚本"; primary: true; clicked => { root.script-generate(); } }
+                        PillBtn { label: "复制脚本"; disabled: SettingsG.script-preview == ""; clicked => { root.script-copy(); } }
+                        Text {
+                            text: "保存位置: " + SettingsG.script-path;
+                            font-size: 12px;
+                            color: ThemeG.text-dim;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                    if SettingsG.script-preview != "" : Rectangle {
+                        height: 240px;
+                        border-radius: ThemeG.radius-s;
+                        border-width: 1px;
+                        border-color: ThemeG.border;
+                        background: ThemeG.panel-2;
+                        TextEdit {
+                            read-only: true;
+                            text: SettingsG.script-preview;
+                            font-size: 12px;
+                            wrap: no-wrap;
+                        }
                     }
                 }
             }
@@ -2025,6 +2310,22 @@ component SettingsView inherits Rectangle {
                             CheckBox { checked <=> SettingsG.autostart; text: "开机自启"; toggled => { root.save(); } }
                             CheckBox { checked <=> SettingsG.silent; text: "静默启动（仅托盘）"; toggled => { root.save(); } }
                         }
+                        // 以管理员身份运行：切换即提示「软件将重启」，确认后按目标权限重启
+                        HorizontalLayout {
+                            spacing: 12px;
+                            height: 28px;
+                            CheckBox {
+                                checked <=> SettingsG.run-as-admin;
+                                text: "以管理员身份运行";
+                                toggled => { root.admin-toggle(); }
+                            }
+                            Text {
+                                text: "切换权限会重启软件（当前窗口先关闭）";
+                                font-size: 11px;
+                                color: ThemeG.text-dim;
+                                vertical-alignment: center;
+                            }
+                        }
                     }
                 }
                 Card {
@@ -2039,8 +2340,6 @@ component SettingsView inherits Rectangle {
                             FieldLabel { text: "端口"; width: 34px; vertical-alignment: center; }
                             LineEdit { width: 160px; text <=> SettingsG.http-port; }
                         }
-                        FieldLabel { text: "上传 API：POST /api/plugin/imagehost/upload"; }
-                        FieldLabel { text: "直链代理：GET /i/{rootId}/{path}"; }
                     }
                 }
                 Card {
@@ -2082,12 +2381,161 @@ component SettingsView inherits Rectangle {
             }
         }
     }
+    // 导出含凭据时的二次确认：Rust 置 conf-confirm-show=true 触发；取消/确认先 close() 再回调 Rust 清理状态。
+    cexp := ConfirmPop {
+        title: "导出包含凭据？";
+        msg: SettingsG.conf-confirm-msg;
+        ok-label: "确认导出";
+        confirmed => { root.conf-export-confirmed(); }
+        cancelled => { root.conf-export-cancelled(); }
+    }
+    // 切换「以管理员身份运行」的确认弹层。
+    // 不用 PopupWindow：CheckBox 的 toggled 发生在同一次点击里，弹出窗口会被
+    // “点击外部关闭”立刻取消；改用页面内模态覆盖层，行为确定且可测。
+    if SettingsG.admin-confirm-show : Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: #00000055;
+        // 吃掉点击，避免穿透到下层控件
+        TouchArea { clicked => { } }
+        Rectangle {
+            width: 380px;
+            height: 176px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: ThemeG.panel;
+            border-radius: ThemeG.radius;
+            border-width: 1px;
+            border-color: ThemeG.border;
+            VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                Text { text: "软件将重启"; font-size: 15px; font-weight: 700; color: ThemeG.text; }
+                Text {
+                    text: SettingsG.admin-confirm-msg;
+                    font-size: 13px;
+                    color: ThemeG.text-dim;
+                    wrap: word-wrap;
+                }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    PillBtn {
+                        label: "取消";
+                        clicked => {
+                            SettingsG.admin-confirm-show = false;
+                            root.admin-cancel();
+                        }
+                    }
+                    PillBtn {
+                        label: "确定";
+                        primary: true;
+                        clicked => {
+                            SettingsG.admin-confirm-show = false;
+                            root.admin-restart();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------- 自定义标题栏（无边框窗口） ----------------
+
+/// 标题栏上的窗口按钮（最小化 / 最大化 / 关闭）
+component WinBtn inherits Rectangle {
+    in property <string> glyph: "";
+    in property <bool> danger: false;
+    callback act;
+    width: 46px;
+    height: 100%;
+    background: ta.has-hover ? (root.danger ? ThemeG.err : ThemeG.hover) : transparent;
+    Text {
+        text: root.glyph;
+        font-family: "Segoe MDL2 Assets";
+        font-size: 10px;
+        color: ta.has-hover && root.danger ? white : ThemeG.text-dim;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.act(); }
+    }
+}
+
+/// 自绘标题栏：隐藏系统边框后由它承担拖动 / 双击最大化 / 窗口按钮。
+/// 拖动交给 WindowMoveArea（winit 原生实现），比自己算坐标更稳。
+component TitleBar inherits Rectangle {
+    in property <bool> is-maximized: false;
+    callback minimize;
+    callback toggle-maximize;
+    callback close-window;
+
+    height: 36px;
+    background: ThemeG.panel;
+
+    // 可拖拽区域（右侧 138px 留给窗口按钮）
+    WindowMoveArea {
+        x: 0;
+        y: 0;
+        width: parent.width - 138px;
+        height: parent.height;
+        // 双击标题栏切换最大化。作为子元素不会抢走拖动（官方文档保证的用法）
+        TouchArea {
+            double-clicked => { root.toggle-maximize(); }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 14px;
+        spacing: 8px;
+        Rectangle {
+            width: 18px;
+            height: 18px;
+            background: ThemeG.primary;
+            border-radius: 5px;
+            Text {
+                text: "R";
+                color: white;
+                font-size: 11px;
+                font-weight: 800;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        Text {
+            text: "RCGUI";
+            font-size: 12px;
+            font-weight: 600;
+            color: ThemeG.text;
+            vertical-alignment: center;
+        }
+        Rectangle {}
+    }
+
+    HorizontalLayout {
+        x: parent.width - 138px;
+        width: 138px;
+        height: 100%;
+        WinBtn { glyph: "\u{E921}"; act => { root.minimize(); } }
+        WinBtn { glyph: root.is-maximized ? "\u{E923}" : "\u{E922}"; act => { root.toggle-maximize(); } }
+        WinBtn { glyph: "\u{E8BB}"; danger: true; act => { root.close-window(); } }
+    }
 }
 
 // ---------------- 主窗口 ----------------
 
 export component MainWindow inherits Window {
-    title: "Rclone GUI";
+    title: "RCGUI";
+    // 隐藏系统边框，改用自绘标题栏，使标题栏与整体 UI 风格一致。
+    // resize-border-width 让窗口四边仍可拖拽缩放（winit 原生处理）。
+    no-frame: true;
+    resize-border-width: 6px;
     preferred-width: 1200px;
     preferred-height: 760px;
     min-width: 940px;
@@ -2148,12 +2596,59 @@ export component MainWindow inherits Window {
     callback settings-test();
     callback pick-exe();
     callback options-save();
+    callback conn-connect();
+    callback conn-disconnect();
+    callback conn-reconnect();
+    callback conf-export();
+    callback conf-import-preview();
+    callback conf-import-apply();
+    callback conf-export-confirmed();
+    callback conf-export-cancelled();
+    callback script-generate();
+    callback script-copy();
+    // 以管理员身份运行的确认（页面内弹层，见 SettingsView）
+    callback admin-toggle();
+    callback admin-restart();
+    callback admin-cancel();
     callback plugin-toggle(int);
+    callback plugin-add-from-file();
+    callback plugin-add-from-dir();
+    callback plugin-open-dir();
     callback show-toast(int, string);
+    callback win-minimize();
+    callback win-toggle-maximize();
+    callback win-close();
 
+
+    // 内置控件（LineEdit / ComboBox / CheckBox / TextEdit / ScrollView）的文字与背景色
+    // 来自 Slint 的 Palette，而 Palette 默认只跟随**系统**明暗（SlintInternal.color-scheme），
+    // 不跟随应用内的 ThemeG.dark。因此在系统为深色、应用切到浅色时，
+    // 输入框文字仍是深色主题的浅色前景，看起来就是"字体颜色没有同步更改"。
+    // 这里把内置控件调色板显式同步到应用主题，保证两者始终一致。
+    private property <bool> palette-dark: ThemeG.dark;
     init => {
         root.refresh-dashboard();
+        Palette.color-scheme = root.palette-dark ? ColorScheme.dark : ColorScheme.light;
     }
+    changed palette-dark => {
+        Palette.color-scheme = root.palette-dark ? ColorScheme.dark : ColorScheme.light;
+    }
+
+    VerticalLayout {
+        spacing: 0px;
+        // 自绘标题栏（系统边框已隐藏）
+        TitleBar {
+            // Slint 的 maximized 与 winit 双向同步（含 Win+↑ / 贴靠），
+            // 因此这里直接用它驱动按钮图标，无需自己维护状态
+            is-maximized: root.maximized;
+            minimize => { root.win-minimize(); }
+            toggle-maximize => { root.win-toggle-maximize(); }
+            close-window => { root.win-close(); }
+        }
+        Rectangle {
+            height: 1px;
+            background: ThemeG.border;
+        }
 
     HorizontalLayout {
         // ---- 左侧栏 ----
@@ -2161,20 +2656,8 @@ export component MainWindow inherits Window {
             width: 64px;
             background: ThemeG.panel;
             VerticalLayout {
-                padding-top: 12px;
+                padding-top: 8px;
                 spacing: 2px;
-                Rectangle {
-                    height: 44px;
-                    Rectangle {
-                        width: 32px; height: 32px;
-                        x: parent.width / 2 - 16px;
-                        y: parent.height / 2 - 16px;
-                        background: ThemeG.primary;
-                        border-radius: 8px;
-                        Text { text: "R"; color: white; font-size: 16px; font-weight: 800; horizontal-alignment: center; vertical-alignment: center; }
-                    }
-                }
-                Rectangle { height: 8px; }
                 for n[i] in root.page-names : Rectangle {
                     height: 52px;
                     background: NavG.idx == i ? ThemeG.accent-soft : (ta.has-hover ? ThemeG.hover : transparent);
@@ -2187,18 +2670,26 @@ export component MainWindow inherits Window {
                         spacing: 3px;
                         Rectangle {
                             height: 22px;
-                            Text { text: root.nav-icons[i]; font-family: "Segoe MDL2 Assets"; font-size: 20px; color: NavG.idx == i ? ThemeG.accent : ThemeG.text-dim; horizontal-alignment: center; vertical-alignment: center; }
-                            // 启动预热中：远程图标右上角迷你 spinner（纯文本，不遮挡输入）
-                            if i == 2 && NavG.starting : Text {
-                                x: parent.width - 11px;
-                                y: 0;
-                                width: 11px;
-                                height: 11px;
-                                text: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][Math.mod(BusyG.frame, 10)];
-                                font-size: 10px;
-                                color: ThemeG.accent;
+                            Text {
+                                text: root.nav-icons[i];
+                                font-family: "Segoe MDL2 Assets";
+                                font-size: 20px;
+                                color: NavG.idx == i ? ThemeG.accent : ThemeG.text-dim;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
+                                // 启动预热中：远程图标整个位置替换为大 spinner
+                                visible: !(i == 2 && NavG.starting);
+                            }
+                            // 启动预热中：spinner 占满整个图标位
+                            if i == 2 && NavG.starting : Rectangle {
+                                x: 0;
+                                y: 0;
+                                width: 100%;
+                                height: 100%;
+                                HorizontalLayout {
+                                    alignment: center;
+                                    Spinner { width: 20px; height: 20px; running: true; }
+                                }
                             }
                         }
                         Text { text: n; font-size: 9px; color: NavG.idx == i ? ThemeG.accent : ThemeG.text-dim; horizontal-alignment: center; }
@@ -2341,12 +2832,28 @@ export component MainWindow inherits Window {
                     image-del(i) => { root.ih-image-del(i); }
                     copy-url(i) => { root.ih-copy-url(i); }
                     plugin-toggle(i) => { root.plugin-toggle(i); }
+                    add-from-file => { root.plugin-add-from-file(); }
+                    add-from-dir => { root.plugin-add-from-dir(); }
+                    open-dir => { root.plugin-open-dir(); }
                 }
                 if NavG.idx == 7 : SettingsView {
                     save => { root.settings-save(); }
                     test => { root.settings-test(); }
                     pick-exe => { root.pick-exe(); }
                     options-save => { root.options-save(); }
+                    conn-connect => { root.conn-connect(); }
+                    conn-disconnect => { root.conn-disconnect(); }
+                    conn-reconnect => { root.conn-reconnect(); }
+                    conf-export => { root.conf-export(); }
+                    conf-import-preview => { root.conf-import-preview(); }
+                    conf-import-apply => { root.conf-import-apply(); }
+                    conf-export-confirmed => { root.conf-export-confirmed(); }
+                    conf-export-cancelled => { root.conf-export-cancelled(); }
+                    script-generate => { root.script-generate(); }
+                    script-copy => { root.script-copy(); }
+                    admin-toggle => { root.admin-toggle(); }
+                    admin-restart => { root.admin-restart(); }
+                    admin-cancel => { root.admin-cancel(); }
                 }
             }
 
@@ -2371,6 +2878,7 @@ export component MainWindow inherits Window {
                 }
             }
         }
+    }
     }
 
     // Toast
