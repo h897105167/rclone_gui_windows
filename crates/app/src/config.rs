@@ -170,7 +170,9 @@ impl Default for AppConfig {
 impl AppConfig {
     /// 设置某 remote 的代理绑定（`proxy_id` 为空串 = 明确不代理）。
     ///
-    /// 换目标时**必须**把下发状态清掉：否则界面会显示「已生效」而 rclone 里还是旧代理。
+    /// 换目标时**只清 `applied`，保留脚印**：`applied_value` / `applied_key` /
+    /// `original_override` 是回滚的唯一依据，清掉就等于“从未管理过”，
+    /// 切回「不代理」时 apply 会判定无需动作，rclone 里的旧代理永远删不掉。
     /// 与 `ProfileDoc::bind_proxy` 的语义保持一致。
     pub fn bind_proxy_slot(&mut self, remote: &str, proxy_id: &str) {
         let key = remote.trim_end_matches(':');
@@ -183,10 +185,6 @@ impl AppConfig {
                 if b.proxy_id != proxy_id {
                     b.proxy_id = proxy_id.to_string();
                     b.applied = false;
-                    b.applied_value.clear();
-                    if proxy_id.is_empty() {
-                        b.original_override = None;
-                    }
                 }
             }
             None => self.proxy_bindings.push(rcgui_profile::RemoteProxyBinding {
@@ -701,4 +699,39 @@ pub fn save(cfg: &AppConfig) -> Result<()> {
     // 第二步：应用偏好（已不含挂载/服务列表）
     let data = serde_json::to_vec_pretty(cfg)?;
     write_atomic(&config_path(), &data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcgui_profile::ProxyProfile;
+
+    /// `bind_proxy_slot` 换目标时只清 `applied`，保留脚印（回滚依据）。
+    ///
+    /// 2026-10-18 修掉的缺陷：清掉 `applied_value` 后，切「不代理」时
+    /// `plan_apply` 会判定「从未管理过」，rclone 里的旧代理永远删不掉。
+    #[test]
+    fn rebinding_keeps_rollback_footprint() {
+        let mut cfg = AppConfig::default();
+        cfg.proxies.push(ProxyProfile {
+            id: "p1".into(),
+            name: "n".into(),
+            ..Default::default()
+        });
+        cfg.bind_proxy_slot("r", "p1");
+        {
+            let b = &mut cfg.proxy_bindings[0];
+            b.applied = true;
+            b.applied_key = "http_proxy".into();
+            b.applied_value = "http://ours:1".into();
+            b.original_override = None;
+        }
+        cfg.bind_proxy_slot("r", "");
+        let b = &cfg.proxy_bindings[0];
+        assert!(b.is_direct());
+        assert!(!b.applied, "换目标后要标成待应用");
+        assert_eq!(b.applied_value, "http://ours:1", "回滚依据不能被清掉");
+        assert_eq!(b.applied_key, "http_proxy");
+        assert!(b.has_footprint());
+    }
 }
