@@ -4,7 +4,8 @@ use crate::config;
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
 use plugin_host::CapProvider;
-use rclone_client::{local_fs, RcloneManager};
+use rcgui_rc::RcState;
+use rclone_client::local_fs;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -68,15 +69,16 @@ impl KvStore {
 }
 
 pub struct RealCaps {
-    pub mgr: std::sync::Arc<RcloneManager>,
+    /// 只依赖连接状态，不依赖进程管理器：插件能力与 rclone 是否由本程序拉起无关。
+    pub rc: std::sync::Arc<RcState>,
     pub store: std::sync::Arc<KvStore>,
 }
 
 #[async_trait::async_trait]
 impl CapProvider for RealCaps {
     async fn rclone_call(&self, method: String, params: Value) -> Result<Value> {
-        let client = self.mgr.client.read().await.clone();
-        client.call(&method, &params).await
+        let client = self.rc.client().await;
+        client.call(&method, &params).await.map_err(Into::into)
     }
 
     async fn upload_file(
@@ -94,8 +96,11 @@ impl CapProvider for RealCaps {
         let name = format!("up-{}-{}", std::process::id(), chrono_ts());
         let tmp = tmp_dir.join(&name);
         std::fs::write(&tmp, &data)?;
-        let client = self.mgr.client.read().await.clone();
-        let r = client.copyfile(&local_fs(&tmp_dir), &name, &fs, &remote_path).await;
+        let client = self.rc.client().await;
+        let r = client
+            .copyfile(&local_fs(&tmp_dir), &name, &fs, &remote_path)
+            .await
+            .map_err(anyhow::Error::from);
         let _ = std::fs::remove_file(&tmp);
         r?;
         Ok(serde_json::json!({}))

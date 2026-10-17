@@ -11,6 +11,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+sha2 = { workspace = true }
+flate2 = { workspace = true }
+crc32fast = "1"
+semver = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }

@@ -28,6 +28,9 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 use wasmtime::{Config, Engine, Module};
 
+pub mod package;
+pub mod zip;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PluginManifest {
     #[serde(default)]
@@ -86,7 +89,10 @@ pub struct PluginHost {
 impl PluginHost {
     pub fn new() -> Result<Self> {
         let mut config = Config::new();
-        config.consume_fuel(false);
+        // 启用 fuel 计量：插件是外部代码，必须有执行上限。
+        // 关闭时一个死循环插件会永久占住一个 blocking 线程（无法取消），
+        // 拖垮整个插件子系统。这里按"每次调用消耗多少 fuel"计费。
+        config.consume_fuel(true);
         Ok(Self {
             engine: Engine::new(&config)?,
             cache: Mutex::new(HashMap::new()),
@@ -233,6 +239,10 @@ fn run_module_sync(engine: &Engine, module: &Module, stdin: Vec<u8>) -> Result<V
     use wasmtime_wasi::preview1::{self, WasiP1Ctx};
     use wasmtime_wasi::WasiCtxBuilder;
 
+    /// 单次插件调用的 fuel 上限。图床上传/扫描这类操作足够用；
+    /// 耗尽即中断执行，避免死循环插件永久占用线程。
+    const FUEL_PER_CALL: u64 = 50_000_000_000;
+
     let mut linker: Linker<WasiP1Ctx> = Linker::new(engine);
     preview1::add_to_linker_sync(&mut linker, |t| t)?;
     let stdout = MemoryOutputPipe::new(128 * 1024 * 1024);
@@ -244,6 +254,7 @@ fn run_module_sync(engine: &Engine, module: &Module, stdin: Vec<u8>) -> Result<V
         .args(&["plugin.wasm"])
         .build_p1();
     let mut store = wasmtime::Store::new(engine, wasi);
+    store.set_fuel(FUEL_PER_CALL)?;
     let instance = linker.instantiate(&mut store, module)?;
     let start = instance
         .get_typed_func::<(), ()>(&mut store, "_start")
@@ -251,6 +262,10 @@ fn run_module_sync(engine: &Engine, module: &Module, stdin: Vec<u8>) -> Result<V
     if let Err(e) = start.call(&mut store, ()) {
         let err_bytes = stderr.contents();
         let err_text = String::from_utf8_lossy(&err_bytes);
+        // fuel 耗尽时 wasmtime 报 "all fuel consumed"；给出更可读的提示
+        if format!("{e}").contains("fuel") {
+            bail!("插件执行超出资源上限，已中止（可能存在死循环或过度计算）\n插件 stderr: {err_text}");
+        }
         bail!("插件运行失败: {e}\n插件 stderr: {err_text}");
     }
     Ok(stdout.contents().to_vec())

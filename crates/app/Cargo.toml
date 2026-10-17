@@ -12,15 +12,18 @@ path = "src/main.rs"
 slint-build = "1"
 
 [dependencies]
+rcgui-profile = { path = "../profile" }
+rcgui-rc = { path = "../rc" }
 rclone_client = { path = "../rclone" }
 plugin_host = { path = "../plugin" }
-slint = { version = "1", features = ["renderer-software"] }
+slint = { version = "1", features = ["renderer-software", "unstable-winit-030"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 sha1 = { workspace = true }
+sha2 = { workspace = true }
 rand = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
@@ -32,5 +35,4 @@ arboard = "3"
 async-trait = { workspace = true }
 rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["png"] }
-open = "5"
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

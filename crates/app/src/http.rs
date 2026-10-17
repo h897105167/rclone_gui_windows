@@ -6,7 +6,6 @@
 use crate::config;
 use crate::kv::RealCaps;
 use anyhow::{anyhow, Result};
-use axum::body::Bytes;
 use axum::extract::{FromRequest, Multipart, Path as AxPath, Query as AxQuery, Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::IntoResponse;
@@ -14,7 +13,7 @@ use axum::routing::{any, get};
 use axum::Router;
 use base64::Engine as _;
 use plugin_host::PluginHost;
-use rclone_client::RcloneManager;
+
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
@@ -27,8 +26,6 @@ const BODY_LIMIT: usize = 100 * 1024 * 1024;
 pub struct HttpState {
     pub host: Arc<PluginHost>,
     pub caps: Arc<RealCaps>,
-    pub mgr: Arc<RcloneManager>,
-    pub exe: PathBuf,
     pub cfg: Arc<std::sync::Mutex<config::AppConfig>>,
 }
 
@@ -46,14 +43,21 @@ pub fn build_router(state: HttpState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/plugin/{id}/{*rest}", any(plugin_dispatch))
+        // 旧版 Obsidian 插件约定的裸路径（raw-body + query），保持向后兼容
+        .route("/upload", any(legacy_upload))
         .route("/i/{root_id}/{*path}", get(direct_link))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
 }
 
-pub async fn serve(state: HttpState, port: u16) -> Result<()> {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    axum::serve(listener, build_router(state)).await?;
+pub async fn serve(
+    state: HttpState,
+    listener: tokio::net::TcpListener,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<()> {
+    axum::serve(listener, build_router(state))
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
 
@@ -83,7 +87,35 @@ async fn plugin_dispatch(
     headers: HeaderMap,
     req: Request,
 ) -> impl IntoResponse {
-    let plugin_path = format!("/{rest}");
+    dispatch_to_plugin(st, id, format!("/{rest}"), method, q, headers, req).await
+}
+
+/// 旧版 Obsidian 插件兼容入口：POST /upload → imagehost 的 /upload。
+///
+/// 早期 Node/Vue 时代的 Obsidian 插件约定直接向 `127.0.0.1:5273/upload`
+/// 以 raw-body + query 方式上传（响应 `{items:[...]}`）。当前实现只暴露
+/// `/api/plugin/imagehost/upload`，旧插件会收到 404 而静默失败。
+/// 这里保留该别名，使旧插件无需改动即可继续工作。
+async fn legacy_upload(
+    State(st): State<HttpState>,
+    method: Method,
+    AxQuery(q): AxQuery<HashMap<String, String>>,
+    headers: HeaderMap,
+    req: Request,
+) -> impl IntoResponse {
+    dispatch_to_plugin(st, "imagehost".to_string(), "/upload".to_string(), method, q, headers, req)
+        .await
+}
+
+async fn dispatch_to_plugin(
+    st: HttpState,
+    id: String,
+    plugin_path: String,
+    method: Method,
+    q: HashMap<String, String>,
+    headers: HeaderMap,
+    req: Request,
+) -> axum::response::Response {
     if !st.plugin_enabled(&id) {
         return (
             StatusCode::FORBIDDEN,
@@ -286,6 +318,18 @@ async fn fetch_roots(st: &HttpState) -> Vec<Value> {
     }
 }
 
+/// 规范化远程相对路径：统一分隔符并剔除 `.` / `..` 段。
+///
+/// 直链路径来自 URL，未规范化时 `..` 会被原样传给 `rclone cat`，
+/// 从而读到图床根目录之外的文件。这里与插件的 normalize_sub 保持同一规则。
+pub(crate) fn normalize_rel_path(p: &str) -> String {
+    p.replace('\\', "/")
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 async fn direct_link_inner(st: &HttpState, root_id: &str, path: &str) -> Result<BodyOf> {
     let roots = fetch_roots(st).await;
     let root = roots
@@ -298,19 +342,31 @@ async fn direct_link_inner(st: &HttpState, root_id: &str, path: &str) -> Result<
         .ok_or_else(|| anyhow!("root 缺少 remote"))?
         .to_string();
 
+    // 防目录穿越：路径必须先规范化再回源
+    let path = normalize_rel_path(path);
+    if path.is_empty() {
+        return Err(anyhow!("路径为空"));
+    }
+
     let name = path.rsplit('/').next().unwrap_or("file").to_string();
     let cache_dir = config::data_dir().join("cache").join(root_id);
     let key = &sha1_hex(format!("{remote}:{path}").as_bytes())[..16];
     let file = cache_dir.join(format!("{key}_{name}"));
 
     if !file.exists() {
-        let tmp = file.with_extension(format!("dl-{}", std::process::id()));
         std::fs::create_dir_all(&cache_dir)?;
-        st.mgr
-            .cat_to_file(Some(&st.exe), &remote, path, &tmp)
+        // 回源：只走 RC（operations/copyfile 到唯一临时文件 → 读字节 → 写缓存）。
+        // 不再启动 `rclone cat` 子进程；该 rclone 版本没有 operations/cat（实测 404）。
+        let dir = cache_dir.join(format!("tmp-{}", std::process::id()));
+        let client = st.caps.rc.client().await;
+        let bytes = rcgui_rc::fetch_to_temp(&client, &remote, &path, &dir)
             .await
-            .map_err(|e| anyhow!("回源失败: {e}"))?;
+            .map_err(|e| anyhow!("回源失败（{}）: {}", e.kind.label(), e))?;
+        // 原子落缓存：先写临时名再改名，避免读到半截文件
+        let tmp = file.with_extension(format!("dl-{}", std::process::id()));
+        tokio::fs::write(&tmp, &bytes).await?;
         std::fs::rename(&tmp, &file)?;
+        let _ = std::fs::remove_dir_all(&dir);
     }
     let bytes = tokio::fs::read(&file).await?;
     Ok((bytes, content_type_of(&name)))

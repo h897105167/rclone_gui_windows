@@ -2,11 +2,12 @@
 name = "rclone_client"
 version.workspace = true
 edition.workspace = true
+description = "rclone 进程管理（legacy）：RC 客户端与连接状态已迁往 rcgui-rc"
 
 [dependencies]
+rcgui-rc = { path = "../rc" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-reqwest = { workspace = true }
 rand = { workspace = true }

@@ -14,6 +14,39 @@ pub struct VersionInfo {
     pub go_version: String,
     #[serde(rename = "isGit", default)]
     pub is_git: bool,
+    /// rclone 返回的版本分解，如 `[1, 75, 2]`；用于版本门槛判定。
+    #[serde(rename = "decomposed", default)]
+    pub decomposed: Vec<u32>,
+}
+
+impl VersionInfo {
+    /// 是否至少为 `major.minor`。`decomposed` 缺失时退化为解析 `version` 字符串。
+    pub fn at_least(&self, major: u32, minor: u32) -> bool {
+        let (maj, min) = match (self.decomposed.first(), self.decomposed.get(1)) {
+            (Some(m), Some(n)) => (*m, *n),
+            _ => {
+                let mut it = self.version.trim_start_matches('v').split('.');
+                let m = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let n = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                (m, n)
+            }
+        };
+        (maj, min) >= (major, minor)
+    }
+}
+
+/// `config/paths` 的返回：rclone 实际使用的目录。
+///
+/// 用途：握手时向**运行的实例**询问真实配置路径，而不是假设
+/// `%APPDATA%\rclone\rclone.conf`，也不需要启动 `rclone config file` 子进程。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConfigPaths {
+    #[serde(default)]
+    pub config: String,
+    #[serde(default)]
+    pub cache: String,
+    #[serde(default)]
+    pub temp: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
