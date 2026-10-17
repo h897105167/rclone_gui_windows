@@ -2041,6 +2041,18 @@ async fn handshake_only(ctx: &Arc<Ctx>) -> ConnOutcome {
         Ok(hs) => {
             // 握手成功才算真正「连上」（此前可能是占位客户端）
             ctx.rc.set_connected(client).await;
+            // 关键：重连后必须清掉 provider 缓存。
+            // 对端可能换了实例/版本，也可能上一次是因为 rclone 侧没配 RC 认证
+            // 才失败的。不清的话，用户即使修好认证、点「重新握手」，
+            // 类型列表也永远停在旧结果（实测反馈：握手成功但 type 不更新）。
+            *ctx.providers_cache.lock().unwrap() = None;
+            *ctx.providers_err.lock().unwrap() = None;
+            // 顺手预取一次：让「拿不到类型」这件事在连接时就暴露，而不是等建远程
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                get_providers(ctx),
+            )
+            .await;
             // 重连后必须重新下发限速：对端可能是新实例，或状态已被重置
             ctx.last_bwlimit.lock().unwrap().clear();
             let mut view = snapshot_view(ctx).await;
@@ -4017,12 +4029,19 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                         .unwrap()
                         .clone()
                         .unwrap_or_else(|| "rclone 未返回后端类型列表".to_string());
+                    // rclone 对 config/* 这类敏感接口要求配置 RC 认证；只连上
+                    // core/version 并不代表能读配置（实测踩过）。给一句能照做的指引。
+                    let auth_hint = if why.to_ascii_lowercase().contains("authentication must be set up") {
+                        "rclone 没有启用 RC 认证：请加 --rc-user/--rc-pass（与「设置」里的一致）或 --rc-no-auth 后重启 rclone，再点「重新握手」。"
+                    } else {
+                        "请到「设置」点「连接/握手」或「重新握手」。"
+                    };
                     toast(
                         &ui2,
                         2,
                         format!(
                             "无法从 rclone 获取远程类型（{why}），已先列出常见类型；\
-                             参数表单需要连接后才能加载。请到「设置」点「连接/握手」或「重新握手」。"
+                             参数表单需要连接后才能加载。{auth_hint}"
                         ),
                     );
                 }
