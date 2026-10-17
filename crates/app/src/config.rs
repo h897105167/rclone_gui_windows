@@ -143,6 +143,12 @@ pub struct AppConfig {
     /// 服务自定义名称映射（同上：只从档案文档落盘）
     #[serde(default, skip_serializing)]
     pub serve_names: Vec<ServeName>,
+    /// 代理配置表（同上：只从档案文档落盘）
+    #[serde(default, skip_serializing)]
+    pub proxies: Vec<rcgui_profile::ProxyProfile>,
+    /// remote → 代理绑定（同上）
+    #[serde(default, skip_serializing)]
+    pub proxy_bindings: Vec<rcgui_profile::RemoteProxyBinding>,
     /// 全局上传限速（数值文本，空 = 不限；rclone 仅支持全局 tx:rx 限速）
     #[serde(default)]
     pub bw_up: String,
@@ -158,6 +164,37 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         serde_json::from_value(serde_json::json!({})).unwrap()
+    }
+}
+
+impl AppConfig {
+    /// 设置某 remote 的代理绑定（`proxy_id` 为空串 = 明确不代理）。
+    ///
+    /// 换目标时**必须**把下发状态清掉：否则界面会显示「已生效」而 rclone 里还是旧代理。
+    /// 与 `ProfileDoc::bind_proxy` 的语义保持一致。
+    pub fn bind_proxy_slot(&mut self, remote: &str, proxy_id: &str) {
+        let key = remote.trim_end_matches(':');
+        match self
+            .proxy_bindings
+            .iter_mut()
+            .find(|b| b.remote.eq_ignore_ascii_case(key))
+        {
+            Some(b) => {
+                if b.proxy_id != proxy_id {
+                    b.proxy_id = proxy_id.to_string();
+                    b.applied = false;
+                    b.applied_value.clear();
+                    if proxy_id.is_empty() {
+                        b.original_override = None;
+                    }
+                }
+            }
+            None => self.proxy_bindings.push(rcgui_profile::RemoteProxyBinding {
+                remote: key.to_string(),
+                proxy_id: proxy_id.to_string(),
+                ..Default::default()
+            }),
+        }
     }
 }
 
@@ -180,9 +217,134 @@ pub fn data_dir() -> PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
     // 展开可能的 8.3 短名（ADMINI~1 → Administrator），保证目录名与提示都正确
     let appdata = long_path(&PathBuf::from(appdata));
-    resolve_data_dir(appdata.join("RCGUI"), appdata.join("rclone-gui"))
+    let dir = resolve_data_dir(appdata.join("RCGUI"), appdata.join("rclone-gui"));
+    // 确保本机用户对数据目录有写权限。
+    //
+    // 背景：如果程序曾以管理员身份运行过，它创建的目录 owner 会是
+    // `BUILTIN\Administrators`，ACL 里往往只有 SYSTEM / Administrators / Local Account，
+    // 没有普通用户或 Users 组的显式 ACE。用户之后以普通权限启动时，
+    // 令牌里的 Administrators 是「仅用于拒绝」，于是任何写入都报
+    // `拒绝访问 (os error 5)` —— 现象像配置错误，实则是目录权限。
+    //
+    // 只在「确实缺 Users 权限」时执行，避免每次取数据目录都去 spawn icacls。
+    ensure_user_can_write_once(&dir);
+    dir
 }
 
+/// 每个进程只尝试修复一次，且只在**确实缺少 Users 权限**时才真正执行。
+///
+/// 用 `OnceLock` 而不是 `Once`：需要记住结果供后续诊断。
+static PERM_FIXED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn ensure_user_can_write_once(dir: &std::path::Path) {
+    PERM_FIXED.get_or_init(|| {
+        // 先做「真实可写性探测」，而不是只看 ACL 里有没有 Users。
+        //
+        // 只看 ACL 会误判：ACL 里可能有继承来的 `Users:(I)(F)` 条目，
+        // 但文件 owner 是 `BUILTIN\Administrators`（管理员权限写过），
+        // 普通权限进程在部分配置下仍然无法覆盖 —— 表现为「明明有权限却拒绝访问」。
+        // 因此这里直接试着建一个临时文件，失败才去修。
+        let writable = probe_writable(dir);
+        debug_log(&format!(
+            "[perm] dir={} writable={}",
+            dir.display(),
+            writable
+        ));
+        if writable {
+            return true;
+        }
+        let ok = ensure_user_can_write(dir, true);
+        let after = probe_writable(dir);
+        debug_log(&format!("[perm] repair attempted -> {ok}, writable_after={after}"));
+        ok && after
+    });
+}
+
+/// 在当前目录真实建一个临时文件来判断可写性。
+///
+/// 这是最可靠的判断方式：ACL 看起来正确不代表真的能写（owner、完整性级别、
+/// 继承标志都可能让写入失败），只有实际写一次才不会骗人。
+fn probe_writable(dir: &std::path::Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let probe = dir.join(format!(".rcgui-wprobe-{}", std::process::id()));
+    match std::fs::write(&probe, b"x") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 极简诊断日志：写到 `%APPDATA%\RCGUI\perm-debug.log`。
+///
+/// 仅用于排查「拒绝访问」这类难以复现的问题；写入失败完全忽略。
+/// 注意**不能**调用 `data_dir()`（会递归进 `ensure_user_can_write_once`），
+/// 所以这里自己拼路径。
+fn debug_log(msg: &str) {
+    if std::env::var("RCGUI_DEBUG_PERM").is_err() {
+        return;
+    }
+    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
+    let path = std::path::PathBuf::from(base).join("RCGUI").join("perm-debug.log");
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{} {msg}", rcgui_profile::now_iso());
+    }
+}
+
+
+/// 确保本目录对**普通用户**可写（补一条 `BUILTIN\Users` 的显式 ACE 并递归）。
+///
+/// 为什么授予 `Users` 而不是「当前用户名」：
+/// - 目录 owner 可能是 `BUILTIN\Administrators`（管理员权限运行时创建）时，
+///   非提升进程不能把 ACL 改成给「自己」授权，实测返回 ERROR_ACCESS_DENIED(5)；
+/// - 给内置 `BUILTIN\Users` 组加 ACE 则是允许的，且覆盖本机所有交互用户。
+///
+/// ⚠️ 关键坑：**`icacls` 的退出码不可靠**。带 `/C` 时它「继续处理剩余文件」，
+/// 即使某个路径报「拒绝访问」也仍然返回 0。因此必须检查输出里是否出现失败字样，
+/// 不能只看 `status.success()`。这一条曾经让自愈逻辑「看起来成功、实际没生效」。
+fn ensure_user_can_write(dir: &std::path::Path, quiet: bool) -> bool {
+    if !dir.exists() {
+        return false;
+    }
+    // 用绝对路径：GUI 进程的 PATH 不保证包含 System32
+    let icacls = std::env::var("SystemRoot")
+        .map(|r| format!(r"{r}\System32\icacls.exe"))
+        .unwrap_or_else(|_| "icacls".to_string());
+    let out = std::process::Command::new(&icacls)
+        .arg(dir)
+        .arg("/grant")
+        .arg("*S-1-5-32-545:(OI)(CI)F") // BUILTIN\Users，用 SID 避免本地化名称差异
+        .arg("/T")
+        .arg("/C")
+        .arg("/Q")
+        .creation_flags_no_window()
+        .output();
+    let _ = quiet;
+    match out {
+        Ok(o) => {
+            if !o.status.success() {
+                return false;
+            }
+            // exit code 为 0 不代表全部成功：扫输出里的失败信号
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let combined = format!("{stdout}{stderr}");
+            !(combined.contains("拒绝访问")
+                || combined.contains("Access is denied")
+                || combined.contains("失败")
+                || combined.contains("Failed processing"))
+        }
+        Err(_) => false,
+    }
+}
 
 /// 把 8.3 短名（如 `ADMINI~1`）解析成真实长路径。
 ///
@@ -313,7 +475,86 @@ pub fn config_path() -> PathBuf {
     data_dir().join("config.json")
 }
 
+/// 写入失败时的自愈：给目录补上「当前用户」的完全控制权限。
+///
+/// **为什么需要这个**：如果程序曾经以「管理员身份」运行过，它创建的
+/// `%APPDATA%\RCGUI` 及其子目录会带上这样一份 ACL：
+///
+/// ```text
+/// O:BAG:S-1-5-21-...-513D:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;LA)
+/// ```
+///
+/// 只有 `SY`（SYSTEM）、`BA`（Administrators）、`LA`（Local Account）三条，
+/// **没有 `Users` / 当前用户的显式 ACE**。而普通（非提升）进程的令牌里，
+/// `BUILTIN\Administrators` 是「仅用于拒绝」(deny only)，`LA` 也不包含
+/// 本机交互用户 —— 结果就是**普通权限下完全无法写入**，报
+/// `拒绝访问 (os error 5)`。
+///
+/// 用户视角的现象极难诊断：配置明明没问题、文件也在，就是存不进去；
+/// 而且往往是「以管理员跑过一次之后」才开始坏。
+///
+/// 这里用 `icacls` 给当前用户补 ACE（继承到子项），成功后原操作重试一次。
+/// 用 `icacls` 而不是自己拼 SDDL：ACL 编辑涉及精确的 ACE 顺序与传播标志，
+/// 交给系统工具更可靠，也便于用户用同样命令手动修复。
+pub fn repair_data_dir_permissions() -> Result<(), String> {
+    let dir = data_dir();
+    if !dir.exists() {
+        return Err(format!("数据目录不存在：{}", dir.display()));
+    }
+    if ensure_user_can_write(&dir, false) {
+        Ok(())
+    } else {
+        let account = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+            (Ok(d), Ok(u)) if !d.is_empty() && !u.is_empty() => format!("{d}\\{u}"),
+            (_, Ok(u)) => u,
+            _ => "<你的用户名>".to_string(),
+        };
+        Err(format!(
+            "自动修复数据目录权限失败。可手动执行：icacls \"{}\" /grant \"{account}:(OI)(CI)F\" /T",
+            dir.display()
+        ))
+    }
+}
+
+/// 给 `std::process::Command` 加「不弹黑框」的 Windows 扩展。
+trait NoWindowExt {
+    fn creation_flags_no_window(&mut self) -> &mut Self;
+}
+
+impl NoWindowExt for std::process::Command {
+    fn creation_flags_no_window(&mut self) -> &mut Self {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW = 0x08000000，避免弹一下控制台
+            self.creation_flags(0x08000000);
+        }
+        self
+    }
+}
+
+/// 写入失败时统一的自愈包装：失败 → 尝试修权限 → 重试一次。
+///
+/// 只在「权限类错误」时才修，避免任何写失败都去动 ACL（那会让真正的
+/// 磁盘满、文件被占用等问题更难诊断）。
 pub fn write_atomic(file: &PathBuf, data: &[u8]) -> Result<()> {
+    match write_atomic_once(file, data) {
+        Ok(()) => Ok(()),
+        Err(e) if is_permission_error(&e) => {
+            repair_data_dir_permissions().map_err(|re| {
+                anyhow::anyhow!(
+                    "{e}；自动修复权限也失败了：{re}",
+                    e = e
+                )
+            })?;
+            // 修完重试一次；这次仍失败就把原始错误抛出去
+            write_atomic_once(file, data)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn write_atomic_once(file: &PathBuf, data: &[u8]) -> Result<()> {
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -321,6 +562,22 @@ pub fn write_atomic(file: &PathBuf, data: &[u8]) -> Result<()> {
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, file)?;
     Ok(())
+}
+
+/// 判断错误是否是「权限/拒绝访问」类。
+fn is_permission_error(e: &anyhow::Error) -> bool {
+    for cause in e.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if io.kind() == std::io::ErrorKind::PermissionDenied {
+                return true;
+            }
+            // Windows: ERROR_ACCESS_DENIED = 5
+            if io.raw_os_error() == Some(5) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn load() -> AppConfig {

@@ -11,6 +11,8 @@ mod http;
 mod kv;
 mod persist;
 mod profiles;
+mod proxy;
+mod reconcile;
 mod script;
 
 use anyhow::anyhow;
@@ -60,6 +62,21 @@ enum Cmd {
     RemoteSave,
     RemoteCancel,
     RemoteTypeChanged,
+    // ---------------- 代理（按 remote 分配） ----------------
+    /// 打开/刷新代理配置列表（供远程页的「代理」列与配置卡片使用）
+    ProxyListRefresh,
+    /// 打开代理配置编辑器（`id` 为空 = 新建）
+    ProxyEditLoad { id: String },
+    /// 保存代理配置编辑器内容
+    ProxySave,
+    /// 删除一条代理配置（UI 已确认关联影响）
+    ProxyDelete { id: String },
+    /// 用户点「删除代理配置」：先算关联再弹确认（不真正删除）
+    ProxyDeleteAsk { id: String },
+    /// 把某 remote 的代理设为第 `idx` 项（0 = 不代理，n = 第 n 条配置）
+    ProxyBind { remote: String, idx: i32 },
+    /// 编辑器取消
+    ProxyCancel,
     ServesRefresh,
     ServeStart,
     ServeStop { id: String },
@@ -111,6 +128,8 @@ enum Cmd {
     AdminRestart,
     /// 用户取消重启：把复选框恢复成当前真实权限状态
     AdminCancel,
+    /// 托盘图标注册失败：把原因告知用户（不能静默）
+    TrayFailed(String),
     Quit,
 }
 
@@ -240,9 +259,70 @@ impl Drop for BusyGuard {
 
 // ---------------- 工具 ----------------
 
+/// 设置远程页「忙碌」指示（驱动侧边栏与工具条 spinner）。
+///
+/// 每个耗时操作开始时置 true、结束时置 false。用 RAII 守卫保证任何提前 return
+/// 或错误路径都会复位，不让 spinner 卡住。
+fn set_remotes_busy(ui: &Weak<MainWindow>, busy: bool) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.global::<RemotesG>().set_loading(busy);
+    });
+}
+
+/// 忙碌守卫：构造时置位，Drop 时复位。
+struct RemotesBusyGuard(Weak<MainWindow>);
+
+impl RemotesBusyGuard {
+    fn new(ui: &Weak<MainWindow>) -> Self {
+        set_remotes_busy(ui, true);
+        Self(ui.clone())
+    }
+}
+
+impl Drop for RemotesBusyGuard {
+    fn drop(&mut self) {
+        set_remotes_busy(&self.0, false);
+    }
+}
+
+/// 历史记录上限。
+///
+/// toast 很频繁（每次刷新失败、每条恢复失败都会来一条），不设上限会无限增长，
+/// 既吃内存也让界面里的 ListView 变慢。200 条足够回看一次操作的全过程。
+const HISTORY_CAP: usize = 200;
+
+/// 把一条消息追加到「历史记录」。
+///
+/// 与 toast 共用同一个入口：`toast_ui` 里调用，所以**任何**提示都会留档，
+/// 不需要各处单独记得去记 —— 这正是「历史记录要包含所有提示」的要求。
+fn push_log_history(ui: &MainWindow, kind: i32, msg: &str) {
+    let g = ui.global::<ToastG>();
+    let rows = g.get_history();
+    let mut v: Vec<LogRow> = Vec::with_capacity(rows.row_count() + 1);
+    // 最新的放最前面，用户一眼就能看到刚才发生了什么
+    v.push(LogRow {
+        kind: kind.to_string().into(),
+        time: chrono::Local::now().format("%H:%M:%S").to_string().into(),
+        msg: msg.to_string().into(),
+    });
+    for i in 0..rows.row_count() {
+        if let Some(r) = rows.row_data(i) {
+            v.push(r);
+        }
+        if v.len() >= HISTORY_CAP {
+            break;
+        }
+    }
+    let has_err = v.iter().any(|r| r.kind.as_str() == "2");
+    g.set_history(ModelRc::from(Rc::new(VecModel::from(v))));
+    g.set_has_errors(has_err);
+}
+
 fn toast_ui(ui: &MainWindow, kind: i32, msg: impl Into<String>) {
+    let msg = msg.into();
+    push_log_history(ui, kind, &msg);
     ui.global::<ToastG>().set_kind(kind);
-    ui.global::<ToastG>().set_msg(msg.into().into());
+    ui.global::<ToastG>().set_msg(msg.into());
     ui.global::<ToastG>().set_show(true);
     let weak = ui.as_weak();
     slint::Timer::single_shot(std::time::Duration::from_millis(2600), move || {
@@ -488,11 +568,82 @@ async fn apply_remotes_filter(ui: &Weak<MainWindow>, full: &[(String, String, St
             rtype: t.clone().into(),
             usage: u.clone().into(),
             needs_auth: *needs.get(n).unwrap_or(&false),
+            // 代理列由下面的 set_rows 之后再统一填（需要读档案，避免这里再开一次盘）
+            proxy_label: "不代理".into(),
+            proxy_pending: false,
+            proxy_conflict: false,
+            proxy_index: 0,
         })
         .collect();
     let _ = ui.upgrade_in_event_loop(move |ui| {
         ui.global::<RemotesG>()
             .set_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+    });
+    // 填代理列（徽标：待应用 / 需要确认）
+    apply_proxy_column(ui).await;
+}
+
+/// 把档案里的代理绑定状态刷到远程列表的「代理」列。
+///
+/// 单独一个函数是因为它在多个时机要重跑：列表刷新、绑定切换后、连接成功后。
+async fn apply_proxy_column(ui: &Weak<MainWindow>) {
+    let snap = {
+        let doc = crate::profiles::store().load().ok().flatten();
+        let d = doc.unwrap_or_default();
+        let reg = rcgui_profile::ProxyRegistry::new(&d.proxies, &d.remote_proxies);
+        // 下拉框候选项（第 0 项固定「不代理」），顺序即 proxies 顺序
+        let mut options: Vec<slint::SharedString> = vec!["不代理".into()];
+        let mut hints: Vec<slint::SharedString> = vec![proxy::DIRECT_HINT.into()];
+        for p in &d.proxies {
+            options.push(format!("{}（{}）", p.name, p.display_target()).into());
+            hints.push(proxy::CREDENTIAL_HINT.into());
+        }
+        let mut rows_state: std::collections::HashMap<String, (String, bool, bool, i32)> =
+            std::collections::HashMap::new();
+        for b in &d.remote_proxies {
+            let bound = reg.by_id(&b.proxy_id);
+            let label = match (b.is_direct(), bound) {
+                (true, _) => "不代理".to_string(),
+                (false, Some(p)) => p.display_target(),
+                // 悬空引用：不能假装代理已生效
+                (false, None) => "配置已删除".to_string(),
+            };
+            let idx = if b.is_direct() {
+                0
+            } else {
+                d.proxies
+                    .iter()
+                    .position(|p| p.id == b.proxy_id)
+                    .map(|p| p as i32 + 1)
+                    .unwrap_or(0)
+            };
+            rows_state.insert(
+                b.remote.clone(),
+                (label, b.needs_apply(), !b.is_direct() && bound.is_none(), idx),
+            );
+        }
+        (options, hints, rows_state)
+    };
+    let (options, hints, state) = snap;
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let g = ui.global::<RemotesG>();
+        g.set_proxy_options(ModelRc::from(Rc::new(VecModel::from(options))));
+        g.set_proxy_option_hints(ModelRc::from(Rc::new(VecModel::from(hints))));
+        let rows = g.get_rows();
+        for i in 0..rows.row_count() {
+            if let Some(mut r) = rows.row_data(i) {
+                let name = r.name.to_string();
+                let (label, pending, conflict, idx) = state
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| ("不代理".to_string(), false, false, 0));
+                r.proxy_label = label.into();
+                r.proxy_pending = pending;
+                r.proxy_conflict = conflict;
+                r.proxy_index = idx;
+                rows.set_row_data(i, r);
+            }
+        }
     });
 }
 
@@ -1160,6 +1311,9 @@ fn main() {
     }
 
     // 配置
+    // 必须在任何档案写入之前注册：程序若曾以管理员身份运行过，数据目录的 ACL
+    // 会让普通权限进程写入报「拒绝访问」，这里给它一次自愈的机会。
+    profiles::install_permission_healer();
     let cfg = config::load();
 
     // Slint UI
@@ -1305,29 +1459,272 @@ fn main() {
         );
     }
 
-    // 托盘（取主窗可 HWND，使左键托盘也能弹出启 退出 的菜单）
-    let main_hwnd: isize = {
+    // 托盘。菜单在托盘线程里创建（右键由系统弹出），
+    // 左键双击也由托盘线程自己处理，因此不需要主窗口 HWND。
+    spawn_tray(ui.as_weak(), tx.clone());
+
+    if !silent_flag && !cfg.silent_start {
+        ui.show().expect("窗口显示失败");
+    }
+
+    // 窗口 / 任务栏图标。
+    //
+    // 必须**延后**到事件循环真正跑起来之后再设置：`ui.show()` 只是发出显示请求，
+    // winit 的原生窗口要等事件循环处理后才存在。启动早期取 HWND 会得到 None，
+    // 图标设置就静默失败了（实测：show() 之后立即取仍是 None）。
+    // 因此先尝试一次，再用一次性定时器在事件循环里补一次。
+    set_window_icon(&ui, &cfg);
+    {
+        let ui_weak = ui.as_weak();
+        let cfg_for_icon = cfg.clone();
+        let timer = Box::leak(Box::new(slint::Timer::default()));
+        timer.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_millis(300),
+            move || {
+                if let Some(u) = ui_weak.upgrade() {
+                    set_window_icon(&u, &cfg_for_icon);
+                }
+            },
+        );
+    }
+    slint::run_event_loop_until_quit().expect("事件循环启动失败");}
+
+/// 取主窗口的 HWND。
+///
+/// 首选 `with_winit_window`（权威来源）；失败时回退到「按窗口标题查找」。
+///
+/// **为什么需要回退**：Slint 的 `ui.show()` 只是发出显示请求，
+/// 真正的 win32 窗口可能在事件循环开始后才由 winit 创建。启动早期调用
+/// `with_winit_window` 会拿到 `None`（实测在 show() 之后仍然如此），
+/// 于是图标设置静默失败。按标题查找则不依赖 winit 的内部时机。
+fn main_window_hwnd(ui: &MainWindow) -> Option<isize> {
+    #[cfg(windows)]
+    {
         use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         use slint::winit_030::WinitWindowAccessor;
-        ui.window()
+
+        let via_winit = ui
+            .window()
             .with_winit_window(|w| {
                 w.window_handle().ok().and_then(|h| match h.as_raw() {
                     RawWindowHandle::Win32(h) => Some(h.hwnd.get() as isize),
                     _ => None,
                 })
             })
-            .flatten()
-            .unwrap_or(0)
-    };
-    spawn_tray(ui.as_weak(), tx.clone(), main_hwnd);
-
-    if !silent_flag && !cfg.silent_start {
-        ui.show().expect("窗口显示失败");
+            .flatten();
+        if via_winit.is_some() {
+            return via_winit;
+        }
+        // 回退：按标题找（标题在 main.slint 里固定为 "RCGUI"）
+        find_window_by_title("RCGUI")
     }
-    slint::run_event_loop_until_quit().expect("事件循环启动失败");
+    #[cfg(not(windows))]
+    {
+        let _ = ui;
+        None
+    }
 }
 
-/// 内置 wasm 插件释放到 data/plugins（不存在时）
+/// 按窗口标题查找顶层窗口 HWND（仅回退路径使用）。
+#[cfg(windows)]
+fn find_window_by_title(title: &str) -> Option<isize> {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
+    };
+
+    struct Ctx<'a> {
+        want: &'a str,
+        found: Option<isize>,
+    }
+
+    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam.0 as *mut Ctx);
+        if ctx.found.is_some() {
+            return BOOL(0); // 已找到，停止枚举
+        }
+        // 只看可见窗口，避免命中隐藏的同名窗口
+        if !IsWindowVisible(hwnd).as_bool() {
+            return BOOL(1);
+        }
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return BOOL(1);
+        }
+        let mut buf = vec![0u16; (len + 1) as usize];
+        let got = GetWindowTextW(hwnd, &mut buf);
+        if got <= 0 {
+            return BOOL(1);
+        }
+        let s = String::from_utf16_lossy(&buf[..got as usize]);
+        if s == ctx.want {
+            ctx.found = Some(hwnd.0 as isize);
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+
+    let mut ctx = Ctx {
+        want: title,
+        found: None,
+    };
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(&mut ctx as *mut Ctx as isize));
+    }
+    ctx.found
+}
+///
+/// 走 win32 的 `WM_SETICON` 而不是 Slint 的 `Window::set_icon`：
+/// Slint 的 `set_icon` 在某些后端（winit）对 Windows 任务栏图标
+/// 不总是生效，而 `WM_SETICON` 是任务栏取图标的权威来源。
+fn set_window_icon(ui: &MainWindow, cfg: &crate::config::AppConfig) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SendMessageW, ICON_BIG, ICON_SMALL, WM_SETICON,
+        };
+
+        // 拿不到 HWND 就静默返回：启动早期（事件循环之前）本来就可能还没有原生窗口，
+        // 调用方会在事件循环里用定时器再试一次。
+        let Some(v) = main_window_hwnd(ui) else {
+            write_icon_log("set_window_icon: hwnd not ready\n");
+            return;
+        };
+        let h = windows::Win32::Foundation::HWND(v as *mut core::ffi::c_void);
+
+        let accent = accent_rgb(cfg);
+        // 同时设置大小两个尺寸：SMALL 用于标题栏/任务栏小图标，
+        // BIG 用于 Alt-Tab 与任务视图。
+        //
+        // 尺寸按**系统当前 DPI**下期望的值生成，而不是硬编码：
+        // 在高 DPI（如 175%）时 SM_CXICON 会是 56 而不是 32，
+        // 给错尺寸虽然会被系统缩放，但会糊。
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXICON, SM_CXSMICON,
+        };
+        for (default, metric, which) in [
+            (32usize, SM_CXICON, ICON_BIG),
+            (16usize, SM_CXSMICON, ICON_SMALL),
+        ] {
+            let m = unsafe { GetSystemMetrics(metric) };
+            let size = if m > 0 { m as usize } else { default };
+
+            if let Some(hicon) = rgba_to_hicon(&make_icon_rgba(size, accent), size) {
+                let prev = unsafe {
+                    SendMessageW(
+                        h,
+                        WM_SETICON,
+                        windows::Win32::Foundation::WPARAM(which as usize),
+                        windows::Win32::Foundation::LPARAM(hicon.0 as isize),
+                    )
+                };
+                write_icon_log(&format!(
+                    "set_window_icon: size={size} which={which} prev={:?}\n",
+                    prev.0
+                ));
+                // 不 DestroyIcon：HICON 已被窗口接管（WM_SETICON 之后由系统持有），
+                // 提前销毁会让图标变成空白。
+            } else {
+                write_icon_log(&format!("set_window_icon: hicon FAILED size={size}\n"));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (ui, cfg);
+    }
+}
+
+/// 托盘诊断日志（同一文件，便于与图标日志对照）。
+fn tray_log(msg: &str) {
+    write_icon_log(&format!("[tray] {msg}\n"));
+}
+
+/// 图标/托盘诊断日志（保留给后续排查）。
+///
+/// 写 **exe 同目录**下的 `rcgui-icon-debug.log`。仅在需要排查
+/// 「图标/托盘看不到效果」时启用（设置 `RCGUI_DEBUG_ICON=1`）。
+/// 不用 `%TEMP%`：本机 `%TEMP%` 在沙箱下表现为可写、实际写入会被拒
+/// （项目里其它测试也踩过这个坑，统一把临时文件放在可执行文件旁）。
+fn write_icon_log(msg: &str) {
+    if std::env::var("RCGUI_DEBUG_ICON").is_err() {
+        return;
+    }
+    let mut p = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    p.push("rcgui-icon-debug.log");
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        let _ = f.write_all(msg.as_bytes());
+        let _ = f.flush();
+    }
+}
+
+/// RGBA 像素 → Windows HICON。
+#[cfg(windows)]
+fn rgba_to_hicon(
+    rgba: &[u8],
+    size: usize,
+) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
+    use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject, HGDIOBJ};
+    use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO};
+
+    // 转成 BGRA：Windows 的 DIB 是 BGRA 顺序
+    let mut bgra = Vec::with_capacity(rgba.len());
+    for px in rgba.chunks_exact(4) {
+        bgra.push(px[2]); // B
+        bgra.push(px[1]); // G
+        bgra.push(px[0]); // R
+        bgra.push(px[3]); // A
+    }
+
+    unsafe {
+        // 颜色位图（带 alpha）
+        let color = CreateBitmap(
+            size as i32,
+            size as i32,
+            1,
+            32,
+            Some(bgra.as_ptr() as *const core::ffi::c_void),
+        );
+        if color.is_invalid() {
+            return None;
+        }
+        // 掩码位图：32 位图标靠 alpha 通道，掩码给全 0 即可
+        let mask_bytes = vec![0u8; (size * size) / 8];
+        let mask = CreateBitmap(
+            size as i32,
+            size as i32,
+            1,
+            1,
+            Some(mask_bytes.as_ptr() as *const core::ffi::c_void),
+        );
+        if mask.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(color.0));
+            return None;
+        }
+
+        let info = ICONINFO {
+            fIcon: windows::Win32::Foundation::BOOL(1),
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: mask,
+            hbmColor: color,
+        };
+        let icon: HICON = CreateIconIndirect(&info).unwrap_or(HICON(std::ptr::null_mut()));
+        // 位图内容已复制进图标，可以立即释放
+        let _ = DeleteObject(HGDIOBJ(color.0));
+        let _ = DeleteObject(HGDIOBJ(mask.0));
+        if icon.0.is_null() {
+            None
+        } else {
+            Some(icon)
+        }
+    }
+}
 fn embed_plugins() {
     const WASM: &[u8] = include_bytes!(concat!(env!("IMAGEHOST_WASM")));
     let dir = config::data_dir().join("plugins");
@@ -1659,11 +2056,15 @@ async fn conn_action(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, which: ConnAction) {
         // 连上后自动恢复上次的挂载/服务（rclone 自己不持久化 mount/serve）。
         // 放到独立线程 + 独立 runtime：conn_action 会被主循环的 Send future await，
         // 而 replay 内部要拿 std Mutex 与 Slint Weak，直接 tokio::spawn 会破坏 Send 约束。
+        //
+        // 代理的「待应用」也在同一处补下发：它同样依赖 std Mutex，
+        // 且必须在 replay 之前完成 —— 否则刚重建的挂载/服务会用到旧代理。
         let ctx2 = ctx.clone();
         let ui2 = ui.clone();
         std::thread::spawn(move || {
             match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(rt) => rt.block_on(async move {
+                    replay_pending_proxies(&ctx2, &ui2).await;
                     persist::replay(&ctx2, &ui2).await;
                 }),
                 Err(_) => {}
@@ -1674,9 +2075,148 @@ async fn conn_action(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, which: ConnAction) {
     }
 }
 
+/// 连接成功后补下发「待应用」的代理绑定。
+///
+/// 与 `persist::replay` 分开的原因：代理下发**不需要**重建挂载/服务，
+/// 而挂载/服务重放需要用户确认（用户明确要求首版不自动）。两者时序上：
+/// 先补代理，再重放挂载/服务，这样重建出来的实例才会用上新代理。
+async fn replay_pending_proxies(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    // 先取待办清单（拿锁、clone、立刻放锁），再做 await
+    let pending: Vec<(String, rcgui_profile::ProxyProfile)> = {
+        let cfg = ctx.cfg.lock().unwrap();
+        let reg = rcgui_profile::ProxyRegistry::new(&cfg.proxies, &cfg.proxy_bindings);
+        cfg.proxy_bindings
+            .iter()
+            .filter(|b| b.needs_apply())
+            .filter_map(|b| reg.for_remote(&b.remote).map(|p| (b.remote.clone(), p.clone())))
+            .collect()
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let client = ctx.rc.client().await;
+    let mut ok = 0usize;
+    let mut errs: Vec<String> = Vec::new();
+    for (remote, profile) in pending {
+        let mut binding = {
+            let cfg = ctx.cfg.lock().unwrap();
+            cfg.proxy_bindings
+                .iter()
+                .find(|b| b.remote.eq_ignore_ascii_case(&remote))
+                .cloned()
+                .unwrap_or_else(|| rcgui_profile::RemoteProxyBinding {
+                    remote: remote.clone(),
+                    ..Default::default()
+                })
+        };
+        match proxy::apply_to_remote(&client, &remote, Some(&profile), &mut binding).await {
+            Ok(out) => {
+                // 下发成功（含冲突）都要把记录写回，冲突时的 applied 保持 true 以免反复重试
+                {
+                    let mut cfg = ctx.cfg.lock().unwrap();
+                    if let Some(slot) = cfg
+                        .proxy_bindings
+                        .iter_mut()
+                        .find(|b| b.remote.eq_ignore_ascii_case(&remote))
+                    {
+                        *slot = binding;
+                    } else {
+                        cfg.proxy_bindings.push(binding);
+                    }
+                    let _ = profiles::save_from_cfg(&cfg);
+                }
+                if out.is_failure() {
+                    errs.push(out.describe(&remote));
+                } else {
+                    ok += 1;
+                }
+            }
+            Err(e) => errs.push(e),
+        }
+    }
+    if ok > 0 {
+        toast(ui, 1, format!("已应用 {ok} 条代理配置。{}", proxy::RESTART_HINT));
+    }
+    if !errs.is_empty() {
+        toast(ui, 2, errs.join("；"));
+    }
+}
+
+/// 删除一条代理配置：先落盘，再把受影响的 remote 在 rclone 侧恢复成原状。
+///
+/// 顺序很重要：**先写档案**，这样即使后面的 RC 调用失败，界面与磁盘也不会互相矛盾；
+/// 失败的那几个 remote 会保留「待应用」标记，下次连接自动重试。
+///
+/// 恢复动作走的是 `proxy::apply_to_remote(None)`，它会按记录还原用户原有代理，
+/// 而不是无脑 unset —— 这是「切回不代理也不误删原有设置」的落地。
+async fn delete_proxy_now(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
+    let (affected, name) = {
+        let mut cfg = ctx.cfg.lock().unwrap();
+        let affected = proxy::remotes_using(&cfg, id);
+        let name = cfg
+            .proxies
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        cfg.proxies.retain(|p| p.id != id);
+        // 绑定也要清掉：留着就是悬空引用
+        cfg.proxy_bindings.retain(|b| b.proxy_id != id);
+        if let Err(e) = profiles::save_from_cfg(&cfg) {
+            toast(ui, 2, format!("删除代理配置失败: {e}"));
+            return;
+        }
+        (affected, name)
+    };
+
+    // 先在 rclone 侧恢复（此时绑定记录还在内存里，能拿到 original_override）
+    let mut errs: Vec<String> = Vec::new();
+    if ctx.rc.is_live() && !affected.is_empty() {
+        let client = ctx.rc.client().await;
+        for remote in &affected {
+            // 注意：上一步已经从 cfg.proxy_bindings 里删掉了，恢复需要原始记录，
+            // 因此这里从档案文件重新读一次（删除动作尚未被本函数写回绑定）。
+            let mut binding = {
+                let doc = profiles::store().load().ok().flatten();
+                doc.and_then(|d| {
+                    d.remote_proxies
+                        .iter()
+                        .find(|b| b.remote.eq_ignore_ascii_case(remote))
+                        .cloned()
+                })
+                .unwrap_or_else(|| rcgui_profile::RemoteProxyBinding {
+                    remote: remote.clone(),
+                    ..Default::default()
+                })
+            };
+            match proxy::apply_to_remote(&client, remote, None, &mut binding).await {
+                Ok(out) => {
+                    if out.is_failure() {
+                        errs.push(out.describe(remote));
+                    }
+                }
+                Err(e) => errs.push(e),
+            }
+        }
+    }
+    if !errs.is_empty() {
+        toast(ui, 2, errs.join("；"));
+    }
+    let msg = if affected.is_empty() {
+        format!("已删除代理配置「{name}」")
+    } else {
+        format!(
+            "已删除代理配置「{name}」，{} 个远程已回落到「不代理」（{}）",
+            affected.len(),
+            affected.join("、")
+        )
+    };
+    toast(ui, 1, msg);
+    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ProxyListRefresh)).await;
+}
+
 /// 断开连接：**不终止 rclone 进程**，只停止使用该端点并保留上次快照。
-async fn disconnect_now(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
-    ctx.rc.set_disconnected(None).await;
+async fn disconnect_now(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {    ctx.rc.set_disconnected(None).await;
     let v = snapshot_view(ctx).await;
     apply_conn_view(ui, v);
     toast(ui, 0, "已断开连接（界面保留上次快照）");
@@ -2355,6 +2895,23 @@ async fn apply_bundle_to_rclone(
         }
     }
 
+    // 凭据缺失的远程集合。
+    //
+    // 为什么需要这个：导出时默认会剥离凭据（`needs_auth = true`），
+    // 导入后 rclone 侧的该远程是「参数不全」的状态。此时对它做任何操作
+    // （挂载、serve/start）rclone 都会在构造后端时报错，例如 teldrive 会报
+    // `missing api_key`、drive 会报 token 相关错误。
+    //
+    // 那个错误看起来像「服务启动参数不对」，实际根因是**凭据没随包导出**。
+    // 因此这里提前跳过并给出真正的原因，而不是把 rclone 的底层报错当结论。
+    let needs_auth: std::collections::HashSet<String> = conf
+        .remotes
+        .iter()
+        .filter(|r| r.needs_auth)
+        .map(|r| r.name.to_ascii_lowercase())
+        .collect();
+    let mut skipped_auth: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
     // 2) 挂载：已经挂着的盘符直接跳过，避免重复挂载报错
     let live = client.mounts().await.unwrap_or_default();
     for m in &conf.profile.mounts {
@@ -2370,6 +2927,11 @@ async fn apply_bundle_to_rclone(
             {
                 errs.push(format!("记录挂载 {point}: {e}"));
             }
+        }
+        if needs_auth.contains(&m.remote.to_ascii_lowercase()) {
+            // 记进档案（下次有凭据时会自动重建），但这次不尝试挂载
+            skipped_auth.insert(m.remote.clone());
+            continue;
         }
         if live
             .iter()
@@ -2387,7 +2949,30 @@ async fn apply_bundle_to_rclone(
         }
     }
 
-    // 3) 服务：serve/start 返回 id 即视为成功
+    // 3) 服务：先查运行态，已在监听同一地址的直接跳过。
+    //
+    // 这里必须和挂载一样做「已存在则跳过」检查，否则导入时会对已在运行的
+    // 8080/8081 再调一次 serve/start，rclone 报
+    // `bind: Only one usage of each socket address is normally permitted`。
+    // 那个报错看起来像导入失败，其实服务本来就好好跑着。
+    let live_addrs: Vec<String> = match client.serve_list().await {
+        Ok(v) => v
+            .get("list")
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|it| {
+                        it.get("params")
+                            .and_then(|p| p.get("addr"))
+                            .or_else(|| it.get("addr"))
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
     for s in &conf.profile.serves {
         if s.remote.trim().is_empty() {
             continue;
@@ -2401,6 +2986,20 @@ async fn apply_bundle_to_rclone(
                 errs.push(format!("记录服务 {}: {e}", s.addr));
             }
         }
+        // 已在监听该地址 → 视为成功，不重复启动
+        if live_addrs.iter().any(|a| a == &s.addr) {
+            ok_serves += 1;
+            continue;
+        }
+        // 凭据缺失 → 不尝试启动。
+        //
+        // 否则 rclone 会在构造后端时失败并报出底层错误（如 teldrive 的
+        // `missing api_key`），看起来像「服务参数不对」，实际是凭据没随包导出。
+        // 那个错误信息会严重误导排查方向，因此这里提前跳过。
+        if needs_auth.contains(&s.remote.to_ascii_lowercase()) {
+            skipped_auth.insert(s.remote.clone());
+            continue;
+        }
         let fs = compose_fs(&s.remote, &s.sub_path);
         match client
             .serve_start(&s.stype, &fs, &s.addr, &s.user, &s.pass)
@@ -2409,6 +3008,16 @@ async fn apply_bundle_to_rclone(
             Ok(_) => ok_serves += 1,
             Err(e) => errs.push(format!("服务 {} {}: {e}", s.stype, s.addr)),
         }
+    }
+
+    // 把「因缺凭据而跳过」的原因单独汇总：这不是失败，而是需要用户补凭据。
+    // 归到 errs 会让「失败 N 项」看起来像程序缺陷，所以单独一条说明。
+    if !skipped_auth.is_empty() {
+        let names: Vec<String> = skipped_auth.into_iter().collect();
+        errs.push(format!(
+            "以下远程的凭据未随包导出，已跳过其挂载/服务的启动（导入后在「远程」页补全凭据即可启用）：{}",
+            names.join("、")
+        ));
     }
 
     (ok_remotes, ok_mounts, ok_serves, errs)
@@ -3405,34 +4014,139 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::RemoteDelete { name } => {
-            // 确认已在 UI 层（ConfirmPop）完成
+            // 确认已在 UI 层（ConfirmPop）完成。
+            //
+            // ⚠️ 顺序很关键：**先停服务、卸载挂载，最后才删远程**。
+            //
+            // 原来的顺序是「先 config/delete 再清理」，结果：
+            // 远程一被删除，rclone 侧该 fs 立刻失效，此时再 unmount / serve_stop
+            // 要么找不到目标、要么报错，而错误被 `let _ =` 吞掉 —— 表现就是
+            // 「删除远程后挂载盘符还在、服务端口还在监听」。
+            // 另外只清档案里记录过的挂载点也不够：用户可能在别处手动建过挂载，
+            // 运行态的挂载必须一起扫。
             let client = ctx.rc.client().await;
+
+            // 1) 收集要清理的挂载点与服务 id
+            let (profile_points, profile_addrs, had_proxy) = {
+                let cfg = ctx.cfg.lock().unwrap();
+                let had_proxy = proxy::bound_profile(&cfg, &name).is_some();
+                let points: Vec<String> = cfg
+                    .auto_mounts
+                    .iter()
+                    .filter(|m| m.remote == name)
+                    .map(|m| m.point.clone())
+                    .collect();
+                let addrs: Vec<String> = cfg
+                    .auto_serves
+                    .iter()
+                    .filter(|s| s.remote == name)
+                    .map(|s| s.addr.clone())
+                    .collect();
+                (points, addrs, had_proxy)
+            };
+
+            // 运行态里的挂载点（含用户手动挂的）与服务（含手动启动的）
+            let live_mounts = client.mounts().await.unwrap_or_default();
+            let mut points_to_unmount: Vec<String> = Vec::new();
+            for m in &live_mounts {
+                let (rname, _) = split_fs_str(&m.fs);
+                if rname == name {
+                    points_to_unmount.push(m.mount_point.clone());
+                }
+            }
+            // 档案里记过但当前没在运行的也放进列表：unmount 对不存在的挂载是幂等的，
+            // 一并调用可以覆盖「刚卸载又自动重挂」这类竞态。
+            for p in &profile_points {
+                let key = mount_key(p);
+                if !points_to_unmount.iter().any(|x| mount_key(x) == key) {
+                    points_to_unmount.push(p.clone());
+                }
+            }
+            let live_serves: Vec<(String, String)> = {
+                let raw = client.serve_list().await.unwrap_or(json!({}));
+                reconcile::serve_addrs_from(&raw)
+                    .into_iter()
+                    .filter_map(|(addr, id)| {
+                        // 只停「本 remote 的」服务：优先按地址匹配档案记录，
+                        // 再按 fs 前缀匹配（fs 形如 name:sub）
+                        let by_addr = profile_addrs.iter().any(|a| a == &addr);
+                        let by_fs = raw
+                            .get("list")
+                            .and_then(|x| x.as_array())
+                            .map(|arr| {
+                                arr.iter().any(|it| {
+                                    let a = it
+                                        .get("params")
+                                        .and_then(|p| p.get("addr"))
+                                        .or_else(|| it.get("addr"))
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or_default();
+                                    if a != addr {
+                                        return false;
+                                    }
+                                    let fs = it
+                                        .get("params")
+                                        .and_then(|p| p.get("fs"))
+                                        .or_else(|| it.get("fs"))
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or_default();
+                                    split_fs_str(fs).0 == name
+                                })
+                            })
+                            .unwrap_or(false);
+                        if by_addr || by_fs {
+                            Some((addr, id))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
+
+            // 2) 先停服务、卸载挂载（此时 remote 还在，操作才有效）
+            let _busy = RemotesBusyGuard::new(ui);
+            let mut errs: Vec<String> = Vec::new();
+            for (addr, id) in &live_serves {
+                match client.serve_stop(id).await {
+                    Ok(()) => {}
+                    Err(e) => errs.push(format!("停止服务 {addr}: {e}")),
+                }
+            }
+            for p in &points_to_unmount {
+                match client.unmount(p).await {
+                    Ok(()) => {}
+                    Err(e) => errs.push(format!("卸载 {p}: {e}")),
+                }
+            }
+
+            // 3) 再删除远程
             match client.config_delete(&name).await {
                 Ok(()) => {
-                    // 级联清理：该远程下记住的挂载/服务一并忘记（否则重放会一直失败）
-                    let (drop_points, drop_addrs) = {
-                        let mut cfg = ctx.cfg.lock().unwrap();
-                        let out = persist::forget_remote(&mut cfg, &name);
-                        let _ = config::save(&cfg);
-                        out
-                    };
-                    // 停止该远程正在活动的挂载/服务（失败静默，rclone 远程已删）
-                    for p in &drop_points {
-                        let _ = client.unmount(p).await;
-                    }
+                    // 4) 最后清理档案里的记忆（否则重放会一直失败并刷错误提示）
                     {
-                        let running = ctx.serves_cache.lock().unwrap().clone();
-                        for row in running.iter() {
-                            let (rname, _) = split_fs_str(&row.fs);
-                            if rname == name || drop_addrs.iter().any(|a| a == &row.addr.as_str()) {
-                                let _ = client.serve_stop(&row.id).await;
-                            }
-                        }
+                        let mut cfg = ctx.cfg.lock().unwrap();
+                        // 代理绑定：远程没了，绑定只会变成悬空引用
+                        cfg.proxy_bindings
+                            .retain(|b| !b.remote.eq_ignore_ascii_case(&name));
+                        let _ = persist::forget_remote(&mut cfg, &name);
+                        let _ = profiles::save_from_cfg(&cfg);
                     }
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::RemotesRefresh)).await;
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ServesRefresh)).await;
-                    toast(ui, 1, format!("已删除 {name} 及其挂载/服务配置"));
+                    let mut msg = format!(
+                        "已删除 {name}（停止服务 {} 个、卸载挂载 {} 个）",
+                        live_serves.len(),
+                        points_to_unmount.len()
+                    );
+                    if had_proxy {
+                        msg.push_str("，代理绑定已清除");
+                    }
+                    if !errs.is_empty() {
+                        toast(ui, 2, format!("{msg}；但有 {} 项清理失败：{}", errs.len(), errs.join("；")));
+                    } else {
+                        toast(ui, 1, msg);
+                    }
                 }
                 Err(e) => toast(ui, 2, format!("删除失败: {e}")),
             }
@@ -3442,6 +4156,340 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             let _ = ui.upgrade_in_event_loop(|ui| {
                 ui.global::<RemotesG>().set_show_editor(false);
             });
+            false
+        }
+        Cmd::ProxyListRefresh => {
+            // 代理配置卡片（行 + 候选下拉由 apply_proxy_column 一并刷新）
+            let rows: Vec<ProxyRow> = {
+                let cfg = ctx.cfg.lock().unwrap();
+                cfg.proxies
+                    .iter()
+                    .map(|p| {
+                        let used = proxy::remotes_using(&cfg, &p.id);
+                        ProxyRow {
+                            id: p.id.clone().into(),
+                            name: p.name.clone().into(),
+                            protocol: p.protocol.label().into(),
+                            target: p.display_target().into(),
+                            auth: if p.has_auth() { "有凭据".into() } else { "无".into() },
+                            used_by: if used.is_empty() {
+                                "—".into()
+                            } else {
+                                used.join("、").into()
+                            },
+                        }
+                    })
+                    .collect()
+            };
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                ui.global::<RemotesG>()
+                    .set_proxy_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+            });
+            // 悬空引用（绑定指向已删除的配置）要主动提示，否则用户只看到一个「待修复」
+            // 徽标却不知道该怎么办。
+            let dangling = {
+                let cfg = ctx.cfg.lock().unwrap();
+                proxy::dangling_remotes(&cfg)
+            };
+            if !dangling.is_empty() {
+                toast(
+                    ui,
+                    2,
+                    format!(
+                        "以下远程引用的代理配置已不存在，请重新选择：{}",
+                        dangling.join("、")
+                    ),
+                );
+            }
+            apply_proxy_column(ui).await;
+            false
+        }
+        Cmd::ProxyEditLoad { id } => {
+            let (is_new, name, proto_idx, host, port, user, pass) = {
+                let cfg = ctx.cfg.lock().unwrap();
+                match cfg.proxies.iter().find(|p| p.id == id) {
+                    Some(p) => (
+                        false,
+                        p.name.clone(),
+                        p.protocol.index(),
+                        p.host.clone(),
+                        p.port.to_string(),
+                        p.user.clone(),
+                        p.pass.clone(),
+                    ),
+                    None => (
+                        true,
+                        String::new(),
+                        0,
+                        String::new(),
+                        "8080".to_string(),
+                        String::new(),
+                        String::new(),
+                    ),
+                }
+            };
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                let g = ui.global::<RemotesG>();
+                g.set_proxy_edit_id(id.into());
+                g.set_proxy_edit_is_new(is_new);
+                g.set_proxy_edit_name(name.into());
+                g.set_proxy_edit_proto(proto_idx);
+                g.set_proxy_edit_host(host.into());
+                g.set_proxy_edit_port(port.into());
+                g.set_proxy_edit_user(user.into());
+                g.set_proxy_edit_pass(pass.into());
+                g.set_proxy_show_editor(true);
+            });
+            false
+        }
+        Cmd::ProxyCancel => {
+            let _ = ui.upgrade_in_event_loop(|ui| {
+                ui.global::<RemotesG>().set_proxy_show_editor(false);
+            });
+            false
+        }
+        Cmd::ProxySave => {
+            let f = read_ui(ui, |ui| {
+                let g = ui.global::<RemotesG>();
+                (
+                    g.get_proxy_edit_id().to_string(),
+                    g.get_proxy_edit_name().to_string(),
+                    g.get_proxy_edit_proto(),
+                    g.get_proxy_edit_host().to_string(),
+                    g.get_proxy_edit_port().to_string(),
+                    g.get_proxy_edit_user().to_string(),
+                    g.get_proxy_edit_pass().to_string(),
+                )
+            })
+            .await
+            .unwrap_or_default();
+            let (edit_id, name, proto_idx, host, port_text, user, pass) = f;
+            let port: u16 = match port_text.trim().parse() {
+                Ok(p) => p,
+                Err(_) => {
+                    toast(ui, 2, "端口必须是 1–65535 的数字");
+                    return false;
+                }
+            };
+            // 新建时 id 为空，需要现生成；先记下「是不是新建」供重名校验排除自己
+            let edit_id_is_new = edit_id.is_empty();
+            let profile = rcgui_profile::ProxyProfile {
+                id: if edit_id_is_new {
+                    proxy::new_proxy_id()
+                } else {
+                    edit_id
+                },
+                name,
+                protocol: rcgui_profile::ProxyProtocol::from_index(proto_idx),
+                host,
+                port,
+                user,
+                pass,
+            };
+            if let Err(e) = profile.validate() {
+                toast(ui, 2, e);
+                return false;
+            }
+            // 重名校验：代理配置是 RCGUI 自己的档案数据，rclone 不会帮我们查重，
+            // 必须在这里拦住，否则会出现两个同名配置，下拉框里无法区分。
+            // 编辑时排除自己的 id，这样只改端口/地址不会被自己名字挡住。
+            {
+                let cfg = ctx.cfg.lock().unwrap();
+                let exclude = if edit_id_is_new { "" } else { profile.id.as_str() };
+                if let Some(dup) = proxy::proxy_name_conflict(&cfg.proxies, &profile.name, exclude) {
+                    drop(cfg);
+                    toast(ui, 2, format!("已存在同名代理配置「{dup}」，请换一个名称"));
+                    return false;
+                }
+            }
+            // 校验 URL 能构造出来（覆盖 IPv6 / 特殊字符等边界）
+            if let Err(e) = profile.to_proxy_url() {
+                toast(ui, 2, e);
+                return false;
+            }
+            // 找出使用该配置的 remote，稍后需要对它们重新下发
+            let affected: Vec<String> = {
+                let mut cfg = ctx.cfg.lock().unwrap();
+                let is_new = !cfg.proxies.iter().any(|p| p.id == profile.id);
+                let label = if is_new { "已新增" } else { "已更新" };
+                cfg.proxies.retain(|p| p.id != profile.id);
+                cfg.proxies.push(profile.clone());
+                // 改动配置内容后，凡是用它的 remote 的下发记录都失效，
+                // 必须重新下发 —— 否则远程仍在用旧代理（用户改了也不生效）。
+                let affected: Vec<String> = cfg
+                    .proxy_bindings
+                    .iter()
+                    .filter(|b| b.proxy_id == profile.id)
+                    .map(|b| b.remote.clone())
+                    .collect();
+                for b in cfg.proxy_bindings.iter_mut() {
+                    if b.proxy_id == profile.id {
+                        b.applied = false;
+                        b.applied_value.clear();
+                    }
+                }
+                if let Err(e) = profiles::save_from_cfg(&cfg) {
+                    toast(ui, 2, format!("保存代理配置失败: {e}"));
+                    return false;
+                }
+                toast(ui, 1, format!("代理配置「{}」{label}", profile.name));
+                affected
+            };
+            {
+                let _ = ui.upgrade_in_event_loop(|ui| {
+                    ui.global::<RemotesG>().set_proxy_show_editor(false);
+                });
+            }
+            // 立刻把新值下发到所有正在使用它的 remote（连上时）。
+            //
+            // 这是「保存代理配置后远程仍用旧代理」的修复：只把 applied 置 false
+            // 只是标记「待应用」，要等下次重连才生效，用户会以为修改丢了。
+            // 改走统一入口 `reconcile()`：它会把「档案里的期望代理」与
+            // 「rclone 里当前实际生效的代理」逐项比对，只对变了的项下发。
+            if !affected.is_empty() && ctx.rc.is_live() {
+                let _busy = RemotesBusyGuard::new(ui);
+                let client = ctx.rc.client().await;
+                let mut draft = ctx.cfg.lock().unwrap().clone();
+                let rep = reconcile::reconcile(&client, &mut draft).await;
+                {
+                    let mut cfg = ctx.cfg.lock().unwrap();
+                    cfg.proxy_bindings = draft.proxy_bindings.clone();
+                    let _ = profiles::save_from_cfg(&cfg);
+                }
+                if !rep.failed.is_empty() {
+                    toast(
+                        ui,
+                        2,
+                        format!("{}：{}", rep.summary(), rep.failed.join("；")),
+                    );
+                } else {
+                    toast(
+                        ui,
+                        1,
+                        format!("{}。{}", rep.summary(), proxy::RESTART_HINT),
+                    );
+                }
+            } else if !affected.is_empty() {
+                toast(
+                    ui,
+                    0,
+                    format!(
+                        "代理配置已保存，{} 个远程标记为待应用（连接后将自动下发）",
+                        affected.len()
+                    ),
+                );
+            }
+            let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ProxyListRefresh)).await;
+            false
+        }
+        Cmd::ProxyDeleteAsk { id } => {
+            let (name, affected) = {
+                let cfg = ctx.cfg.lock().unwrap();
+                let name = cfg
+                    .proxies
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                (name, proxy::remotes_using(&cfg, &id))
+            };
+            if name.is_empty() {
+                toast(ui, 2, "该代理配置已不存在，请刷新后重试");
+                return false;
+            }
+            let affected_text = if affected.is_empty() {
+                String::new()
+            } else {
+                format!("以下远程会回落到「不代理」：{}", affected.join("、"))
+            };
+            // 没有关联时不必二次确认，直接删
+            if affected.is_empty() {
+                delete_proxy_now(ctx, ui, &id).await;
+                return false;
+            }
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                let g = ui.global::<RemotesG>();
+                g.set_proxy_del_id(id.into());
+                g.set_proxy_del_name(name.into());
+                g.set_proxy_del_affected(affected_text.into());
+                g.set_proxy_del_show(true);
+            });
+            false
+        }
+        Cmd::ProxyDelete { id } => {
+            delete_proxy_now(ctx, ui, &id).await;
+            false
+        }
+        Cmd::ProxyBind { remote, idx } => {
+            let (profile, proxy_id) = {
+                let cfg = ctx.cfg.lock().unwrap();
+                if idx <= 0 {
+                    (None, String::new())
+                } else {
+                    match cfg.proxies.get((idx - 1) as usize) {
+                        Some(p) => (Some(p.clone()), p.id.clone()),
+                        None => {
+                            drop(cfg);
+                            toast(ui, 2, "选择的代理配置已不存在，请刷新后重试");
+                            return false;
+                        }
+                    }
+                }
+            };
+            // 1) 先写档案（离线也要能存），标记为待应用
+            {
+                let mut cfg = ctx.cfg.lock().unwrap();
+                cfg.bind_proxy_slot(&remote, &proxy_id);
+                if let Err(e) = profiles::save_from_cfg(&cfg) {
+                    toast(ui, 2, format!("保存代理绑定失败: {e}"));
+                    return false;
+                }
+            }
+            // 2) 连上了就立刻让它生效。
+            //
+            // 这里改走统一的 `reconcile::reconcile()`，不再手工逐条下发：
+            // 它会把档案（期望）与 rclone 运行态（现状）做一次逐项比对，
+            // 只对真正不一致的项动作。这样「切换代理」和「改代理配置后重载」
+            // 以及「导入后的重载」共用同一套代码，不会再出现某条路径漏写。
+            if ctx.rc.is_live() {
+                let _busy = RemotesBusyGuard::new(ui);
+                let client = ctx.rc.client().await;
+                // 关键：先 clone 出配置并**立刻放锁**，再 await reconcile。
+                // 持有 MutexGuard 跨 await 会让 future 非 Send（tokio::spawn 会拒绝）。
+                let mut draft = ctx.cfg.lock().unwrap().clone();
+                let rep = reconcile::reconcile(&client, &mut draft).await;
+                {
+                    // 写回：只把 reconcile 会改动的字段合并回真实配置，
+                    // 避免整份覆盖掉这期间 UI 可能改过的其他设置。
+                    let mut cfg = ctx.cfg.lock().unwrap();
+                    cfg.proxy_bindings = draft.proxy_bindings.clone();
+                    let _ = profiles::save_from_cfg(&cfg);
+                }
+                if !rep.failed.is_empty() {
+                    toast(
+                        ui,
+                        2,
+                        format!("{}：{}", rep.summary(), rep.failed.join("；")),
+                    );
+                } else {
+                    toast(
+                        ui,
+                        1,
+                        format!("{}。{}", rep.summary(), proxy::RESTART_HINT),
+                    );
+                }
+                let _ = profile;
+            } else {
+                toast(
+                    ui,
+                    0,
+                    format!(
+                        "{remote} 的代理已保存，当前未连接 rclone，将在连接后自动应用。{}",
+                        proxy::RESTART_HINT
+                    ),
+                );
+            }
+            let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ProxyListRefresh)).await;
             false
         }
         Cmd::ServesRefresh => {
@@ -3549,6 +4597,25 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             if addr_t.is_empty() {
                 toast(ui, 2, "请填写监听地址");
                 return false;
+            }
+            // 服务显示名重名校验：必须在**启动之前**拦，否则服务已经起来了才发现重名，
+            // 用户还得手动去停。同地址视为「编辑自己」，允许保留原名。
+            {
+                let svc = svc_name.trim().to_string();
+                if !svc.is_empty() {
+                    let cfg = ctx.cfg.lock().unwrap();
+                    if let Some(dup) =
+                        proxy::serve_name_conflict(&cfg.serve_names, &svc, &addr_t)
+                    {
+                        drop(cfg);
+                        toast(
+                            ui,
+                            2,
+                            format!("已存在同名服务「{dup}」，请换一个名称"),
+                        );
+                        return false;
+                    }
+                }
             }
             // busy 由守卫托管：任何返回路径都会复位
             let _busy = BusyGuard::new(ui, BusyKind::Serves);
@@ -4240,6 +5307,11 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             toast(ui, 0, "已取消，保持当前权限");
             false
         }
+        Cmd::TrayFailed(msg) => {
+            // 托盘失败只在界面里提示（不弹窗打断），并记进历史记录。
+            toast(ui, 2, msg);
+            false
+        }
         Cmd::ConfApply => {
             let Some(conf) = ctx.pending_import.lock().unwrap().take() else {
                 toast(ui, 0, "请先「导入预览」，确认无误后再应用");
@@ -4249,8 +5321,13 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             match conf_io::apply(&conf, &mut cfg) {
                 Ok(bak) => {
                     *ctx.cfg.lock().unwrap() = cfg.clone();
-                    // 写入档案后，再通过 RC 把远程/挂载/服务真正应用到本地 rclone
-                    let (ok_r, ok_m, ok_s, errs) = apply_bundle_to_rclone(ctx, &conf).await;
+                    // 写入档案后，再通过 RC 把远程/挂载/服务真正应用到本地 rclone。
+                    // 这一步可能很慢（逐条建远程、挂载、起服务），因此全程显示 spinner，
+                    // 让用户知道「正在做什么」而不是点完没反应。
+                    let (ok_r, ok_m, ok_s, errs) = {
+                        let _busy = RemotesBusyGuard::new(ui);
+                        apply_bundle_to_rclone(ctx, &conf).await
+                    };
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::RemotesRefresh)).await;
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ServesRefresh)).await;
@@ -4962,6 +6039,62 @@ fn wire_callbacks(
             let _ = tx.send(Cmd::RemoteTypeChanged);
         }
     });
+    // ---------------- 代理 ----------------
+    ui.on_proxy_changed({
+        let tx = tx.clone();
+        move |remote, idx| {
+            let _ = tx.send(Cmd::ProxyBind {
+                remote: remote.to_string(),
+                idx,
+            });
+        }
+    });
+    ui.on_proxy_add({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::ProxyEditLoad {
+                id: String::new(),
+            });
+        }
+    });
+    ui.on_proxy_edit({
+        let tx = tx.clone();
+        move |id| {
+            let _ = tx.send(Cmd::ProxyEditLoad { id: id.to_string() });
+        }
+    });
+    ui.on_proxy_save({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::ProxySave);
+        }
+    });
+    ui.on_proxy_cancel({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::ProxyCancel);
+        }
+    });
+    ui.on_proxy_del({
+        let tx = tx.clone();
+        move |id| {
+            // 先问后删：由 ProxyDeleteAsk 算出「哪些 remote 在用」并弹确认，
+            // 用户确认后才发 ProxyDelete。用户明确要求删除被使用的配置时必须提示关联。
+            let _ = tx.send(Cmd::ProxyDeleteAsk { id: id.to_string() });
+        }
+    });
+    ui.on_proxy_del_confirm({
+        let tx = tx.clone();
+        move |id| {
+            let _ = tx.send(Cmd::ProxyDelete { id: id.to_string() });
+        }
+    });
+    ui.on_proxy_refresh({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::ProxyListRefresh);
+        }
+    });
     ui.on_serves_refresh({
         let tx = tx.clone();
         move || {
@@ -5300,105 +6433,430 @@ fn wire_callbacks(
 
 // ---------------- 托盘 ----------------
 
-fn spawn_tray(ui: Weak<MainWindow>, tx: mpsc::UnboundedSender<Cmd>, main_hwnd: isize) {
+/// 托盘图标 + 右键菜单。
+///
+/// ## 为什么必须在**同一个线程**里创建并跑消息循环
+///
+/// `tray-icon` 的 Windows 后端只做了两件事：`CreateWindowExW` 建一个隐藏窗口，
+/// 然后用 `Shell_NotifyIconW` 把 `WM_USER_TRAYICON`(=6002) 作为回调消息注册进去。
+/// 它**不运行任何消息循环**（源码里没有 `GetMessage`/`DispatchMessage`）。
+///
+/// 也就是说：鼠标在托盘图标上的点击，是系统把 `WM_USER_TRAYICON` 投递到那个
+/// 隐藏窗口的消息队列里；**只有该线程跑起消息循环**，这些消息才会被取出、
+/// 进而被 `tray-icon` 翻译成 `TrayIconEvent`。之前这里只在 `std::thread` 里
+/// `try_recv()` 轮询 —— 队列永远收不到东西，所以左右键都没反应。
+///
+/// 现在的做法：托盘在自己的线程里创建，然后**跑一个真正的 GetMessage 循环**，
+/// 事件由 `tray-icon` 通过 channel 送达，我们在循环里定时 try_recv 处理。
+fn spawn_tray(ui: Weak<MainWindow>, tx: mpsc::UnboundedSender<Cmd>) {
+    let accent = accent_rgb(&crate::config::load());
     std::thread::spawn(move || {
-        use tray_icon::menu::{ContextMenu, Menu, MenuEvent, MenuItem};
+        use tray_icon::menu::{Menu, MenuEvent, MenuItem};
         use tray_icon::{TrayIconBuilder, TrayIconEvent};
 
-        let icon_rgba = make_icon_rgba(32);
-        let Ok(icon) = tray_icon::Icon::from_rgba(icon_rgba, 32, 32) else {
-            return;
-        };
-        let menu = Menu::new();
-        let open_item = MenuItem::with_id("open", "打开主窗口", true, None);
-        let quit_item = MenuItem::with_id("quit", "退出", true, None);
-        let _ = menu.append_items(&[&open_item, &quit_item]);
+        #[cfg(windows)]
+        {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+            };
 
-        let _tray = TrayIconBuilder::new()
-            // 同一份菜单：右键由系统弹出，左键我们手动在主窗口上弹出
-            .with_menu(Box::new(menu.clone()))
-            .with_tooltip("Rclone GUI（左键菜单，含退出）")
-            .with_icon(icon)
-            .build();
-
-        loop {
-            while let Ok(ev) = MenuEvent::receiver().try_recv() {
-                match ev.id.0.as_str() {
-                    "open" => {
-                        let _ = ui.upgrade_in_event_loop(
-                            |ui| {
-                                ui.show().ok();
-                                ui.window().set_minimized(false);
-                            },
-                        );
-                    }
-                    "quit" => {
-                        let _ = tx.send(Cmd::Quit);
-                    }
-                    _ => {}
+            // 图标与 AppMark 同一造型、跟随强调色
+            let icon_rgba = make_icon_rgba(32, accent);
+            tray_log("tray: icon rgba built");
+            let icon = match tray_icon::Icon::from_rgba(icon_rgba, 32, 32) {
+                Ok(i) => i,
+                Err(e) => {
+                    tray_log(&format!("tray: Icon::from_rgba FAILED: {e}"));
+                    return;
                 }
-            }
-            while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-                // 左键点击：弹出与右键相同的菜单（启 打开主窗可 / 退出 ），
-                // 记录退出主在托盘区一眼可见；无有数 hwnd 时退化为直接显示主窗可
-                if matches!(
-                    ev,
-                    TrayIconEvent::Click {
+            };
+            tray_log("tray: icon created");
+
+            // 菜单：主界面 / 退出
+            let menu = Menu::new();
+            let open_item = MenuItem::with_id("open", "主界面", true, None);
+            let quit_item = MenuItem::with_id("quit", "退出", true, None);
+            let _ = menu.append_items(&[&open_item, &quit_item]);
+
+            // 关键：`_tray` 必须活到线程结束。写成 `let _tray` 会在作用域结束时
+            // drop，图标随之消失；这里显式持有。
+            let tray = TrayIconBuilder::new()
+                // 右键菜单由系统在图标上弹出；左键双击我们自己处理
+                .with_menu(Box::new(menu.clone()))
+                .with_tooltip("RCGUI")
+                .with_icon(icon)
+                .build();
+            // 关键：`_tray` 必须活到线程结束 —— 一旦 drop，图标就从托盘消失。
+            let _tray = match tray {
+                Ok(t) => {
+                    tray_log("tray: icon added to tray");
+                    t
+                }
+                Err(e) => {
+                    // 托盘注册失败要**明确告知用户**，不能静默。
+                    //
+                    // 实测最常见的失败是 `拒绝访问 (os error 5)`：托盘图标由
+                    // 高完整性的 explorer.exe 托管，若本进程或所在目录被打了
+                    // **低完整性（Low Mandatory Level）** 标签，Shell_NotifyIconW
+                    // 会被拒。用户看到的现象就是「托盘图标不见了」，但完全不知道原因。
+                    let msg = format!(
+                        "托盘图标注册失败（{e}）。若系统托盘里没有 RCGUI：\
+                         通常是因为程序所在目录被标记为低完整性、或以受限权限运行；\
+                         已尝试把目录完整性调整为普通级别。"
+                    );
+                    tray_log(&format!("tray: build FAILED: {e}"));
+                    // 尝试自愈：把目录完整性调回 Medium（需要所有者权限）
+                    if let Ok(exe) = std::env::current_exe() {
+                        if let Some(dir) = exe.parent() {
+                            use std::os::windows::process::CommandExt;
+                            let _ = std::process::Command::new("icacls")
+                                .arg(dir)
+                                .arg("/setintegritylevel")
+                                .arg("Medium")
+                                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                                .output();
+                        }
+                    }
+                    let _ = tx.send(Cmd::TrayFailed(msg));
+                    return;
+                }
+            };
+            tray_log("tray: entering message loop");
+
+            // 记录上一次左键按下的时间，用于识别「双击」。
+            // 不能用 TrayIconEvent::DoubleClick：tray-icon 在 Windows 上
+            // 只对部分版本可靠，手动计时更稳（阈值取系统默认的 500ms）。
+            let mut last_left_click: Option<std::time::Instant> = None;
+
+            loop {
+                // 1) 先把消息队列里的消息泵出去。
+                //
+                // 用 PeekMessageW（非阻塞）而不是 GetMessageW（阻塞）：
+                // 托盘事件由 `tray-icon` 通过 channel 投递，若阻塞在 GetMessageW
+                // 里，channel 中的事件要等到下一条窗口消息才会被处理，
+                // 表现为「点了要等很久才响应」。
+                let mut msg = MSG::default();
+                loop {
+                    let has = unsafe {
+                        PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool()
+                    };
+                    if !has {
+                        break;
+                    }
+                    let _ = unsafe { TranslateMessage(&msg) };
+                    unsafe { DispatchMessageW(&msg) };
+                }
+
+                // 2) 菜单项点击
+                while let Ok(ev) = MenuEvent::receiver().try_recv() {
+                    match ev.id.0.as_str() {
+                        "open" => {
+                            let _ = ui.upgrade_in_event_loop(|ui| {
+                                show_main_window(&ui);
+                            });
+                        }
+                        "quit" => {
+                            let _ = tx.send(Cmd::Quit);
+                        }
+                        _ => {}
+                    }
+                }
+
+                // 3) 托盘图标自身事件
+                while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+                    if let TrayIconEvent::Click {
                         button: tray_icon::MouseButton::Left,
                         button_state: tray_icon::MouseButtonState::Up,
                         ..
-                    }
-                ) {
-                    if main_hwnd != 0 {
-                        menu.show_context_menu_for_hwnd(main_hwnd, None);
-                    } else {
-                        let _ = ui.upgrade_in_event_loop(|ui| {
-                            ui.show().ok();
-                            ui.window().set_minimized(false);
-                        });
+                    } = ev
+                    {
+                        // 需求：**左键双击**弹出主界面（单击不动作）。
+                        let now = std::time::Instant::now();
+                        let is_double = last_left_click
+                            .map(|t| now.duration_since(t) < std::time::Duration::from_millis(500))
+                            .unwrap_or(false);
+                        last_left_click = Some(now);
+                        if is_double {
+                            last_left_click = None; // 复位，避免三击被当成两轮双击
+                            let _ = ui.upgrade_in_event_loop(|ui| {
+                                show_main_window(&ui);
+                            });
+                        }
                     }
                 }
+
+                // 4) 让出 CPU：既不 busy-loop，也不阻塞消息处理
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            std::thread::sleep(std::time::Duration::from_millis(120));
+
+            // 保持 tray 存活到循环结束（循环是死循环，这里仅为语义完整）
+            #[allow(unreachable_code)]
+            {
+                drop(_tray);
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = (ui, tx);
         }
     });
 }
 
-/// 程序化生成图标：蓝底圆形 + 白色闪电
-fn make_icon_rgba(size: usize) -> Vec<u8> {
+/// 显示主窗口并置前（从托盘唤起时用）。
+fn show_main_window(ui: &MainWindow) {
+    let _ = ui.show();
+    ui.window().set_minimized(false);
+    // 置前：否则窗口可能被其他程序盖住，用户以为点了没反应。
+    #[cfg(windows)]
+    {
+        use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use slint::winit_030::WinitWindowAccessor;
+        // Window::window_handle 需要经 with_winit_window 访问
+        let hwnd: Option<isize> = ui
+            .window()
+            .with_winit_window(|w| {
+                w.window_handle().ok().and_then(|h| match h.as_raw() {
+                    RawWindowHandle::Win32(h) => Some(h.hwnd.get() as isize),
+                    _ => None,
+                })
+            })
+            .flatten();
+        if let Some(v) = hwnd {
+            let h = windows::Win32::Foundation::HWND(v as *mut core::ffi::c_void);
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                    h,
+                    windows::Win32::UI::WindowsAndMessaging::SW_RESTORE,
+                );
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(h);
+            }
+        }
+    }
+}
+
+/// 程序化生成应用图标（RGBA，用于托盘与窗口/任务栏）。
+///
+/// 造型与 Slint 里的 `AppMark` 保持一致：圆角方块底 + 白色云 + 云内的终端窗口。
+/// 颜色由调用方传入，因此能跟随强调色。
+///
+/// **全部用代码画**而不是嵌入 PNG：图标需要随强调色变化、还要多个尺寸
+/// （托盘 32、任务栏 64），程序化生成可以一次算好任意尺寸，也不必维护资源文件。
+fn make_icon_rgba(size: usize, accent: [u8; 3]) -> Vec<u8> {
     let mut buf = vec![0u8; size * size * 4];
-    let center = (size - 1) as f32 / 2.0;
-    let r = size as f32 / 2.0 - 1.0;
+    let s = size as f32;
+    let radius = s * 0.24; // 与 AppMark 的 border-radius 一致
+    let (ar, ag, ab) = (accent[0], accent[1], accent[2]);
+
+    // 圆角方块内部判定：四个角按圆角半径切掉
+    let in_rounded_rect = |x: f32, y: f32| -> bool {
+        let (cx, cy) = (x.clamp(radius, s - radius), y.clamp(radius, s - radius));
+        let dx = x - cx;
+        let dy = y - cy;
+        dx * dx + dy * dy <= radius * radius
+            || (x >= radius && x <= s - radius)
+            || (y >= radius && y <= s - radius)
+    };
+
+    // 三个圆的并集构成云（与 AppMark 的几何比例一致）
+    let circle = |x: f32, y: f32, cx: f32, cy: f32, r: f32| -> bool {
+        let dx = x - cx;
+        let dy = y - cy;
+        dx * dx + dy * dy <= r * r
+    };
+    let in_cloud = |x: f32, y: f32| -> bool {
+        // 左圆
+        circle(x, y, s * 0.35, s * 0.53, s * 0.21)
+            // 右大圆
+            || circle(x, y, s * 0.63, s * 0.45, s * 0.25)
+            // 底部横条：用矩形近似（原 Slint 版本是圆角条）
+            || (x >= s * 0.14 && x <= s * 0.88 && y >= s * 0.52 && y <= s * 0.74)
+    };
+    // 云内终端窗口（主色挖空）
+    let in_terminal = |x: f32, y: f32| -> bool {
+        let (x0, y0) = (s * 0.30, s * 0.44);
+        let (w, h) = (s * 0.46, s * 0.34);
+        let r = s * 0.07;
+        if x < x0 || x > x0 + w || y < y0 || y > y0 + h {
+            return false;
+        }
+        let (cx, cy) = (
+            x.clamp(x0 + r, x0 + w - r),
+            y.clamp(y0 + r, y0 + h - r),
+        );
+        let dx = x - cx;
+        let dy = y - cy;
+        dx * dx + dy * dy <= r * r
+            || (x >= x0 + r && x <= x0 + w - r)
+            || (y >= y0 + r && y <= y0 + h - r)
+    };
+    // 终端里的 ">_"：用斜线 + 横线近似，小尺寸下也能看出是命令行
+    let in_chevron = |x: f32, y: f32| -> bool {
+        let (bx, by) = (s * 0.355, s * 0.585); // 尖角位置
+        // 上斜边：从左上到尖角
+        let up = (y >= by - s * 0.075 && y <= by)
+            && (x - (bx - (by - y) * 0.9)).abs() <= s * 0.035;
+        // 下斜边：从尖角到左下
+        let dn = (y >= by && y <= by + s * 0.075)
+            && (x - (bx - (y - by) * 0.9)).abs() <= s * 0.035;
+        up || dn
+    };
+    let in_underscore = |x: f32, y: f32| -> bool {
+        x >= s * 0.53 && x <= s * 0.67 && y >= s * 0.645 && y <= s * 0.685
+    };
+
     for y in 0..size {
         for x in 0..size {
-            let dx = x as f32 - center;
-            let dy = y as f32 - center;
-            let dist = (dx * dx + dy * dy).sqrt();
+            let (fx, fy) = (x as f32, y as f32);
             let i = (y * size + x) * 4;
-            if dist <= r {
-                let t = y as f32 / size as f32;
-                buf[i] = (37.0 + t * 30.0) as u8;
-                buf[i + 1] = (99.0 + t * 40.0) as u8;
-                buf[i + 2] = (235.0 + t * 20.0) as u8;
-                let nx = (x as f32 - center) / r;
-                let ny = (y as f32 - center) / r;
-                let bolt = (ny > -0.9 && ny < 0.1 && nx > -0.08 - ny * 0.22 && nx < 0.08 - ny * 0.22)
-                    || (ny >= 0.1 && ny < 0.8 && nx > 0.02 - ny * 0.45 && nx < 0.2 - ny * 0.45);
-                if bolt {
-                    buf[i] = 255;
-                    buf[i + 1] = 255;
-                    buf[i + 2] = 255;
-                }
-                buf[i + 3] = 255;
+            if !in_rounded_rect(fx, fy) {
+                continue; // 方块外保持透明
             }
+            let (r, g, b) = if in_terminal(fx, fy) {
+                if in_chevron(fx, fy) || in_underscore(fx, fy) {
+                    (255, 255, 255)
+                } else {
+                    (ar, ag, ab) // 终端底色 = 主色
+                }
+            } else if in_cloud(fx, fy) {
+                (255, 255, 255)
+            } else {
+                (ar, ag, ab)
+            };
+            buf[i] = r;
+            buf[i + 1] = g;
+            buf[i + 2] = b;
+            buf[i + 3] = 255;
         }
     }
     buf
 }
 
+/// 取当前主题的强调色（RGB），用于生成图标。
+///
+/// 与 Slint 的 `ThemeG.accent` 对齐：这里按主题模式 + 强调色索引算出同一份颜色。
+fn accent_rgb(cfg: &crate::config::AppConfig) -> [u8; 3] {
+    // (浅色, 深色) 两种主题下的强调色，与 theme.slint 的 accent 定义保持一致
+    let dark = match cfg.theme_mode {
+        1 => false, // 浅色
+        2 => true,  // 深色
+        _ => true,  // 跟随系统：默认按深色取（差异很小，不影响可辨识度）
+    };
+    let palette: [(u8, u8, u8, u8, u8, u8); 4] = [
+        (0x58, 0xa6, 0xff, 0x09, 0x69, 0xda), // 蓝
+        (0x3f, 0xb9, 0x50, 0x1a, 0x7f, 0x37), // 绿
+        (0xd2, 0xa8, 0xff, 0x82, 0x50, 0xdf), // 紫
+        (0xff, 0xa6, 0x57, 0xbc, 0x4c, 0x00), // 橙
+    ];
+    let p = palette[(cfg.accent_idx as usize).min(palette.len() - 1)];
+    if dark {
+        [p.0, p.1, p.2]
+    } else {
+        [p.3, p.4, p.5]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------- 应用图标 ----------------
+
+    /// 图标必须真的画出内容，而不是全透明。
+    ///
+    /// 这条测试的价值：图标生成是纯几何运算，写错一个坐标就可能整张空白，
+    /// 而空白图标在界面里表现为「任务栏没图标」，很难往几何 bug 上想。
+    #[test]
+    fn icon_has_visible_pixels() {
+        let rgba = make_icon_rgba(32, [0x58, 0xa6, 0xff]);
+        assert_eq!(rgba.len(), 32 * 32 * 4, "RGBA 缓冲区大小必须匹配尺寸");
+        let opaque = rgba.chunks_exact(4).filter(|p| p[3] == 255).count();
+        // 圆角方块占据大部分面积，至少应有 50% 不透明像素
+        assert!(
+            opaque > 32 * 32 / 2,
+            "不透明像素太少（{opaque}），图标可能是空白的"
+        );
+    }
+
+    /// 圆角：四个角必须是透明的，否则就不是圆角方块。
+    #[test]
+    fn icon_corners_are_rounded() {
+        let size = 32;
+        let rgba = make_icon_rgba(size, [0x58, 0xa6, 0xff]);
+        let alpha_at = |x: usize, y: usize| rgba[(y * size + x) * 4 + 3];
+        assert_eq!(alpha_at(0, 0), 0, "左上角应透明（圆角）");
+        assert_eq!(alpha_at(size - 1, 0), 0, "右上角应透明（圆角）");
+        assert_eq!(alpha_at(0, size - 1), 0, "左下角应透明（圆角）");
+        assert_eq!(alpha_at(size - 1, size - 1), 0, "右下角应透明（圆角）");
+        // 中心必须不透明
+        assert_eq!(alpha_at(size / 2, size / 2), 255);
+    }
+
+    /// 强调色必须真正作用到图标上（否则「随强调色变色」就是假的功能）。
+    #[test]
+    fn icon_takes_accent_colour() {
+        let blue = make_icon_rgba(32, [0x58, 0xa6, 0xff]);
+        let green = make_icon_rgba(32, [0x3f, 0xb9, 0x50]);
+        assert_ne!(blue, green, "不同强调色必须生成不同图标");
+    }
+
+    /// 任意尺寸都要能画（托盘 32 / 任务栏 64 / 小图标 16）。
+    #[test]
+    fn icon_generates_at_multiple_sizes() {
+        for size in [16usize, 32, 64] {
+            let rgba = make_icon_rgba(size, [0x58, 0xa6, 0xff]);
+            assert_eq!(rgba.len(), size * size * 4);
+            let opaque = rgba.chunks_exact(4).filter(|p| p[3] == 255).count();
+            assert!(opaque > 0, "{size}px 图标不能是空白的");
+        }
+    }
+
+    /// 把生成的图标导出为 PNG，供人工确认造型（非断言式测试）。
+    ///
+    /// 跑法：`cargo test -p rclone-gui dump_icon_png -- --ignored --nocapture`
+    /// 产物在 `target/rcgui-icon-*.png`。
+    /// 注意不能写 `%TEMP%`：本机沙箱下它不可写（os error 5），
+    /// 项目里既有测试也因此统一把临时目录放在测试可执行文件旁。
+    #[test]
+    #[ignore]
+    fn dump_icon_png() {
+        let base = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(std::env::temp_dir);
+        for (size, name) in [(64usize, "64"), (32, "32")] {
+            let rgba = make_icon_rgba(size, [0x58, 0xa6, 0xff]);
+            let mut p = base.join(format!("rcgui-icon-{name}.png"));
+            let buf = image::RgbaImage::from_raw(size as u32, size as u32, rgba)
+                .expect("RGBA 尺寸匹配");
+            // 失败时退到 CWD，避免整个测试因目录权限问题失败
+            if buf.save(&p).is_err() {
+                p = std::path::PathBuf::from(format!("rcgui-icon-{name}.png"));
+                buf.save(&p).expect("保存 PNG 失败");
+            }
+            eprintln!("wrote {}", p.display());
+        }
+    }
+
+
+    #[test]
+    fn accent_rgb_matches_theme_palette() {
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.theme_mode = 2; // 深色
+        cfg.accent_idx = 0; // 蓝
+        assert_eq!(accent_rgb(&cfg), [0x58, 0xa6, 0xff]);
+
+        cfg.accent_idx = 1; // 绿
+        assert_eq!(accent_rgb(&cfg), [0x3f, 0xb9, 0x50]);
+
+        cfg.theme_mode = 1; // 浅色
+        cfg.accent_idx = 0;
+        assert_eq!(accent_rgb(&cfg), [0x09, 0x69, 0xda]);
+
+        // 越界索引不能 panic
+        cfg.accent_idx = 99;
+        let _ = accent_rgb(&cfg);
+    }
 
     /// 回归：`wait_mount_ready_rc` 必须有**绝对时间**的硬上限。
     ///

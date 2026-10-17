@@ -46,6 +46,11 @@ pub const METHOD_REQS: &[MethodReq] = &[
     // 以下缺失只影响体验，不阻断
     MethodReq { name: "config/paths", alternatives: &[], required: false, capability: "读取配置文件路径" },
     MethodReq { name: "config/providers", alternatives: &[], required: false, capability: "动态参数表单" },
+    // 代理功能需要：config/get 读现有值、config/unset 移除代理。
+    // 做成非阻断：老版本缺这两个方法时，远程/挂载/服务仍可用，
+    // 只是「按 remote 分配代理」这项能力要明确报「不支持」而不是通用失败。
+    MethodReq { name: "config/get", alternatives: &[], required: false, capability: "读取单条远程配置（代理功能依赖）" },
+    MethodReq { name: "config/unset", alternatives: &[], required: false, capability: "移除远程代理（代理功能依赖）" },
     MethodReq { name: "options/get", alternatives: &[], required: false, capability: "读取运行参数" },
     MethodReq { name: "options/set", alternatives: &[], required: false, capability: "修改运行参数" },
     MethodReq { name: "core/bwlimit", alternatives: &[], required: false, capability: "全局限速" },
@@ -147,6 +152,34 @@ impl Handshake {
         }
     }
 
+    /// 「按 remote 分配代理」这项能力是否可用。
+    ///
+    /// 依赖 `config/update`（写代理，属必需能力）+ `config/get`（读原值做回滚）
+    /// + `config/unset`（移除代理）。三者缺一，都不能安全地实现
+    /// 「不静默覆盖用户原有代理」这条要求 —— 宁可明说「不支持」。
+    ///
+    /// 返回 `Err` 是**面向用户**的中文原因，可直接进 toast。
+    pub fn proxy_capability(&self) -> Result<(), String> {
+        let mut missing: Vec<&str> = Vec::new();
+        if !self.supports("config/update") {
+            missing.push("config/update");
+        }
+        if !self.supports("config/get") {
+            missing.push("config/get");
+        }
+        if !self.supports("config/unset") {
+            missing.push("config/unset");
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "该 rclone 实例缺少 {}，无法按远程分配代理（升级 rclone 后重试）",
+                missing.join(" / ")
+            ))
+        }
+    }
+
     pub fn config_path(&self) -> String {
         self.config
             .as_ref()
@@ -231,5 +264,41 @@ mod tests {
         let hs = hs_with(Some(&["config/listremotes", "serve/list"]), (1, 75));
         let s = hs.summary();
         assert!(s.contains("2 个 RC 方法"), "got {s}");
+    }
+
+    #[test]
+    fn proxy_capability_needs_get_update_unset() {
+        let full = ["config/update", "config/get", "config/unset"];
+        let hs = hs_with(Some(&full), (1, 75));
+        assert!(hs.proxy_capability().is_ok());
+
+        // 缺任何一个都要明确报出来，并说明缺的是哪个
+        for drop_it in full {
+            let list: Vec<&str> = full.iter().copied().filter(|m| *m != drop_it).collect();
+            let hs = hs_with(Some(&list), (1, 75));
+            let err = hs.proxy_capability().unwrap_err();
+            assert!(err.contains(drop_it), "错误信息应点明缺 {drop_it}：{err}");
+            assert!(err.contains("升级 rclone"), "应给出可操作的后续动作：{err}");
+        }
+    }
+
+    #[test]
+    fn proxy_capability_is_permissive_when_methods_unknown() {
+        // 老版本没有 rc/list：不能因此断言「不支持」，否则明明是好的也用不了
+        let hs = hs_with(None, (1, 75));
+        assert!(hs.proxy_capability().is_ok());
+    }
+
+    /// 加进 METHOD_REQS 的两个新方法是**非阻断**的：
+    /// 缺失时只能进 warnings，不能把 is_compatible 弄成 false。
+    #[test]
+    fn proxy_methods_are_not_blocking() {
+        for want in ["config/get", "config/unset"] {
+            let req = METHOD_REQS
+                .iter()
+                .find(|r| r.name == want)
+                .unwrap_or_else(|| panic!("{want} 应出现在 METHOD_REQS 里"));
+            assert!(!req.required, "{want} 不应是阻断性能力");
+        }
     }
 }
