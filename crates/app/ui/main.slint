@@ -552,6 +552,9 @@ component ConfirmPop inherits PopupWindow {
             }
             Text {
                 text: root.msg;
+                // 必须给固定宽度：只写 wrap 不约束宽度时，preferred-height 按
+                // 单行估算，长文案换行后会溢出卡片的 height，把下面的按钮挤掉。
+                width: 288px;
                 font-size: 13px;
                 color: ThemeG.text-dim;
                 wrap: word-wrap;
@@ -1047,6 +1050,10 @@ component FilesView inherits Rectangle {
 
 component RemotesView inherits Rectangle {
     background: transparent;
+    // 窗口可视高度（由 MainWindow 传入）。
+    // 不能用 `root.height`：本组件在整页 ScrollView 里，root.height 是**内容**高度，
+    // 用它限制弹窗纵坐标等于没限制，弹窗会一直被窗口底边裁掉。
+    in property <length> viewport-h: 720px;
     callback refresh;
     callback filter-changed(string);
     callback add;
@@ -1253,10 +1260,20 @@ component RemotesView inherits Rectangle {
         // 整页滚动下不能用 `fill: true` / `vertical-stretch: 1`（那是给固定布局
         // 「撑满剩余空间」用的）：在 ScrollView 里它们会让高度计算变成循环依赖。
         // 改为按行数估算固定高度，超出由页面滚动承载。
+        //
+        // 踩过的坑（实测）：卡片高度按行数算好了，但列表容器只写
+        // `vertical-stretch: 1` —— Card 内部 VerticalLayout 的对齐方式是
+        // `start`（只有 fill: true 才是 stretch），拉伸拿不到任何剩余空间，
+        // 列表塌成一行：标题写着「远程存储（4）」，列表里只画出第一条，
+        // 而且因为 ListView 视口只有一行高，滚轮也滚不动。
+        // 因此这里**两个高度都必须由 rows.length 推导**，不依赖布局结果。
         Card {
             title: "远程存储（" + RemotesG.rows.length + "）";
             pad: 0px;
-            height: Math.max(160px, Math.min(420px, 72px + RemotesG.rows.length * 41px));
+            // 高度 = 卡片标题行 36 + 表头行 36 + 每行 40 + 2（上下边框）。
+            // 标题行是 Card 内建的，容易被漏掉：只算一个 36 会让最后一行被裁。
+            // 列表最多 9 行（360）高，再多由列表内部滚动。
+            height: 74px + Math.min(360px, Math.max(40px, RemotesG.rows.length * 40px));
             VerticalLayout {
                 Rectangle {
                     height: 36px;
@@ -1275,7 +1292,8 @@ component RemotesView inherits Rectangle {
                     }
                 }
                 Rectangle {
-                    vertical-stretch: 1;
+                    // 必须显式给高度，理由见上面的注释（vertical-stretch 拿不到空间）。
+                    height: Math.min(360px, Math.max(40px, RemotesG.rows.length * 40px));
                     ListView {
                         for r[i] in RemotesG.rows : Rectangle {
                             height: 40px;
@@ -1388,7 +1406,10 @@ component RemotesView inherits Rectangle {
                                                 root.del-idx = i;
                                                 root.del-name = r.name;
                                                 root.pop-ax = Math.max(0px, Math.min(self.absolute-position.x - root.absolute-position.x + self.width / 2 - 160px, root.width - 324px));
-                                                root.pop-ay = self.absolute-position.y - root.absolute-position.y + self.height + 4px;
+                                                // 弹窗锚在按钮下方；靠近窗口底部时必须往上收，否则
+                                                // 按钮会被窗口底边裁掉（实测：代理配置卡片在页面底部，
+                                                // 「删除代理」的确认框只剩标题和正文，确认/取消点不到）。
+                                                root.pop-ay = Math.max(0px, Math.min(self.absolute-position.y - root.absolute-position.y + self.height + 4px, root.viewport-h - 216px));
                                                 delp.show();
                                             }
                                         }
@@ -1416,9 +1437,9 @@ component RemotesView inherits Rectangle {
             title: "代理配置（" + RemotesG.proxy-rows.length + "）";
             VerticalLayout {
                 spacing: 8px;
-                // 说明：必须写清三件事，否则用户会误判功能边界
+                // 说明：必须写清四件事，否则用户会误判功能边界
                 Text {
-                    text: "按远程分配代理。「不代理」= 不设置 RCGUI 的远程级代理，rclone 仍可能继承系统的 HTTP_PROXY / HTTPS_PROXY 环境变量，不等于强制直连。代理只在远程建立连接时生效：正在运行的挂载/服务需要重新挂载或重启才会使用新代理。";
+                    text: "按远程分配代理。「不代理」= 不设置 RCGUI 的远程级代理，rclone 仍可能继承系统的 HTTP_PROXY / HTTPS_PROXY 环境变量，不等于强制直连。代理只在远程建立连接时生效：正在运行的挂载/服务需要重新挂载或重启才会使用新代理。实测限制：ftp / sftp 两类远程不读取本程序的代理设置（rclone 后端不认 override.http_proxy），给它们选代理不会生效，详见 docs/proxy-verification.md。";
                     font-size: 11px;
                     color: ThemeG.text-dim;
                     wrap: word-wrap;
@@ -2112,6 +2133,8 @@ component TransfersView inherits Rectangle {
 
 component PluginsView inherits Rectangle {
     background: transparent;
+    // 同 RemotesView：弹窗纵坐标要按窗口可视高度收，不能用内容高度。
+    in property <length> viewport-h: 720px;
     callback rescan;
     callback save-config;
     callback add-root;
@@ -2402,7 +2425,10 @@ component PluginsView inherits Rectangle {
                                                 root.tok-idx = ti;
                                                 root.tok-name = t.name;
                                                 root.pop-ax = Math.max(0px, Math.min(self.absolute-position.x - root.absolute-position.x + self.width / 2 - 160px, root.width - 324px));
-                                                root.pop-ay = self.absolute-position.y - root.absolute-position.y + self.height + 4px;
+                                                // 弹窗锚在按钮下方；靠近窗口底部时必须往上收，否则
+                                                // 按钮会被窗口底边裁掉（实测：代理配置卡片在页面底部，
+                                                // 「删除代理」的确认框只剩标题和正文，确认/取消点不到）。
+                                                root.pop-ay = Math.max(0px, Math.min(self.absolute-position.y - root.absolute-position.y + self.height + 4px, root.viewport-h - 216px));
                                                 tp.show();
                                             }
                                         }
@@ -2452,7 +2478,10 @@ component PluginsView inherits Rectangle {
                                                         root.img-idx = imi;
                                                         root.img-path = im.path;
                                                         root.pop-ax = Math.max(0px, Math.min(self.absolute-position.x - root.absolute-position.x + self.width / 2 - 160px, root.width - 324px));
-                                                        root.pop-ay = self.absolute-position.y - root.absolute-position.y + self.height + 4px;
+                                                        // 弹窗锚在按钮下方；靠近窗口底部时必须往上收，否则
+                                                // 按钮会被窗口底边裁掉（实测：代理配置卡片在页面底部，
+                                                // 「删除代理」的确认框只剩标题和正文，确认/取消点不到）。
+                                                root.pop-ay = Math.max(0px, Math.min(self.absolute-position.y - root.absolute-position.y + self.height + 4px, root.viewport-h - 216px));
                                                         ip.show();
                                                     }
                                                 }
@@ -3275,6 +3304,7 @@ export component MainWindow inherits Window {
                     copy-link(i) => { root.files-copy-link(i); }
                 }
                 if NavG.idx == 2 : RemotesView {
+                    viewport-h: root.height;
                     refresh => { root.remotes-refresh(); }
                     filter-changed(t) => { root.remotes-filter(t); }
                     add => { root.remote-add(); }
@@ -3316,6 +3346,7 @@ export component MainWindow inherits Window {
                     job-stop(id) => { root.job-stop(id); }
                 }
                 if NavG.idx == 6 : PluginsView {
+                    viewport-h: root.height;
                     rescan => { root.plugins-rescan(); }
                     save-config => { root.ih-save-config(); }
                     add-root => { root.ih-add-root(); }
