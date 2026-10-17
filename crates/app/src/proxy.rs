@@ -13,11 +13,15 @@
 //! 3. **不重启、不停 rclone** —— 只调 `config/update` / `config/unset`，
 //!    绝不触碰进程；代理只在后端实例创建时生效，所以要提示用户重新挂载/启动服务。
 //!
-//! 另外：rclone 只认 `override.http_proxy` 一个键（SOCKS5 靠 `socks5://` scheme），
-//! 详见 `docs/proxy-verification.md`。
+//! 另外：大多数后端只认 `override.http_proxy` 一个键；ftp / sftp 用后端原生
+//! `http_proxy` / `socks_proxy`（由 `rcgui_profile::proxy` 决定该写哪个键）。
+//! 依据见 `docs/proxy-ftp-sftp-and-errors.md`。
 
 use crate::config::AppConfig;
-use rcgui_profile::proxy::{plan_set, remember_original, ProxyAction, ProxyProfile};
+use rcgui_profile::proxy::{
+    plan_apply, uses_native_keys, ApplyPlan, PlanOutcome, ProxyConfigValues, ProxyKey, ProxyProfile,
+    ProxyStep,
+};
 use rcgui_profile::{ProxyRegistry, RemoteProxyBinding};
 use rcgui_rc::RcClient;
 
@@ -27,21 +31,22 @@ pub fn bound_profile(cfg: &AppConfig, remote: &str) -> Option<ProxyProfile> {
     reg.for_remote(remote).cloned()
 }
 
-/// 读取 rclone 里某 remote 当前的 `override.http_proxy`。
+/// 读取 rclone 里某 remote 的类型与三个代理键的当前值。
 ///
-/// 返回 `Ok(None)` 表示键不存在（与「存在但为空」区分开，回滚时要用）。
-pub async fn read_current(
+/// 只调一次 `config/get`：类型必须来自 rclone（权威），不能拿 UI 缓存猜；
+/// 三个键一次取全，换键 / 影子键检测都不需要再发请求。
+async fn read_config(
     client: &RcClient,
     remote: &str,
-) -> Result<Option<String>, String> {
+) -> Result<(String, ProxyConfigValues), String> {
     let map = client
         .config_get(remote)
         .await
         .map_err(|e| format!("读取 {remote} 的配置失败：{e}"))?;
-    match map.get("override.http_proxy") {
-        None => Ok(None),
-        Some(v) => Ok(Some(v.as_str().unwrap_or_default().to_string())),
-    }
+    Ok((
+        ProxyConfigValues::backend_type(&map),
+        ProxyConfigValues::from_config_map(&map),
+    ))
 }
 
 /// 一次下发的结果。
@@ -55,8 +60,14 @@ pub enum ApplyOutcome {
     Removed,
     /// 已恢复成用户原有的值
     Restored(String),
+    /// 用户自己在 rclone 里配了原生代理键：按“只补空缺”跳过，**没有写入**
+    RespectExisting { key: ProxyKey },
     /// rclone 里的值被别人改过，需要用户裁决，**本次什么都没改**
-    Conflict { ours: String, current: String },
+    Conflict {
+        key: ProxyKey,
+        ours: String,
+        current: String,
+    },
     /// 「不代理」且本来就没被我们管过，什么都没做
     LeftAlone,
 }
@@ -66,6 +77,16 @@ impl ApplyOutcome {
         matches!(self, Self::Conflict { .. })
     }
 
+    /// 本次是否真的改动了 rclone（用于统计「已重载 N 项」）。
+    pub fn is_changed(&self) -> bool {
+        matches!(self, Self::Applied | Self::Removed | Self::Restored(_))
+    }
+
+    /// 是否因为尊重用户已有配置而跳过。
+    pub fn is_skipped(&self) -> bool {
+        matches!(self, Self::RespectExisting { .. })
+    }
+
     /// 面向用户的一句话说明（不含密码）。
     pub fn describe(&self, remote: &str) -> String {
         match self {
@@ -73,18 +94,64 @@ impl ApplyOutcome {
             Self::Applied => format!("{remote} 的代理已生效"),
             Self::Removed => format!("{remote} 的代理已移除（原本没有代理）"),
             Self::Restored(_) => format!("{remote} 的代理已恢复为你原来设置的值"),
-            Self::Conflict { current, .. } => format!(
-                "{remote}：rclone 里的代理已被其他方式修改（当前 {}），为避免覆盖你的改动已跳过",
-                if current.is_empty() { "为空" } else { current }
+            Self::RespectExisting { key } => format!(
+                "{remote}：你在 rclone 里已经设置了 {}，本程序只补空缺、不会覆盖；如需使用这里的代理，请先在远程配置里清空它",
+                key.label()
+            ),
+            Self::Conflict { key, current, .. } => format!(
+                "{remote}：rclone 里的 {} 已被其他方式修改（当前 {}），为避免覆盖你的改动已跳过",
+                key.label(),
+                redact_proxy_value(current)
             ),
             Self::LeftAlone => format!("{remote} 未由本程序管理，保持原样"),
         }
     }
 }
 
+/// 把代理值里的凭据部分打码后用于提示。
+///
+/// 代理 URL 与原生 `socks_proxy` 都可能带 `user:pass@`，而提示会进 toast、
+/// 历史记录，也可能被截图 —— 不能原样透出。
+pub fn redact_proxy_value(v: &str) -> String {
+    if v.is_empty() {
+        return "（空）".into();
+    }
+    let (prefix, rest) = match v.find("://") {
+        Some(i) => (&v[..i + 3], &v[i + 3..]),
+        None => ("", v),
+    };
+    match rest.rfind('@') {
+        Some(i) => format!("{prefix}***@{}", &rest[i + 1..]),
+        None => v.to_string(),
+    }
+}
+
+/// 执行一个原子写操作。
+async fn run_step(client: &RcClient, name: &str, step: &ProxyStep) -> Result<(), String> {
+    let key = step.key().config_key();
+    match step {
+        ProxyStep::Set { value, .. } | ProxyStep::Restore { value, .. } => {
+            let mut params = serde_json::Map::new();
+            params.insert(key.to_string(), serde_json::Value::String(value.clone()));
+            client
+                .config_update(name, serde_json::Value::Object(params))
+                .await
+                .map_err(|e| format!("写入 {name} 的 {key} 失败：{e}"))
+        }
+        ProxyStep::Unset { .. } => client
+            .config_unset(name, &[key])
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("移除 {name} 的 {key} 失败：{e}")),
+    }
+}
+
 /// 把某 remote 的代理设为 `desired`（`None` = 不代理）并落到 rclone。
 ///
-/// `binding` 会被就地更新（下发状态 + 被覆盖的原值），调用方负责落盘。
+/// `binding` 会被就地更新（脚印 + 下发状态），调用方负责落盘。**即使返回 `Err`
+/// 也应把 `binding` 写回**：换键时旧键可能已经成功还原，丢掉这次更新会让下一次
+/// 比对把「已还原」误判成「被外部改过」。
+///
 /// **本函数只发 RC 请求，绝不启动/停止/重启 rclone 进程。**
 pub async fn apply_to_remote(
     client: &RcClient,
@@ -92,81 +159,64 @@ pub async fn apply_to_remote(
     desired: Option<&ProxyProfile>,
     binding: &mut RemoteProxyBinding,
 ) -> Result<ApplyOutcome, String> {
-    let name = remote.trim_end_matches(':').to_string();
-    let desired_url = match desired {
-        Some(p) => Some(p.to_proxy_url()?),
-        None => None,
-    };
-    let current = read_current(client, &name).await?;
+    let name = remote.trim_end_matches(':');
+    let (backend_type, values) = read_config(client, name).await?;
 
     // 决策是纯函数，放在 profile crate 里可单测
-    let action = plan_set(desired_url.as_deref(), current.as_deref(), Some(binding));
+    let plan = plan_apply(desired, &backend_type, &values, Some(binding))?;
 
-    match action {
-        // 决策说「什么都不用做」时，要区分两种原因，否则界面会误报：
-        // - 已经是期望值 → Unchanged（无需改动）
-        // - 从未由我们管理过（用户自己设的代理）→ LeftAlone（明确不碰）
-        ProxyAction::Nothing => {
-            let ours = binding.applied_value.is_empty() && binding.original_override.is_none();
-            if desired_url.is_none() && ours {
-                Ok(ApplyOutcome::LeftAlone)
-            } else {
-                Ok(ApplyOutcome::Unchanged)
+    match plan {
+        ApplyPlan::Nothing { key } => {
+            // 没有脚印时把「已经满足」记一笔：否则 `needs_apply()` 永远为真，
+            // 每次连接都会重试一次、界面也一直显示「待应用」。
+            if !binding.has_footprint() {
+                binding.applied = true;
+                binding.applied_key = key.config_key().to_string();
+                binding.applied_value.clear();
+                binding.original_override = None;
             }
+            Ok(ApplyOutcome::Unchanged)
         }
-
-        ProxyAction::Set(url) => {
-            // 关键：覆盖前先记住用户原值（若已有更早的记录则沿用，不覆盖成自己的值）
-            let original = remember_original(Some(binding), current.as_deref());
-            client
-                .config_update(
-                    &name,
-                    serde_json::json!({ "override.http_proxy": url }),
-                )
-                .await
-                .map_err(|e| format!("写入 {name} 的代理失败：{e}"))?;
-            binding.applied = true;
-            binding.applied_value = url;
-            binding.original_override = original;
-            Ok(ApplyOutcome::Applied)
-        }
-
-        ProxyAction::Unset => {
-            client
-                .config_unset(&name, &["override.http_proxy"])
-                .await
-                .map_err(|e| format!("移除 {name} 的代理失败：{e}"))?;
-            binding.applied = true;
-            binding.applied_value = String::new();
-            binding.original_override = None;
-            Ok(ApplyOutcome::Removed)
-        }
-
-        ProxyAction::Restore(v) => {
-            if v.is_empty() {
-                // 原本存在但为空 → 写回空值，而不是删键，保持与用户原状一致
-                client
-                    .config_update(&name, serde_json::json!({ "override.http_proxy": "" }))
-                    .await
-                    .map_err(|e| format!("恢复 {name} 的代理失败：{e}"))?;
-            } else {
-                client
-                    .config_update(
-                        &name,
-                        serde_json::json!({ "override.http_proxy": v }),
-                    )
-                    .await
-                    .map_err(|e| format!("恢复 {name} 的代理失败：{e}"))?;
-            }
-            binding.applied = true;
-            binding.applied_value = v.clone();
-            binding.original_override = None;
-            Ok(ApplyOutcome::Restored(v))
-        }
-
-        ProxyAction::Conflict { ours, current } => {
+        ApplyPlan::Unmanaged => Ok(ApplyOutcome::LeftAlone),
+        ApplyPlan::RespectExisting { key } => Ok(ApplyOutcome::RespectExisting { key }),
+        ApplyPlan::Conflict {
+            key,
+            ours,
+            current,
+        } => {
             // 什么都不改：用户的改动优先，让他在界面上确认后再操作
-            Ok(ApplyOutcome::Conflict { ours, current })
+            Ok(ApplyOutcome::Conflict {
+                key,
+                ours,
+                current,
+            })
+        }
+        ApplyPlan::Steps {
+            steps,
+            commit,
+            outcome,
+        } => {
+            for step in &steps {
+                run_step(client, name, step).await?;
+                // 换键时旧键一还原就作废脚印：否则下一步失败会留下
+                // 「旧键已还原、记录还指向旧值」的假冲突。
+                if step.key() != commit.key {
+                    binding.clear_footprint();
+                }
+            }
+            // 被用户配置挡住时保持“待应用”：等用户清空那个键后，
+            // 下次连接/重载还能自动补上，而不是永远停在“已处理”。
+            let respected = matches!(&outcome, PlanOutcome::Respect(_));
+            binding.applied = !respected;
+            binding.applied_key = commit.key.config_key().to_string();
+            binding.applied_value = commit.value.clone();
+            binding.original_override = commit.original.clone();
+            Ok(match outcome {
+                PlanOutcome::Applied => ApplyOutcome::Applied,
+                PlanOutcome::Removed => ApplyOutcome::Removed,
+                PlanOutcome::Restored(v) => ApplyOutcome::Restored(v),
+                PlanOutcome::Respect(key) => ApplyOutcome::RespectExisting { key },
+            })
         }
     }
 }
@@ -195,24 +245,15 @@ pub const DIRECT_HINT: &str = "「不代理」= 不设置 RCGUI 的 remote 级�
 /// 凭据存储形式的说明（实测：百分号编码明文，连 obscure 都不是）。
 pub const CREDENTIAL_HINT: &str = "代理账号密码会以明文（百分号编码）写入 rclone.conf，不是加密，请勿在共享环境使用敏感凭据。";
 
-/// 「该类型不读取 override.http_proxy」的警告。
+/// ftp / sftp 的代理键与限制说明（绑定时提示）。
 ///
-/// 实测（rclone v1.75.4，本地 `rclone serve ftp` / `serve sftp` + 会记日志的
-/// 中继代理）：给 ftp / sftp 的 remote 写 `override.http_proxy` 后，列表照常
-/// 成功，但代理侧**一个连接都没收到** —— 也就是静默直连。这两类后端只认自己
-/// 的原生选项：`http_proxy` 要写完整 URL，`socks_proxy` 只认裸 `host:port`
-/// （带 `socks5://` 会报 `too many colons in address`）。
-///
-/// 在这些类型上真正做对需要改成按类型选键、并同步改造回滚与 reconcile，
-/// 属于后续工作；在那之前**必须至少不谎报「已生效」**。
-pub const INERT_TYPE_HINT: &str = "注意：rclone 的 ftp / sftp 后端不读取 override.http_proxy，此时代理不会真正生效（已实测）；这两类只能用原生 http_proxy / socks_proxy，详见 docs/proxy-verification.md。";
+/// 三条都是实测/上游源码确认的，不能省略：用原生键而不是 `override.http_proxy`、
+/// `socks_proxy` 只认裸 `host:port`、写入后正在运行的挂载/服务不会热生效。
+pub const NATIVE_KEY_HINT: &str = "ftp / sftp 使用 rclone 原生 http_proxy / socks_proxy 键；若该远程自己已设了代理，本程序只补空缺、不会覆盖（rclone 优先使用 socks_proxy）。SOCKS5 与 SOCKS5H 在这两类后端上等价（都由代理解析域名）；账号密码以明文写入 rclone.conf，密码不能包含「@」、用户名不能包含「:」。";
 
-/// 该 remote 类型是否真的会读取 `override.http_proxy`。
-///
-/// 返回 `false` 的类型（ftp / sftp）下发代理是静默无效的，UI 必须提示。
-pub fn type_honors_override(rtype: &str) -> bool {
-    let t = rtype.trim().to_ascii_lowercase();
-    !matches!(t.as_str(), "ftp" | "sftp")
+/// ftp / sftp 的绑定提示；其它类型返回 `None`。
+pub fn native_note(rtype: &str) -> Option<&'static str> {
+    uses_native_keys(rtype).then_some(NATIVE_KEY_HINT)
 }
 
 
@@ -448,20 +489,20 @@ mod tests {
         // 重启提示必须说清「需要重新挂载/启动」
         assert!(RESTART_HINT.contains("重新挂载"));
         assert!(RESTART_HINT.contains("重新启动"));
-        // 静默无效的类型必须被点名，不能含糊成「可能」
-        assert!(INERT_TYPE_HINT.contains("ftp"));
-        assert!(INERT_TYPE_HINT.contains("sftp"));
-        assert!(INERT_TYPE_HINT.contains("不会真正生效"));
+        // ftp/sftp 的说明必须点明原生键、只补空缺、凭据限制
+        assert!(NATIVE_KEY_HINT.contains("原生 http_proxy"));
+        assert!(NATIVE_KEY_HINT.contains("只补空缺"));
+        assert!(NATIVE_KEY_HINT.contains("socks_proxy"));
+        assert!(NATIVE_KEY_HINT.contains("「@」"));
     }
 
-    /// 实测结论：只有 ftp / sftp 不认 override.http_proxy。
+    /// 只有 ftp / sftp 需要原生键说明；其它类型不能误导用户。
     #[test]
-    fn only_ftp_and_sftp_ignore_the_override_key() {
-        assert!(!type_honors_override("ftp"));
-        assert!(!type_honors_override("sftp"));
-        assert!(!type_honors_override("  SFTP ")); // 大小写/空白不该影响判定
-        for t in ["webdav", "s3", "drive", "onedrive", "http", "b2", "teldrive", "local"] {
-            assert!(type_honors_override(t), "{t} 应当读取 override.http_proxy");
+    fn native_note_only_for_ftp_and_sftp() {
+        assert!(native_note("ftp").is_some());
+        assert!(native_note("  SFTP ").is_some());
+        for t in ["webdav", "s3", "drive", "local", ""] {
+            assert!(native_note(t).is_none(), "{t} 不该出现原生键说明");
         }
     }
 
@@ -537,22 +578,55 @@ mod tests {
 
     #[test]
     fn outcome_is_failure_only_for_conflict() {
-        assert!(ApplyOutcome::Conflict { ours: "a".into(), current: "b".into() }.is_failure());
+        assert!(ApplyOutcome::Conflict {
+            key: ProxyKey::Override,
+            ours: "a".into(),
+            current: "b".into()
+        }
+        .is_failure());
         assert!(!ApplyOutcome::Applied.is_failure());
         assert!(!ApplyOutcome::Unchanged.is_failure());
         assert!(!ApplyOutcome::LeftAlone.is_failure());
+        assert!(!ApplyOutcome::RespectExisting { key: ProxyKey::NativeSocks }.is_failure());
+        // 只有真正写过的才算「已重载」
+        assert!(ApplyOutcome::Applied.is_changed());
+        assert!(ApplyOutcome::Removed.is_changed());
+        assert!(ApplyOutcome::Restored("x".into()).is_changed());
+        assert!(!ApplyOutcome::Unchanged.is_changed());
+        assert!(!ApplyOutcome::LeftAlone.is_changed());
+        assert!(ApplyOutcome::RespectExisting { key: ProxyKey::NativeHttp }.is_skipped());
     }
 
+    /// 冲突提示必须把凭据打码：它会进 toast、历史记录，也可能被截图。
     #[test]
-    fn conflict_description_never_leaks_password() {
+    fn conflict_description_redacts_credentials() {
         let d = ApplyOutcome::Conflict {
+            key: ProxyKey::Override,
             ours: "http://u:secret@h:1".into(),
             current: "http://u:secret2@h:2".into(),
         }
         .describe("teldrive");
-        // 描述里只可能出现「当前值」，但那是 rclone 里的代理 URL（可能含密码）。
-        // 因此这里断言 describe 不额外拼接 ours，避免重复暴露。
         assert!(d.contains("已被其他方式修改"));
+        assert!(!d.contains("secret"), "密码不得出现在提示里：{d}");
+        assert!(d.contains("***@h:2"), "主机可以保留：{d}");
+        // 原生 socks 的裸 user:pass@ 形式同样要打码
+        assert_eq!(
+            redact_proxy_value("bob:pw@127.0.0.1:1080"),
+            "***@127.0.0.1:1080"
+        );
+        assert_eq!(redact_proxy_value(""), "（空）");
+        assert_eq!(redact_proxy_value("http://h:1"), "http://h:1");
+    }
+
+    #[test]
+    fn respect_message_does_not_leak_values() {
+        let d = ApplyOutcome::RespectExisting {
+            key: ProxyKey::NativeSocks,
+        }
+        .describe("ftp1");
+        assert!(d.contains("只补空缺"));
+        assert!(d.contains("socks_proxy"));
+        assert!(!d.contains("user:pass"));
     }
 
     // ---------------- 代理失败提示 ----------------

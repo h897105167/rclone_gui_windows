@@ -29,47 +29,62 @@
 //! 且不依赖 rclone 并不具备的能力。
 
 use crate::config::AppConfig;
-use rcgui_profile::proxy::ProxyProfile;
-use rcgui_profile::{MountProfile, ProxyRegistry, ServeProfile};
+use rcgui_profile::proxy::{plan_apply, ApplyPlan, ProxyConfigValues, ProxyProfile};
+use rcgui_profile::{MountProfile, ProxyRegistry, RemoteProxyBinding, ServeProfile};
 use rcgui_rc::RcClient;
 use std::collections::HashSet;
 
 // ---------------- 期望状态 ----------------
 
+/// 一个 remote 的期望代理，以及档案里的绑定记录。
+///
+/// 绑定记录一并带上：`plan_apply` 需要它才知道「上次写的是哪个键、原值是什么」，
+/// 否则没法判断该回滚哪个键、也没法识别「被外部改过」。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DesiredRemote {
+    pub remote: String,
+    /// `None` = 明确不代理 / 引用的配置已不存在
+    pub proxy: Option<ProxyProfile>,
+    pub binding: RemoteProxyBinding,
+}
+
 /// 一次「期望状态」快照：从档案现算，不缓存。
 #[derive(Debug, Clone, Default)]
 pub struct Desired {
-    /// remote 名 → 期望的 `override.http_proxy`（`None` = 不代理）
-    pub remotes: Vec<(String, Option<String>)>,
+    pub remotes: Vec<DesiredRemote>,
     pub mounts: Vec<MountProfile>,
     pub serves: Vec<ServeProfile>,
 }
 
 /// 从档案算出期望状态。
 ///
-/// 代理 URL 在这里就构造好（失败则视为「不代理」并记进 `errors`），
-/// 避免下游每处都要再处理一次构造失败。
+/// 悬空引用（引用的配置已删除）按「不代理」处理，同时记一条错误；若该绑定
+/// 还留着脚印，`plan` 会顺带把它回滚掉，不会把 rclone 里的旧代理留在那儿。
+///
+/// 值的构造（URL / 原生 socks 格式）不在这里做：它依赖 remote 的真实类型，
+/// 只有 `config/get` 才有权威答案，统一在 `plan_apply` 里处理。
 pub fn desired_from(cfg: &AppConfig) -> (Desired, Vec<String>) {
     let mut errors = Vec::new();
     let reg = ProxyRegistry::new(&cfg.proxies, &cfg.proxy_bindings);
-    let mut remotes: Vec<(String, Option<String>)> = Vec::new();
+    let mut remotes = Vec::new();
     for b in &cfg.proxy_bindings {
-        if b.is_direct() {
-            // 明确「不代理」也要出现在期望里：它表示「把 override.http_proxy 去掉/还原」
-            remotes.push((b.remote.clone(), None));
-            continue;
-        }
-        match reg.by_id(&b.proxy_id) {
-            Some(p) => match p.to_proxy_url() {
-                Ok(url) => remotes.push((b.remote.clone(), Some(url))),
-                Err(e) => errors.push(format!("{} 的代理地址无效：{e}", b.remote)),
-            },
-            // 悬空引用：期望「不代理」，但要让用户知道这不是他的选择
-            None => {
-                errors.push(format!("{} 引用的代理配置已不存在", b.remote));
-                remotes.push((b.remote.clone(), None));
+        let proxy = if b.is_direct() {
+            None
+        } else {
+            match reg.by_id(&b.proxy_id) {
+                Some(p) => Some(p.clone()),
+                // 悬空引用：期望「不代理」，但要让用户知道这不是他的选择
+                None => {
+                    errors.push(format!("{} 引用的代理配置已不存在", b.remote));
+                    None
+                }
             }
-        }
+        };
+        remotes.push(DesiredRemote {
+            remote: b.remote.clone(),
+            proxy,
+            binding: b.clone(),
+        });
     }
     (
         Desired {
@@ -158,9 +173,10 @@ pub fn serve_addrs_from(v: &serde_json::Value) -> Vec<(String, String)> {
 /// 一个待执行的动作。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    /// 把某 remote 的代理设为该值
-    SetProxy { remote: String, url: String },
-    /// 移除某 remote 的代理（恢复原值由 `proxy::apply_to_remote` 负责）
+    /// 让某 remote 的代理变成档案里的期望。具体写哪个键、写什么值由
+    /// `proxy::apply_to_remote` 按真实 backend 类型决定，这里只表达「要动」。
+    SetProxy { remote: String },
+    /// 移除/还原某 remote 的代理（用绑定里记录的键与回滚值）
     UnsetProxy { remote: String },
     /// 挂载
     Mount { fs: String, point: String },
@@ -175,7 +191,7 @@ pub enum Action {
 impl Action {
     pub fn describe(&self) -> String {
         match self {
-            Self::SetProxy { remote, .. } => format!("设置 {remote} 的代理"),
+            Self::SetProxy { remote } => format!("设置 {remote} 的代理"),
             Self::UnsetProxy { remote } => format!("移除 {remote} 的代理"),
             Self::Mount { fs, point } => format!("挂载 {fs} → {point}"),
             Self::Unmount { point } => format!("卸载 {point}"),
@@ -189,43 +205,54 @@ impl Action {
 ///
 /// 纯函数，不碰网络——这让「只重建该重建的」这条要求可以被单元测试固定住。
 ///
-/// `proxy_actual` 是「remote → rclone 里当前的 override.http_proxy」。
-/// 只对**档案里出现过绑定**的 remote 做代理比对；档案没提的 remote 一律不碰
-/// （用户自己配的代理不归我们管）。
+/// 代理部分直接复用 `plan_apply`（与真正下发时同一套规则），避免「计划说不用动、
+/// 执行时却又写了」或反过来的不一致。只对**档案里出现过绑定**的 remote 比对；
+/// 档案没提的 remote 一律不碰（用户自己配的代理不归我们管）。
+///
+/// 返回 `(动作, 错误)`；错误用于「代理配置本身无效」这类没法变成动作的问题。
 pub fn plan(
     desired: &Desired,
     actual: &Actual,
-    proxy_actual: &[(String, Option<String>)],
-) -> Vec<Action> {
+    proxy_actual: &[ProxyActual],
+) -> (Vec<Action>, Vec<String>) {
     let mut out = Vec::new();
+    let mut errors = Vec::new();
 
-    // ---- 代理：只在「期望值与 rclone 当前值不同」时动作 ----
-    for (remote, want) in &desired.remotes {
-        let cur = proxy_actual
+    // ---- 代理：只在「期望与现状不一致」时动作 ----
+    for d in &desired.remotes {
+        let Some(state) = proxy_actual
             .iter()
-            .find(|(r, _)| r.eq_ignore_ascii_case(remote))
-            .and_then(|(_, v)| v.clone());
-
-        match want {
-            // 期望设置某个代理
-            Some(url) => {
-                if cur.as_deref() != Some(url.as_str()) {
-                    out.push(Action::SetProxy {
-                        remote: remote.clone(),
-                        url: url.clone(),
-                    });
-                }
+            .find(|s| s.remote.eq_ignore_ascii_case(&d.remote))
+        else {
+            // config_get 失败：collect 阶段已记错误。不知道该看哪个键时宁可不动。
+            continue;
+        };
+        let plan = match plan_apply(
+            d.proxy.as_ref(),
+            &state.backend_type,
+            &state.values,
+            Some(&d.binding),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                errors.push(format!("{} 的代理配置无效：{e}", d.remote));
+                continue;
             }
-            // 期望「不代理」：只有当前确实有值时才需要动作。
-            // 具体是「恢复原值」还是「删除键」由 `proxy::apply_to_remote` 决定
-            // （它手里有 original_override 记录），这里只表达「需要清掉」。
-            None => {
-                if cur.is_some() {
-                    out.push(Action::UnsetProxy {
-                        remote: remote.clone(),
-                    });
+        };
+        match plan {
+            // 已是期望 / 从没管过：无需动作
+            ApplyPlan::Nothing { .. } | ApplyPlan::Unmanaged => {}
+            // 其余情况（含冲突、尊重用户已有配置）都交给 apply 判定并报告：
+            // plan 只回答「要不要动」，规则不重复实现第二遍。
+            _ => out.push(if d.proxy.is_some() {
+                Action::SetProxy {
+                    remote: d.remote.clone(),
                 }
-            }
+            } else {
+                Action::UnsetProxy {
+                    remote: d.remote.clone(),
+                }
+            }),
         }
     }
 
@@ -277,7 +304,7 @@ pub fn plan(
         }
     }
 
-    out
+    (out, errors)
 }
 
 // ---------------- 执行 ----------------
@@ -286,6 +313,8 @@ pub fn plan(
 #[derive(Debug, Clone, Default)]
 pub struct ReconcileReport {
     pub done: Vec<String>,
+    /// 没写入、但需要告诉用户的原因（如「该远程已有你自己设的原生代理」）
+    pub skipped: Vec<String>,
     pub failed: Vec<String>,
     /// 已实际发生的动作数（0 表示「本来就是一致的」）
     pub changed: usize,
@@ -295,14 +324,24 @@ impl ReconcileReport {
     /// 是否什么都没做（含失败）。测试用。
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.done.is_empty() && self.failed.is_empty()
+        self.done.is_empty() && self.skipped.is_empty() && self.failed.is_empty()
+    }
+
+    /// 给用户看的细节：失败在前，跳过在后。
+    pub fn detail(&self) -> String {
+        let mut parts = self.failed.clone();
+        parts.extend(self.skipped.iter().cloned());
+        parts.join("；")
     }
 
     pub fn summary(&self) -> String {
-        if self.changed == 0 && self.failed.is_empty() {
+        if self.changed == 0 && self.failed.is_empty() && self.skipped.is_empty() {
             return "运行状态已与配置一致，无需重载".into();
         }
         let mut s = format!("已重载 {} 项", self.changed);
+        if !self.skipped.is_empty() {
+            s.push_str(&format!("，{} 项跳过", self.skipped.len()));
+        }
         if !self.failed.is_empty() {
             s.push_str(&format!("，{} 项失败", self.failed.len()));
         }
@@ -319,24 +358,39 @@ pub async fn collect_actual(client: &RcClient) -> Actual {
     a
 }
 
-/// 采集「remote → 当前 override.http_proxy」。
+/// 一个 remote 的代理现状：真实 backend 类型 + 三个可能的代理键。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyActual {
+    pub remote: String,
+    /// `config/get` 里的 `type`（权威值；空串 = 拿不到，按 override 处理）
+    pub backend_type: String,
+    pub values: ProxyConfigValues,
+}
+
+/// 采集有绑定 remote 的代理现状。
 ///
 /// 只查有绑定的 remote，避免为了比对而把全部远程的凭据都读一遍。
+///
+/// 读取失败**不能吞成空值**：分键之后“不知道该看哪个键”会让判断完全错位
+/// （把用户已有的代理当成不存在，或反过来），因此失败记进错误列表并跳过
+/// 该 remote —— 宁可不判定，也不猜。
 pub async fn collect_proxy_actual(
     client: &RcClient,
     remotes: &[String],
-) -> Vec<(String, Option<String>)> {
+) -> (Vec<ProxyActual>, Vec<String>) {
     let mut out = Vec::new();
+    let mut errors = Vec::new();
     for r in remotes {
-        let v = match client.config_get(r).await {
-            Ok(map) => map
-                .get("override.http_proxy")
-                .map(|x| x.as_str().unwrap_or_default().to_string()),
-            Err(_) => None,
-        };
-        out.push((r.clone(), v));
+        match client.config_get(r).await {
+            Ok(map) => out.push(ProxyActual {
+                remote: r.clone(),
+                backend_type: ProxyConfigValues::backend_type(&map),
+                values: ProxyConfigValues::from_config_map(&map),
+            }),
+            Err(e) => errors.push(format!("读取 {r} 的代理状态失败：{e}（本次跳过该远程）")),
+        }
     }
-    out
+    (out, errors)
 }
 
 /// 执行动作序列。单条失败不影响其他条目。
@@ -348,8 +402,8 @@ pub async fn execute(
     let mut rep = ReconcileReport::default();
     for a in actions {
         match a {
-            Action::SetProxy { remote, .. } | Action::UnsetProxy { remote } => {
-                // 代理的写回需要更新绑定记录（含被覆盖的原值），
+            Action::SetProxy { remote } | Action::UnsetProxy { remote } => {
+                // 代理的写回需要更新绑定记录（脚印 + 用的哪个键），
                 // 因此复用单条下发逻辑，而不是在这里重新实现一遍。
                 let profile: Option<ProxyProfile> = {
                     let reg = ProxyRegistry::new(&cfg.proxies, &cfg.proxy_bindings);
@@ -360,29 +414,35 @@ pub async fn execute(
                     .iter()
                     .find(|b| b.remote.eq_ignore_ascii_case(remote))
                     .cloned()
-                    .unwrap_or_else(|| rcgui_profile::RemoteProxyBinding {
+                    .unwrap_or_else(|| RemoteProxyBinding {
                         remote: remote.clone(),
                         ..Default::default()
                     });
-                match crate::proxy::apply_to_remote(client, remote, profile.as_ref(), &mut binding)
-                    .await
+                let result =
+                    crate::proxy::apply_to_remote(client, remote, profile.as_ref(), &mut binding)
+                        .await;
+                // **失败也要写回**：换键时旧键可能已经成功还原，丢掉这次更新会让
+                // 下一次比对把「已还原」误判成「被外部改过」。
+                if let Some(slot) = cfg
+                    .proxy_bindings
+                    .iter_mut()
+                    .find(|b| b.remote.eq_ignore_ascii_case(remote))
                 {
+                    *slot = binding;
+                } else {
+                    cfg.proxy_bindings.push(binding);
+                }
+                match result {
                     Ok(out) => {
                         if out.is_failure() {
                             rep.failed.push(out.describe(remote));
-                        } else {
+                        } else if out.is_skipped() {
+                            rep.skipped.push(out.describe(remote));
+                        } else if out.is_changed() {
                             rep.done.push(out.describe(remote));
                             rep.changed += 1;
                         }
-                        if let Some(slot) = cfg
-                            .proxy_bindings
-                            .iter_mut()
-                            .find(|b| b.remote.eq_ignore_ascii_case(remote))
-                        {
-                            *slot = binding;
-                        } else {
-                            cfg.proxy_bindings.push(binding);
-                        }
+                        // Unchanged / LeftAlone：没有变化，不用报告
                     }
                     Err(e) => rep.failed.push(format!("{remote}: {e}")),
                 }
@@ -437,11 +497,13 @@ pub async fn execute(
 /// 而 `std::sync::MutexGuard` 不是 `Send`，跨越 `await` 会让整个 future 变成
 /// 非 `Send`，无法交给 `tokio::spawn`。
 pub async fn reconcile(client: &RcClient, cfg: &mut AppConfig) -> ReconcileReport {
-    let (desired, errors) = desired_from(cfg);
+    let (desired, mut errors) = desired_from(cfg);
     let actual = collect_actual(client).await;
-    let remotes: Vec<String> = desired.remotes.iter().map(|(r, _)| r.clone()).collect();
-    let proxy_actual = collect_proxy_actual(client, &remotes).await;
-    let actions = plan(&desired, &actual, &proxy_actual);
+    let remotes: Vec<String> = desired.remotes.iter().map(|r| r.remote.clone()).collect();
+    let (proxy_actual, proxy_errors) = collect_proxy_actual(client, &remotes).await;
+    errors.extend(proxy_errors);
+    let (actions, plan_errors) = plan(&desired, &actual, &proxy_actual);
+    errors.extend(plan_errors);
     let mut rep = execute(client, cfg, &actions).await;
     rep.failed.extend(errors);
     rep
@@ -479,6 +541,37 @@ mod tests {
         c
     }
 
+    fn proxy_profile(id: &str, protocol: rcgui_profile::ProxyProtocol, host: &str, port: u16) -> ProxyProfile {
+        ProxyProfile {
+            id: id.into(),
+            name: "n".into(),
+            protocol,
+            host: host.into(),
+            port,
+            user: String::new(),
+            pass: String::new(),
+        }
+    }
+
+    fn state(remote: &str, rtype: &str, values: ProxyConfigValues) -> ProxyActual {
+        ProxyActual {
+            remote: remote.into(),
+            backend_type: rtype.into(),
+            values,
+        }
+    }
+
+    fn binding_with_footprint(remote: &str, key: &str, value: &str, original: Option<&str>) -> RemoteProxyBinding {
+        RemoteProxyBinding {
+            remote: remote.into(),
+            proxy_id: String::new(),
+            applied: true,
+            applied_key: key.into(),
+            applied_value: value.into(),
+            original_override: original.map(str::to_string),
+        }
+    }
+
     #[test]
     fn no_drift_means_no_actions() {
         let cfg = cfg_with_mount("r", "T:");
@@ -489,8 +582,10 @@ mod tests {
             mount_fs: vec!["r:".into()],
             serve_addrs: Vec::new(),
         };
+        let (acts, errs) = plan(&desired, &actual, &[]);
+        assert!(errs.is_empty());
         assert!(
-            plan(&desired, &actual, &[]).is_empty(),
+            acts.is_empty(),
             "已经在跑且一致时不应产生任何动作"
         );
     }
@@ -500,7 +595,7 @@ mod tests {
         let cfg = cfg_with_mount("r", "T:");
         let (desired, _) = desired_from(&cfg);
         let actual = Actual::default();
-        let acts = plan(&desired, &actual, &[]);
+        let (acts, _) = plan(&desired, &actual, &[]);
         // 注意：app 侧的 normalize_mount_point 会把 "T:" 规范成 "T:\\"
         // （与 profile crate 的 "T:" 形式不同；挂载这一步用的是 app 侧实现）
         assert_eq!(
@@ -519,7 +614,7 @@ mod tests {
             mount_fs: vec!["r:".into()],
             serve_addrs: Vec::new(),
         };
-        assert!(plan(&desired, &actual, &[]).is_empty());
+        assert!(plan(&desired, &actual, &[]).0.is_empty());
     }
 
     #[test]
@@ -531,7 +626,7 @@ mod tests {
             mount_fs: vec!["x:".into()],
             serve_addrs: Vec::new(),
         };
-        let acts = plan(&desired, &actual, &[]);
+        let (acts, _) = plan(&desired, &actual, &[]);
         assert_eq!(acts, vec![Action::Unmount { point: "U:".into() }]);
     }
 
@@ -553,7 +648,7 @@ mod tests {
             serve_addrs: vec![("127.0.0.1:8080".into(), "id1".into())],
         };
         assert!(
-            plan(&desired, &actual, &[]).is_empty(),
+            plan(&desired, &actual, &[]).0.is_empty(),
             "已在监听的地址不能再 serve/start（会报 bind: address already in use）"
         );
     }
@@ -563,7 +658,7 @@ mod tests {
         let cfg = cfg_with_serve("127.0.0.1:8081");
         let (desired, _) = desired_from(&cfg);
         let actual = Actual::default();
-        let acts = plan(&desired, &actual, &[]);
+        let (acts, _) = plan(&desired, &actual, &[]);
         assert_eq!(
             acts,
             vec![Action::StartServe {
@@ -583,7 +678,7 @@ mod tests {
             mount_fs: vec![],
             serve_addrs: vec![("127.0.0.1:9".into(), "id9".into())],
         };
-        let acts = plan(&desired, &actual, &[]);
+        let (acts, _) = plan(&desired, &actual, &[]);
         assert_eq!(
             acts,
             vec![Action::StopServe { addr: "127.0.0.1:9".into(), id: "id9".into() }]
@@ -593,27 +688,19 @@ mod tests {
     #[test]
     fn proxy_change_produces_set() {
         let mut cfg = AppConfig::default();
-        let p = ProxyProfile {
-            id: "p1".into(),
-            name: "n".into(),
-            protocol: rcgui_profile::ProxyProtocol::Http,
-            host: "127.0.0.1".into(),
-            port: 8899,
-            user: String::new(),
-            pass: String::new(),
-        };
-        cfg.proxies.push(p);
+        cfg.proxies
+            .push(proxy_profile("p1", rcgui_profile::ProxyProtocol::Http, "127.0.0.1", 8899));
         cfg.bind_proxy_slot("teldrive", "p1");
         let (desired, errs) = desired_from(&cfg);
         assert!(errs.is_empty());
         // rclone 里还没有这个键
-        let proxy_actual = vec![("teldrive".to_string(), None)];
-        let acts = plan(&desired, &Actual::default(), &proxy_actual);
+        let proxy_actual = vec![state("teldrive", "s3", ProxyConfigValues::default())];
+        let (acts, errs) = plan(&desired, &Actual::default(), &proxy_actual);
+        assert!(errs.is_empty());
         assert_eq!(
             acts,
             vec![Action::SetProxy {
-                remote: "teldrive".into(),
-                url: "http://127.0.0.1:8899".into()
+                remote: "teldrive".into()
             }]
         );
     }
@@ -622,30 +709,143 @@ mod tests {
     #[test]
     fn unchanged_proxy_is_noop() {
         let mut cfg = AppConfig::default();
-        cfg.proxies.push(ProxyProfile {
-            id: "p1".into(),
-            name: "n".into(),
-            protocol: rcgui_profile::ProxyProtocol::Http,
-            host: "h".into(),
-            port: 1,
-            user: String::new(),
-            pass: String::new(),
-        });
+        cfg.proxies
+            .push(proxy_profile("p1", rcgui_profile::ProxyProtocol::Http, "h", 1));
         cfg.bind_proxy_slot("r", "p1");
         let (desired, _) = desired_from(&cfg);
-        let proxy_actual = vec![("r".to_string(), Some("http://h:1".to_string()))];
-        assert!(plan(&desired, &Actual::default(), &proxy_actual).is_empty());
+        let proxy_actual = vec![state(
+            "r",
+            "s3",
+            ProxyConfigValues {
+                override_http: Some("http://h:1".into()),
+                ..Default::default()
+            },
+        )];
+        assert!(plan(&desired, &Actual::default(), &proxy_actual).0.is_empty());
     }
 
-    /// 「不代理」+ rclone 里有值 → 应产生移除动作（实际恢复原值由 apply 负责）。
+    /// ftp 的目标键是原生 http_proxy：override 上有没有值都不该影响判断。
     #[test]
-    fn direct_binding_clears_existing_proxy() {
+    fn ftp_proxy_compares_native_http_key() {
         let mut cfg = AppConfig::default();
-        cfg.bind_proxy_slot("r", "");
+        cfg.proxies
+            .push(proxy_profile("p1", rcgui_profile::ProxyProtocol::Http, "rcgui", 1));
+        cfg.bind_proxy_slot("r", "p1");
         let (desired, _) = desired_from(&cfg);
-        let proxy_actual = vec![("r".to_string(), Some("http://old:1".to_string()))];
-        let acts = plan(&desired, &Actual::default(), &proxy_actual);
+
+        // 原生键为空、override 上有旧值（老版本写的）→ 仍需写入原生键
+        let stale_override = vec![state(
+            "r",
+            "ftp",
+            ProxyConfigValues {
+                override_http: Some("http://old:1".into()),
+                ..Default::default()
+            },
+        )];
+        assert_eq!(
+            plan(&desired, &Actual::default(), &stale_override).0,
+            vec![Action::SetProxy { remote: "r".into() }]
+        );
+
+        // 原生键已是期望值 → 无需动作
+        let done = vec![state(
+            "r",
+            "ftp",
+            ProxyConfigValues {
+                native_http: Some("http://rcgui:1".into()),
+                ..Default::default()
+            },
+        )];
+        assert!(plan(&desired, &Actual::default(), &done).0.is_empty());
+    }
+
+    /// 用户自己设了原生代理：plan 仍然给出动作，让 apply 判定并报告「只补空缺」。
+    #[test]
+    fn ftp_existing_user_proxy_is_reported_by_apply() {
+        let mut cfg = AppConfig::default();
+        cfg.proxies
+            .push(proxy_profile("p1", rcgui_profile::ProxyProtocol::Http, "rcgui", 1));
+        cfg.bind_proxy_slot("r", "p1");
+        let (desired, _) = desired_from(&cfg);
+        let proxy_actual = vec![state(
+            "r",
+            "ftp",
+            ProxyConfigValues {
+                native_http: Some("http://user:3128".into()),
+                ..Default::default()
+            },
+        )];
+        assert_eq!(
+            plan(&desired, &Actual::default(), &proxy_actual).0,
+            vec![Action::SetProxy { remote: "r".into() }],
+            "由 apply 返回 RespectExisting 并计入 skipped"
+        );
+    }
+
+    /// 「不代理」+ 有脚印 → 应产生回滚动作（还原哪个键由 apply 用记录决定）。
+    #[test]
+    fn direct_binding_with_footprint_rolls_back() {
+        let mut cfg = AppConfig::default();
+        cfg.proxy_bindings
+            .push(binding_with_footprint("r", "override.http_proxy", "http://old:1", None));
+        let (desired, _) = desired_from(&cfg);
+        let proxy_actual = vec![state(
+            "r",
+            "s3",
+            ProxyConfigValues {
+                override_http: Some("http://old:1".into()),
+                ..Default::default()
+            },
+        )];
+        let (acts, _) = plan(&desired, &Actual::default(), &proxy_actual);
         assert_eq!(acts, vec![Action::UnsetProxy { remote: "r".into() }]);
+    }
+
+    /// 「不代理」但从未下发过：rclone 里的值不归我们管，一个动作都不能有。
+    #[test]
+    fn direct_binding_without_footprint_is_noop() {
+        let mut cfg = AppConfig::default();
+        cfg.proxy_bindings.push(RemoteProxyBinding {
+            remote: "r".into(),
+            proxy_id: String::new(),
+            ..Default::default()
+        });
+        let (desired, _) = desired_from(&cfg);
+        let proxy_actual = vec![state(
+            "r",
+            "s3",
+            ProxyConfigValues {
+                override_http: Some("http://user:3128".into()),
+                ..Default::default()
+            },
+        )];
+        assert!(plan(&desired, &Actual::default(), &proxy_actual).0.is_empty());
+    }
+
+    /// 采集失败（没有现状）时不能猜，也不能产生动作。
+    #[test]
+    fn missing_proxy_state_is_skipped() {
+        let mut cfg = AppConfig::default();
+        cfg.proxies
+            .push(proxy_profile("p1", rcgui_profile::ProxyProtocol::Http, "h", 1));
+        cfg.bind_proxy_slot("r", "p1");
+        let (desired, _) = desired_from(&cfg);
+        assert!(plan(&desired, &Actual::default(), &[]).0.is_empty());
+    }
+
+    /// 原生 socks 凭据无法表达时，plan 要把原因当成错误报出来，而不是静默。
+    #[test]
+    fn unrepresentable_native_socks_is_reported() {
+        let mut cfg = AppConfig::default();
+        let mut p = proxy_profile("p1", rcgui_profile::ProxyProtocol::Socks5, "h", 1080);
+        p.user = "a@b".into();
+        cfg.proxies.push(p);
+        cfg.bind_proxy_slot("r", "p1");
+        let (desired, _) = desired_from(&cfg);
+        let proxy_actual = vec![state("r", "ftp", ProxyConfigValues::default())];
+        let (acts, errs) = plan(&desired, &Actual::default(), &proxy_actual);
+        assert!(acts.is_empty());
+        assert!(errs.iter().any(|e| e.contains("代理配置无效")));
     }
 
     #[test]
@@ -654,8 +854,28 @@ mod tests {
         cfg.bind_proxy_slot("r", "gone-id");
         let (desired, errs) = desired_from(&cfg);
         assert_eq!(desired.remotes.len(), 1);
-        assert!(desired.remotes[0].1.is_none(), "悬空引用按不代理处理");
+        assert!(desired.remotes[0].proxy.is_none(), "悬空引用按不代理处理");
         assert!(errs.iter().any(|e| e.contains("已不存在")));
+    }
+
+    /// 悬空引用但还留着脚印：仍要回滚，不能把旧代理留在 rclone 里。
+    #[test]
+    fn dangling_binding_with_footprint_still_rolls_back() {
+        let mut cfg = AppConfig::default();
+        cfg.proxy_bindings
+            .push(binding_with_footprint("r", "override.http_proxy", "http://old:1", None));
+        cfg.proxy_bindings[0].proxy_id = "gone".into();
+        let (desired, _) = desired_from(&cfg);
+        let proxy_actual = vec![state(
+            "r",
+            "s3",
+            ProxyConfigValues {
+                override_http: Some("http://old:1".into()),
+                ..Default::default()
+            },
+        )];
+        let (acts, _) = plan(&desired, &Actual::default(), &proxy_actual);
+        assert_eq!(acts, vec![Action::UnsetProxy { remote: "r".into() }]);
     }
 
     #[test]
@@ -666,7 +886,10 @@ mod tests {
         r.changed = 2;
         r.done.push("x".into());
         assert!(r.summary().contains("已重载 2 项"));
+        r.skipped.push("s".into());
+        assert!(r.summary().contains("1 项跳过"));
         r.failed.push("y".into());
         assert!(r.summary().contains("1 项失败"));
+        assert!(r.detail().starts_with('y'), "失败排在跳过之前");
     }
 }

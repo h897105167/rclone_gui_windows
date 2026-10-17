@@ -257,14 +257,12 @@ impl ProfileDoc {
         {
             Some(b) => {
                 if b.proxy_id != proxy_id {
-                    // 换了目标配置（或切成不代理）→ 之前的下发记录不再成立，
-                    // 必须重新走一遍「读原值 + 写入 + 记录」的流程。
+                    // 换了目标配置（或切成不代理）：只标记“待应用”，**不能清掉脚印**。
+                    // 脚印（applied_key / applied_value / original_override）是回滚的
+                    // 唯一依据；清掉之后 apply 会判定“从未管理过”而一个字节都不写，
+                    // rclone 里就永久留着一个没人认领的代理地址。
                     b.proxy_id = proxy_id.to_string();
                     b.applied = false;
-                    b.applied_value.clear();
-                    if proxy_id.is_empty() {
-                        b.original_override = None;
-                    }
                 }
             }
             None => self.remote_proxies.push(RemoteProxyBinding {
@@ -595,6 +593,34 @@ mod tests {
         let p = std::env::temp_dir().join("rcgui-profile-does-not-exist.json");
         let _ = std::fs::remove_file(&p);
         assert!(Store::new(&p).load().unwrap().is_none());
+    }
+
+    /// 切「不代理」只清 `applied`，**不能清脚印**：否则回滚没有依据，
+    /// rclone 里的旧代理会永久留着（2026-10-18 修掉的缺陷）。
+    #[test]
+    fn rebinding_keeps_rollback_footprint() {
+        let mut d = ProfileDoc::default();
+        d.upsert_proxy(ProxyProfile {
+            id: "p1".into(),
+            name: "n".into(),
+            ..Default::default()
+        });
+        d.bind_proxy("r", "p1");
+        {
+            let b = &mut d.remote_proxies[0];
+            b.applied = true;
+            b.applied_key = "override.http_proxy".into();
+            b.applied_value = "http://ours:1".into();
+            b.original_override = Some("http://user:3128".into());
+        }
+        d.bind_proxy("r", "");
+        let b = &d.remote_proxies[0];
+        assert!(b.is_direct());
+        assert!(!b.applied, "换目标后要标成待应用");
+        assert_eq!(b.applied_key, "override.http_proxy");
+        assert_eq!(b.applied_value, "http://ours:1", "回滚依据不能被清掉");
+        assert_eq!(b.original_override.as_deref(), Some("http://user:3128"));
+        assert!(b.has_footprint());
     }
 
     #[test]

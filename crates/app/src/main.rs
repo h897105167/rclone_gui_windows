@@ -2192,7 +2192,8 @@ async fn replay_pending_proxies(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         return;
     }
     let client = ctx.rc.client().await;
-    let mut ok = 0usize;
+    let mut changed = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
     let mut errs: Vec<String> = Vec::new();
     for (remote, profile) in pending {
         let mut binding = {
@@ -2206,33 +2207,45 @@ async fn replay_pending_proxies(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
                     ..Default::default()
                 })
         };
-        match proxy::apply_to_remote(&client, &remote, Some(&profile), &mut binding).await {
+        let result = proxy::apply_to_remote(&client, &remote, Some(&profile), &mut binding).await;
+        // 不论成功失败都写回：换键时旧键可能已经成功还原，丢掉这次更新会让
+        // 下一次比对把「已还原」误判成「被外部改过」。
+        {
+            let mut cfg = ctx.cfg.lock().unwrap();
+            if let Some(slot) = cfg
+                .proxy_bindings
+                .iter_mut()
+                .find(|b| b.remote.eq_ignore_ascii_case(&remote))
+            {
+                *slot = binding;
+            } else {
+                cfg.proxy_bindings.push(binding);
+            }
+            let _ = profiles::save_from_cfg(&cfg);
+        }
+        match result {
             Ok(out) => {
-                // 下发成功（含冲突）都要把记录写回，冲突时的 applied 保持 true 以免反复重试
-                {
-                    let mut cfg = ctx.cfg.lock().unwrap();
-                    if let Some(slot) = cfg
-                        .proxy_bindings
-                        .iter_mut()
-                        .find(|b| b.remote.eq_ignore_ascii_case(&remote))
-                    {
-                        *slot = binding;
-                    } else {
-                        cfg.proxy_bindings.push(binding);
-                    }
-                    let _ = profiles::save_from_cfg(&cfg);
-                }
                 if out.is_failure() {
                     errs.push(out.describe(&remote));
-                } else {
-                    ok += 1;
+                } else if out.is_skipped() {
+                    // 用户自己在 rclone 里设了原生代理：只补空缺，不覆盖
+                    skipped.push(out.describe(&remote));
+                } else if out.is_changed() {
+                    changed += 1;
                 }
             }
             Err(e) => errs.push(e),
         }
     }
-    if ok > 0 {
-        toast(ui, 1, format!("已应用 {ok} 条代理配置。{}", proxy::RESTART_HINT));
+    if changed > 0 {
+        toast(
+            ui,
+            1,
+            format!("已应用 {changed} 条代理配置。{}", proxy::RESTART_HINT),
+        );
+    }
+    if !skipped.is_empty() {
+        toast(ui, 0, skipped.join("；"));
     }
     if !errs.is_empty() {
         toast(ui, 2, errs.join("；"));
@@ -2258,7 +2271,7 @@ async fn delete_proxy_now(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
             .unwrap_or_default();
         // 关键：回滚需要用 `original_override` / `applied_value`，而下面就会把
         // 这些绑定从档案里删掉。必须先克隆出来，否则回滚时拿到的是空绑定，
-        // `plan_set` 会判定「不是本程序管的」→ 一个字节都不写，
+        // `plan_apply` 会判定「不是本程序管的」→ 一个字节都不写，
         // rclone 里仍然留着那个已经删掉的代理（实测就是这样漏掉的）。
         let bindings_before: Vec<rcgui_profile::RemoteProxyBinding> = cfg
             .proxy_bindings
@@ -4456,8 +4469,10 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 let label = if is_new { "已新增" } else { "已更新" };
                 cfg.proxies.retain(|p| p.id != profile.id);
                 cfg.proxies.push(profile.clone());
-                // 改动配置内容后，凡是用它的 remote 的下发记录都失效，
-                // 必须重新下发 —— 否则远程仍在用旧代理（用户改了也不生效）。
+                // 改动配置内容后，用它的 remote 都标记为「待应用」，由下面的
+                // reconcile 逐项比对后重写。
+                // **不能清 applied_value**：它是回滚依据，清掉会让我们的旧值在
+                // 下一轮被当成「别人改的」→ 误报冲突；协议变了也会丢掉旧键记录。
                 let affected: Vec<String> = cfg
                     .proxy_bindings
                     .iter()
@@ -4467,7 +4482,6 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 for b in cfg.proxy_bindings.iter_mut() {
                     if b.proxy_id == profile.id {
                         b.applied = false;
-                        b.applied_value.clear();
                     }
                 }
                 if let Err(e) = profiles::save_from_cfg(&cfg) {
@@ -4499,11 +4513,9 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     let _ = profiles::save_from_cfg(&cfg);
                 }
                 if !rep.failed.is_empty() {
-                    toast(
-                        ui,
-                        2,
-                        format!("{}：{}", rep.summary(), rep.failed.join("；")),
-                    );
+                    toast(ui, 2, format!("{}：{}", rep.summary(), rep.detail()));
+                } else if !rep.skipped.is_empty() {
+                    toast(ui, 0, format!("{}：{}", rep.summary(), rep.detail()));
                 } else {
                     toast(
                         ui,
@@ -4587,13 +4599,9 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     return false;
                 }
             }
-            // 该类型是否真的会读 override.http_proxy：
-            // ftp / sftp 实测不读，下发等于静默无效，必须当场说明，
-            // 不能让用户以为「已生效」。（正确做法是改写原生键，属后续工作。）
-            let inert_hint = match &profile {
-                Some(_) => remote_type(ctx, &remote)
-                    .filter(|t| !proxy::type_honors_override(t))
-                    .map(|_| proxy::INERT_TYPE_HINT),
+            // ftp / sftp 走原生键：要让用户知道键名、只补空缺策略和凭据限制。
+            let native_hint = match &profile {
+                Some(_) => remote_type(ctx, &remote).and_then(|t| proxy::native_note(&t)),
                 None => None,
             };
             // 2) 连上了就立刻让它生效。
@@ -4623,8 +4631,19 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                         format!(
                             "{}：{}{}",
                             rep.summary(),
-                            rep.failed.join("；"),
-                            inert_hint.unwrap_or("")
+                            rep.detail(),
+                            native_hint.unwrap_or("")
+                        ),
+                    );
+                } else if !rep.skipped.is_empty() {
+                    toast(
+                        ui,
+                        0,
+                        format!(
+                            "{}：{}{}",
+                            rep.summary(),
+                            rep.detail(),
+                            native_hint.unwrap_or("")
                         ),
                     );
                 } else {
@@ -4635,11 +4654,10 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                             "{}。{}{}",
                             rep.summary(),
                             proxy::RESTART_HINT,
-                            inert_hint.unwrap_or("")
+                            native_hint.unwrap_or("")
                         ),
                     );
                 }
-                let _ = profile;
             } else {
                 toast(
                     ui,
@@ -4647,7 +4665,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     format!(
                         "{remote} 的代理已保存，当前未连接 rclone，将在连接后自动应用。{}{}",
                         proxy::RESTART_HINT,
-                        inert_hint.unwrap_or("")
+                        native_hint.unwrap_or("")
                     ),
                 );
             }

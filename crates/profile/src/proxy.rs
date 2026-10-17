@@ -1,15 +1,27 @@
-//! remote 级代理配置模型。
+//! remote 级代理配置模型，以及「这次该写哪个键、写什么值」的纯决策。
 //!
 //! 定位（用户需求）：**按 remote 分流**，不是按文件、域名或单次请求分流。
 //!
-//! 实测约束（见 `docs/proxy-verification.md`，rclone v1.75.4）：
+//! 实测约束（rclone v1.75.4；键与格式另核对过上游 `backend/ftp`、`backend/sftp`、
+//! `lib/proxy` 源码）：
 //!
-//! 1. rclone 只认 `override.http_proxy` **一个**键，由 Go `http.Transport` 按 URL
+//! 1. 大多数后端只认 `override.http_proxy` **一个**键，由 Go `http.Transport` 按 URL
 //!    scheme 决定走 HTTP 还是 SOCKS5。`override.socks_proxy` 会被写进 conf 但
-//!    **完全不生效**，因此本模块只生成 `override.http_proxy`。
-//! 2. rclone 对代理 URL **不做任何校验**：非法字符串照单全收，未知 scheme 会被静默
+//!    **完全不生效**。
+//! 2. **ftp / sftp 是例外**：它们有后端原生选项 `http_proxy`（完整 URL）与
+//!    `socks_proxy`（裸 `[user[:pass]@]host:port`，**不做 URL 解码**）。两个键同时
+//!    存在时 **socks_proxy 优先**（两个后端都是 `if socks != "" { } else if http`）。
+//! 3. rclone 对代理 URL **不做任何校验**：非法字符串照单全收，未知 scheme 会被静默
 //!    当作 HTTP 代理使用。所以校验必须在这里做完，不能指望 rclone 报错。
-//! 3. 代理账号密码以**百分号编码的明文**落 rclone.conf，不是 obscure、更不是加密。
+//! 4. 代理账号密码以明文落 rclone.conf：override 是百分号编码的 URL，
+//!    原生 `socks_proxy` 是原样字符串（连百分号编码都没有）。
+//!
+//! ## 产品策略（用户 2026-10-18 决定）
+//!
+//! **原生键只补空缺**：ftp / sftp 上如果用户自己已经写了 `http_proxy` 或
+//! `socks_proxy`，RCGUI 不覆盖、不代管，只在界面上说明；只有两个键都为空时才写入。
+//! `override.http_proxy` 沿用既定语义：覆盖前记原值，切回「不代理」时还原而不是删键。
+//! 取舍与依据见 `docs/proxy-ftp-sftp-and-errors.md`。
 //!
 //! 设计取舍：模型里把 `protocol / host / port / user / pass` 拆开存，不存拼好的 URL。
 //! 这样「改端口」不会因为要把旧 URL 解析回来而引入解析歧义，也让 UI 表单与模型一一对应；
@@ -49,7 +61,7 @@ impl Default for ProxyProtocol {
 }
 
 impl ProxyProtocol {
-    /// URL scheme。写进 `override.http_proxy` 的前缀。
+    /// URL scheme。写进 `override.http_proxy` / 原生 `http_proxy` 的前缀。
     pub fn scheme(self) -> &'static str {
         match self {
             Self::Http => "http",
@@ -101,6 +113,140 @@ impl ProxyProtocol {
     /// 该协议是否走 SOCKS5（UI 提示与参数差异用）。
     pub fn is_socks(self) -> bool {
         matches!(self, Self::Socks5 | Self::Socks5h)
+    }
+}
+
+/// rclone 里实际承载代理的配置键。
+///
+/// 大多数后端只有 `override.http_proxy`；ftp / sftp 用后端原生键。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyKey {
+    /// `override.http_proxy`：HTTP 类后端的统一入口，值 = 带 scheme 的完整 URL
+    Override,
+    /// `http_proxy`：ftp / sftp 原生键，值 = `http(s)://[user:pass@]host:port`
+    NativeHttp,
+    /// `socks_proxy`：ftp / sftp 原生键，值 = 裸 `[user[:pass]@]host:port`
+    NativeSocks,
+}
+
+impl ProxyKey {
+    /// 写进 `config/update` / `config/unset` 的真实键名。
+    pub const fn config_key(self) -> &'static str {
+        match self {
+            Self::Override => "override.http_proxy",
+            Self::NativeHttp => "http_proxy",
+            Self::NativeSocks => "socks_proxy",
+        }
+    }
+
+    /// 面向用户的键名。**不携带值**，避免把凭据带进提示。
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Override => "override.http_proxy",
+            Self::NativeHttp => "原生 http_proxy",
+            Self::NativeSocks => "原生 socks_proxy",
+        }
+    }
+
+    /// 是否是 ftp / sftp 的原生键。
+    pub const fn is_native(self) -> bool {
+        !matches!(self, Self::Override)
+    }
+
+    /// ftp / sftp 的另一个原生键。rclone 会优先使用 `socks_proxy`。
+    pub const fn native_peer(self) -> Option<Self> {
+        match self {
+            Self::NativeHttp => Some(Self::NativeSocks),
+            Self::NativeSocks => Some(Self::NativeHttp),
+            Self::Override => None,
+        }
+    }
+
+    /// 从档案里持久化的键名还原；未知一律 `None`（**不猜**）。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "override.http_proxy" => Some(Self::Override),
+            "http_proxy" => Some(Self::NativeHttp),
+            "socks_proxy" => Some(Self::NativeSocks),
+            _ => None,
+        }
+    }
+}
+
+/// 三个可能承载代理的键的当前值（`None` = 键不存在，`Some("")` = 存在但为空）。
+///
+/// 区分 `None` 与 `Some("")` 是回滚正确性的前提：原本存在但为空的键要恢复成空值，
+/// 而不是删掉。rclone `config/get` 只返回**显式配置过**的键，不合成默认值，
+/// 因此这个区分是可靠的。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyConfigValues {
+    pub override_http: Option<String>,
+    pub native_http: Option<String>,
+    pub native_socks: Option<String>,
+}
+
+impl ProxyConfigValues {
+    pub fn get(&self, key: ProxyKey) -> Option<&str> {
+        match key {
+            ProxyKey::Override => self.override_http.as_deref(),
+            ProxyKey::NativeHttp => self.native_http.as_deref(),
+            ProxyKey::NativeSocks => self.native_socks.as_deref(),
+        }
+    }
+
+    pub fn set(&mut self, key: ProxyKey, value: Option<String>) {
+        match key {
+            ProxyKey::Override => self.override_http = value,
+            ProxyKey::NativeHttp => self.native_http = value,
+            ProxyKey::NativeSocks => self.native_socks = value,
+        }
+    }
+
+    /// 从 rclone `config/get` 的返回里取三个键。
+    pub fn from_config_map(map: &serde_json::Map<String, serde_json::Value>) -> Self {
+        let get = |k: &str| {
+            map.get(k)
+                .map(|v| v.as_str().unwrap_or_default().to_string())
+        };
+        Self {
+            override_http: get("override.http_proxy"),
+            native_http: get("http_proxy"),
+            native_socks: get("socks_proxy"),
+        }
+    }
+
+    /// `config/get` 里的 backend type（统一小写；缺失返回空串）。
+    pub fn backend_type(map: &serde_json::Map<String, serde_json::Value>) -> String {
+        map.get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+    }
+}
+
+/// 该后端类型是否使用 ftp / sftp 的原生代理键。
+///
+/// 全量 `config/providers` 扫描（71 个后端）里只有 `ftp` / `sftp` 声明了
+/// `http_proxy` / `socks_proxy`（`google photos` 的 `proxy` 是 gphotosdl 专用，
+/// 与代理无关）。未知/空类型一律走 `override`，保持旧行为。
+pub fn uses_native_keys(backend_type: &str) -> bool {
+    matches!(
+        backend_type.trim().to_ascii_lowercase().as_str(),
+        "ftp" | "sftp"
+    )
+}
+
+/// 目标 backend 上应该写哪个键。
+pub fn proxy_key_for(backend_type: &str, protocol: ProxyProtocol) -> ProxyKey {
+    if uses_native_keys(backend_type) {
+        if protocol.is_socks() {
+            ProxyKey::NativeSocks
+        } else {
+            ProxyKey::NativeHttp
+        }
+    } else {
+        ProxyKey::Override
     }
 }
 
@@ -214,6 +360,62 @@ impl ProxyProfile {
         ))
     }
 
+    /// 这条配置落到指定 backend 上时要写的键与值。
+    ///
+    /// - 普通后端：`override.http_proxy` + 完整 URL（与 [`Self::to_proxy_url`] 一致）
+    /// - ftp / sftp + http/https：原生 `http_proxy` + 完整 URL
+    /// - ftp / sftp + socks5/socks5h：原生 `socks_proxy` + **裸** `[user[:pass]@]host:port`
+    pub fn to_apply_value(&self, backend_type: &str) -> Result<(ProxyKey, String), String> {
+        let key = proxy_key_for(backend_type, self.protocol);
+        let value = match key {
+            ProxyKey::NativeSocks => self.to_native_socks_value()?,
+            _ => self.to_proxy_url()?,
+        };
+        Ok((key, value))
+    }
+
+    /// 构造 ftp / sftp 原生 `socks_proxy` 的值。
+    ///
+    /// 格式由 rclone `lib/proxy.SOCKS5Dial` 决定：先按**第一个** `@` 切出
+    /// `user[:pass]`，再按**第一个** `:` 切出用户名与密码，全程**不做 URL 解码**。
+    /// 因此这里不能百分号编码（会把 `%40` 原样发给代理），只能把无法表达的凭据
+    /// 直接拒绝并给出可操作的说明。
+    ///
+    /// 注意 `socks5` 与 `socks5h` 在这里**等价**：x/net/proxy 总是把主机名交给
+    /// 代理解析，没有“本地解析”的变体。UI 必须明示这一点。
+    pub fn to_native_socks_value(&self) -> Result<String, String> {
+        self.validate()?;
+        if self.user.contains('@') || self.pass.contains('@') {
+            return Err(
+                "ftp / sftp 的原生 socks_proxy 不支持账号或密码里的「@」：rclone 会在第一个 @ 处切分，且不做 URL 解码"
+                    .into(),
+            );
+        }
+        if self.user.contains(':') {
+            return Err(
+                "ftp / sftp 的原生 socks_proxy 不支持用户名里的「:」：rclone 用它分隔用户名与密码"
+                    .into(),
+            );
+        }
+        // IPv6 字面量在 host:port 里必须带方括号，否则 x/net/proxy 解析不了
+        let host = self.host.trim();
+        let host_part = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        let target = format!("{host_part}:{}", self.port);
+        Ok(if self.has_auth() {
+            if self.pass.is_empty() {
+                format!("{}@{target}", self.user)
+            } else {
+                format!("{}:{}@{target}", self.user, self.pass)
+            }
+        } else {
+            target
+        })
+    }
+
     /// 供 UI 显示：**永远不含密码**。
     pub fn display_target(&self) -> String {
         let host = if self.host.contains(':') {
@@ -259,15 +461,24 @@ pub struct RemoteProxyBinding {
     pub proxy_id: String,
     /// 是否已经下发到 rclone。false = 待应用（RC 未连接时的状态）
     pub applied: bool,
-    /// 上次**由本程序**写入 rclone 的实际值（空 = 从未写过）。
+    /// 上次**由本程序**写入 rclone 的实际值（空 = 没留下值）。
     ///
     /// 用来判断 rclone 里的当前值是否仍是我们写的：
     /// 若不一致，说明用户在别处改过，此时切回「不代理」不能贸然覆盖。
     pub applied_value: String,
-    /// 覆盖前用户**原有**的 `override.http_proxy`。
+    /// 上次**由本程序**写入的是哪个 rclone 配置键（空 = 旧档案，按 override 解释）。
+    ///
+    /// 必须记住键：ftp/sftp 用原生 `http_proxy`/`socks_proxy`，普通后端用
+    /// `override.http_proxy`。换键（改协议、改远程类型）时，回滚只能回到
+    /// **当时写过的那个键**，不能按“现在的类型”重新猜。
+    pub applied_key: String,
+    /// 覆盖前 `applied_key` 所指键上**原有**的值。
     ///
     /// - `None`：原本没有这个键（切回「不代理」时应删除键）
     /// - `Some("")`：原本存在但为空（应恢复成空值而不是删键）
+    ///
+    /// 名字里的 `override` 是历史原因：该字段最初只服务于 `override.http_proxy`，
+    /// 现在泛指“被我们覆盖的那个键”。
     pub original_override: Option<String>,
 }
 
@@ -280,6 +491,34 @@ impl RemoteProxyBinding {
     /// 是否需要在连上 rclone 后补下发。
     pub fn needs_apply(&self) -> bool {
         !self.is_direct() && !self.applied
+    }
+
+    /// 上次写过的键。旧档案没有 `applied_key`：旧实现只写 override，
+    /// 因此有下发记录时按 `override.http_proxy` 解释；什么都没写过则 `None`。
+    pub fn applied_key(&self) -> Option<ProxyKey> {
+        ProxyKey::parse(&self.applied_key).or_else(|| {
+            if !self.applied_value.is_empty() || self.original_override.is_some() {
+                Some(ProxyKey::Override)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// 我们在 rclone 里是否留有脚印。
+    ///
+    /// 有值 = 要回滚；有原值记录 = 也要回滚（哪怕上次写的是空）。
+    /// 回滚完成后会调用 [`Self::clear_footprint`]，所以“没有脚印”=
+    /// 用户现在的配置不归我们管，任何情况下都不该动。
+    pub fn has_footprint(&self) -> bool {
+        !self.applied_value.is_empty() || self.original_override.is_some()
+    }
+
+    /// 清掉脚印（回滚成功，或换键时旧键已还原）。
+    pub fn clear_footprint(&mut self) {
+        self.applied_key.clear();
+        self.applied_value.clear();
+        self.original_override = None;
     }
 }
 
@@ -338,122 +577,304 @@ impl ProxyProfile {
     }
 }
 
-/// 把「期望状态」+「rclone 当前实际值」换算成一次具体操作。
-///
-/// 抽成纯函数是为了能脱离 RC 与网络做单元测试 —— 这段逻辑承载
-/// 「不静默覆盖用户原有代理」「切回不代理也不误删」两条硬要求，
-/// 是本次功能最容易出致命错误的地方。
+// ---------------- 下发计划 ----------------
+
+/// 一次下发中的一个原子写操作。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProxyAction {
-    /// 无需任何操作
-    Nothing,
-    /// 把 remote 的 `override.http_proxy` 设成这个值
-    Set(String),
-    /// 删除 remote 的 `override.http_proxy` 键
-    Unset,
-    /// 恢复成原来的值（键原本存在）
-    Restore(String),
-    /// rclone 里的值已被别人改过，与我们的记录不一致 → 必须让用户裁决
+pub enum ProxyStep {
+    /// 把某键设成该值
+    Set { key: ProxyKey, value: String },
+    /// 删除某键
+    Unset { key: ProxyKey },
+    /// 把某键恢复成覆盖前的值
+    Restore { key: ProxyKey, value: String },
+}
+
+impl ProxyStep {
+    pub fn key(&self) -> ProxyKey {
+        match self {
+            Self::Set { key, .. } | Self::Unset { key } | Self::Restore { key, .. } => *key,
+        }
+    }
+}
+
+/// 执行成功后要写回绑定的字段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingCommit {
+    pub key: ProxyKey,
+    /// 我们留在 rclone 里的值；空串 = 没有留下值（已删除，或没写）
+    pub value: String,
+    /// 覆盖前该键的原值（`None` = 原本没有这个键）
+    pub original: Option<String>,
+}
+
+/// 一次下发的面向用户的结果类别。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanOutcome {
+    Applied,
+    Removed,
+    Restored(String),
+    /// 旧键已还原，但目标键上是用户自己的配置，本次没有写入
+    Respect(ProxyKey),
+}
+
+/// [`plan_apply`] 的结论。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyPlan {
+    /// 已经是期望值，不需要任何写入
+    Nothing { key: ProxyKey },
+    /// 需要按顺序执行这些步骤；全部成功后按 `commit` 更新绑定
+    Steps {
+        steps: Vec<ProxyStep>,
+        commit: BindingCommit,
+        outcome: PlanOutcome,
+    },
+    /// 用户已经在这个键上配了代理：尊重用户配置，只补空缺
+    RespectExisting { key: ProxyKey },
+    /// rclone 里的值被本程序之外的方式改过
     Conflict {
-        /// 上次由本程序写入的值
+        key: ProxyKey,
         ours: String,
-        /// 现在 rclone 里的值
         current: String,
     },
+    /// 从没由本程序管理过，也不该由本程序回滚
+    Unmanaged,
 }
 
-impl ProxyAction {
-    pub fn is_noop(&self) -> bool {
-        matches!(self, Self::Nothing)
+/// 取出「我们在 rclone 里留下的脚印」。
+///
+/// 只有 `applied_value` 非空或 `original_override` 存在时才算有脚印；
+/// 否则无论 `applied_key` 里留着什么，都不该去动 rclone。
+///
+/// 返回值全部借用绑定本身，因此是 `Copy` 的，可以在同一函数里多次判断。
+fn footprint_of(b: &RemoteProxyBinding) -> Option<(ProxyKey, &str, Option<&str>)> {
+    if !b.has_footprint() {
+        return None;
     }
+    let key = b.applied_key()?;
+    Some((key, b.applied_value.as_str(), b.original_override.as_deref()))
 }
 
-/// 计算「把某 remote 的代理设为 `desired`」需要做什么。
+/// 计算一次下发该做什么。**纯函数**，不碰网络也不碰文件。
 ///
-/// 参数：
-/// - `desired`：期望写入的完整代理 URL（`None` = 用户选「不代理」）
-/// - `current`：rclone 里**现在**的 `override.http_proxy`（`None` = 键不存在）
-/// - `binding`：已有的绑定记录（`None` = 从未管理过这个 remote）
+/// 规则（用户 2026-10-18 决定：原生键**只补空缺**）：
 ///
-/// 关键规则：
-/// 1. 要设置时，若 rclone 里已有值且**不是我们写的** → 先把它记进
-///    `original_override`（由调用方写入绑定），本次仍然覆盖 —— 但调用方据此可回滚。
-/// 2. 要移除（切回不代理）时：
-///    - 从未管理过 → 什么都别动（用户自己设的代理不归我们管）
-///    - rclone 里的值 ≠ 我们上次写的 → 别人改过，报冲突，**不覆盖**
-///    - 否则恢复 `original_override`：有的恢复原值，没有的删键
-pub fn plan_set(
-    desired: Option<&str>,
-    current: Option<&str>,
+/// | 情形 | 结论 |
+/// |---|---|
+/// | 目标键上有我们的脚印且值未变 | `Nothing` |
+/// | 目标键上有我们的脚印、但值被外部改过 | `Conflict`，零写入 |
+/// | 目标键上没有脚印、已有用户值 | `RespectExisting`，零写入 |
+/// | 目标是原生键、另一个原生键有用户值 | `RespectExisting`（rclone 优先 socks） |
+/// | 脚印在别的键（改协议/改远程类型） | 先还原旧键，再写新键 |
+/// | 期望「不代理」且有脚印 | 还原原值或删键，并清空脚印 |
+/// | 期望「不代理」且无脚印 | `Unmanaged` |
+///
+/// `backend_type` 必须来自 `config/get` 的 `type`（权威值），不要用 UI 缓存猜。
+pub fn plan_apply(
+    desired: Option<&ProxyProfile>,
+    backend_type: &str,
+    values: &ProxyConfigValues,
     binding: Option<&RemoteProxyBinding>,
-) -> ProxyAction {
-    match desired {
-        // ---- 设置代理 ----
-        Some(url) => {
-            if current == Some(url) {
-                ProxyAction::Nothing
-            } else {
-                ProxyAction::Set(url.to_string())
+) -> Result<ApplyPlan, String> {
+    let footprint = binding.and_then(footprint_of);
+
+    // ---------- 期望「不代理」：回滚 ----------
+    let Some(profile) = desired else {
+        return Ok(rollback_plan(footprint, values));
+    };
+
+    // ---------- 期望设置某个代理 ----------
+    let (target, value) = profile.to_apply_value(backend_type)?;
+
+    // 1) 脚印就在目标键上：就地判断
+    if let Some((key, ours, original)) = footprint.filter(|(k, _, _)| *k == target) {
+        if ours.is_empty() {
+            // 我们上次删掉了这个键，现在它又有值 → 别人设的
+            if let Some(cur) = values.get(key) {
+                return Ok(ApplyPlan::Conflict {
+                    key,
+                    ours: String::new(),
+                    current: cur.to_string(),
+                });
+            }
+        } else if values.get(key) != Some(ours) {
+            return Ok(ApplyPlan::Conflict {
+                key,
+                ours: ours.to_string(),
+                current: values.get(key).unwrap_or_default().to_string(),
+            });
+        }
+        // rclone 会优先使用 socks_proxy：另一个原生键被用户占用时，
+        // 我们写的值其实不会生效，必须说清楚而不是谎报成功。
+        if let Some(peer) = key.native_peer() {
+            if values.get(peer).map(|v| !v.is_empty()).unwrap_or(false) {
+                return Ok(ApplyPlan::RespectExisting { key: peer });
             }
         }
-        // ---- 切回「不代理」 ----
-        None => {
-            let Some(b) = binding else {
-                // 从没管过这个 remote：现在它身上的代理（如果有）是用户自己设的，
-                // 我们没有原值记录，也就谈不上「恢复」——一律不碰。
-                return ProxyAction::Nothing;
-            };
-            // 从没**成功下发过**任何东西：既没有 applied_value，也没有原值记录。
-            // 此时无论 rclone 里现在是什么值，都不是我们写的，不该去动它。
-            // （典型场景：只是存了一条「不代理」的绑定记录，还没连过 rclone）
-            if b.applied_value.is_empty() && b.original_override.is_none() {
-                return ProxyAction::Nothing;
+        if ours == value {
+            return Ok(ApplyPlan::Nothing { key });
+        }
+        // 值变了（用户改了地址/协议）：覆盖的是我们自己的值，原值记录沿用
+        return Ok(ApplyPlan::Steps {
+            steps: vec![ProxyStep::Set {
+                key,
+                value: value.clone(),
+            }],
+            commit: BindingCommit {
+                key,
+                value,
+                original: original.map(str::to_string),
+            },
+            outcome: PlanOutcome::Applied,
+        });
+    }
+
+    // 2) 脚印在别的键上：先还原（那是我们自己写的，且原生 socks 会遮挡用户配置）
+    let mut steps = Vec::new();
+    let mut after = values.clone();
+    if let Some((key, ours, original)) = footprint {
+        let current = values.get(key);
+        let untouched = if ours.is_empty() {
+            current.is_none() || current == Some("")
+        } else {
+            current == Some(ours)
+        };
+        if !untouched {
+            return Ok(ApplyPlan::Conflict {
+                key,
+                ours: ours.to_string(),
+                current: current.unwrap_or_default().to_string(),
+            });
+        }
+        let rollback = match original {
+            Some(v) => {
+                after.set(key, Some(v.to_string()));
+                ProxyStep::Restore {
+                    key,
+                    value: v.to_string(),
+                }
             }
-            // 判断 rclone 里的值是否仍是我们上次写的
-            let ours = &b.applied_value;
-            let untouched = match (b.original_override.as_deref(), current) {
-                // 我们上次写的是 X，现在仍是 X → 是我们留下的
-                _ if !ours.is_empty() && current == Some(ours.as_str()) => true,
-                // 我们上次删掉了键（写的是空），现在仍不存在 → 是我们留下的
-                _ if ours.is_empty() && current.is_none() => true,
-                // 我们上次写的就是当前这个值
-                _ if current == Some(ours.as_str()) => true,
-                _ => false,
-            };
-            if !untouched {
-                return ProxyAction::Conflict {
-                    ours: ours.clone(),
-                    current: current.unwrap_or("").to_string(),
+            None => {
+                after.set(key, None);
+                ProxyStep::Unset { key }
+            }
+        };
+        steps.push(rollback);
+    }
+
+    // 3) 目标键上的现状
+    if let Some(cur) = after.get(target) {
+        if !cur.is_empty() {
+            // 已经是期望值：不重复写，也不「接管」用户的值（否则回滚时会误删）
+            if cur == value.as_str() {
+                if steps.is_empty() {
+                    return Ok(ApplyPlan::Nothing { key: target });
+                }
+                return Ok(finish_without_write(steps, target, target));
+            }
+            // 原生键只补空缺；override 类沿用「覆盖 + 记原值」，落到第 4 步
+            if target.is_native() {
+                let peer_occupied = target
+                    .native_peer()
+                    .and_then(|peer| after.get(peer))
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false);
+                let key = if peer_occupied {
+                    target.native_peer().unwrap_or(target)
+                } else {
+                    target
                 };
-            }
-            match b.original_override.as_deref() {
-                Some(v) => ProxyAction::Restore(v.to_string()),
-                None => ProxyAction::Unset,
+                return Ok(finish_without_write(steps, target, key));
             }
         }
+    }
+    if let Some(peer) = target.native_peer() {
+        if after.get(peer).map(|v| !v.is_empty()).unwrap_or(false) {
+            return Ok(finish_without_write(steps, target, peer));
+        }
+    }
+
+    // 4) 写目标键。非原生键覆盖前要记住用户原值；原生键按策略此时必为空。
+    let original = if target.is_native() {
+        None
+    } else {
+        after.get(target).map(|v| v.to_string())
+    };
+    steps.push(ProxyStep::Set {
+        key: target,
+        value: value.clone(),
+    });
+    Ok(ApplyPlan::Steps {
+        steps,
+        commit: BindingCommit {
+            key: target,
+            value,
+            original,
+        },
+        outcome: PlanOutcome::Applied,
+    })
+}
+
+/// 回滚计划：有脚印就还原，没有就明确「不归我们管」。
+fn rollback_plan(
+    footprint: Option<(ProxyKey, &str, Option<&str>)>,
+    values: &ProxyConfigValues,
+) -> ApplyPlan {
+    let Some((key, ours, original)) = footprint else {
+        return ApplyPlan::Unmanaged;
+    };
+    let current = values.get(key);
+    let untouched = if ours.is_empty() {
+        current.is_none() || current == Some("")
+    } else {
+        current == Some(ours)
+    };
+    if !untouched {
+        return ApplyPlan::Conflict {
+            key,
+            ours: ours.to_string(),
+            current: current.unwrap_or_default().to_string(),
+        };
+    }
+    let (step, outcome) = match original {
+        Some(v) => (
+            ProxyStep::Restore {
+                key,
+                value: v.to_string(),
+            },
+            PlanOutcome::Restored(v.to_string()),
+        ),
+        None => (ProxyStep::Unset { key }, PlanOutcome::Removed),
+    };
+    ApplyPlan::Steps {
+        steps: vec![step],
+        // 回滚后不再留脚印：否则下一轮会把“恢复值”当成我们写的再删一次，
+        // 最终吃掉用户原有的设置（缺陷 B）。
+        commit: BindingCommit {
+            key,
+            value: String::new(),
+            original: None,
+        },
+        outcome,
     }
 }
 
-/// 在真正写入前，算出应该记进绑定的 `original_override`。
-///
-/// - 保留**最早**记录到的原值：第二次覆盖时不能把「我们自己写的值」当成原值，
-///   否则回滚链就断了（A 覆盖 B 覆盖 C，回滚要回到 A）。
-/// - 若 rclone 里当前值恰好是我们上次写的，说明中间没人动过，原值沿用。
-pub fn remember_original(
-    binding: Option<&RemoteProxyBinding>,
-    current: Option<&str>,
-) -> Option<String> {
-    if let Some(b) = binding {
-        // 已经有原值记录：除非当前值被别人改过（此时也不该覆盖），否则保持不动
-        if b.original_override.is_some() {
-            return b.original_override.clone();
-        }
-        // 我们上次写过，且现在仍是那个值 → 原值就是「没有」
-        if !b.applied_value.is_empty() && current == Some(b.applied_value.as_str()) {
-            return None;
+/// 旧键已还原（或本来无需还原），但目标键被用户占用 → 只报告、不写入。
+fn finish_without_write(steps: Vec<ProxyStep>, target: ProxyKey, note: ProxyKey) -> ApplyPlan {
+    if steps.is_empty() {
+        ApplyPlan::RespectExisting { key: note }
+    } else {
+        ApplyPlan::Steps {
+            steps,
+            // 旧键已还原，目标键归用户 → 我们不留脚印
+            commit: BindingCommit {
+                key: target,
+                value: String::new(),
+                original: None,
+            },
+            outcome: PlanOutcome::Respect(note),
         }
     }
-    current.map(|v| v.to_string())
 }
 
 #[cfg(test)]
@@ -712,146 +1133,406 @@ mod tests {
         assert!(!direct.needs_apply());
     }
 
-    // ---------------- plan_set：不静默覆盖用户原有代理 ----------------
+    // ---------------- 键选择与值构造 ----------------
 
-    fn binding(applied_value: &str, original: Option<&str>) -> RemoteProxyBinding {
+    /// 只有 ftp / sftp 走原生键；其它（含未知类型）保持 override。
+    #[test]
+    fn only_ftp_and_sftp_use_native_keys() {
+        use ProxyProtocol::*;
+        assert_eq!(proxy_key_for("ftp", Http), ProxyKey::NativeHttp);
+        assert_eq!(proxy_key_for("  SFTP ", Socks5), ProxyKey::NativeSocks);
+        assert_eq!(proxy_key_for("sftp", Socks5h), ProxyKey::NativeSocks);
+        assert_eq!(proxy_key_for("ftp", Https), ProxyKey::NativeHttp);
+        for t in ["s3", "webdav", "drive", "", "unknown", "alias"] {
+            assert_eq!(proxy_key_for(t, Socks5), ProxyKey::Override, "{t} 应走 override");
+        }
+        assert!(uses_native_keys("FTP"));
+        assert!(!uses_native_keys("s3"));
+        assert_eq!(ProxyKey::parse("http_proxy"), Some(ProxyKey::NativeHttp));
+        assert_eq!(ProxyKey::parse("override.socks_proxy"), None);
+    }
+
+    fn apply_value(p: &ProxyProfile, t: &str) -> (&'static str, String) {
+        let (k, v) = p.to_apply_value(t).expect("值应能构造");
+        (k.config_key(), v)
+    }
+
+    #[test]
+    fn apply_value_selects_key_and_format() {
+        let http = p(ProxyProtocol::Http, "h", 1);
+        let socks = p(ProxyProtocol::Socks5, "h", 1);
+        assert_eq!(apply_value(&http, "ftp"), ("http_proxy", "http://h:1".into()));
+        assert_eq!(apply_value(&http, "s3"), ("override.http_proxy", "http://h:1".into()));
+        assert_eq!(apply_value(&socks, "ftp"), ("socks_proxy", "h:1".into()));
+        assert_eq!(apply_value(&socks, "s3"), ("override.http_proxy", "socks5://h:1".into()));
+    }
+
+    /// 原生 socks_proxy 是**裸** host:port，不带 scheme，也不做 URL 编码。
+    #[test]
+    fn native_socks_value_has_no_scheme() {
+        let mut x = p(ProxyProtocol::Socks5, "127.0.0.1", 1080);
+        assert_eq!(x.to_native_socks_value().unwrap(), "127.0.0.1:1080");
+        x.user = "bob".into();
+        assert_eq!(x.to_native_socks_value().unwrap(), "bob@127.0.0.1:1080");
+        x.pass = "pa:ss".into();
+        assert_eq!(
+            x.to_native_socks_value().unwrap(),
+            "bob:pa:ss@127.0.0.1:1080",
+            "密码里的「:」可以（rclone 只按第一个 : 切分）"
+        );
+    }
+
+    /// rclone 不做 URL 解码，所以「@」无法表达，只能拒绝并说明。
+    #[test]
+    fn native_socks_rejects_ambiguous_credentials() {
+        let mut x = p(ProxyProtocol::Socks5, "h", 1);
+        x.user = "a:b".into();
+        let e = x.to_native_socks_value().unwrap_err();
+        assert!(e.contains("用户名") && e.contains(":"));
+        x.user = "a@b".into();
+        assert!(x.to_native_socks_value().unwrap_err().contains("@"));
+        x.user = "u".into();
+        x.pass = "p@ss".into();
+        assert!(x.to_native_socks_value().unwrap_err().contains("@"));
+    }
+
+    #[test]
+    fn native_socks_brackets_ipv6() {
+        let x = p(ProxyProtocol::Socks5h, "::1", 1080);
+        assert_eq!(x.to_native_socks_value().unwrap(), "[::1]:1080");
+    }
+
+    #[test]
+    fn config_values_read_the_three_keys() {
+        let map: serde_json::Map<String, serde_json::Value> = serde_json::json!({
+            "type": "ftp",
+            "http_proxy": "http://p:1",
+            "socks_proxy": "",
+            "pass": "secret"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let v = ProxyConfigValues::from_config_map(&map);
+        assert_eq!(v.native_http.as_deref(), Some("http://p:1"));
+        assert_eq!(v.native_socks.as_deref(), Some(""), "存在但为空要保留区分");
+        assert_eq!(v.override_http, None, "没配置的键不能凭默认值造出来");
+        assert_eq!(ProxyConfigValues::backend_type(&map), "ftp");
+    }
+
+    // ---------------- plan_apply：覆盖 / 只补空缺 / 回滚 ----------------
+
+    fn vals(
+        override_http: Option<&str>,
+        http: Option<&str>,
+        socks: Option<&str>,
+    ) -> ProxyConfigValues {
+        ProxyConfigValues {
+            override_http: override_http.map(str::to_string),
+            native_http: http.map(str::to_string),
+            native_socks: socks.map(str::to_string),
+        }
+    }
+
+    /// 一条「我们写过」的绑定。`key` 为空 = 旧档案（按 override 解释）。
+    fn binding(key: &str, applied_value: &str, original: Option<&str>) -> RemoteProxyBinding {
         RemoteProxyBinding {
             remote: "r".into(),
             proxy_id: "p1".into(),
             applied: true,
+            applied_key: key.into(),
             applied_value: applied_value.into(),
-            original_override: original.map(|s| s.to_string()),
+            original_override: original.map(str::to_string),
         }
     }
 
+    fn steps_of(plan: ApplyPlan) -> (Vec<ProxyStep>, BindingCommit, PlanOutcome) {
+        match plan {
+            ApplyPlan::Steps {
+                steps,
+                commit,
+                outcome,
+            } => (steps, commit, outcome),
+            other => panic!("应为 Steps，实际 {other:?}"),
+        }
+    }
+
+    /// 普通后端：首次下发写 override，并把用户原值记进绑定。
     #[test]
-    fn set_proxy_when_nothing_there() {
+    fn plain_backend_sets_override_and_remembers_original() {
+        let prof = p(ProxyProtocol::Http, "rcgui", 1);
+        let cur = vals(Some("http://user:3128"), None, None);
+        let (steps, commit, outcome) =
+            steps_of(plan_apply(Some(&prof), "s3", &cur, None).unwrap());
         assert_eq!(
-            plan_set(Some("http://new:1"), None, None),
-            ProxyAction::Set("http://new:1".into())
+            steps,
+            vec![ProxyStep::Set { key: ProxyKey::Override, value: "http://rcgui:1".into() }]
         );
+        assert_eq!(commit.key, ProxyKey::Override);
+        assert_eq!(commit.value, "http://rcgui:1");
+        assert_eq!(commit.original.as_deref(), Some("http://user:3128"));
+        assert_eq!(outcome, PlanOutcome::Applied);
     }
 
     #[test]
-    fn setting_same_value_is_noop() {
+    fn plain_backend_same_value_is_nothing() {
+        let prof = p(ProxyProtocol::Http, "rcgui", 1);
+        let cur = vals(Some("http://rcgui:1"), None, None);
         assert_eq!(
-            plan_set(Some("http://new:1"), Some("http://new:1"), None),
-            ProxyAction::Nothing,
+            plan_apply(Some(&prof), "s3", &cur, None).unwrap(),
+            ApplyPlan::Nothing { key: ProxyKey::Override },
             "值相同就不要重复调 config/update"
         );
     }
 
-    /// 用户原本手动配了代理 → 我们覆盖，但必须能记住原值以便回滚。
+    /// 已经是我们写的值：什么都不做，且不能再记一次原值。
     #[test]
-    fn overwriting_user_proxy_records_original() {
-        let current = Some("http://user-proxy:3128");
+    fn same_value_with_footprint_is_nothing() {
+        let prof = p(ProxyProtocol::Http, "rcgui", 1);
+        let cur = vals(Some("http://rcgui:1"), None, None);
+        let b = binding("override.http_proxy", "http://rcgui:1", Some("http://user:3128"));
         assert_eq!(
-            plan_set(Some("http://rcgui:1"), current, None),
-            ProxyAction::Set("http://rcgui:1".into())
-        );
-        // 首次覆盖：原值就是当前值
-        assert_eq!(
-            remember_original(None, current),
-            Some("http://user-proxy:3128".into()),
-            "必须记住用户原有代理，否则回滚不了"
+            plan_apply(Some(&prof), "s3", &cur, Some(&b)).unwrap(),
+            ApplyPlan::Nothing { key: ProxyKey::Override }
         );
     }
 
-    /// 第二次覆盖时不能把自己上次写的值当成「原值」，否则回滚链断裂。
+    /// 改地址但键没变：覆盖我们自己的值，**保留最早的原值**。
     #[test]
-    fn second_overwrite_keeps_earliest_original() {
-        let b = binding("http://rcgui-1", Some("http://user-proxy:3128"));
+    fn value_change_keeps_earliest_original() {
+        let prof = p(ProxyProtocol::Http, "rcgui2", 2);
+        let cur = vals(Some("http://rcgui:1"), None, None);
+        let b = binding("override.http_proxy", "http://rcgui:1", Some("http://user:3128"));
+        let (steps, commit, _) =
+            steps_of(plan_apply(Some(&prof), "s3", &cur, Some(&b)).unwrap());
+        assert_eq!(steps.len(), 1);
+        assert_eq!(commit.original.as_deref(), Some("http://user:3128"));
+    }
+
+    /// 切回不代理：恢复用户原值，且**清空脚印**（否则下一轮会把恢复值删掉）。
+    #[test]
+    fn rollback_restores_original_and_clears_footprint() {
+        let cur = vals(Some("http://rcgui:1"), None, None);
+        let b = binding("override.http_proxy", "http://rcgui:1", Some("http://user:3128"));
+        let (steps, commit, outcome) = steps_of(plan_apply(None, "s3", &cur, Some(&b)).unwrap());
         assert_eq!(
-            remember_original(Some(&b), Some("http://rcgui-1")),
-            Some("http://user-proxy:3128".into()),
-            "已有原值记录时必须沿用最早的那个"
+            steps,
+            vec![ProxyStep::Restore { key: ProxyKey::Override, value: "http://user:3128".into() }]
         );
-        // rclone 里当前值已是我们写的、且原来没有 → 原值仍是 None
-        let b2 = binding("http://rcgui-1", None);
-        assert_eq!(remember_original(Some(&b2), Some("http://rcgui-1")), None);
-    }
+        assert_eq!(commit.value, "", "回滚后不再留脚印");
+        assert_eq!(commit.original, None);
+        assert_eq!(outcome, PlanOutcome::Restored("http://user:3128".into()));
 
-    #[test]
-    fn switching_back_restores_user_original() {
-        let b = binding("http://rcgui:1", Some("http://user-proxy:3128"));
+        // 第二轮回滚：脚印已清空 → 不归我们管，绝不能把刚恢复的值删掉
+        let mut b2 = b.clone();
+        b2.applied_value.clear();
+        b2.original_override = None;
+        let cur2 = vals(Some("http://user:3128"), None, None);
         assert_eq!(
-            plan_set(None, Some("http://rcgui:1"), Some(&b)),
-            ProxyAction::Restore("http://user-proxy:3128".into()),
-            "切回不代理必须恢复用户原值，而不是直接删键"
+            plan_apply(None, "s3", &cur2, Some(&b2)).unwrap(),
+            ApplyPlan::Unmanaged
         );
     }
 
     #[test]
-    fn switching_back_unsets_when_there_was_no_original() {
-        let b = binding("http://rcgui:1", None);
-        assert_eq!(plan_set(None, Some("http://rcgui:1"), Some(&b)), ProxyAction::Unset);
+    fn rollback_unsets_when_there_was_no_original() {
+        let cur = vals(Some("http://rcgui:1"), None, None);
+        let b = binding("override.http_proxy", "http://rcgui:1", None);
+        let (steps, commit, outcome) = steps_of(plan_apply(None, "s3", &cur, Some(&b)).unwrap());
+        assert_eq!(steps, vec![ProxyStep::Unset { key: ProxyKey::Override }]);
+        assert_eq!(commit.value, "");
+        assert_eq!(outcome, PlanOutcome::Removed);
     }
 
+    /// 原本存在但为空：恢复成空值，而不是删键。
     #[test]
-    fn never_managed_remote_is_left_alone() {
+    fn rollback_restores_empty_value_instead_of_unsetting() {
+        let cur = vals(Some("http://rcgui:1"), None, None);
+        let b = binding("override.http_proxy", "http://rcgui:1", Some(""));
+        let (steps, _, outcome) = steps_of(plan_apply(None, "s3", &cur, Some(&b)).unwrap());
         assert_eq!(
-            plan_set(None, Some("http://user-proxy:3128"), None),
-            ProxyAction::Nothing,
-            "从没管过的 remote，用户自己设的代理不能被我们删掉"
+            steps,
+            vec![ProxyStep::Restore { key: ProxyKey::Override, value: String::new() }]
         );
-        assert_eq!(plan_set(None, None, None), ProxyAction::Nothing);
+        assert_eq!(outcome, PlanOutcome::Restored(String::new()));
     }
 
+    /// 从没管过 → 用户的代理不能被我们删掉。
     #[test]
-    fn already_direct_binding_is_noop() {
-        // 只是存了一条「不代理」的记录、还没连过 rclone：什么都不能动
-        let b = RemoteProxyBinding {
+    fn unmanaged_remote_is_left_alone() {
+        let cur = vals(Some("http://user:3128"), None, None);
+        assert_eq!(plan_apply(None, "s3", &cur, None).unwrap(), ApplyPlan::Unmanaged);
+        let empty = RemoteProxyBinding {
             remote: "r".into(),
             ..Default::default()
         };
-        assert_eq!(plan_set(None, None, Some(&b)), ProxyAction::Nothing);
         assert_eq!(
-            plan_set(None, Some("x"), Some(&b)),
-            ProxyAction::Nothing,
-            "从未下发过，rclone 里的值不归我们管"
+            plan_apply(None, "s3", &cur, Some(&empty)).unwrap(),
+            ApplyPlan::Unmanaged,
+            "只有一条「不代理」记录、没下发过，不归我们管"
         );
     }
 
-    /// 我们删过键、之后键又出现了 → 别人重新设的，报冲突不覆盖。
+    /// 别人改过 rclone 里的值 → 报冲突，零写入。
     #[test]
-    fn reappeared_key_after_we_unset_is_conflict() {
-        let b = binding("", Some("http://orig"));
+    fn external_change_is_conflict() {
+        let cur = vals(Some("http://someone-else:9"), None, None);
+        let b = binding("override.http_proxy", "http://rcgui:1", None);
         assert_eq!(
-            plan_set(None, Some("http://new"), Some(&b)),
-            ProxyAction::Conflict { ours: String::new(), current: "http://new".into() }
-        );
-    }
-
-    /// 关键安全性：别人改过 rclone 里的值，我们不能一把盖掉。
-    #[test]
-    fn external_change_is_reported_as_conflict() {
-        let b = binding("http://rcgui:1", Some("http://user-proxy:3128"));
-        assert_eq!(
-            plan_set(None, Some("http://someone-else:9"), Some(&b)),
-            ProxyAction::Conflict {
+            plan_apply(None, "s3", &cur, Some(&b)).unwrap(),
+            ApplyPlan::Conflict {
+                key: ProxyKey::Override,
                 ours: "http://rcgui:1".into(),
-                current: "http://someone-else:9".into()
-            },
-            "rclone 里的值已被他人修改，必须报冲突而不是静默覆盖"
-        );
-    }
-
-    #[test]
-    fn conflict_when_we_unset_but_key_reappeared() {
-        let b = binding("", Some("http://user-proxy:3128"));
-        assert_eq!(
-            plan_set(None, Some("http://someone-else:9"), Some(&b)),
-            ProxyAction::Conflict {
-                ours: String::new(),
                 current: "http://someone-else:9".into()
             }
         );
+        // 换个新地址也一样：不能一把盖掉别人的改动
+        let prof = p(ProxyProtocol::Http, "rcgui2", 2);
+        assert!(matches!(
+            plan_apply(Some(&prof), "s3", &cur, Some(&b)).unwrap(),
+            ApplyPlan::Conflict { .. }
+        ));
+    }
+
+    /// ftp 走原生 http_proxy，不能再去写 override。
+    #[test]
+    fn ftp_uses_native_http_proxy_not_override() {
+        let prof = p(ProxyProtocol::Http, "rcgui", 1);
+        let empty = vals(None, None, None);
+        let (steps, commit, _) = steps_of(plan_apply(Some(&prof), "ftp", &empty, None).unwrap());
+        assert_eq!(
+            steps,
+            vec![ProxyStep::Set { key: ProxyKey::NativeHttp, value: "http://rcgui:1".into() }]
+        );
+        assert_eq!(commit.key, ProxyKey::NativeHttp);
+        assert_eq!(commit.original, None, "原生键只补空缺：写入时它必然为空");
     }
 
     #[test]
-    fn restore_of_empty_original_keeps_key_empty() {
-        // 原本存在但为空 → 应恢复成空而不是删键（区分 None 与 Some("")）
-        let b = binding("http://rcgui:1", Some(""));
-        assert_eq!(plan_set(None, Some("http://rcgui:1"), Some(&b)), ProxyAction::Restore(String::new()));
+    fn ftp_socks_writes_bare_host_port() {
+        let mut prof = p(ProxyProtocol::Socks5, "10.0.0.9", 1080);
+        prof.user = "u".into();
+        prof.pass = "p".into();
+        let empty = vals(None, None, None);
+        let (steps, _, _) = steps_of(plan_apply(Some(&prof), "sftp", &empty, None).unwrap());
+        assert_eq!(
+            steps,
+            vec![ProxyStep::Set {
+                key: ProxyKey::NativeSocks,
+                value: "u:p@10.0.0.9:1080".into()
+            }]
+        );
+    }
+
+    /// 只补空缺：用户自己设的 http_proxy 不能被覆盖。
+    #[test]
+    fn ftp_respects_existing_user_http_proxy() {
+        let prof = p(ProxyProtocol::Http, "rcgui", 1);
+        let cur = vals(None, Some("http://user:3128"), None);
+        assert_eq!(
+            plan_apply(Some(&prof), "ftp", &cur, None).unwrap(),
+            ApplyPlan::RespectExisting { key: ProxyKey::NativeHttp }
+        );
+        // 值恰好相同 → 视为已满足，但不能接管（回滚时会误删用户的值）
+        let same = vals(None, Some("http://rcgui:1"), None);
+        assert_eq!(
+            plan_apply(Some(&prof), "ftp", &same, None).unwrap(),
+            ApplyPlan::Nothing { key: ProxyKey::NativeHttp }
+        );
+        // 空值不算用户配置
+        let empty_slot = vals(None, Some(""), None);
+        assert!(matches!(
+            plan_apply(Some(&prof), "ftp", &empty_slot, None).unwrap(),
+            ApplyPlan::Steps { .. }
+        ));
+    }
+
+    /// rclone 优先用 socks_proxy：另一个原生键有值时必须说明，而不是写个死值。
+    #[test]
+    fn ftp_respects_user_socks_proxy() {
+        let prof = p(ProxyProtocol::Http, "rcgui", 1);
+        let cur = vals(None, None, Some("user:pass@h:1080"));
+        assert_eq!(
+            plan_apply(Some(&prof), "ftp", &cur, None).unwrap(),
+            ApplyPlan::RespectExisting { key: ProxyKey::NativeSocks }
+        );
+    }
+
+    /// 改协议 = 换键：先还原旧键，再写新键。
+    #[test]
+    fn switching_protocol_rolls_back_old_key() {
+        let prof = p(ProxyProtocol::Socks5, "rcgui", 1080);
+        let cur = vals(None, Some("http://rcgui:1"), None);
+        let b = binding("http_proxy", "http://rcgui:1", None);
+        let (steps, commit, outcome) =
+            steps_of(plan_apply(Some(&prof), "ftp", &cur, Some(&b)).unwrap());
+        assert_eq!(
+            steps,
+            vec![
+                ProxyStep::Unset { key: ProxyKey::NativeHttp },
+                ProxyStep::Set { key: ProxyKey::NativeSocks, value: "rcgui:1080".into() },
+            ]
+        );
+        assert_eq!(commit.key, ProxyKey::NativeSocks);
+        assert_eq!(outcome, PlanOutcome::Applied);
+    }
+
+    /// 换键时旧键被外部改过 → 冲突，新键也不能写。
+    #[test]
+    fn switching_protocol_conflicts_when_old_key_changed() {
+        let prof = p(ProxyProtocol::Socks5, "rcgui", 1080);
+        let cur = vals(None, Some("http://someone-else:9"), None);
+        let b = binding("http_proxy", "http://rcgui:1", None);
+        assert!(matches!(
+            plan_apply(Some(&prof), "ftp", &cur, Some(&b)).unwrap(),
+            ApplyPlan::Conflict { key: ProxyKey::NativeHttp, .. }
+        ));
+    }
+
+    /// 旧档案没有 applied_key：按 override 解释，回滚仍能对上。
+    #[test]
+    fn legacy_binding_without_key_rolls_back_override() {
+        let cur = vals(Some("http://rcgui:1"), None, None);
+        let b = binding("", "http://rcgui:1", None);
+        let (steps, _, _) = steps_of(plan_apply(None, "ftp", &cur, Some(&b)).unwrap());
+        assert_eq!(steps, vec![ProxyStep::Unset { key: ProxyKey::Override }]);
+    }
+
+    /// 远程类型从 s3 改成 ftp：旧 override 先还原，再写原生键。
+    #[test]
+    fn type_change_moves_override_to_native() {
+        let prof = p(ProxyProtocol::Http, "rcgui", 1);
+        let cur = ProxyConfigValues {
+            override_http: Some("http://rcgui-old:1".into()),
+            ..Default::default()
+        };
+        let b = binding("override.http_proxy", "http://rcgui-old:1", Some("http://user:3128"));
+        let (steps, commit, _) =
+            steps_of(plan_apply(Some(&prof), "ftp", &cur, Some(&b)).unwrap());
+        assert_eq!(
+            steps,
+            vec![
+                ProxyStep::Restore { key: ProxyKey::Override, value: "http://user:3128".into() },
+                ProxyStep::Set { key: ProxyKey::NativeHttp, value: "http://rcgui:1".into() },
+            ]
+        );
+        assert_eq!(commit.key, ProxyKey::NativeHttp);
+    }
+
+    /// 换键后目标键上是用户的值：旧键还原 + 明确跳过，且不能留脚印。
+    #[test]
+    fn switch_respects_occupied_target_after_rollback() {
+        let prof = p(ProxyProtocol::Http, "rcgui", 1);
+        let cur = ProxyConfigValues {
+            native_http: Some("http://user:3128".into()),
+            native_socks: Some("10.0.0.9:1080".into()),
+            ..Default::default()
+        };
+        let b = binding("socks_proxy", "10.0.0.9:1080", None);
+        let (steps, commit, outcome) =
+            steps_of(plan_apply(Some(&prof), "ftp", &cur, Some(&b)).unwrap());
+        assert_eq!(steps, vec![ProxyStep::Unset { key: ProxyKey::NativeSocks }]);
+        assert_eq!(commit.value, "", "没有写入目标键，不能留脚印");
+        assert_eq!(outcome, PlanOutcome::Respect(ProxyKey::NativeHttp));
     }
 }
