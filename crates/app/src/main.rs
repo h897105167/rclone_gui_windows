@@ -319,7 +319,14 @@ fn push_log_history(ui: &MainWindow, kind: i32, msg: &str) {
 }
 
 fn toast_ui(ui: &MainWindow, kind: i32, msg: impl Into<String>) {
-    let msg = msg.into();
+    // 错误统一过一遍「代理归因」：只有当 rclone 原文里带明确代理证据
+    // （proxyconnect / 407 / 502）时才改写，其它错误原样透出。
+    // 详见 `crate::proxy::annotate_error`。
+    let msg = if kind == 2 {
+        crate::proxy::annotate_error(&msg.into(), None)
+    } else {
+        msg.into()
+    };
     push_log_history(ui, kind, &msg);
     ui.global::<ToastG>().set_kind(kind);
     ui.global::<ToastG>().set_msg(msg.into());
@@ -335,6 +342,25 @@ fn toast_ui(ui: &MainWindow, kind: i32, msg: impl Into<String>) {
 fn toast(ui: &Weak<MainWindow>, kind: i32, msg: impl Into<String>) {
     let msg = msg.into();
     let _ = ui.upgrade_in_event_loop(move |ui| toast_ui(&ui, kind, msg));
+}
+
+/// 该 remote 绑定的代理地址（`host:port`）；未绑定返回 `None`。
+///
+/// 仅用于错误提示的**弱归因**：rclone 对「远端不可达」和「代理不可达」都会
+/// 给出 `request send failed / timeout / EOF` 这类文本，没有代理证据时不能
+/// 断言是谁的问题，只知道该远程配了代理时才加一句「可能与代理有关」。
+fn remote_proxy_endpoint(ctx: &Arc<Ctx>, remote: &str) -> Option<String> {
+    let cfg = ctx.cfg.lock().ok()?;
+    crate::proxy::bound_profile(&cfg, remote).map(|p| format!("{}:{}", p.host, p.port))
+}
+
+/// 从远程缓存里取某 remote 的类型（缓存未加载时返回 `None`）。
+fn remote_type(ctx: &Arc<Ctx>, remote: &str) -> Option<String> {
+    let cache = ctx.remotes_cache.lock().ok()?;
+    cache
+        .iter()
+        .find(|(n, _, _)| n.eq_ignore_ascii_case(remote))
+        .map(|(_, t, _)| t.clone())
 }
 
 /// 搜索框防抖：记录每个 scope 最近一次输入时间，由 UI 定时器在闲置 300ms 后触发。
@@ -2150,7 +2176,7 @@ async fn replay_pending_proxies(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
 /// 恢复动作走的是 `proxy::apply_to_remote(None)`，它会按记录还原用户原有代理，
 /// 而不是无脑 unset —— 这是「切回不代理也不误删原有设置」的落地。
 async fn delete_proxy_now(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
-    let (affected, name) = {
+    let (affected, name, bindings_before) = {
         let mut cfg = ctx.cfg.lock().unwrap();
         let affected = proxy::remotes_using(&cfg, id);
         let name = cfg
@@ -2159,6 +2185,16 @@ async fn delete_proxy_now(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
             .find(|p| p.id == id)
             .map(|p| p.name.clone())
             .unwrap_or_default();
+        // 关键：回滚需要用 `original_override` / `applied_value`，而下面就会把
+        // 这些绑定从档案里删掉。必须先克隆出来，否则回滚时拿到的是空绑定，
+        // `plan_set` 会判定「不是本程序管的」→ 一个字节都不写，
+        // rclone 里仍然留着那个已经删掉的代理（实测就是这样漏掉的）。
+        let bindings_before: Vec<rcgui_profile::RemoteProxyBinding> = cfg
+            .proxy_bindings
+            .iter()
+            .filter(|b| b.proxy_id == id)
+            .cloned()
+            .collect();
         cfg.proxies.retain(|p| p.id != id);
         // 绑定也要清掉：留着就是悬空引用
         cfg.proxy_bindings.retain(|b| b.proxy_id != id);
@@ -2166,29 +2202,22 @@ async fn delete_proxy_now(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
             toast(ui, 2, format!("删除代理配置失败: {e}"));
             return;
         }
-        (affected, name)
+        (affected, name, bindings_before)
     };
 
-    // 先在 rclone 侧恢复（此时绑定记录还在内存里，能拿到 original_override）
+    // 再在 rclone 侧回滚到「不代理」/ 用户原值（用上面克隆出来的绑定记录）
     let mut errs: Vec<String> = Vec::new();
     if ctx.rc.is_live() && !affected.is_empty() {
         let client = ctx.rc.client().await;
         for remote in &affected {
-            // 注意：上一步已经从 cfg.proxy_bindings 里删掉了，恢复需要原始记录，
-            // 因此这里从档案文件重新读一次（删除动作尚未被本函数写回绑定）。
-            let mut binding = {
-                let doc = profiles::store().load().ok().flatten();
-                doc.and_then(|d| {
-                    d.remote_proxies
-                        .iter()
-                        .find(|b| b.remote.eq_ignore_ascii_case(remote))
-                        .cloned()
-                })
+            let mut binding = bindings_before
+                .iter()
+                .find(|b| b.remote.eq_ignore_ascii_case(remote))
+                .cloned()
                 .unwrap_or_else(|| rcgui_profile::RemoteProxyBinding {
                     remote: remote.clone(),
                     ..Default::default()
-                })
-            };
+                });
             match proxy::apply_to_remote(&client, remote, None, &mut binding).await {
                 Ok(out) => {
                     if out.is_failure() {
@@ -3088,6 +3117,9 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             if remote.is_empty() {
                 return false;
             }
+            // 取一次「该远程是否绑了代理」：网络类错误没有代理证据时，
+            // 只给弱提示（见 proxy::annotate_error），不能断言是谁的问题。
+            let proxy_ep = remote_proxy_endpoint(ctx, &remote);
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
             let res = tokio::time::timeout(
@@ -3122,7 +3154,11 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                         }
                         Err(e) => {
                             g.set_entries(ModelRc::from(Rc::new(VecModel::from(Vec::<FileRow>::new()))));
-                            toast_ui(&ui, 2, format!("列目录失败: {e}"));
+                            let msg = crate::proxy::annotate_error(
+                                &format!("列目录失败: {e}"),
+                                proxy_ep.as_deref(),
+                            );
+                            toast_ui(&ui, 2, msg);
                         }
                     }
                     g.set_sel(-1);
@@ -3136,6 +3172,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             if remote.is_empty() {
                 return false;
             }
+            let proxy_ep = remote_proxy_endpoint(ctx, &remote);
             let target = join_path(&path, &name);
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
@@ -3173,7 +3210,11 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                             g.set_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
                         }
                         Err(e) => {
-                            toast_ui(&ui, 2, format!("无法进入 {name}: {e}"));
+                            let msg = crate::proxy::annotate_error(
+                                &format!("无法进入 {name}: {e}"),
+                                proxy_ep.as_deref(),
+                            );
+                            toast_ui(&ui, 2, msg);
                         }
                     }
                     g.set_sel(-1);
@@ -4445,6 +4486,15 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     return false;
                 }
             }
+            // 该类型是否真的会读 override.http_proxy：
+            // ftp / sftp 实测不读，下发等于静默无效，必须当场说明，
+            // 不能让用户以为「已生效」。（正确做法是改写原生键，属后续工作。）
+            let inert_hint = match &profile {
+                Some(_) => remote_type(ctx, &remote)
+                    .filter(|t| !proxy::type_honors_override(t))
+                    .map(|_| proxy::INERT_TYPE_HINT),
+                None => None,
+            };
             // 2) 连上了就立刻让它生效。
             //
             // 这里改走统一的 `reconcile::reconcile()`，不再手工逐条下发：
@@ -4469,13 +4519,23 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     toast(
                         ui,
                         2,
-                        format!("{}：{}", rep.summary(), rep.failed.join("；")),
+                        format!(
+                            "{}：{}{}",
+                            rep.summary(),
+                            rep.failed.join("；"),
+                            inert_hint.unwrap_or("")
+                        ),
                     );
                 } else {
                     toast(
                         ui,
                         1,
-                        format!("{}。{}", rep.summary(), proxy::RESTART_HINT),
+                        format!(
+                            "{}。{}{}",
+                            rep.summary(),
+                            proxy::RESTART_HINT,
+                            inert_hint.unwrap_or("")
+                        ),
                     );
                 }
                 let _ = profile;
@@ -4484,8 +4544,9 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     ui,
                     0,
                     format!(
-                        "{remote} 的代理已保存，当前未连接 rclone，将在连接后自动应用。{}",
-                        proxy::RESTART_HINT
+                        "{remote} 的代理已保存，当前未连接 rclone，将在连接后自动应用。{}{}",
+                        proxy::RESTART_HINT,
+                        inert_hint.unwrap_or("")
                     ),
                 );
             }
@@ -6429,6 +6490,10 @@ fn wire_callbacks(
     let _ = tx.send(Cmd::RemotesRefresh);
     let _ = tx.send(Cmd::MountsRefresh);
     let _ = tx.send(Cmd::PluginsRescan);
+    // 代理配置表也要在启动时拉一次：远程行的下拉是从 `proxy-options` 渲染的，
+    // 而「代理配置」卡片用的是 `proxy-rows`。少了这一条，重启后会看到
+    // 远程行显示着代理名、下面的卡片却是「代理配置（0）」，必须手动点刷新才恢复。
+    let _ = tx.send(Cmd::ProxyListRefresh);
 }
 
 // ---------------- 托盘 ----------------

@@ -195,9 +195,154 @@ pub const DIRECT_HINT: &str = "「不代理」= 不设置 RCGUI 的 remote 级�
 /// 凭据存储形式的说明（实测：百分号编码明文，连 obscure 都不是）。
 pub const CREDENTIAL_HINT: &str = "代理账号密码会以明文（百分号编码）写入 rclone.conf，不是加密，请勿在共享环境使用敏感凭据。";
 
+/// 「该类型不读取 override.http_proxy」的警告。
+///
+/// 实测（rclone v1.75.4，本地 `rclone serve ftp` / `serve sftp` + 会记日志的
+/// 中继代理）：给 ftp / sftp 的 remote 写 `override.http_proxy` 后，列表照常
+/// 成功，但代理侧**一个连接都没收到** —— 也就是静默直连。这两类后端只认自己
+/// 的原生选项：`http_proxy` 要写完整 URL，`socks_proxy` 只认裸 `host:port`
+/// （带 `socks5://` 会报 `too many colons in address`）。
+///
+/// 在这些类型上真正做对需要改成按类型选键、并同步改造回滚与 reconcile，
+/// 属于后续工作；在那之前**必须至少不谎报「已生效」**。
+pub const INERT_TYPE_HINT: &str = "注意：rclone 的 ftp / sftp 后端不读取 override.http_proxy，此时代理不会真正生效（已实测）；这两类只能用原生 http_proxy / socks_proxy，详见 docs/proxy-verification.md。";
+
+/// 该 remote 类型是否真的会读取 `override.http_proxy`。
+///
+/// 返回 `false` 的类型（ftp / sftp）下发代理是静默无效的，UI 必须提示。
+pub fn type_honors_override(rtype: &str) -> bool {
+    let t = rtype.trim().to_ascii_lowercase();
+    !matches!(t.as_str(), "ftp" | "sftp")
+}
+
+
 /// 新建代理配置时的 ID 生成。
 pub fn new_proxy_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+// ---------------- 代理失败的友好提示 ----------------
+//
+// rclone 的报错原文很长且夹着 SDK 措辞（`operation error S3: ListBuckets …
+// request send failed, Get "…": proxyconnect tcp: dial tcp …`），用户看不出
+// 「到底该改哪里」。这里把**实测出现过**的签名映射成一句可操作的话，
+// 同时保留原文供排查。
+//
+// 设计底线：宁可不判定，也不要误报。只有原文里出现明确的代理证据
+// （`proxyconnect`、407、502）才归因给代理；普通网络故障一律原样透出。
+// 实测样本见 `docs/proxy-failure-messages.md`。
+
+/// 由 rclone 原文判定出的代理故障类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyFailure {
+    /// 代理端口没人监听：`proxyconnect tcp: dial tcp … actively refused it`
+    Refused,
+    /// 代理要求认证：`Statuscode 407` / `ProxyAuthenticationRequired`
+    AuthRequired,
+    /// 代理网关上游不可达：`StatusCode: 502` / `api error BadGateway`
+    BadGateway,
+    /// `https://` 指向了纯 HTTP 代理：`tls: first record does not look like a TLS handshake`
+    SchemeMismatch,
+}
+
+impl ProxyFailure {
+    /// 简短标签，用作提示开头。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Refused => "代理拒绝连接",
+            Self::AuthRequired => "代理要求认证",
+            Self::BadGateway => "代理上游不可达",
+            Self::SchemeMismatch => "代理协议不匹配",
+        }
+    }
+
+    /// 下一步该做什么（一句话，不掺与代理无关的原因）。
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Refused => {
+                "代理端口上没有服务在监听：请确认代理软件已启动，并核对代理配置里的地址与端口。"
+            }
+            Self::AuthRequired => {
+                "代理要求用户名/密码（HTTP 407）：请在代理配置里填写账号密码，或改用免认证的代理。"
+            }
+            Self::BadGateway => {
+                "代理返回 502：它连不上自己的上游或目标站点，请检查代理软件内部的上游设置。"
+            }
+            Self::SchemeMismatch => {
+                "代理协议填错：https:// 只能用于支持 TLS 的代理；本机常见的 Clash / v2ray 等要用 http:// 或 socks5://。"
+            }
+        }
+    }
+}
+
+/// 注解里标记「已经补过提示」的固定片段，用于避免重复包装。
+const ANNOTATED_MARK: &str = "（rclone 原文：";
+
+/// 从 rclone 原文判断代理故障；没有明确证据就返回 `None`。
+pub fn classify_proxy_failure(raw: &str) -> Option<ProxyFailure> {
+    let s = raw.to_ascii_lowercase();
+
+    // 407 / ProxyAuthenticationRequired 只可能来自代理，无需再要 proxyconnect。
+    if s.contains("statuscode: 407")
+        || s.contains("proxyauthenticationrequired")
+        || s.contains("proxy authentication required")
+    {
+        return Some(ProxyFailure::AuthRequired);
+    }
+    // 502 可能来自代理，也可能是后端自己返回的网关错误；rclone 对代理 502 的
+    // 措辞是 `api error BadGateway`，据此判定并在文案里说明「代理返回」。
+    if s.contains("statuscode: 502") || s.contains("api error badgateway") {
+        return Some(ProxyFailure::BadGateway);
+    }
+
+    let via_proxy = s.contains("proxyconnect");
+    if via_proxy && s.contains("does not look like a tls handshake") {
+        return Some(ProxyFailure::SchemeMismatch);
+    }
+    if via_proxy && (s.contains("actively refused") || s.contains("connection refused")) {
+        return Some(ProxyFailure::Refused);
+    }
+    None
+}
+
+/// 是否像一次网络层失败（用于「该远程绑了代理」时的弱归因）。
+fn looks_like_network_failure(raw: &str) -> bool {
+    let s = raw.to_ascii_lowercase();
+    // 这些片段对「代理不通」和「远端本身不可达」都成立，只能用来提示，
+    // 不能用来断言是谁的问题。
+    const SIGNS: [&str; 6] = [
+        "request send failed",
+        "timeout",
+        "eof",
+        "connection reset",
+        "no such host",
+        "network is unreachable",
+    ];
+    SIGNS.iter().any(|k| s.contains(k))
+}
+
+/// 给一条错误补上代理相关的中文提示。
+///
+/// - 命中实测签名 → `【代理】<标签>：<怎么办>（rclone 原文：…）`
+/// - 未命中但有代理上下文，且看着像网络失败 → 弱提示「可能与代理有关」
+/// - 其它情况原样返回，绝不改写无关错误
+///
+/// 已带注解的文本直接原样返回，因此可以安全地在多个层重复调用。
+pub fn annotate_error(raw: &str, proxy_endpoint: Option<&str>) -> String {
+    if raw.contains(ANNOTATED_MARK) {
+        return raw.to_string();
+    }
+    if let Some(f) = classify_proxy_failure(raw) {
+        return format!("【代理】{}：{}{ANNOTATED_MARK}{raw}）", f.label(), f.hint());
+    }
+    if let Some(ep) = proxy_endpoint {
+        if looks_like_network_failure(raw) {
+            return format!(
+                "该远程绑定了代理 {ep}，本次失败可能与代理有关；若代理正常，请再查远程自身配置。{ANNOTATED_MARK}{raw}）"
+            );
+        }
+    }
+    raw.to_string()
 }
 
 /// 检查代理配置名称是否与**其他**配置重复。
@@ -303,6 +448,21 @@ mod tests {
         // 重启提示必须说清「需要重新挂载/启动」
         assert!(RESTART_HINT.contains("重新挂载"));
         assert!(RESTART_HINT.contains("重新启动"));
+        // 静默无效的类型必须被点名，不能含糊成「可能」
+        assert!(INERT_TYPE_HINT.contains("ftp"));
+        assert!(INERT_TYPE_HINT.contains("sftp"));
+        assert!(INERT_TYPE_HINT.contains("不会真正生效"));
+    }
+
+    /// 实测结论：只有 ftp / sftp 不认 override.http_proxy。
+    #[test]
+    fn only_ftp_and_sftp_ignore_the_override_key() {
+        assert!(!type_honors_override("ftp"));
+        assert!(!type_honors_override("sftp"));
+        assert!(!type_honors_override("  SFTP ")); // 大小写/空白不该影响判定
+        for t in ["webdav", "s3", "drive", "onedrive", "http", "b2", "teldrive", "local"] {
+            assert!(type_honors_override(t), "{t} 应当读取 override.http_proxy");
+        }
     }
 
     #[test]
@@ -393,5 +553,83 @@ mod tests {
         // 描述里只可能出现「当前值」，但那是 rclone 里的代理 URL（可能含密码）。
         // 因此这里断言 describe 不额外拼接 ours，避免重复暴露。
         assert!(d.contains("已被其他方式修改"));
+    }
+
+    // ---------------- 代理失败提示 ----------------
+    //
+    // 下面每条原文都是 rclone v1.75.4 实测抓到的（见 docs/proxy-failure-messages.md），
+    // 不要为了「看起来更整齐」而改写这些字符串：它们就是判定依据。
+
+    /// HTTP 代理端口没人监听。
+    const SAMPLE_HTTP_REFUSED: &str = r#"无法进入 mywebdav: operations/list: error in ListJSON: operation error S3: ListBuckets, exceeded maximum number of attempts, 1, https response error StatusCode: 0, RequestID: , HostID: , request send failed, Get "http://127.0.0.1:9/?x-id=ListBuckets": proxyconnect tcp: dial tcp 127.0.0.1:9: connectex: No connection could be made because the target machine actively refused it."#;
+
+    /// SOCKS5 代理端口没人监听（文案与 HTTP 一致，靠 scheme 区分，故同样归类）。
+    const SAMPLE_SOCKS_REFUSED: &str = r#"error listing: operation error S3: ListBuckets, http response error StatusCode: 0, request send failed, Get "http://127.0.0.1:9/": proxyconnect tcp: dial tcp 127.0.0.1:55890: connectex: No connection could be made because the target machine actively refused it."#;
+
+    /// 代理要求认证。
+    const SAMPLE_407: &str = r#"error listing: operation error S3: ListBuckets, https response error StatusCode: 407, RequestID: , HostID: , api error ProxyAuthenticationRequired: Proxy Authentication Required"#;
+
+    /// 代理网关上游不可达。
+    const SAMPLE_502: &str = r#"error listing: operation error S3: ListBuckets, exceeded maximum number of attempts, 1, https response error StatusCode: 502, RequestID: , HostID: , api error BadGateway: Bad Gateway"#;
+
+    /// `https://` 代理其实是个明文 HTTP 代理。
+    const SAMPLE_TLS_MISMATCH: &str = r#"error listing: operation error S3: ListBuckets, exceeded maximum number of attempts, 1, https response error StatusCode: 0, RequestID: , HostID: , request send failed, Get "http://127.0.0.1:9/?x-id=ListBuckets": proxyconnect tcp: tls: first record does not look like a TLS handshake"#;
+
+    #[test]
+    fn refused_proxy_is_recognized_for_http_and_socks5() {
+        assert_eq!(classify_proxy_failure(SAMPLE_HTTP_REFUSED), Some(ProxyFailure::Refused));
+        assert_eq!(classify_proxy_failure(SAMPLE_SOCKS_REFUSED), Some(ProxyFailure::Refused));
+    }
+
+    #[test]
+    fn auth_and_gateway_failures_are_recognized() {
+        assert_eq!(classify_proxy_failure(SAMPLE_407), Some(ProxyFailure::AuthRequired));
+        assert_eq!(classify_proxy_failure(SAMPLE_502), Some(ProxyFailure::BadGateway));
+    }
+
+    #[test]
+    fn tls_handshake_mismatch_is_recognized() {
+        assert_eq!(
+            classify_proxy_failure(SAMPLE_TLS_MISMATCH),
+            Some(ProxyFailure::SchemeMismatch)
+        );
+    }
+
+    /// 目标站点自己拒绝连接（没有走代理）时**不能**归因给代理。
+    #[test]
+    fn plain_origin_refusal_is_not_blamed_on_proxy() {
+        let raw = r#"error listing: dial tcp 127.0.0.1:9000: connectex: No connection could be made because the target machine actively refused it."#;
+        assert_eq!(classify_proxy_failure(raw), None);
+        assert_eq!(annotate_error(raw, None), raw);
+        // 即使该远程绑定了代理，没有网络失败特征也不该硬扯上代理
+        let unrelated = "无法进入 mywebdav: remote not found";
+        assert_eq!(annotate_error(unrelated, Some("127.0.0.1:8080")), unrelated);
+    }
+
+    /// 已知的判定边界：超时/EOF 这类文本里没有代理证据，不做强归因。
+    #[test]
+    fn timeout_without_proxy_evidence_stays_raw() {
+        let raw = r#"operation error S3: ListBuckets, request send failed, Get "http://127.0.0.1:9/": net/http: timeout awaiting response headers"#;
+        assert_eq!(classify_proxy_failure(raw), None);
+        assert_eq!(annotate_error(raw, None), raw);
+        // 但知道「该远程绑了代理」时会给一句弱提示，不冒充结论
+        let weak = annotate_error(raw, Some("127.0.0.1:8080"));
+        assert!(weak.contains("可能与代理有关"));
+        assert!(weak.contains("127.0.0.1:8080"));
+        // 原文必须保留，便于排查
+        assert!(weak.contains("timeout awaiting response headers"));
+    }
+
+    #[test]
+    fn annotate_keeps_raw_text_and_is_idempotent() {
+        let once = annotate_error(SAMPLE_407, None);
+        assert!(once.starts_with("【代理】代理要求认证："));
+        assert!(once.contains("ProxyAuthenticationRequired"), "原文必须保留");
+        // 二次调用不得再套一层
+        let twice = annotate_error(&once, None);
+        assert_eq!(once, twice);
+        // 弱提示同样幂等
+        let weak = annotate_error("request send failed: EOF", Some("h:1"));
+        assert_eq!(annotate_error(&weak, Some("h:1")), weak);
     }
 }
