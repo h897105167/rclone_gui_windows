@@ -897,8 +897,8 @@ component FilesView inherits Rectangle {
             Rectangle { width: 4px; }
             IconBtn { label: "\u{E74A}"; clicked => { root.go-up(); } }
             // 路径面包屑：每一级可点，点击退回该级（像资源管理器）。
-            // 路径很长时向右溢出、左侧被裁掉：HorizontalLayout 的 end 对齐
-            // 允许负起点，所以**当前目录始终可见**（见 i-slint-core/layout.rs）。
+            // 左对齐；超长时向右溢出并被裁掉（当前目录可能被挡住，
+            // 用「↑ 上级」或面包屑仍可回退）。
             Rectangle {
                 background: ThemeG.panel;
                 border-radius: ThemeG.radius-s;
@@ -906,10 +906,12 @@ component FilesView inherits Rectangle {
                 border-color: ThemeG.border;
                 clip: true;
                 HorizontalLayout {
+                    width: parent.width;
+                    height: parent.height;
                     padding-left: 10px;
                     padding-right: 10px;
                     spacing: 2px;
-                    alignment: end;
+                    alignment: start;
                     for c[i] in FilesG.crumbs : HorizontalLayout {
                         spacing: 2px;
                         crumb-ta := TouchArea {
