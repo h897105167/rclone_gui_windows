@@ -1,0 +1,12 @@
+[package]
+name = "oneclick-plugin"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "oneclick"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

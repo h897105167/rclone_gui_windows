@@ -17,6 +17,15 @@
 //!
 //! 插件是无状态 WASI 命令：需要宿主能力时先发 `need`，宿主执行后带
 //! `provided` 再次运行同一 wasm，插件根据 `state` 续算，直到产出 `ops`+`result`。
+//!
+//! 能力分两类：
+//!
+//! - **通用能力**（`fs.*` / `http.*` / `proc.*` / `net.*` / `kv.*` / `ui.*` / `env.info`）：
+//!   名字到能力组的映射见 [`config::cap_of_op`]。插件必须在 `config.json` 的
+//!   `capabilities` 里声明对应组，否则宿主拒绝执行——拒绝发生在宿主侧，
+//!   插件无法绕过。
+//! - **旧版专用能力**（`kv.get_all` / `rclone.call`）：上一代插件直接用，
+//!   没有声明机制，调用方传空 `allowed` 表示不限制。
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
@@ -28,6 +37,8 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 use wasmtime::{Config, Engine, Module};
 
+pub mod bundle;
+pub mod config;
 pub mod package;
 pub mod zip;
 
@@ -69,7 +80,7 @@ pub struct PluginResponse {
     pub error: Option<Value>,
 }
 
-/// 宿主能力提供者（由 app 层实现，桥接 rclone 与 kv 存储）
+/// 宿主能力提供者（由 app 层实现，桥接 rclone、kv 存储与操作系统原语）
 #[async_trait]
 pub trait CapProvider: Send + Sync {
     async fn rclone_call(&self, method: String, params: Value) -> Result<Value>;
@@ -79,8 +90,87 @@ pub trait CapProvider: Send + Sync {
     async fn kv_set(&self, plugin_id: &str, key: String, value: Value) -> Result<()>;
     async fn kv_delete(&self, plugin_id: &str, key: String) -> Result<()>;
     async fn log(&self, message: String);
+
+    /// 通用能力调用（`fs.*` / `http.*` / `proc.*` / `net.*` / `kv.*` / `ui.*` / `env.*`）。
+    ///
+    /// `op` 是点分操作名，`params` 是插件给的参数，返回值直接作为该轮 `provided`
+    /// 里对应 `key` 的内容。**能力授权由 [`PluginHost::invoke`] 在本方法之前完成**，
+    /// 实现方不需要再检查一遍。
+    ///
+    /// 默认实现返回错误：让不关心新能力的旧实现（以及测试桩）继续可用。
+    async fn cap_call(&self, op: &str, params: Value) -> Result<Value> {
+        Err(anyhow!("宿主未实现能力: {op}（参数 {params}）"))
+    }
+
+    /// 让宿主弹一个通知（插件主动推送，不需要返回值）。
+    async fn toast(&self, _level: &str, _message: String) {}
+
+    /// 宿主当前正在执行的长任务进度，形如
+    /// `{"busy":true,"label":"正在下载…","done":123,"total":456}`。
+    ///
+    /// 宿主每一轮都会把它填进 `params.live`，插件无需额外 `need`
+    /// 就能在 `snapshot` 里回显进度（长任务执行期间不受协商轮次限制）。
+    fn live(&self) -> Value {
+        Value::Null
+    }
 }
 
+/// 能力授权表：本次调用允许的能力组。
+///
+/// - `Unrestricted`：旧格式插件 / 测试，不做限制
+/// - `Groups`：只允许列出的组（来自 `config.json` 的 `capabilities`）
+#[derive(Debug, Clone, Default)]
+pub enum Allowed {
+    #[default]
+    Unrestricted,
+    Groups(Vec<String>),
+}
+
+impl Allowed {
+    /// 从配置里的能力组构造。
+    pub fn from_groups(groups: &[String]) -> Self {
+        if groups.is_empty() {
+            // 空列表是"什么都没声明"，不是"不限制"：拿不到任何通用能力。
+            Allowed::Groups(Vec::new())
+        } else {
+            Allowed::Groups(groups.to_vec())
+        }
+    }
+
+    /// 检查某个操作是否被允许；返回缺失的能力组（便于报错时告诉用户改配置）。
+    pub fn deny_reason(&self, op: &str) -> Option<String> {
+        let group = config::cap_of_op(op);
+        match self {
+            Allowed::Unrestricted => None,
+            Allowed::Groups(groups) => {
+                let Some(g) = group else {
+                    return Some(format!("宿主不认识的能力: {op}"));
+                };
+                if groups.iter().any(|c| c == g) {
+                    None
+                } else {
+                    Some(format!(
+                        "插件未在 config.json 的 capabilities 里声明「{g}」，拒绝执行 {op}"
+                    ))
+                }
+            }
+        }
+    }
+
+    fn check(&self, op: &str) -> Result<()> {
+        match self.deny_reason(op) {
+            None => Ok(()),
+            Some(why) => bail!("{why}"),
+        }
+    }
+}
+
+/// 单个动作允许的最大「need → 重新执行」轮次。
+///
+/// 插件是无状态的：每一轮都是全新进程，只能靠 `state` 把中间结果带回来。
+/// 下载并安装一个 rclone 要走「解析版本 / 下载 / 解压 / 找 exe / 校验 / 复制」
+/// 六步，再留几轮给可选的二次探测，因此给到 16。
+const MAX_ROUNDS: usize = 16;
 pub struct PluginHost {
     engine: Engine,
     cache: Mutex<HashMap<PathBuf, (SystemTime, Module)>>,
@@ -147,14 +237,32 @@ impl PluginHost {
         caps: Option<std::sync::Arc<dyn CapProvider>>,
         plugin_id: &str,
     ) -> Result<Value> {
+        self.invoke_with(wasm, method, params, caps, plugin_id, &Allowed::Unrestricted)
+            .await
+    }
+
+    /// 带能力授权的调用。`allowed` 一般来自 `config.json` 的 `capabilities`。
+    pub async fn invoke_with(
+        &self,
+        wasm: &Path,
+        method: &str,
+        params: Value,
+        caps: Option<std::sync::Arc<dyn CapProvider>>,
+        plugin_id: &str,
+        allowed: &Allowed,
+    ) -> Result<Value> {
         let mut provided = Value::Null;
         let mut state = Value::Null;
-        for _round in 0..8 {
+        for _round in 0..MAX_ROUNDS {
             let mut req = json!({ "id": 1, "method": method });
             let mut p = params.clone();
             if let Some(obj) = p.as_object_mut() {
                 obj.insert("provided".into(), provided.clone());
                 obj.insert("state".into(), state.clone());
+                // 宿主当前进度：插件可以在不回传 need 的情况下回显
+                if let Some(c) = caps.as_ref() {
+                    obj.insert("live".into(), c.live());
+                }
             }
             req["params"] = p;
 
@@ -176,13 +284,29 @@ impl PluginHost {
                 for n in resp.need {
                     let key = if n.key.is_empty() { n.cap.clone() } else { n.key };
                     let v = match n.cap.as_str() {
+                        // 旧版专用能力（上一代插件直接调用，未做能力声明）
                         "kv.get_all" => caps.kv_get_all(plugin_id).await?,
                         "rclone.call" => {
                             let m = n.params.get("method").and_then(|x| x.as_str()).unwrap_or("").to_string();
                             let pr = n.params.get("params").cloned().unwrap_or(Value::Null);
+                            allowed.check("rclone.call")?;
                             caps.rclone_call(m, pr).await?
                         }
-                        other => bail!("插件请求了未知能力: {other}"),
+                        other => {
+                            allowed.check(other)?;
+                            // 让能力实现知道是哪个插件在调用（proc.* 按插件分组登记子进程）
+                            let mut p = n.params.clone();
+                            if let Some(obj) = p.as_object_mut() {
+                                obj.insert("_plugin".into(), Value::String(plugin_id.to_string()));
+                            }
+                            // 单次能力失败**不中断整轮**：插件经常需要在「预期会失败」的
+                            // 调用之间做回退（镜像 404、路径还不存在、进程已退出……）。
+                            // 失败以 `{"_error": "..."}` 的形式交给插件自己判断。
+                            match caps.cap_call(other, p).await {
+                                Ok(v) => v,
+                                Err(e) => json!({ "_error": format!("{e:#}") }),
+                            }
+                        }
                     };
                     prov.insert(key, v);
                 }
@@ -192,18 +316,23 @@ impl PluginHost {
             }
             if !resp.ops.is_empty() {
                 let caps = caps.as_ref().ok_or_else(|| anyhow!("插件返回 ops 但没有能力提供者"))?;
-                exec_ops(&resp.ops, caps, plugin_id).await?;
+                exec_ops(&resp.ops, caps, plugin_id, allowed).await?;
             }
             if let Some(result) = resp.result {
                 return Ok(result);
             }
             bail!("插件未返回 result");
         }
-        bail!("插件能力协商轮次超限（8）")
+        bail!("插件能力协商轮次超限（{MAX_ROUNDS}）")
     }
 }
 
-async fn exec_ops(ops: &[Value], caps: &std::sync::Arc<dyn CapProvider>, plugin_id: &str) -> Result<()> {
+async fn exec_ops(
+    ops: &[Value],
+    caps: &std::sync::Arc<dyn CapProvider>,
+    plugin_id: &str,
+    allowed: &Allowed,
+) -> Result<()> {
     for op in ops {
         let kind = op.get("op").and_then(|v| v.as_str()).unwrap_or("");
         let s = |k: &str| op.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -211,15 +340,36 @@ async fn exec_ops(ops: &[Value], caps: &std::sync::Arc<dyn CapProvider>, plugin_
             "rclone.call" => {
                 let m = s("method");
                 let p = op.get("params").cloned().unwrap_or(Value::Null);
+                allowed.check("rclone.call")?;
                 caps.rclone_call(m, p).await?;
             }
             "rclone.upload_file" => {
+                allowed.check("rclone.call")?;
                 caps.upload_file(s("fs"), s("remote_path"), s("filename"), s("data_b64")).await?;
             }
-            "kv.set" => caps.kv_set(plugin_id, s("key"), op.get("value").cloned().unwrap_or(Value::Null)).await?,
-            "kv.delete" => caps.kv_delete(plugin_id, s("key")).await?,
+            "kv.set" => {
+                allowed.check("kv.set")?;
+                caps.kv_set(plugin_id, s("key"), op.get("value").cloned().unwrap_or(Value::Null)).await?
+            }
+            "kv.delete" => {
+                allowed.check("kv.delete")?;
+                caps.kv_delete(plugin_id, s("key")).await?
+            }
             "log.write" => caps.log(s("message")).await,
-            other => bail!("未知插件 op: {other}"),
+            "ui.toast" => {
+                allowed.check("ui.toast")?;
+                caps.toast(&s("level"), s("message")).await
+            }
+            other => {
+                allowed.check(other)?;
+                // 其余 op 一律转发给通用能力实现（参数为去掉 `op` 字段的整个对象）
+                let mut params = op.clone();
+                if let Some(obj) = params.as_object_mut() {
+                    obj.remove("op");
+                    obj.insert("_plugin".into(), Value::String(plugin_id.to_string()));
+                }
+                caps.cap_call(other, params).await?;
+            }
         }
     }
     Ok(())

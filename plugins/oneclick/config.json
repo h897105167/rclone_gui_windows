@@ -1,0 +1,57 @@
+{
+  "id": "onerclone",
+  "name": "一键 rclone",
+  "version": "0.2.0",
+  "entry": "main.wasm",
+  "description": "检测 / 安装 / 启动本机 rclone（rcd），并自动连接",
+  "author": "内置",
+  "tags": ["rclone", "进程", "安装", "下载", "rcd"],
+  "capabilities": ["kv", "fs", "http", "proc", "net", "env"],
+  "platform": "windows",
+  "builtin": true,
+  "plugin_setting": {
+    "version": 1,
+    "summary": "检测 / 安装 / 启动本机 rclone",
+    "on_start": "auto_start",
+    "on_exit": "stop_on_exit",
+    "controls": [
+      { "kind": "status", "key": "conn", "label": "运行状态", "lamp": true },
+      { "kind": "group", "key": "g_exe", "label": "① rclone 程序" },
+      { "kind": "field", "key": "exe", "label": "程序路径", "field": "path",
+        "placeholder": "选择 rclone.exe（也可以用下方「一键下载并安装」）",
+        "dialog_title": "选择 rclone.exe", "filters": ["exe"] },
+      { "kind": "action", "key": "pick_exe", "label": "浏览…", "line": "exe-actions" },
+      { "kind": "action", "key": "revalidate", "label": "重新校验", "line": "exe-actions" },
+      { "kind": "checks", "key": "checks", "text": "尚未校验：点「重新校验」确认这个文件确实是 rclone" },
+
+      { "kind": "group", "key": "g_install", "label": "② 一键安装" },
+      { "kind": "field", "key": "edition", "label": "版本", "field": "select",
+        "options": ["官方版", "增强版"], "default": "官方版" },
+      { "kind": "field", "key": "source", "label": "下载源", "field": "select",
+        "options": ["官方源", "镜像优先"], "default": "官方源" },
+      { "kind": "hint", "key": "install_edition_hint",
+        "text": "增强版（teldrive 后端）只发布在 GitHub Releases，镜像源对它不可用。" },
+      { "kind": "action", "key": "install", "label": "一键下载并安装", "style": "primary" },
+      { "kind": "progress", "key": "progress" },
+      { "kind": "hint", "key": "install_hint", "text": "" },
+
+      { "kind": "group", "key": "g_args", "label": "③ 启动参数" },
+      { "kind": "field", "key": "rc_user", "label": "用户名", "field": "text", "default": "gui" },
+      { "kind": "field", "key": "rc_pass", "label": "密码", "field": "password",
+        "placeholder": "留空则 rclone 会拒绝没有凭据的连接" },
+      { "kind": "field", "key": "port", "label": "端口", "field": "number", "default": "5572" },
+      { "kind": "field", "key": "no_auth", "label": "本地不校验", "field": "bool", "default": "false" },
+      { "kind": "field", "key": "silent", "label": "静默启动", "field": "bool", "default": "true" },
+      { "kind": "hint", "key": "auth_warning", "text": "" },
+
+      { "kind": "group", "key": "g_boot", "label": "④ 启动策略" },
+      { "kind": "field", "key": "auto_start", "label": "随程序自动启动", "field": "bool", "default": "false" },
+      { "kind": "field", "key": "stop_on_exit", "label": "退出时停止 rclone", "field": "bool", "default": "true" },
+      { "kind": "hint", "key": "auto_start_hint", "text": "" },
+
+      { "kind": "divider", "key": "d_run" },
+      { "kind": "action", "key": "start", "label": "启动 rclone", "style": "primary", "line": "run-actions" },
+      { "kind": "action", "key": "stop", "label": "停止", "style": "danger", "line": "run-actions" }
+    ]
+  }
+}
