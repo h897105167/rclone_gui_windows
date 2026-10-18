@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     // 1) Slint UI 编译
@@ -47,4 +47,66 @@ fn main() {
             );
         }
     }
+
+    // 3) 把内置插件资产复制到 exe 同级目录
+    //
+    // `crates/app/src/plugins.rs::builtin_root()` 在运行期读 `<exe>/assets/plugins`，
+    // 而 cargo 不会把非 Rust 资产复制到 target/<profile>/。这里在构建期补上，
+    // 好处是 `cargo build -p rclone-gui` 一条命令就能得到一个可直接运行的目录。
+    //
+    // 资产由 scripts/build.ps1 生成（编 wasm → 复制 config.json/main.wasm → 生成 check.sha256）。
+    println!("cargo:rerun-if-changed=assets/plugins");
+    let assets = PathBuf::from("assets/plugins");
+    if assets.is_dir() {
+        match target_profile_dir() {
+            Some(dst) => {
+                let dst = dst.join("assets").join("plugins");
+                if let Err(e) = copy_dir(&assets, &dst) {
+                    println!("cargo:warning=复制内置插件资产失败: {e}");
+                }
+            }
+            None => println!("cargo:warning=无法定位 target profile 目录，内置插件资产未复制"),
+        }
+    }
+}
+
+/// 从 `OUT_DIR`（`<target>/<profile>/build/<pkg>-<hash>/out`）上溯三级得到 `<target>/<profile>`。
+fn target_profile_dir() -> Option<PathBuf> {
+    let out = PathBuf::from(std::env::var_os("OUT_DIR")?);
+    let up = |p: &Path, n: usize| -> Option<PathBuf> {
+        let mut cur = p.to_path_buf();
+        for _ in 0..n {
+            cur = cur.parent()?.to_path_buf();
+        }
+        Some(cur)
+    };
+    let dir = up(&out, 3)?;
+    // 只接受确实以 profile 名结尾的路径，避免把资产复制到意料之外的位置
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
+    if dir.file_name().map(|n| n == profile.as_str()).unwrap_or(false) {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)?.flatten() {
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir(&from, &to)?;
+        } else {
+            let same_len = std::fs::metadata(&to)
+                .ok()
+                .zip(std::fs::metadata(&from).ok())
+                .map(|(a, b)| a.len() == b.len())
+                .unwrap_or(false);
+            if !same_len {
+                std::fs::copy(&from, &to)?;
+            }
+        }
+    }
+    Ok(())
 }

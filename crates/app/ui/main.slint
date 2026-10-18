@@ -42,19 +42,31 @@ export struct PluginRow {
     desc: string,
     loaded: bool,
     enabled: bool,
-    // ---- 插件包（plugin package）扩展字段 ----
-    // 类型： "wasm"（本进程内 WASM 插件）| "package"（外部程序插件包）
+    // 载体： "wasm"（本进程内 WASM 脚本）| "package"（外部程序插件包）
+    // 注意：这不是给用户看/搜的「类型」，检索请用 tags
     kind: string,
     author: string,
     entry: string,
     // 完整性校验是否通过
     verified: bool,
-    // 是否有专属配置界面（目前仅 imagehost 为 true）
-    has-config: bool,
+    // 是否随软件一起安装（仍可卸载；卸载后可「恢复内置」）
+    builtin: bool,
+    // 是否有由 config.json 的 plugin_setting 驱动的通用设置面板
+    has-panel: bool,
+    // 检索用的标签（已按 config.json 的 tags 小写化）
+    tags: [string],
+    // 徽标与提示灯（"": 无 / "ok" / "warn" / "err"）
+    lamp: string,
     // 状态提示（校验失败原因等）
     status: string,
     // 目录路径，便于用户定位
     path: string,
+}
+// 已被卸载、仍可恢复的内置插件（显示在插件页顶部，避免卸载后再也找不回来）
+export struct RemovedRow {
+    id: string,
+    name: string,
+    version: string,
 }
 export struct RootRow {
     id: string,
@@ -62,12 +74,50 @@ export struct RootRow {
     is-default: bool,
     public-template: string,
 }
-/// 一键 rclone：校验清单的一行（✓ / ✗）
-export struct OcCheck {
+/// 通用插件面板里的一个按钮（同一行可并排多个）
+export struct PanelBtn {
     label: string,
-    value: string,
-    ok: bool,
+    // 对应 config.json 里那个 action 控件的 key
+    action: string,
+    // "secondary" | "primary" | "danger"
+    style: string,
+    enabled: bool,
 }
+
+/// 通用插件设置面板的一行。
+///
+/// 由宿主把 config.json 的 `plugin_setting.controls` 与插件运行时上报的
+/// 状态**摊平**成这个一维列表（Slint 的 for 只能在直接子级展开，不能嵌套继承）。
+/// kind 取值：
+///   group   —— 分组标题（label）
+///   field   —— 一行输入（field-kind / value / options / placeholder）
+///   actions —— 一行按钮（buttons，最多三个）
+///   status  —— 状态行（label + text，lamp 决定左边指示灯颜色）
+///   hint    —— 灰色提示文字（text；warning=true 时用警告色）
+///   progress—— 进度条（progress: 0..100，-1 表示不确定）
+///   check   —— 校验清单行（label + value + ok）
+///   divider —— 分隔线
+export struct PanelRow {
+    kind: string,
+    key: string,
+    label: string,
+    text: string,
+    value: string,
+    // "text" | "password" | "number" | "bool" | "select" | "path"
+    field-kind: string,
+    placeholder: string,
+    options: [string],
+    // select 字段的当前选中项下标（由宿主按 value 在 options 里的位置算好）
+    selected-index: int,
+    buttons: [PanelBtn],
+    progress: int,
+    ok: bool,
+    // "" | "ok" | "warn" | "err"
+    lamp: string,
+    warning: bool,
+    enabled: bool,
+}
+
 export struct TokenRow {
     id: string,
     name: string,
@@ -272,50 +322,32 @@ export global PluginsG {
     in-out property <[TokenRow]> tokens: [];
     in-out property <[ImageRow]> images: [];
 
-    // ---------------- 内置插件：一键 rclone ----------------
-    // 该插件由 Rust 侧以「内置」行注入插件列表（id = "onerclone"），
-    // 状态全部由 Rust 单向写入，UI 只读 + 触发回调。
-    /// 插件是否启用（停用时所有动作按钮禁用）
-    in-out property <bool> oc-enabled: true;
-    /// rclone.exe 路径（可手动编辑）
-    in-out property <string> oc-exe: "";
-    /// 最近一次校验得到的版本（如 v1.75.4）
-    in-out property <string> oc-exe-version: "";
-    /// 当前路径是否已通过校验（决定「自动启动」能不能勾选）
-    in-out property <bool> oc-verified: false;
-    /// 校验清单（文件名 / 大小 / PE / 签名 / 版本探测）
-    in-out property <[OcCheck]> oc-checks: [];
-    in-out property <bool> oc-checking: false;
-    /// 版本选项与下载源选项
-    in-out property <[string]> oc-editions: ["官方版", "增强版（rclone-extra）"];
-    in-out property <int> oc-edition-idx: 0;
-    in-out property <[string]> oc-sources: ["GitHub / 官网", "清华镜像源（含国内回退）"];
-    in-out property <int> oc-source-idx: 0;
-    /// 下载安装进度：0..100；-1 表示不确定
-    in-out property <int> oc-progress: 0;
-    in-out property <bool> oc-installing: false;
-    in-out property <string> oc-phase: "";
-    in-out property <string> oc-install-hint: "";
-    /// 启动参数
-    in-out property <string> oc-user: "gui";
-    in-out property <string> oc-pass: "";
-    in-out property <string> oc-port: "5572";
-    in-out property <bool> oc-no-auth: false;
-    in-out property <bool> oc-silent: true;
-    /// 鉴权缺口提示（没勾 no_auth 且用户名密码都空时非空）
-    in-out property <string> oc-auth-warning: "";
-    /// 启动策略
-    in-out property <bool> oc-auto-start: false;
-    in-out property <bool> oc-stop-on-exit: false;
-    /// 本程序拉起的 rclone 是否在跑（与「是否连上」是两件事）
-    in-out property <bool> oc-running: false;
-    in-out property <int> oc-pid: 0;
-    in-out property <string> oc-uptime: "";
-    in-out property <bool> oc-busy: false;
-    /// 一行状态文本（已连接 / 未连接 / 最后错误）
-    in-out property <string> oc-status: "";
-    /// 提示灯：true = 绿灯（已连接），false = 黄灯（未连接）
-    in-out property <bool> oc-conn-live: false;
+    // ---------------- 通用插件设置面板 ----------------
+    // 面板内容完全由插件 config.json 的 plugin_setting 决定：Slint 侧不认识任何
+    // 具体插件 id，只按 PanelRow.kind 渲染。Rust 侧把「声明式控件 + 插件运行时状态」
+    // 摊平成一维 PanelRow 列表写进 panel-rows。
+    /// 当前展开的插件 id（与 rows 的索引分离，避免重扫后错位）
+    in-out property <string> panel-plugin: "";
+    /// 正在展开的面板内容（未展开时为空）
+    in-out property <[PanelRow]> panel-rows: [];
+    /// 面板正在从插件取状态
+    in-out property <bool> panel-loading: false;
+    /// 面板最近一次错误（插件抛错 / 校验失败）
+    in-out property <string> panel-error: "";
+    /// 检索框（按名称 / id / tags 过滤）
+    in-out property <string> search: "";
+    /// 已被卸载、可一键恢复的内置插件
+    ///
+    /// 卸载后卡片会从列表消失，「恢复内置」按钮也就跟着没了 —— 因此把可恢复的
+    /// 内置插件单独列出来，显示在顶部操作栏，保证卸载之后仍然找得回来。
+    in-out property <[RemovedRow]> removed-builtins: [];
+
+    // ---------------- 宿主级长任务进度 ----------------
+    // 由 Rust 侧 caps::pump_progress 每秒写入；不依赖插件提前返回。
+    in-out property <bool> op-busy: false;
+    in-out property <string> op-label: "";
+    /// 0..1；小于 0 表示不确定进度
+    in-out property <float> op-progress: -1.0;
 }
 
 export global RemotesG {
@@ -2445,24 +2477,38 @@ component PluginsView inherits Rectangle {
     callback add-from-file;
     callback add-from-dir;
     callback open-dir;
-    // 内置插件「一键 rclone」
-    callback oc-pick-exe;
-    callback oc-revalidate;
-    callback oc-install;
-    callback oc-start;
-    callback oc-stop;
-    callback oc-save;
+    // ---- 通用插件面板（内容由插件 config.json 的 plugin_setting 决定） ----
+    // 展开 / 收起某个插件时请求宿主重建面板内容
+    callback panel-open(int);
+    callback panel-close;
+    // 字段改动：key 来自 config.json 的控件 key
+    callback panel-field(string, string);
+    // 动作按钮：key 来自 config.json 的 action 控件 key
+    callback panel-action(string);
+    // 卸载插件（会删插件目录与该插件的 kv 数据）
+    callback plugin-uninstall(int);
+    // 恢复随软件安装的内置插件（上一步卸载过才会出现）
+    callback plugin-restore(int);
+    // 按 id 恢复内置插件（用于顶部「已卸载」入口，此时列表里没有这一行）
+    callback plugin-restore-by-id(string);
+    // 检索框改动（按名称 / id / tags 过滤）
+    callback plugin-search(string);
     // 确认弹窗所需的待操作状态
     property <int> tok-idx: -1;
     property <string> tok-name: "";
     property <int> img-idx: -1;
     property <string> img-path: "";
+    property <int> cb-idx: -1;
+    property <string> cb-name: "";
     property <length> pop-ax;
     property <length> pop-ay;
     ScrollView {
         VerticalLayout {
             padding: 24px;
             spacing: 12px;
+            // 页面纵向 alignment: start：多余高度不摊给子项。
+            // 否则每个插件的「外层容器」会各自分到一段空白，卡片之间被拉出大缝。
+            alignment: start;
             // ---- 顶部操作栏：添加插件 + 刷新 ----
             Card {
                 VerticalLayout {
@@ -2489,6 +2535,65 @@ component PluginsView inherits Rectangle {
                         color: ThemeG.text-dim;
                         wrap: word-wrap;
                     }
+                    // ---- 已卸载的内置插件（可一键恢复） ----
+                    // 卸载后卡片会从列表消失，右下角的「恢复内置」按钮也跟着消失，
+                    // 所以把入口固定放在这里。
+                    if PluginsG.removed-builtins.length > 0 : VerticalLayout {
+                        spacing: 6px;
+                        for rb[rbi] in PluginsG.removed-builtins : HorizontalLayout {
+                            height: 26px;
+                            spacing: 8px;
+                            Text {
+                                text: "「" + rb.name + "」已卸载";
+                                font-size: 12px;
+                                color: ThemeG.text-dim;
+                                vertical-alignment: center;
+                            }
+                            // 弹簧：不给它，PillBtn（Rectangle）会把整行剩余宽度吃掉
+                            Rectangle {}
+                            PillBtn {
+                                label: "恢复内置";
+                                compact: true;
+                                clicked => { root.plugin-restore-by-id(rb.id); }
+                            }
+                        }
+                    }
+                    // ---- 宿主级长任务进度（下载 / 解压 / 安装） ----
+                    // 插件调用一次只跑一轮，长任务的进度只能由宿主广播：
+                    // caps::ProgressHub 写入这三个属性，UI 每秒拉一次。
+                    if PluginsG.op-busy : VerticalLayout {
+                        spacing: 4px;
+                        HorizontalLayout {
+                            height: 18px;
+                            spacing: 8px;
+                            Text {
+                                text: PluginsG.op-label;
+                                font-size: 11px;
+                                color: ThemeG.text-dim;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                            Text {
+                                text: PluginsG.op-progress >= 0 ? Math.round(PluginsG.op-progress * 100) + "%" : "";
+                                font-size: 11px;
+                                color: ThemeG.text-dim;
+                                vertical-alignment: center;
+                            }
+                        }
+                        Rectangle {
+                            height: 6px;
+                            border-radius: 3px;
+                            background: ThemeG.panel-2;
+                            // op-progress < 0 表示总长度未知（不确定进度）：只显示底色，不画假进度
+                            if PluginsG.op-progress >= 0 : Rectangle {
+                                height: parent.height;
+                                width: parent.width * Math.min(PluginsG.op-progress, 1.0);
+                                border-radius: 3px;
+                                background: ThemeG.accent;
+                            }
+                        }
+                    }
                 }
             }
             HorizontalLayout {
@@ -2497,431 +2602,373 @@ component PluginsView inherits Rectangle {
                 Rectangle {}
                 IconBtn { label: "\u{E72C}"; clicked => { root.rescan(); } }
             }
+            // 检索框：按名称 / id / tags 过滤（tag 来自插件 config.json 的 tags）
+            HorizontalLayout {
+                height: 30px;
+                spacing: 8px;
+                LineEdit {
+                    horizontal-stretch: 1;
+                    placeholder-text: "按名称、ID 或标签检索插件…";
+                    text <=> PluginsG.search;
+                }
+                Text {
+                    text: PluginsG.rows.length + " 个插件";
+                    font-size: 12px;
+                    color: ThemeG.text-dim;
+                    vertical-alignment: center;
+                }
+            }
             if PluginsG.rows.length == 0 : Card {
                 Text { text: "未发现插件"; font-size: 13px; color: ThemeG.text-dim; }
             }
-            for p[i] in PluginsG.rows : Rectangle {
-                background: ThemeG.panel;
-                border-radius: ThemeG.radius;
-                border-width: 1px;
-                border-color: PluginsG.expanded == i ? ThemeG.accent : ThemeG.border;
-                clip: true;
-                VerticalLayout {
-                    alignment: start;
-                    // ---- 卷帘头（始终显示；复选框固定于右侧中间） ----
-                    Rectangle {
-                        height: 56px;
-                        background: PluginsG.expanded == i ? ThemeG.accent-soft : transparent;
-                        hta := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => { PluginsG.expanded = PluginsG.expanded == i ? -1 : i; }
-                        }
-                        HorizontalLayout {
-                            padding-left: 16px;
-                            padding-right: 12px;
-                            spacing: 12px;
-                            MdlIcon {
-                                glyph: p.kind == "package" ? "\u{E8B7}" : "\u{EA86}";
-                                width: 22px;
-                                font-size: 17px;
-                                color: p.enabled ? ThemeG.accent : ThemeG.text-dim;
+            // 注意：外层容器（VerticalLayout）承担拉伸，卡片本身保持自然高度。
+            // 否则行高不足时 Slint 会把卡片拉伸成一整块，视觉上很难看。
+            for p[i] in PluginsG.rows : VerticalLayout {
+                alignment: start;
+                card := Rectangle {
+                    background: ThemeG.panel;
+                    border-radius: ThemeG.radius;
+                    border-width: 1px;
+                    border-color: PluginsG.expanded == i ? ThemeG.accent : ThemeG.border;
+                    clip: true;
+                    VerticalLayout {
+                        // ---- 卷帘头（始终显示；复选框固定于右侧中间） ----
+                        Rectangle {
+                            height: 56px;
+                            background: PluginsG.expanded == i ? ThemeG.accent-soft : transparent;
+                            hta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { PluginsG.expanded = PluginsG.expanded == i ? -1 : i; root.panel-open(i); }
                             }
-                            Text { text: p.name; font-size: 14px; font-weight: 600; color: p.enabled ? ThemeG.text : ThemeG.text-dim; vertical-alignment: center; }
-                            Text { text: "v" + p.version; font-size: 11px; color: ThemeG.text-dim; vertical-alignment: center; }
-                            // 类型 / 校验状态徽标
-                            Rectangle {
-                                height: 20px;
-                                width: p.kind == "package" ? 52px : (p.kind == "builtin" ? 48px : 44px);
-                                border-radius: 10px;
-                                background: p.kind == "package" ? ThemeG.panel-2 : ThemeG.accent-soft;
-                                Text {
-                                    text: p.kind == "package" ? "插件包" : (p.kind == "builtin" ? "内置" : "WASM");
-                                    font-size: 10px;
-                                    color: p.kind == "package" ? ThemeG.text-dim : ThemeG.accent;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                            }
-                            if p.kind == "package" && !p.verified : Rectangle {
-                                height: 20px;
-                                width: 52px;
-                                border-radius: 10px;
-                                background: ThemeG.err;
-                                Text { text: "校验失败"; font-size: 10px; color: white; horizontal-alignment: center; vertical-alignment: center; }
-                            }
-                            Rectangle {
-                                horizontal-stretch: 1;
-                                Text { text: p.desc; font-size: 12px; color: ThemeG.text-dim; width: parent.width; overflow: elide; vertical-alignment: center; }
-                            }
-                            // 一键 rclone：折叠状态下也能看到提示灯（黄=未连接 / 绿=已连接）
-                            if p.id == "onerclone" : Rectangle {
-                                width: 10px;
-                                height: 10px;
-                                border-radius: 5px;
-                                background: PluginsG.oc-conn-live ? ThemeG.ok : ThemeG.warn;
-                            }
-                            Text { text: p.enabled ? "已启用" : "已停用"; font-size: 12px; color: p.enabled ? ThemeG.ok : ThemeG.text-dim; vertical-alignment: center; }
-                            MdlIcon {
-                                glyph: PluginsG.expanded == i ? "\u{E70E}" : "\u{E70D}";
-                                width: 20px;
-                                font-size: 13px;
-                            }
-                            CheckBox {
-                                checked: p.enabled;
-                                enabled: p.verified;
-                                toggled => { root.plugin-toggle(i); }
-                            }
-                        }
-                    }
-                    // ---- 卷帘内容（仅展开时渲染） ----
-                    if PluginsG.expanded == i : VerticalLayout {
-                        padding-left: 16px;
-                        padding-right: 16px;
-                        padding-bottom: 16px;
-                        spacing: 14px;
-                        Rectangle { height: 1px; background: ThemeG.border; }
-                        if p.id != "imagehost" && p.id != "onerclone" : VerticalLayout {
-                            spacing: 6px;
+                            // 横向布局里垂直居中要用 cross-axis-alignment（alignment 是主轴）
                             HorizontalLayout {
-                                spacing: 8px;
-                                Text { text: "ID"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
-                                Text { text: p.id; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
-                            }
-                            if p.author != "" : HorizontalLayout {
-                                spacing: 8px;
-                                Text { text: "作者"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
-                                Text { text: p.author; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
-                            }
-                            if p.entry != "" : HorizontalLayout {
-                                spacing: 8px;
-                                Text { text: "入口文件"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
-                                Text { text: p.entry; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
-                            }
-                            HorizontalLayout {
-                                spacing: 8px;
-                                Text { text: "完整性"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
-                                Text {
-                                    text: p.verified ? "校验通过" : "校验失败";
-                                    font-size: 12px;
-                                    color: p.verified ? ThemeG.ok : ThemeG.err;
-                                    vertical-alignment: center;
+                                padding-left: 16px;
+                                padding-right: 12px;
+                                spacing: 12px;
+                                cross-axis-alignment: center;
+                                MdlIcon {
+                                    glyph: p.kind == "package" ? "\u{E8B7}" : "\u{EA86}";
+                                    width: 22px;
+                                    font-size: 17px;
+                                    color: p.enabled ? ThemeG.accent : ThemeG.text-dim;
                                 }
-                            }
-                            if !p.verified && p.status != "" : Rectangle {
-                                background: ThemeG.panel-2;
-                                border-radius: ThemeG.radius-s;
-                                height: pstat.preferred-height + 16px;
-                                pstat := Text {
-                                    text: p.status;
-                                    font-size: 11px;
-                                    color: ThemeG.err;
-                                    wrap: word-wrap;
-                                    x: 10px;
-                                    width: parent.width - 20px;
-                                    y: 8px;
-                                }
-                            }
-                            HorizontalLayout {
-                                spacing: 8px;
-                                Text { text: "位置"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
-                                Text { text: p.path; font-size: 11px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
-                            }
-                            if p.kind == "package" : Text {
-                                text: "启用 = 执行上面的入口文件（.msi 会以静默方式安装）。停用不会卸载已安装的程序。";
-                                font-size: 11px;
-                                color: ThemeG.text-dim;
-                                wrap: word-wrap;
-                            }
-                        }
-                        // ================= 内置插件：一键 rclone =================
-                        // 布局注意：Card 内部 VerticalLayout 的对齐是 start，
-                        // 子元素写 vertical-stretch 拿不到剩余空间，所以每行都给显式高度。
-                        if p.id == "onerclone" : VerticalLayout {
-                            spacing: 12px;
-
-                            // ---- 状态区：提示灯 + 状态 + 启动/停止 ----
-                            Rectangle {
-                                height: 58px;
-                                background: ThemeG.panel-2;
-                                border-radius: ThemeG.radius-s;
-                                HorizontalLayout {
-                                    padding-left: 14px;
-                                    padding-right: 12px;
-                                    spacing: 10px;
-                                    // 提示灯：黄 = 未连接，绿 = 已连接（固定尺寸，避免被拉伸）
-                                    Rectangle {
-                                        width: 12px;
-                                        height: 12px;
-                                        border-radius: 6px;
-                                        background: PluginsG.oc-conn-live ? ThemeG.ok : ThemeG.warn;
-                                    }
-                                    VerticalLayout {
-                                        alignment: center;
-                                        spacing: 2px;
-                                        Text {
-                                            text: PluginsG.oc-conn-live ? "已连接 rclone" : "未连接 rclone";
-                                            font-size: 13px;
-                                            font-weight: 600;
-                                            color: PluginsG.oc-conn-live ? ThemeG.ok : ThemeG.warn;
-                                        }
-                                        Text {
-                                            text: PluginsG.oc-status;
-                                            font-size: 11px;
-                                            color: ThemeG.text-dim;
-                                            overflow: elide;
-                                        }
-                                    }
-                                    Rectangle { horizontal-stretch: 1; }
-                                    if PluginsG.oc-running : Text {
-                                        text: "PID " + PluginsG.oc-pid + (PluginsG.oc-uptime != "" ? " · " + PluginsG.oc-uptime : "");
-                                        font-size: 11px;
-                                        color: ThemeG.text-dim;
+                                Text { text: p.name; font-size: 14px; font-weight: 600; color: p.enabled ? ThemeG.text : ThemeG.text-dim; vertical-alignment: center; }
+                                Text { text: "v" + p.version; font-size: 11px; color: ThemeG.text-dim; vertical-alignment: center; }
+                                // 载体徽标：程序插件包 / WASM 脚本
+                                Rectangle {
+                                    height: 20px;
+                                    width: p.kind == "package" ? 52px : 44px;
+                                    border-radius: 10px;
+                                    background: p.kind == "package" ? ThemeG.panel-2 : ThemeG.accent-soft;
+                                    Text {
+                                        text: p.kind == "package" ? "插件包" : "WASM";
+                                        font-size: 10px;
+                                        color: p.kind == "package" ? ThemeG.text-dim : ThemeG.accent;
+                                        horizontal-alignment: center;
                                         vertical-alignment: center;
                                     }
-                                    PillBtn {
-                                        label: "停止";
-                                        compact: true;
-                                        danger: true;
-                                        disabled: !PluginsG.oc-running || PluginsG.oc-busy;
-                                        clicked => { root.oc-stop(); }
+                                }
+                                // 「内置」= 随软件安装（仍可卸载，卸载后可恢复）
+                                if p.builtin : Rectangle {
+                                    height: 20px;
+                                    width: 48px;
+                                    border-radius: 10px;
+                                    background: ThemeG.accent-soft;
+                                    Text {
+                                        text: "内置";
+                                        font-size: 10px;
+                                        color: ThemeG.accent;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
                                     }
-                                    PillBtn {
-                                        label: PluginsG.oc-running ? "重启 rclone" : "一键启用 rclone";
-                                        compact: false;
-                                        primary: true;
-                                        disabled: PluginsG.oc-busy || !PluginsG.oc-enabled;
-                                        clicked => { root.oc-start(); }
-                                    }
+                                }
+                                if !p.verified : Rectangle {
+                                    height: 20px;
+                                    width: 52px;
+                                    border-radius: 10px;
+                                    background: ThemeG.err;
+                                    Text { text: "校验失败"; font-size: 10px; color: white; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    Text { text: p.desc; font-size: 12px; color: ThemeG.text-dim; width: parent.width; overflow: elide; vertical-alignment: center; }
+                                }
+                                // 提示灯（绿=正常 / 黄=待办 / 红=异常）：由宿主按插件上报的状态写入
+                                if p.lamp != "" : Rectangle {
+                                    width: 10px;
+                                    height: 10px;
+                                    border-radius: 5px;
+                                    background: p.lamp == "ok" ? ThemeG.ok : (p.lamp == "err" ? ThemeG.err : ThemeG.warn);
+                                }
+                                Text { text: p.enabled ? "已启用" : "已停用"; font-size: 12px; color: p.enabled ? ThemeG.ok : ThemeG.text-dim; vertical-alignment: center; }
+                                MdlIcon {
+                                    glyph: PluginsG.expanded == i ? "\u{E70E}" : "\u{E70D}";
+                                    width: 20px;
+                                    font-size: 13px;
+                                }
+                                CheckBox {
+                                    checked: p.enabled;
+                                    enabled: p.verified;
+                                    toggled => { root.plugin-toggle(i); }
                                 }
                             }
-
-                            // ---- ① 程序路径 + 校验 ----
-                            VerticalLayout {
-                                spacing: 8px;
-                                Text { text: "① rclone 程序"; font-size: 12px; font-weight: 600; color: ThemeG.text-dim; }
-                                HorizontalLayout {
-                                    spacing: 8px;
-                                    height: 32px;
-                                    LineEdit {
-                                        text <=> PluginsG.oc-exe;
-                                        placeholder-text: "C:\\...\\rclone.exe";
-                                        horizontal-stretch: 1;
-                                        // 手改了路径就作废旧校验结论，避免「显示已验证但其实是另一个文件」
-                                        edited(t) => {
-                                            PluginsG.oc-verified = false;
-                                            PluginsG.oc-status = "路径已修改，尚未校验";
-                                        }
-                                    }
-                                    PillBtn {
-                                        label: "设置 rclone";
-                                        primary: true;
-                                        disabled: PluginsG.oc-checking;
-                                        clicked => { root.oc-pick-exe(); }
-                                    }
-                                    PillBtn {
-                                        label: PluginsG.oc-checking ? "校验中…" : "重新校验";
-                                        disabled: PluginsG.oc-checking || PluginsG.oc-exe == "";
-                                        clicked => { root.oc-revalidate(); }
-                                    }
-                                }
-                                if PluginsG.oc-checks.length == 0 : Text {
-                                    text: "尚未校验。点「设置 rclone」选择文件，或直接粘贴路径后点「重新校验」。";
-                                    font-size: 11px;
-                                    color: ThemeG.text-dim;
-                                    wrap: word-wrap;
-                                }
-                                for c in PluginsG.oc-checks : Rectangle {
-                                    height: 21px;
-                                    HorizontalLayout {
-                                        spacing: 8px;
-                                        Text {
-                                            text: c.ok ? "\u{E73E}" : "\u{E711}";
-                                            font-family: "Segoe MDL2 Assets";
-                                            font-size: 11px;
-                                            width: 14px;
-                                            color: c.ok ? ThemeG.ok : ThemeG.err;
-                                            vertical-alignment: center;
-                                        }
-                                        Text {
-                                            text: c.label;
-                                            font-size: 12px;
-                                            width: 74px;
-                                            color: ThemeG.text-dim;
-                                            vertical-alignment: center;
-                                        }
-                                        Text {
-                                            text: c.value;
-                                            font-size: 12px;
-                                            color: c.ok ? ThemeG.text : ThemeG.err;
-                                            overflow: elide;
-                                            horizontal-stretch: 1;
-                                            vertical-alignment: center;
-                                        }
-                                    }
-                                }
-                                Text {
-                                    text: "「一键启用 / 重启」启动的就是上面这个 rclone.exe；下面的「版本」只影响「一键安装」下载哪一个发行版。";
-                                    font-size: 11px;
-                                    color: ThemeG.text-dim;
-                                    wrap: word-wrap;
-                                }
-                            }
-
+                        }
+                        // ---- 卷帘内容（仅展开时渲染） ----
+                        if PluginsG.expanded == i : VerticalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            padding-bottom: 16px;
+                            spacing: 14px;
                             Rectangle { height: 1px; background: ThemeG.border; }
-
-                            // ---- ② 一键安装 ----
+                            // 通用信息块（所有插件都有）
                             VerticalLayout {
-                                spacing: 8px;
-                                Text { text: "② 一键安装（下载 → 解压 → 校验 → 自动填入路径）"; font-size: 12px; font-weight: 600; color: ThemeG.text-dim; }
+                                spacing: 6px;
                                 HorizontalLayout {
                                     spacing: 8px;
-                                    height: 32px;
-                                    FieldLabel { text: "版本"; width: 34px; vertical-alignment: center; }
-                                    ComboBox {
-                                        width: 200px;
-                                        model: PluginsG.oc-editions;
-                                        current-index <=> PluginsG.oc-edition-idx;
-                                        selected(t) => { root.oc-save(); }
-                                    }
-                                    FieldLabel { text: "下载源"; width: 46px; vertical-alignment: center; }
-                                    ComboBox {
-                                        width: 230px;
-                                        model: PluginsG.oc-sources;
-                                        current-index <=> PluginsG.oc-source-idx;
-                                        selected(t) => { root.oc-save(); }
+                                    Text { text: "ID"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
+                                    Text { text: p.id; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
+                                }
+                                if p.author != "" : HorizontalLayout {
+                                    spacing: 8px;
+                                    Text { text: "作者"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
+                                    Text { text: p.author; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
+                                }
+                                if p.entry != "" : HorizontalLayout {
+                                    spacing: 8px;
+                                    Text { text: "入口文件"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
+                                    Text { text: p.entry; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
+                                }
+                                if p.tags.length > 0 : HorizontalLayout {
+                                    spacing: 8px;
+                                    Text { text: "标签"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        for tg[ti] in p.tags : TagPill { label: tg; tint: ThemeG.accent; }
                                     }
                                     Rectangle {}
-                                    PillBtn {
-                                        label: PluginsG.oc-installing ? "安装中…" : "一键下载并安装";
-                                        primary: true;
-                                        disabled: PluginsG.oc-installing || !PluginsG.oc-enabled;
-                                        clicked => { root.oc-install(); }
-                                    }
                                 }
-                                // 进度条（-1 = 不确定：服务器没给 Content-Length）
-                                if PluginsG.oc-installing : Rectangle {
-                                    height: 8px;
-                                    border-radius: 4px;
-                                    background: ThemeG.panel-2;
-                                    Rectangle {
-                                        x: 0;
-                                        y: 0;
-                                        height: parent.height;
-                                        border-radius: 4px;
-                                        background: ThemeG.accent;
-                                        width: PluginsG.oc-progress < 0
-                                            ? (parent.width / 3)
-                                            : (parent.width * PluginsG.oc-progress / 100);
-                                    }
-                                }
-                                if PluginsG.oc-phase != "" : Text {
-                                    text: PluginsG.oc-phase;
-                                    font-size: 11px;
-                                    color: ThemeG.text-dim;
-                                    wrap: word-wrap;
-                                }
-                                Text {
-                                    text: PluginsG.oc-install-hint;
-                                    font-size: 11px;
-                                    color: ThemeG.text-dim;
-                                    wrap: word-wrap;
-                                }
-                            }
-
-                            Rectangle { height: 1px; background: ThemeG.border; }
-
-                            // ---- ③ 启动参数 ----
-                            VerticalLayout {
-                                spacing: 8px;
-                                Text { text: "③ 启动参数（rclone rcd --rc-addr 127.0.0.1:端口）"; font-size: 12px; font-weight: 600; color: ThemeG.text-dim; }
                                 HorizontalLayout {
                                     spacing: 8px;
-                                    height: 32px;
-                                    FieldLabel { text: "用户名"; width: 46px; vertical-alignment: center; }
-                                    LineEdit {
-                                        width: 140px;
-                                        text <=> PluginsG.oc-user;
-                                        enabled: !PluginsG.oc-no-auth;
-                                        placeholder-text: "留空则不带 --rc-user";
-                                        edited(t) => { root.oc-save(); }
+                                    Text { text: "完整性"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
+                                    Text {
+                                        text: p.verified ? "校验通过" : "校验失败";
+                                        font-size: 12px;
+                                        color: p.verified ? ThemeG.ok : ThemeG.err;
+                                        vertical-alignment: center;
                                     }
-                                    FieldLabel { text: "密码"; width: 34px; vertical-alignment: center; }
-                                    LineEdit {
-                                        width: 140px;
-                                        text <=> PluginsG.oc-pass;
-                                        enabled: !PluginsG.oc-no-auth;
-                                        input-type: InputType.password;
-                                        placeholder-text: "留空则不带 --rc-pass";
-                                        edited(t) => { root.oc-save(); }
-                                    }
-                                    FieldLabel { text: "端口"; width: 34px; vertical-alignment: center; }
-                                    LineEdit {
-                                        width: 86px;
-                                        text <=> PluginsG.oc-port;
-                                        edited(t) => { root.oc-save(); }
-                                    }
-                                    // no_auth：勾选后禁用账号密码输入，并改为 --rc-no-auth
-                                    CheckBox {
-                                        checked <=> PluginsG.oc-no-auth;
-                                        text: "no_auth";
-                                        toggled => { root.oc-save(); }
+                                }
+                                if !p.verified && p.status != "" : Rectangle {
+                                    background: ThemeG.panel-2;
+                                    border-radius: ThemeG.radius-s;
+                                    height: pstat.preferred-height + 16px;
+                                    pstat := Text {
+                                        text: p.status;
+                                        font-size: 11px;
+                                        color: ThemeG.err;
+                                        wrap: word-wrap;
+                                        x: 10px;
+                                        width: parent.width - 20px;
+                                        y: 8px;
                                     }
                                 }
                                 HorizontalLayout {
-                                    spacing: 12px;
-                                    height: 26px;
-                                    CheckBox {
-                                        checked <=> PluginsG.oc-silent;
-                                        text: "静默启动（隐藏终端）";
-                                        toggled => { root.oc-save(); }
-                                    }
-                                    Text {
-                                        text: "静默 = CREATE_NO_WINDOW，等价 PowerShell 的 -WindowStyle Hidden；取消勾选会弹出 rclone 自己的控制台窗口";
-                                        font-size: 11px;
-                                        color: ThemeG.text-dim;
-                                        vertical-alignment: center;
-                                        overflow: elide;
-                                        horizontal-stretch: 1;
-                                    }
+                                    spacing: 8px;
+                                    Text { text: "位置"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
+                                    Text { text: p.path; font-size: 11px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
+                                    Rectangle {}
+                                    PillBtn { label: "打开目录"; compact: true; clicked => { root.open-dir(); } }
                                 }
-                                if PluginsG.oc-auth-warning != "" : Text {
-                                    text: PluginsG.oc-auth-warning;
+                                if p.kind == "package" && !p.has-panel : Text {
+                                    text: "启用 = 执行上面的入口文件（.msi 会以静默方式安装）。停用不会卸载已安装的程序。";
                                     font-size: 11px;
-                                    color: ThemeG.warn;
+                                    color: ThemeG.text-dim;
                                     wrap: word-wrap;
                                 }
                             }
-
-                            Rectangle { height: 1px; background: ThemeG.border; }
-
-                            // ---- ④ 启动策略 ----
-                            VerticalLayout {
-                                spacing: 8px;
-                                Text { text: "④ 启动策略"; font-size: 12px; font-weight: 600; color: ThemeG.text-dim; }
-                                HorizontalLayout {
-                                    spacing: 20px;
-                                    height: 26px;
-                                    // 必须先有「已校验的路径」，否则不允许勾选（需求第 3 条）
-                                    CheckBox {
-                                        checked <=> PluginsG.oc-auto-start;
-                                        enabled: PluginsG.oc-verified;
-                                        text: "运行时自动启动 rclone";
-                                        toggled => { root.oc-save(); }
-                                    }
-                                    CheckBox {
-                                        checked <=> PluginsG.oc-stop-on-exit;
-                                        text: "退出时停止 rclone（只停本程序拉起的那个）";
-                                        toggled => { root.oc-save(); }
-                                    }
-                                    if !PluginsG.oc-verified : Text {
-                                        text: "「自动启动」需先设置并通过校验";
+                            // ---- 通用设置面板：完全由插件 config.json 的 plugin_setting 驱动 ----
+                            // Slint 侧不认识任何具体插件 id，只按 PanelRow.kind 渲染。
+                            if p.has-panel : VerticalLayout {
+                                spacing: 12px;
+                                if PluginsG.panel-loading : Text {
+                                    text: "正在读取插件状态…";
+                                    font-size: 11px;
+                                    color: ThemeG.text-dim;
+                                }
+                                if PluginsG.panel-error != "" : Rectangle {
+                                    background: ThemeG.panel-2;
+                                    border-radius: ThemeG.radius-s;
+                                    height: perr.preferred-height + 16px;
+                                    perr := Text {
+                                        text: PluginsG.panel-error;
                                         font-size: 11px;
-                                        color: ThemeG.warn;
-                                        vertical-alignment: center;
+                                        color: ThemeG.err;
+                                        wrap: word-wrap;
+                                        x: 10px;
+                                        width: parent.width - 20px;
+                                        y: 8px;
+                                    }
+                                }
+                                for r[ri] in PluginsG.panel-rows : VerticalLayout {
+                                    // 分组标题
+                                    if r.kind == "group" : Text {
+                                        text: r.label;
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        color: ThemeG.text-dim;
+                                    }
+                                    // 分隔线
+                                    if r.kind == "divider" : Rectangle { height: 1px; background: ThemeG.border; }
+                                    // 状态行：灯 + 标题 + 状态文本
+                                    if r.kind == "status" : Rectangle {
+                                        height: 40px;
+                                        background: ThemeG.panel-2;
+                                        border-radius: ThemeG.radius-s;
+                                        HorizontalLayout {
+                                            padding-left: 12px;
+                                            padding-right: 12px;
+                                            spacing: 10px;
+                                            cross-axis-alignment: center;
+                                            if r.lamp != "" : Rectangle {
+                                                width: 10px;
+                                                height: 10px;
+                                                border-radius: 5px;
+                                                background: r.lamp == "ok" ? ThemeG.ok : (r.lamp == "err" ? ThemeG.err : ThemeG.warn);
+                                            }
+                                            Text { text: r.label; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                                            Text { text: r.text; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                        }
+                                    }
+                                    // 提示文字
+                                    if r.kind == "hint" : Text {
+                                        text: r.text;
+                                        font-size: 11px;
+                                        color: r.warning ? ThemeG.warn : ThemeG.text-dim;
+                                        wrap: word-wrap;
+                                    }
+                                    // 进度条（-1 = 不确定进度）
+                                    if r.kind == "progress" : VerticalLayout {
+                                        spacing: 4px;
+                                        if r.label != "" : Text { text: r.label; font-size: 11px; color: ThemeG.text-dim; }
+                                        Rectangle {
+                                            height: 8px;
+                                            border-radius: 4px;
+                                            background: ThemeG.panel-2;
+                                            if r.progress >= 0 : Rectangle {
+                                                height: parent.height;
+                                                width: parent.width * min(r.progress, 100) / 100;
+                                                border-radius: 4px;
+                                                background: ThemeG.accent;
+                                            }
+                                        }
+                                    }
+                                    // 校验清单行
+                                    if r.kind == "check" : HorizontalLayout {
+                                        height: 20px;
+                                        spacing: 8px;
+                                        cross-axis-alignment: center;
+                                        MdlIcon {
+                                            glyph: r.ok ? "\u{E73E}" : "\u{E711}";
+                                            width: 16px;
+                                            font-size: 12px;
+                                            color: r.ok ? ThemeG.ok : ThemeG.err;
+                                        }
+                                        Text { text: r.label; font-size: 12px; color: ThemeG.text-dim; width: 96px; vertical-alignment: center; }
+                                        Text { text: r.value; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                    }
+                                    // 一行按钮（最多三个并排）
+                                    if r.kind == "actions" : HorizontalLayout {
+                                        height: 32px;
+                                        spacing: 8px;
+                                        Rectangle {}
+                                        for b[bi] in r.buttons : PillBtn {
+                                            label: b.label;
+                                            primary: b.style == "primary";
+                                            danger: b.style == "danger";
+                                            disabled: !b.enabled || !p.enabled;
+                                            clicked => { root.panel-action(b.action); }
+                                        }
+                                    }
+                                    // 输入行
+                                    if r.kind == "field" : VerticalLayout {
+                                        spacing: 4px;
+                                        HorizontalLayout {
+                                            height: 30px;
+                                            spacing: 8px;
+                                            cross-axis-alignment: center;
+                                            Text {
+                                                text: r.label;
+                                                font-size: 12px;
+                                                color: ThemeG.text-dim;
+                                                width: 120px;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                            }
+                                            if r.field-kind == "bool" : CheckBox {
+                                                checked: r.value == "true";
+                                                enabled: r.enabled && p.enabled;
+                                                toggled => { root.panel-field(r.key, self.checked ? "true" : "false"); }
+                                            }
+                                            if r.field-kind == "select" : ComboBox {
+                                                horizontal-stretch: 1;
+                                                model: r.options;
+                                                // 选中项由宿主算好（Slint 的数组没有 index-of，无法在前端反查）
+                                                current-index: r.selected-index;
+                                                selected(t) => { root.panel-field(r.key, t); }
+                                            }
+                                            if r.field-kind == "path" : LineEdit {
+                                                horizontal-stretch: 1;
+                                                text: r.value;
+                                                enabled: r.enabled && p.enabled;
+                                                placeholder-text: r.placeholder;
+                                                edited(t) => { root.panel-field(r.key, t); }
+                                            }
+                                            if r.field-kind == "number" : LineEdit {
+                                                width: 120px;
+                                                text: r.value;
+                                                enabled: r.enabled && p.enabled;
+                                                placeholder-text: r.placeholder;
+                                                edited(t) => { root.panel-field(r.key, t); }
+                                            }
+                                            if r.field-kind == "password" : LineEdit {
+                                                horizontal-stretch: 1;
+                                                text: r.value;
+                                                enabled: r.enabled && p.enabled;
+                                                input-type: InputType.password;
+                                                placeholder-text: r.placeholder;
+                                                edited(t) => { root.panel-field(r.key, t); }
+                                            }
+                                            if r.field-kind == "text" : LineEdit {
+                                                horizontal-stretch: 1;
+                                                text: r.value;
+                                                enabled: r.enabled && p.enabled;
+                                                placeholder-text: r.placeholder;
+                                                edited(t) => { root.panel-field(r.key, t); }
+                                            }
+                                        }
                                     }
                                 }
                             }
-                        }
+                            // ---- 卸载 ----
+                            // 「恢复内置」不放在这里：内置插件一旦被卸载，卡片就从列表
+                            // 消失了，这里的按钮也就点不到。恢复入口固定在顶部操作栏。
+                            HorizontalLayout {
+                                height: 32px;
+                                spacing: 8px;
+                                Rectangle {}
+                                PillBtn {
+                                    label: "卸载插件";
+                                    compact: true;
+                                    danger: true;
+                                    clicked => {
+                                        // 卸载会删插件目录与该插件的 kv 数据，先确认一次
+                                        root.cb-idx = i;
+                                        root.cb-name = p.name;
+                                        root.pop-ax = Math.max(0px, Math.min(self.absolute-position.x - root.absolute-position.x + self.width / 2 - 160px, root.width - 324px));
+                                        root.pop-ay = Math.max(0px, Math.min(self.absolute-position.y - root.absolute-position.y + self.height + 4px, root.viewport-h - 216px));
+                                        up.show();
+                                    }
+                                }
+                            }
 
                         if p.id == "imagehost" : VerticalLayout {
                             spacing: 14px;
@@ -3095,6 +3142,7 @@ component PluginsView inherits Rectangle {
             }
         }
     }
+    }
     // 撤销令牌确认弹窗
     tp := ConfirmPop {
         title: "撤销令牌";
@@ -3111,6 +3159,15 @@ component PluginsView inherits Rectangle {
         x: root.pop-ax;
         y: root.pop-ay;
         confirmed => { root.image-del(root.img-idx); }
+    }
+    // 卸载插件确认弹窗：卸载会删掉插件目录与该插件的 kv 数据，删了要重新添加
+    up := ConfirmPop {
+        title: "卸载插件";
+        msg: "确认卸载「" + root.cb-name + "」？插件目录与该插件的设置会一并删除。";
+        ok-label: "卸载";
+        x: root.pop-ax;
+        y: root.pop-ay;
+        confirmed => { root.plugin-uninstall(root.cb-idx); }
     }
 }
 
@@ -3737,13 +3794,15 @@ export component MainWindow inherits Window {
     callback plugin-add-from-file();
     callback plugin-add-from-dir();
     callback plugin-open-dir();
-    // 内置插件「一键 rclone」
-    callback oneclick-pick-exe();
-    callback oneclick-revalidate();
-    callback oneclick-install();
-    callback oneclick-start();
-    callback oneclick-stop();
-    callback oneclick-save();
+    // ---- 通用插件面板 ----
+    callback plugin-panel-open(int);
+    callback plugin-panel-close();
+    callback plugin-panel-field(string, string);
+    callback plugin-panel-action(string);
+    callback plugin-uninstall(int);
+    callback plugin-restore(int);
+    callback plugin-restore-by-id(string);
+    callback plugin-search(string);
     callback show-toast(int, string);
     callback win-minimize();
     callback win-toggle-maximize();
@@ -3984,12 +4043,15 @@ export component MainWindow inherits Window {
                     add-from-file => { root.plugin-add-from-file(); }
                     add-from-dir => { root.plugin-add-from-dir(); }
                     open-dir => { root.plugin-open-dir(); }
-                    oc-pick-exe => { root.oneclick-pick-exe(); }
-                    oc-revalidate => { root.oneclick-revalidate(); }
-                    oc-install => { root.oneclick-install(); }
-                    oc-start => { root.oneclick-start(); }
-                    oc-stop => { root.oneclick-stop(); }
-                    oc-save => { root.oneclick-save(); }
+                    // 通用插件面板
+                    panel-open(i) => { root.plugin-panel-open(i); }
+                    panel-close => { root.plugin-panel-close(); }
+                    panel-field(k, v) => { root.plugin-panel-field(k, v); }
+                    panel-action(a) => { root.plugin-panel-action(a); }
+                    plugin-uninstall(i) => { root.plugin-uninstall(i); }
+                    plugin-restore(i) => { root.plugin-restore(i); }
+                    plugin-restore-by-id(id) => { root.plugin-restore-by-id(id); }
+                    plugin-search(q) => { root.plugin-search(q); }
                 }
                 if NavG.idx == 7 : SettingsView {
                     save => { root.settings-save(); }

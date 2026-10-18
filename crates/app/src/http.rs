@@ -3,8 +3,8 @@
 //! - GET /i/{rootId}/{*path} → 图床直链代理（磁盘缓存 + rclone cat 回源）
 //! - GET /api/health
 
+use crate::caps::HostCaps;
 use crate::config;
-use crate::kv::RealCaps;
 use anyhow::{anyhow, Result};
 use axum::extract::{FromRequest, Multipart, Path as AxPath, Query as AxQuery, Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
@@ -25,7 +25,7 @@ const BODY_LIMIT: usize = 100 * 1024 * 1024;
 #[derive(Clone)]
 pub struct HttpState {
     pub host: Arc<PluginHost>,
-    pub caps: Arc<RealCaps>,
+    pub caps: Arc<HostCaps>,
     pub cfg: Arc<std::sync::Mutex<config::AppConfig>>,
 }
 

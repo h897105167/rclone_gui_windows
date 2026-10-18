@@ -1,11 +1,9 @@
-//! 插件宿主能力实现：KV 持久化 + rclone 桥接 + 上传桥接
+//! 插件 KV 持久化（每个插件一个命名空间，落盘到 `<data>/plugins/<id>/kv.json`）。
+//!
+//! 插件的能力实现（含 OS 原语）在 [`crate::caps`] 里；这里只管存值。
 
 use crate::config;
-use anyhow::{anyhow, Result};
-use base64::Engine as _;
-use plugin_host::CapProvider;
-use rcgui_rc::RcState;
-use rclone_client::local_fs;
+use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -66,72 +64,4 @@ impl KvStore {
         ns.remove(key);
         self.save_ns(plugin_id, &ns)
     }
-}
-
-pub struct RealCaps {
-    /// 只依赖连接状态，不依赖进程管理器：插件能力与 rclone 是否由本程序拉起无关。
-    pub rc: std::sync::Arc<RcState>,
-    pub store: std::sync::Arc<KvStore>,
-}
-
-#[async_trait::async_trait]
-impl CapProvider for RealCaps {
-    async fn rclone_call(&self, method: String, params: Value) -> Result<Value> {
-        let client = self.rc.client().await;
-        client.call(&method, &params).await.map_err(Into::into)
-    }
-
-    async fn upload_file(
-        &self,
-        fs: String,
-        remote_path: String,
-        _filename: String,
-        data_b64: String,
-    ) -> Result<Value> {
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(data_b64.as_bytes())
-            .map_err(|e| anyhow!("base64 解码失败: {e}"))?;
-        let tmp_dir = config::data_dir().join("tmp");
-        std::fs::create_dir_all(&tmp_dir)?;
-        let name = format!("up-{}-{}", std::process::id(), chrono_ts());
-        let tmp = tmp_dir.join(&name);
-        std::fs::write(&tmp, &data)?;
-        let client = self.rc.client().await;
-        let r = client
-            .copyfile(&local_fs(&tmp_dir), &name, &fs, &remote_path)
-            .await
-            .map_err(anyhow::Error::from);
-        let _ = std::fs::remove_file(&tmp);
-        r?;
-        Ok(serde_json::json!({}))
-    }
-
-    async fn kv_get_all(&self, plugin_id: &str) -> Result<Value> {
-        Ok(self.store.get_all(plugin_id))
-    }
-
-    async fn kv_set(&self, plugin_id: &str, key: String, value: Value) -> Result<()> {
-        self.store.set(plugin_id, &key, value)
-    }
-
-    async fn kv_delete(&self, plugin_id: &str, key: String) -> Result<()> {
-        self.store.delete(plugin_id, &key)
-    }
-
-    async fn log(&self, message: String) {
-        let dir = config::data_dir().join("plugins").join("imagehost");
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("log.txt"))
-            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{message}\n").as_bytes()));
-    }
-}
-
-fn chrono_ts() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}{}", now.as_millis(), now.subsec_nanos())
 }

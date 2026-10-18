@@ -127,6 +127,13 @@ pub struct AppConfig {
     /// 插件启用表
     #[serde(default)]
     pub plugin_enabled: std::collections::HashMap<String, bool>,
+    /// 用户卸载过的内置插件 id（墓碑）。
+    ///
+    /// 内置插件与用户插件在磁盘上同构，卸载后目录就没了；没有墓碑的话下次启动
+    /// 又会被 `plugins::ensure_builtin` 释放回来，用户会觉得「删不掉」。
+    /// 点「恢复内置」时从这张表里移除。
+    #[serde(default)]
+    pub plugin_removed: Vec<String>,
     /// 自动挂载列表
     ///
     /// **不再写入 config.json**：唯一落盘位置是档案文档
@@ -159,12 +166,6 @@ pub struct AppConfig {
     pub bw_down: String,
     #[serde(default = "d_unit")]
     pub bw_down_unit: i32,
-    /// 内置插件「一键 rclone」的配置（路径 / 版本 / 启动参数 / 自启策略）。
-    ///
-    /// 这是本程序唯一会「拉起 rclone 进程」的地方，完全由用户在该插件页显式开启，
-    /// 默认不自动启动、退出时也不停止（见 `crate::oneclick` 模块头注释）。
-    #[serde(default)]
-    pub oneclick: crate::oneclick::OneClickCfg,
 }
 
 impl Default for AppConfig {

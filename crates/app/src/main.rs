@@ -5,12 +5,13 @@
 //! 架构：主线程跑 Slint UI；后台 std 线程内 tokio runtime 负责
 //! rclone 生命周期 / 内嵌 HTTP / 统计轮询 / UI 命令处理；托盘独立线程。
 
+mod caps;
 mod config;
 mod conf_io;
 mod http;
 mod kv;
-mod oneclick;
 mod persist;
+mod plugins;
 mod profiles;
 mod proxy;
 mod reconcile;
@@ -112,6 +113,22 @@ enum Cmd {
     PluginAddFromDir,
     /// 打开插件目录
     PluginOpenDir,
+    /// 展开某个插件：拉取并合成它的通用设置面板
+    PluginPanelOpen { idx: i32 },
+    /// 收起当前展开的面板
+    PluginPanelClose,
+    /// 面板里某个输入字段被改动
+    PluginPanelField { key: String, value: String },
+    /// 面板里某个按钮被点击
+    PluginPanelAction { action: String },
+    /// 卸载插件（删目录 + 清启用记录；内置插件留墓碑）
+    PluginUninstall { idx: i32 },
+    /// 恢复被卸载的内置插件
+    PluginRestore { idx: i32 },
+    /// 按 id 恢复被卸载的内置插件（卸载后列表里没有那一行，只能靠 id）
+    PluginRestoreById { id: String },
+    /// 插件列表检索词变化
+    PluginSearch,
     IhSaveConfig,
     IhAddRoot,
     IhDelRoot { id: String },
@@ -120,19 +137,6 @@ enum Cmd {
     IhRevokeToken { id: String },
     IhImagesRefresh,
     IhImageDel { path: String },
-    // ---------------- 内置插件：一键 rclone ----------------
-    /// 打开文件选择器设置 rclone.exe，并立即校验
-    OneClickPickExe,
-    /// 对 UI 里当前的路径重新校验
-    OneClickRevalidate,
-    /// 一键下载 + 静默安装（解压即安装），完成后自动填入路径
-    OneClickInstall,
-    /// 一键启用 / 重启 rclone（带 RC 参数），随后自动连接
-    OneClickStart,
-    /// 停止本程序拉起的 rclone
-    OneClickStop,
-    /// 保存启动参数 / 策略（复选框与下拉框变更时触发）
-    OneClickSave,
     CopyText { text: String },
     SettingsSave,
     SettingsTest,
@@ -171,6 +175,8 @@ struct Ctx {
     mgr: Arc<RcloneManager>,
     host: Arc<plugin_host::PluginHost>,
     store: Arc<kv::KvStore>,
+    /// 插件长任务（下载 / 解压 / 安装）的进度广播，UI 每 200ms 拉一次
+    progress: Arc<caps::ProgressHub>,
     cfg: Arc<std::sync::Mutex<config::AppConfig>>,
     http_restart: Arc<tokio::sync::Notify>,
     /// (name, type, usage) 全量远程缓存，筛选时避免重复请求
@@ -221,10 +227,11 @@ struct HttpServer {
 }
 
 impl Ctx {
-    fn caps(&self) -> Arc<kv::RealCaps> {
-        Arc::new(kv::RealCaps {
+    fn caps(&self) -> Arc<caps::HostCaps> {
+        Arc::new(caps::HostCaps {
             rc: self.rc.clone(),
             store: self.store.clone(),
+            progress: self.progress.clone(),
         })
     }
 }
@@ -1703,11 +1710,15 @@ fn main() {
     let cfg_arc = Arc::new(std::sync::Mutex::new(cfg.clone()));
     // 连接状态与进程管理分开持有：`rc` 是 RC 调用入口，`mgr` 只负责进程生命周期。
     let rc = Arc::new(RcState::new());
+    // 插件长任务进度中心：宿主写入，UI 定时器读出并绘制
+    let progress = Arc::new(caps::ProgressHub::default());
+    progress.set_ui(ui.as_weak());
     let ctx = Arc::new(Ctx {
         rc: rc.clone(),
         mgr: Arc::new(RcloneManager::new(rc)),
         host,
         store,
+        progress: progress.clone(),
         cfg: cfg_arc.clone(),
         http_restart: Arc::new(tokio::sync::Notify::new()),
         remotes_cache: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -2269,9 +2280,6 @@ fn now_hms() -> String {
 }
 
 fn apply_conn_view(ui: &Weak<MainWindow>, v: ConnView) {
-    // 插件状态行只用裸地址：`endpoint` 那份展示串会带「（用户 gui，含密钥）」，
-    // 而「含密钥」在空密码时是误导（只是带了 Authorization 头）。
-    let for_oc = (v.live, v.endpoint_url.clone(), v.error.clone());
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let s = ui.global::<SettingsG>();
         s.set_conn_status(v.status.as_str().into());
@@ -2287,21 +2295,6 @@ fn apply_conn_view(ui: &Weak<MainWindow>, v: ConnView) {
         let d = ui.global::<DashboardG>();
         d.set_running(v.live);
         d.set_stale(v.stale);
-        // 内置插件「一键 rclone」的提示灯：绿=已连接 / 黄=未连接。
-        // 直接复用同一份连接状态，避免自己维护一套可能漂移的布尔量。
-        let (live, endpoint, error) = for_oc;
-        let p = ui.global::<PluginsG>();
-        p.set_oc_conn_live(live);
-        p.set_oc_status(
-            if live {
-                format!("已连接 {endpoint}")
-            } else if !error.is_empty() {
-                error
-            } else {
-                "未连接".to_string()
-            }
-            .into(),
-        );
     });
 }
 
@@ -2707,7 +2700,7 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
             version: None,
         }
     };
-    let mut ready = conn.view.live;
+    let ready = conn.view.live;
     apply_conn_view(&ui, conn.view.clone());
     if ready {
         if !conn.view.error.is_empty() {
@@ -2734,12 +2727,22 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
         );
     }
 
-    // 1.4) 内置插件「一键 rclone」：按用户设置自动拉起 rclone 并重连。
+    // 1.35) 释放内置插件：它们在 assets/plugins 里随程序发布，但装到用户数据目录后
+    //       与用户自己装的插件完全同构，因此可以卸载。卸载过的（`plugin_removed`
+    //       墓碑）不再释放，直到用户点「恢复内置」。
+    {
+        let added = plugins::ensure_builtin(&ctx);
+        if !added.is_empty() {
+            eprintln!("[plugin] 已释放内置插件: {}", added.join(", "));
+        }
+    }
+
+    // 1.4) 插件自启动：按插件声明的 `plugin_setting.on_start` 让它自己决定做什么。
     //
-    // 只有用户在插件里勾选了「运行时自动启动 rclone」且路径已设置时才走到这里；
-    // 默认配置（不勾）**完全没有**任何进程动作 —— 上面的「连不上就是离线模式」不变。
-    if !ready && oneclick_autostart(&ctx, &ui).await {
-        ready = true;
+    // 默认配置下没有任何插件会被释放到 enabled=true 之外的状态，因此这里通常什么都不做；
+    // 具体「要不要拉起 rclone」由插件在 wasm 里判断并操作宿主能力，宿主不解释语义。
+    if !ready {
+        plugins::autostart(&ctx, &ui).await;
     }
 
     // 1.5) 先刷新界面列表（远程 / 挂载 / 服务），保证“已连接的远程”先显示出来
@@ -2839,8 +2842,8 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
                     });
                 }
                 // 本地进程状态（不产生任何 RC 请求，也不受「未连接」影响）：
-                // 「一键 rclone」的 PID / 运行时长 / 是否还在跑
-                refresh_oc_runtime(&ui);
+                // 插件长任务进度（下载 / 解压 / 安装）+ 插件子进程存活灯
+                caps::pump_progress(&ctx.progress);
                 // 防重入：上一轮周期任务未完成则跳过本轮，避免 rclone 慢/挂时挂起任务无限堆积。
                 {
                     let mut wd = tick_watchdog.lock().unwrap();
@@ -3168,9 +3171,10 @@ async fn spawn_http(ctx: &Arc<Ctx>, port: u16, ui: Weak<MainWindow>) {
     // 1) 优雅关闭并等待旧实例退出（释放监听套接字）
     stop_http(ctx).await;
 
-    let caps = Arc::new(kv::RealCaps {
+    let caps = Arc::new(caps::HostCaps {
         rc: ctx.rc.clone(),
         store: ctx.store.clone(),
+        progress: ctx.progress.clone(),
     });
     let st = http::HttpState {
         host: ctx.host.clone(),
@@ -3509,11 +3513,12 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             // **不**调用 core/quit、**不**杀 rclone、**不**卸载挂载、**不**停止 serve：
             // rclone 的生命周期与运行中的挂载/服务都由用户自己掌握。
             //
-            // 唯一例外：用户在内置插件「一键 rclone」里显式勾选了「退出时停止 rclone」，
-            // 此时只结束**本程序自己拉起并持有句柄**的那个子进程（oneclick::stop）。
+            // 唯一例外：插件通过 `proc.start` 拉起的子进程，只要它没把
+            // `keep_on_exit` 置真，就在这里结束掉（见 `caps::stop_plugin_procs_on_exit`）。
+            // 是否「退出时停止」由插件自己决定并告诉宿主，宿主不需要理解插件语义。
             //
             // ---- 退出路径的健壮性（本轮踩坑）----
-            // 实测「退出时停止 rclone」开启时有 1/3 概率关窗后进程变成没有窗口的僵尸：
+            // 实测退出处理里只要有一步卡住，关窗后进程就变成没有窗口的僵尸：
             // 命令循环卡在退出处理里的某个 await 上，`quit_event_loop()` 永远等不到。
             // 根因没能定位（RwLock / http_server 锁都已排除，线程全在 Wait），因此这里
             // 不再依赖「清理一定完成」：
@@ -3524,19 +3529,7 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 std::thread::sleep(std::time::Duration::from_secs(4));
                 std::process::exit(0);
             });
-            let stop_child = ctx
-                .cfg
-                .lock()
-                .map(|c| c.oneclick.stop_on_exit)
-                .unwrap_or(false);
-            if stop_child {
-                if let Some(pid) = oneclick::running_pid() {
-                    match oneclick::stop() {
-                        Ok(_) => eprintln!("[oneclick] 退出时已停止 rclone（PID {pid}）"),
-                        Err(e) => eprintln!("[oneclick] 退出停止 rclone 失败: {e}"),
-                    }
-                }
-            }
+            caps::stop_plugin_procs_on_exit();
             let ctx2 = ctx.clone();
             let ui2 = ui.clone();
             std::thread::spawn(move || {
@@ -5576,50 +5569,57 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             })
             .await
             .flatten();
-            if let Some((id, old_enabled, kind, verified, path)) = row {
-                // 未通过完整性校验的插件包不允许启用
-                if !old_enabled && kind == "package" && !verified {
+            if let Some((id, old_enabled, _kind, verified, path)) = row {
+                // 未通过完整性校验的插件一律不允许启用
+                if !old_enabled && !verified {
                     toast(ui, 2, format!("插件 {id} 未通过完整性校验，无法启用"));
                     return false;
                 }
                 let enabled = !old_enabled;
 
-                // 插件包：启用 = 执行 entry_file（例如安装 WinFsp 的 msi）
-                if enabled && kind == "package" {
+                // 旧格式插件包：启用 = 执行 entry_file（例如安装 WinFsp 的 msi）。
+                // 新格式（config.json + main.wasm）没有「入口可执行文件」这一步，
+                // 它是 WASI 脚本，由宿主在面板/动作调用时载入。
+                if enabled {
                     let dir = PathBuf::from(&path);
-                    let meta = match read_plugin_json_lenient(&dir) {
-                        Some(m) => m,
-                        None => {
-                            toast(ui, 2, format!("插件 {id} 的 plugin.json 无法读取"));
-                            return false;
-                        }
-                    };
-                    // 再次校验，避免文件在校验之后被替换（TOCTOU）
-                    if let Err(e) =
-                        plugin_host::package::load_from_dir(&dir, &gui_version())
-                    {
-                        toast(ui, 2, format!("插件 {id} 校验失败: {e:#}"));
-                        return false;
-                    }
-                    toast(ui, 1, format!("正在执行插件 {id} 的入口文件…"));
-                    let r = tokio::task::spawn_blocking(move || {
-                        plugin_host::package::run_entry_file(&dir, &meta)
-                    })
-                    .await;
-                    match r {
-                        Ok(Ok(0)) => toast(ui, 1, format!("插件 {id} 已启用（入口文件执行成功）")),
-                        Ok(Ok(code)) => toast(
-                            ui,
-                            2,
-                            format!("插件 {id} 入口文件退出码 {code}（可能未成功，请检查）"),
-                        ),
-                        Ok(Err(e)) => {
-                            toast(ui, 2, format!("插件 {id} 启动失败: {e:#}"));
-                            return false; // 执行失败不记录为已启用
-                        }
-                        Err(e) => {
-                            toast(ui, 2, format!("插件 {id} 执行线程异常: {e}"));
-                            return false;
+                    if dir.is_dir() && dir.join("plugin.json").is_file() {
+                        match read_plugin_json_lenient(&dir) {
+                            Some(meta) => {
+                                // 再次校验，避免文件在校验之后被替换（TOCTOU）
+                                if let Err(e) =
+                                    plugin_host::package::load_from_dir(&dir, &gui_version())
+                                {
+                                    toast(ui, 2, format!("插件 {id} 校验失败: {e:#}"));
+                                    return false;
+                                }
+                                toast(ui, 1, format!("正在执行插件 {id} 的入口文件…"));
+                                let r = tokio::task::spawn_blocking(move || {
+                                    plugin_host::package::run_entry_file(&dir, &meta)
+                                })
+                                .await;
+                                match r {
+                                    Ok(Ok(0)) => {
+                                        toast(ui, 1, format!("插件 {id} 已启用（入口文件执行成功）"))
+                                    }
+                                    Ok(Ok(code)) => toast(
+                                        ui,
+                                        2,
+                                        format!("插件 {id} 入口文件退出码 {code}（可能未成功，请检查）"),
+                                    ),
+                                    Ok(Err(e)) => {
+                                        toast(ui, 2, format!("插件 {id} 启动失败: {e:#}"));
+                                        return false; // 执行失败不记录为已启用
+                                    }
+                                    Err(e) => {
+                                        toast(ui, 2, format!("插件 {id} 执行线程异常: {e}"));
+                                        return false;
+                                    }
+                                }
+                            }
+                            None => {
+                                toast(ui, 2, format!("插件 {id} 的 plugin.json 无法读取"));
+                                return false;
+                            }
                         }
                     }
                 }
@@ -5629,17 +5629,12 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                     cfg.plugin_enabled.insert(id.clone(), enabled);
                     let _ = config::save(&cfg);
                 }
-                // 内置插件（一键 rclone）：启用状态也决定面板按钮是否可用
-                let builtin = kind == "builtin";
                 let _ = ui.upgrade_in_event_loop(move |ui| {
                     let g = ui.global::<PluginsG>();
                     let model = g.get_rows();
                     if let Some(mut row) = model.row_data(idx as usize) {
                         row.enabled = enabled;
                         model.set_row_data(idx as usize, row);
-                    }
-                    if builtin {
-                        g.set_oc_enabled(enabled);
                     }
                     toast_ui(
                         &ui,
@@ -5803,29 +5798,186 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             }
             false
         }
-        // ---------------- 内置插件：一键 rclone ----------------
-        Cmd::OneClickPickExe => {
-            oneclick_pick_exe(ctx, ui).await;
+        // ---------------- 插件通用面板 / 卸载 ----------------
+        Cmd::PluginPanelOpen { idx } => {
+            let row = read_ui(ui, move |ui| {
+                ui.global::<PluginsG>()
+                    .get_rows()
+                    .row_data(idx as usize)
+                    .map(|r| (r.id.to_string(), r.has_panel, r.verified))
+            })
+            .await
+            .flatten();
+            if let Some((id, has_panel, verified)) = row {
+                if !verified {
+                    toast(ui, 2, "插件未通过完整性校验，设置面板不可用");
+                    return false;
+                }
+                let panel_id = id.clone();
+                let _ = ui.upgrade_in_event_loop(move |ui| {
+                    let g = ui.global::<PluginsG>();
+                    g.set_panel_plugin(panel_id.as_str().into());
+                    g.set_panel_loading(has_panel);
+                    g.set_panel_error("".into());
+                    g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(Vec::<
+                        crate::PanelRow,
+                    >::new()))));
+                });
+                if has_panel {
+                    match plugins::build_panel(ctx, &id).await {
+                        Ok(rows) => {
+                            let _ = ui.upgrade_in_event_loop(move |ui| {
+                                let g = ui.global::<PluginsG>();
+                                let list = plugins::panel_to_slint(&rows);
+                                g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(list))));
+                                g.set_panel_loading(false);
+                            });
+                        }
+                        Err(e) => {
+                            let msg = format!("{e:#}");
+                            let _ = ui.upgrade_in_event_loop(move |ui| {
+                                let g = ui.global::<PluginsG>();
+                                g.set_panel_loading(false);
+                                g.set_panel_error(msg.as_str().into());
+                            });
+                        }
+                    }
+                }
+            }
             false
         }
-        Cmd::OneClickRevalidate => {
-            oneclick_revalidate(ctx, ui).await;
+        Cmd::PluginPanelClose => {
+            let _ = ui.upgrade_in_event_loop(|ui| {
+                let g = ui.global::<PluginsG>();
+                g.set_panel_plugin("".into());
+                g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(Vec::<
+                    crate::PanelRow,
+                >::new()))));
+                g.set_panel_error("".into());
+            });
             false
         }
-        Cmd::OneClickInstall => {
-            oneclick_install(ctx, ui).await;
+        Cmd::PluginPanelField { key, value } => {
+            let id = read_ui(ui, |ui| {
+                ui.global::<PluginsG>().get_panel_plugin().to_string()
+            })
+            .await
+            .unwrap_or_default();
+            if !id.is_empty() && !key.is_empty() {
+                // 立刻落盘：用户在输入框里的每个字符都要保住
+                plugins::set_form_field(&ctx.store, &id, &key, &value);
+            }
             false
         }
-        Cmd::OneClickStart => {
-            oneclick_start(ctx, ui).await;
+        Cmd::PluginPanelAction { action } => {
+            let id = read_ui(ui, |ui| {
+                ui.global::<PluginsG>().get_panel_plugin().to_string()
+            })
+            .await
+            .unwrap_or_default();
+            if id.is_empty() || action.is_empty() {
+                return false;
+            }
+            match plugins::run_action(ctx, &id, &action, ui).await {
+                Ok(()) => {
+                    // 动作可能改变了状态与表单，重新拉一次面板
+                    if let Ok(rows) = plugins::build_panel(ctx, &id).await {
+                        let _ = ui.upgrade_in_event_loop(move |ui| {
+                            let g = ui.global::<PluginsG>();
+                            let list = plugins::panel_to_slint(&rows);
+                            g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(list))));
+                            g.set_panel_loading(false);
+                        });
+                    }
+                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::PluginsRescan)).await;
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    let msg2 = msg.clone();
+                    let _ = ui.upgrade_in_event_loop(move |ui| {
+                        let g = ui.global::<PluginsG>();
+                        g.set_panel_loading(false);
+                        g.set_panel_error(msg2.as_str().into());
+                    });
+                    toast(ui, 2, format!("插件动作失败: {msg}"));
+                }
+            }
             false
         }
-        Cmd::OneClickStop => {
-            oneclick_stop(ctx, ui).await;
+        Cmd::PluginUninstall { idx } => {
+            let row = read_ui(ui, move |ui| {
+                ui.global::<PluginsG>()
+                    .get_rows()
+                    .row_data(idx as usize)
+                    .map(|r| (r.id.to_string(), r.name.to_string(), r.builtin))
+            })
+            .await
+            .flatten();
+            if let Some((id, name, builtin)) = row {
+                // 先让插件自己收尾（停进程等），再删目录
+                plugins::shutdown_plugin(ctx, &id).await;
+                match plugins::uninstall(ctx, &id) {
+                    Ok(removed) => {
+                        let msg = if builtin {
+                            format!(
+                                "已卸载「{name}」；如需再次使用，可在插件页点「恢复内置」"
+                            )
+                        } else {
+                            format!("已卸载「{name}」")
+                        };
+                        let _ = removed;
+                        toast(ui, 1, msg);
+                        let _ = ui.upgrade_in_event_loop(|ui| {
+                            let g = ui.global::<PluginsG>();
+                            g.set_panel_plugin("".into());
+                            g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(
+                                Vec::<crate::PanelRow>::new(),
+                            ))));
+                        });
+                        let _ = Box::pin(handle_cmd(ctx, ui, Cmd::PluginsRescan)).await;
+                    }
+                    Err(e) => toast(ui, 2, format!("卸载失败: {e:#}")),
+                }
+            }
             false
         }
-        Cmd::OneClickSave => {
-            oneclick_save(ctx, ui).await;
+        Cmd::PluginRestore { idx } => {
+            let row = read_ui(ui, move |ui| {
+                ui.global::<PluginsG>()
+                    .get_rows()
+                    .row_data(idx as usize)
+                    .map(|r| (r.id.to_string(), r.name.to_string()))
+            })
+            .await
+            .flatten();
+            if let Some((id, name)) = row {
+                match plugins::restore_builtin(ctx, &id) {
+                    Ok(()) => {
+                        toast(ui, 1, format!("已恢复内置插件「{name}」"));
+                        let _ = Box::pin(handle_cmd(ctx, ui, Cmd::PluginsRescan)).await;
+                    }
+                    Err(e) => toast(ui, 2, format!("恢复失败: {e:#}")),
+                }
+            }
+            false
+        }
+        Cmd::PluginRestoreById { id } => {
+            let name = plugins::removed_builtins(ctx)
+                .into_iter()
+                .find(|(bid, _, _)| bid == &id)
+                .map(|(_, name, _)| name)
+                .unwrap_or_else(|| id.clone());
+            match plugins::restore_builtin(ctx, &id) {
+                Ok(()) => {
+                    toast(ui, 1, format!("已恢复内置插件「{name}」"));
+                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::PluginsRescan)).await;
+                }
+                Err(e) => toast(ui, 2, format!("恢复失败: {e:#}")),
+            }
+            false
+        }
+        Cmd::PluginSearch => {
+            let _ = Box::pin(handle_cmd(ctx, ui, Cmd::PluginsRescan)).await;
             false
         }
         Cmd::CopyText { text } => {
@@ -6116,125 +6268,38 @@ fn gui_version() -> String {
 }
 
 async fn rescan_plugins(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
-    let mut rows: Vec<PluginRow> = Vec::new();
-    // 0) 内置插件：一键 rclone。随程序发布、没有独立文件，因此恒在列表首位。
-    //    「启用」只控制本插件面板的可用性；真正的启动动作仍然要用户点按钮/勾自启。
-    {
-        let enabled = ctx
-            .cfg
-            .lock()
-            .map(|c| c.plugin_enabled.get("onerclone").copied().unwrap_or(true))
-            .unwrap_or(true);
-        rows.push(PluginRow {
-            id: "onerclone".into(),
-            name: "一键 rclone".into(),
-            version: gui_version().into(),
-            desc: "检测 / 安装 / 启动本机 rclone（rcd），并自动连接".into(),
-            loaded: true,
-            enabled,
-            kind: "builtin".into(),
-            author: "内置".into(),
-            entry: "".into(),
-            verified: true,
-            has_config: true,
-            status: "".into(),
-            path: "内置（随程序发布，无需安装）".into(),
-        });
-    }
-    let mut dirs = vec![plugins_dir()];
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(d) = exe.parent() {
-            dirs.push(d.join("assets/plugins"));
-        }
-    }
-    let enabled_map = ctx.cfg.lock().unwrap().plugin_enabled.clone();
-
-    // 1) WASM 插件（单文件 .wasm）
-    for dir in &dirs {
-        let Ok(rd) = std::fs::read_dir(dir) else { continue };
-        for entry in rd.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("wasm") {
-                if let Ok(m) = ctx.host.load_manifest(&p).await {
-                    let enabled = enabled_map.get(&m.id).copied().unwrap_or(true);
-                    let has_config = m.id == "imagehost";
-                    rows.push(PluginRow {
-                        id: m.id.clone().into(),
-                        name: m.name.clone().into(),
-                        version: m.version.into(),
-                        desc: m.description.into(),
-                        loaded: true,
-                        enabled,
-                        kind: "wasm".into(),
-                        author: "".into(),
-                        entry: "".into(),
-                        verified: true,
-                        has_config,
-                        status: "".into(),
-                        path: p.display().to_string().into(),
-                    });
-                }
-            }
-        }
-    }
-
-    // 2) 插件包（目录形态，含 plugin.json）
-    //    完整性校验失败或版本不兼容的包也会列出，但标记为不可用、不可启用，
-    //    这样用户能看到"为什么我的插件没生效"。
-    let gv = gui_version();
-    let root = plugins_dir();
-    if let Ok(rd) = std::fs::read_dir(&root) {
-        for entry in rd.flatten() {
-            let dir = entry.path();
-            if !dir.is_dir() || !dir.join("plugin.json").is_file() {
-                continue;
-            }
-            let (meta, verified, status) = match plugin_host::package::load_from_dir(&dir, &gv) {
-                Ok((m, _)) => (m, true, String::new()),
-                Err(e) => {
-                    // 校验失败：尽量读出元数据用于展示
-                    match read_plugin_json_lenient(&dir) {
-                        Some(m) => (m, false, format!("{e:#}")),
-                        None => continue, // 连 plugin.json 都读不出，跳过
-                    }
-                }
-            };
-            let enabled = enabled_map.get(&meta.id).copied().unwrap_or(false);
-            rows.push(PluginRow {
-                id: meta.id.clone().into(),
-                name: meta.name.clone().into(),
-                version: meta.version.clone().into(),
-                desc: meta.description.clone().into(),
-                loaded: verified,
-                // 未通过校验的包强制视为未启用
-                enabled: enabled && verified,
-                kind: "package".into(),
-                author: meta.author.clone().into(),
-                entry: meta.entry_file.clone().into(),
-                verified,
-                has_config: false,
-                status: status.into(),
-                path: dir.display().to_string().into(),
-            });
-        }
-    }
-
-    let imagehost = rows.iter().any(|r| r.id == "imagehost");
-    let dir_text = plugins_dir().display().to_string();
-    let _ = ui.upgrade_in_event_loop(
-        move |ui| {
-            let g = ui.global::<PluginsG>();
-            g.set_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
-            g.set_loaded(imagehost);
-            g.set_dir(dir_text.into());
-        },
-    );
+    let all = plugins::scan_rows(ctx).await;
+    let needle = read_ui(ui, |ui| ui.global::<PluginsG>().get_search().to_string())
+        .await
+        .unwrap_or_default();
+    let rows = plugins::filter_rows(&all, &needle);
+    let imagehost = all.iter().any(|r| r.id == "imagehost" && r.enabled);
+    let dir_text = plugins::plugins_dir().display().to_string();
+    // 已卸载但仍可恢复的内置插件：列表里已经没有它们的卡片，
+    // 只能靠顶部这一条入口把「恢复内置」按钮留住。
+    let removed = plugins::removed_builtins(ctx);
+    // `PluginRow` 含 `ModelRc`（Rc），不是 Send：只把纯数据的 `Row` 移进闭包，
+    // 在 UI 线程内部再转成 Slint 结构体。
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let g = ui.global::<PluginsG>();
+        let list = plugins::rows_to_slint(&rows);
+        g.set_rows(ModelRc::from(Rc::new(VecModel::from(list))));
+        g.set_loaded(imagehost);
+        g.set_dir(dir_text.into());
+        let rb = removed
+            .iter()
+            .map(|(id, name, version)| crate::RemovedRow {
+                id: id.as_str().into(),
+                name: name.as_str().into(),
+                version: version.as_str().into(),
+            })
+            .collect::<Vec<_>>();
+        g.set_removed_builtins(ModelRc::from(Rc::new(VecModel::from(rb))));
+    });
     if imagehost {
         load_ih_config(ctx, ui).await;
         let _ = Box::pin(handle_cmd(ctx, ui, Cmd::IhImagesRefresh)).await;
     }
-    // 一键 rclone 的配置面板始终加载（插件可能被停用，但面板要能显示并再次启用）
-    load_oc_config(ctx, ui).await;
 }
 
 /// 宽松读取 plugin.json（即使 manifest 校验失败，也能展示插件名/版本）
@@ -6281,7 +6346,16 @@ async fn plugin_add_from_file(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let tmp = plugins_tmp_dir();
     let gv = gui_version();
     let res = tokio::task::spawn_blocking(move || {
-        plugin_host::package::install_from_zip(&data, &root, &tmp, &gv)
+        // 先按新格式（config.json / check.sha256 / main.wasm）装；
+        // 只有它明确判定「这不是新格式包」时才回落到旧格式（plugin.json / manifest.sha256）。
+        match plugin_host::bundle::install_zip(&data, &root, &tmp, &gv) {
+            Ok(outcome) => Ok(outcome),
+            Err(new_err) => match plugin_host::package::install_from_zip(&data, &root, &tmp, &gv) {
+                Ok(outcome) => Ok(outcome),
+                // 两种格式都不认：报新格式的错误（用户手上的多半是新格式包）
+                Err(_) => Err(new_err),
+            },
+        }
     })
     .await;
 
@@ -6306,7 +6380,14 @@ async fn plugin_add_from_dir(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let root = plugins_dir();
     let gv = gui_version();
     let res = tokio::task::spawn_blocking(move || {
-        plugin_host::package::install_verified_dir(&dir, &root, &gv)
+        // 同 plugin_add_from_file：新格式优先，旧格式回落
+        match plugin_host::bundle::install_dir(&dir, &root, &gv, false) {
+            Ok(outcome) => Ok(outcome),
+            Err(new_err) => match plugin_host::package::install_verified_dir(&dir, &root, &gv) {
+                Ok(outcome) => Ok(outcome),
+                Err(_) => Err(new_err),
+            },
+        }
     })
     .await;
 
@@ -6516,555 +6597,6 @@ async fn invoke_plugin(
     ctx.host
         .invoke(&find_wasm(id), "request", params, Some(ctx.caps()), id)
         .await
-}
-
-// ---------------- 内置插件：一键 rclone（UI 侧接线） ----------------
-//
-// 业务逻辑都在 `oneclick` 模块里；这里是「读 UI → 调模块 → 写 UI / 落盘 / 握手」。
-// 唯一的例外是进程是否存活这类运行时状态，由 1s 周期任务刷新。
-
-/// 本程序拉起的 rclone 已运行多久（`3m12s` 这种短格式）。
-fn fmt_uptime(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m{}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
-    }
-}
-
-/// 安装位置说明（权限不同目录不同，必须让用户看到真实路径）。
-fn oc_install_hint(cfg: &oneclick::OneClickCfg, elevated: bool) -> String {
-    let root = oneclick::install_root(elevated);
-    let perm = if elevated { "管理员" } else { "普通权限" };
-    let mut s = format!("安装位置：{}（当前权限：{perm}）", root.display());
-    if cfg.install_dir.trim().is_empty() {
-        s.push_str("。系统级安装需要管理员权限；普通权限下会装到用户目录，功能一致。");
-    } else {
-        s.push_str(&format!("。上次安装到：{}", cfg.install_dir));
-    }
-    s
-}
-
-/// 鉴权缺口提示。
-fn oc_auth_warning(cfg: &oneclick::OneClickCfg) -> String {
-    if cfg.authless() {
-        "未填用户名、密码为空、又没勾 no_auth：rclone 会拒绝 config/* 接口（原文 authentication must be set up）。填个用户名，或勾上 no_auth。".into()
-    } else {
-        String::new()
-    }
-}
-
-/// 读 UI 上的「一键 rclone」字段，合成配置（`install_dir` 由调用方补）。
-async fn oc_read_ui(ui: &Weak<MainWindow>) -> Option<oneclick::OneClickCfg> {
-    read_ui(ui, |ui| {
-        let g = ui.global::<PluginsG>();
-        let port: u16 = g.get_oc_port().trim().parse().unwrap_or(0);
-        oneclick::OneClickCfg {
-            exe: g.get_oc_exe().trim().to_string(),
-            exe_version: g.get_oc_exe_version().to_string(),
-            edition: g.get_oc_edition_idx().clamp(0, 1) as u8,
-            source: g.get_oc_source_idx().clamp(0, 1) as u8,
-            rc_user: g.get_oc_user().to_string(),
-            rc_pass: g.get_oc_pass().to_string(),
-            port,
-            no_auth: g.get_oc_no_auth(),
-            silent: g.get_oc_silent(),
-            auto_start: g.get_oc_auto_start(),
-            stop_on_exit: g.get_oc_stop_on_exit(),
-            install_dir: String::new(),
-        }
-    })
-    .await
-}
-
-/// 把内存里的 oneclick 配置合并进 AppConfig 并落盘。
-fn oc_persist(ctx: &Arc<Ctx>, oc: oneclick::OneClickCfg) {
-    let mut cfg = ctx.cfg.lock().unwrap().clone();
-    cfg.oneclick = oc;
-    *ctx.cfg.lock().unwrap() = cfg.clone();
-    if let Err(e) = config::save(&cfg) {
-        eprintln!("[oneclick] 保存配置失败: {e}");
-    }
-}
-
-/// 把配置投影到 UI。
-async fn load_oc_config(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
-    let (cfg, enabled) = {
-        let c = ctx.cfg.lock().unwrap();
-        (
-            c.oneclick.clone(),
-            c.plugin_enabled.get("onerclone").copied().unwrap_or(true),
-        )
-    };
-    let elevated = is_elevated();
-    let running = oneclick::running_pid();
-    let uptime = oneclick::uptime_secs();
-    let hint = oc_install_hint(&cfg, elevated);
-    let warn = oc_auth_warning(&cfg);
-    let exe = cfg.exe.clone();
-    let exe_for_check = cfg.exe.clone();
-    let has_exe = cfg.has_exe();
-    let _ = ui.upgrade_in_event_loop(move |ui| {
-        let g = ui.global::<PluginsG>();
-        g.set_oc_enabled(enabled);
-        g.set_oc_exe(exe.as_str().into());
-        g.set_oc_exe_version(cfg.exe_version.as_str().into());
-        g.set_oc_edition_idx(cfg.edition.min(1) as i32);
-        g.set_oc_source_idx(cfg.source.min(1) as i32);
-        g.set_oc_user(cfg.rc_user.as_str().into());
-        g.set_oc_pass(cfg.rc_pass.as_str().into());
-        g.set_oc_port(cfg.port.to_string().into());
-        g.set_oc_no_auth(cfg.no_auth);
-        g.set_oc_silent(cfg.silent);
-        g.set_oc_auto_start(cfg.auto_start);
-        g.set_oc_stop_on_exit(cfg.stop_on_exit);
-        g.set_oc_install_hint(hint.as_str().into());
-        g.set_oc_auth_warning(warn.as_str().into());
-        g.set_oc_running(running.is_some());
-        g.set_oc_pid(running.unwrap_or(0) as i32);
-        g.set_oc_uptime(uptime.map(fmt_uptime).unwrap_or_default().into());
-        if !g.get_oc_conn_live() {
-            g.set_oc_status(
-                if running.is_some() {
-                    "已启动，正在连接…"
-                } else {
-                    "未启动"
-                }
-                .into(),
-            );
-        }
-    });
-    // 有路径就在后台跑一次真校验，保证「已验证 / 校验清单」永远反映磁盘上的那个文件
-    if has_exe {
-        oc_validate(ctx, ui, exe_for_check, false, false).await;
-    }
-}
-
-/// 校验一个候选路径并把结果写回 UI（可选落盘）。
-async fn oc_validate(
-    ctx: &Arc<Ctx>,
-    ui: &Weak<MainWindow>,
-    path: String,
-    persist: bool,
-    toast_bad: bool,
-) {
-    let _ = ui.upgrade_in_event_loop(|ui| ui.global::<PluginsG>().set_oc_checking(true));
-    let p = path.clone();
-    let res = tokio::task::spawn_blocking(move || oneclick::validate(&p)).await;
-    let (rows, ok, version, detail) = match res {
-        Ok(check) => {
-            let rows: Vec<OcCheck> = check
-                .rows
-                .iter()
-                .map(|r| OcCheck {
-                    label: r.label.as_str().into(),
-                    value: r.value.as_str().into(),
-                    ok: r.ok,
-                })
-                .collect();
-            (rows, check.ok, check.version, check.detail)
-        }
-        Err(e) => {
-            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<PluginsG>().set_oc_checking(false));
-            toast(ui, 2, format!("校验线程异常: {e}"));
-            return;
-        }
-    };
-    let rows2 = rows.clone();
-    let version2 = version.clone();
-    let detail2 = detail.clone();
-    let _ = ui.upgrade_in_event_loop(move |ui| {
-        let g = ui.global::<PluginsG>();
-        g.set_oc_checking(false);
-        g.set_oc_checks(ModelRc::from(Rc::new(VecModel::from(rows2))));
-        g.set_oc_verified(ok);
-        if ok {
-            g.set_oc_exe_version(version2.as_str().into());
-            g.set_oc_status(format!("已识别 rclone {version2}").into());
-        } else {
-            g.set_oc_exe_version("".into());
-            g.set_oc_status(detail2.as_str().into());
-            // 校验失败时不能保留「自动启动」，否则每次开机都会失败一次
-            if g.get_oc_auto_start() {
-                g.set_oc_auto_start(false);
-            }
-        }
-    });
-    if toast_bad && !ok {
-        toast(ui, 2, format!("校验未通过：{detail}"));
-    }
-    if persist {
-        let mut oc = ctx.cfg.lock().unwrap().oneclick.clone();
-        oc.exe = path;
-        oc.exe_version = if ok { version } else { String::new() };
-        if !ok {
-            // 校验失败就不能留着「自动启动」，否则每次开机都会失败一次
-            oc.auto_start = false;
-        }
-        oc_persist(ctx, oc);
-    }
-}
-
-/// 设置 rclone 路径：文件选择器 → 立即校验。
-async fn oneclick_pick_exe(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
-    let cur = ctx.cfg.lock().unwrap().oneclick.exe.clone();
-    let mut dlg = rfd::FileDialog::new()
-        .set_title("选择 rclone.exe")
-        .add_filter("rclone 可执行文件", &["exe"])
-        .add_filter("所有文件", &["*"]);
-    if let Some(dir) = Path::new(&cur).parent() {
-        if dir.is_dir() {
-            dlg = dlg.set_directory(dir);
-        }
-    }
-    let Some(path) = dlg.pick_file() else {
-        return;
-    };
-    let text = path.display().to_string();
-    // 先把路径填进 UI（即使校验失败也要让用户看到「我选的是哪个文件」）
-    {
-        let t = text.clone();
-        let _ = ui.upgrade_in_event_loop(move |ui| ui.global::<PluginsG>().set_oc_exe(t.into()));
-    }
-    oc_validate(ctx, ui, text, true, true).await;
-}
-
-/// 「重新校验」：对 UI 里当前的路径做一次完整校验。
-async fn oneclick_revalidate(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
-    let Some(oc) = oc_read_ui(ui).await else { return };
-    if oc.exe.trim().is_empty() {
-        toast(ui, 2, "还没有选择 rclone.exe");
-        return;
-    }
-    oc_validate(ctx, ui, oc.exe, true, true).await;
-}
-
-/// 把安装阶段映射到 UI（进度 / 文案）。
-fn apply_oc_stage(ui: &MainWindow, st: oneclick::Stage) {
-    let g = ui.global::<PluginsG>();
-    match st {
-        oneclick::Stage::Resolve(t) | oneclick::Stage::Source(t) => {
-            g.set_oc_phase(t.as_str().into());
-        }
-        oneclick::Stage::Download { done, total } => {
-            let pct = match total {
-                Some(t) if t > 0 => ((done as f64 / t as f64) * 100.0).round() as i32,
-                _ => -1,
-            };
-            g.set_oc_progress(pct.clamp(-1, 100));
-            let total_txt = total
-                .map(|t| fmt_bytes(t as f64))
-                .unwrap_or_else(|| "?".into());
-            g.set_oc_phase(format!("正在下载 {} / {}", fmt_bytes(done as f64), total_txt).into());
-        }
-        oneclick::Stage::Extract(t)
-        | oneclick::Stage::Verify(t)
-        | oneclick::Stage::Install(t) => {
-            g.set_oc_phase(t.as_str().into());
-        }
-    }
-}
-
-/// 一键下载 + 安装。（「静默安装」= 解压到固定目录，不弹任何安装向导）
-async fn oneclick_install(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
-    if !plugin_enabled(ctx, "onerclone") {
-        toast(ui, 2, "「一键 rclone」插件已停用，请先在插件行右侧启用");
-        return;
-    }
-    let Some(mut oc) = oc_read_ui(ui).await else { return };
-    oc.install_dir = ctx.cfg.lock().unwrap().oneclick.install_dir.clone();
-    let elevated = is_elevated();
-    let _ = ui.upgrade_in_event_loop(|ui| {
-        let g = ui.global::<PluginsG>();
-        g.set_oc_installing(true);
-        g.set_oc_progress(0);
-        g.set_oc_phase("准备中…".into());
-    });
-    let ui2 = ui.clone();
-    let progress: oneclick::Progress = Arc::new(move |st| {
-        let _ = ui2.upgrade_in_event_loop(move |ui| apply_oc_stage(&ui, st));
-    });
-    let res = oneclick::install(oc.edition, oc.source, elevated, progress).await;
-    match res {
-        Ok(out) => {
-            let mut cfg = ctx.cfg.lock().unwrap().clone();
-            cfg.oneclick.exe = out.exe.clone();
-            cfg.oneclick.exe_version = out.version.clone();
-            cfg.oneclick.install_dir = out.dir.clone();
-            *ctx.cfg.lock().unwrap() = cfg.clone();
-            if let Err(e) = config::save(&cfg) {
-                toast(ui, 2, format!("安装成功但保存配置失败: {e}"));
-            }
-            let (exe, version, notes) = (out.exe.clone(), out.version.clone(), out.notes.clone());
-            let _ = ui.upgrade_in_event_loop(move |ui| {
-                let g = ui.global::<PluginsG>();
-                g.set_oc_installing(false);
-                g.set_oc_progress(100);
-                g.set_oc_exe(exe.as_str().into());
-                g.set_oc_exe_version(version.as_str().into());
-                let mut phase = format!("安装完成：rclone {version}");
-                if !notes.is_empty() {
-                    phase.push_str("（");
-                    phase.push_str(&notes.join("；"));
-                    phase.push('）');
-                }
-                g.set_oc_phase(phase.into());
-            });
-            // 安装后立即再校验一次：既要填清单，也要拿到最终结论
-            oc_validate(ctx, ui, out.exe, true, false).await;
-            toast(
-                ui,
-                1,
-                format!("rclone {} 已安装到 {}", out.version, out.dir),
-            );
-        }
-        Err(e) => {
-            let msg = format!("安装失败：{e}");
-            let _ = ui.upgrade_in_event_loop(move |ui| {
-                let g = ui.global::<PluginsG>();
-                g.set_oc_installing(false);
-                g.set_oc_progress(0);
-                g.set_oc_phase(msg.as_str().into());
-            });
-            toast(ui, 2, format!("一键安装失败：{e:#}"));
-        }
-    }
-}
-
-/// 启动 / 重启 rclone，并在端口就绪后自动握手。
-async fn oneclick_start(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
-    if !plugin_enabled(ctx, "onerclone") {
-        toast(ui, 2, "「一键 rclone」插件已停用，请先在插件行右侧启用");
-        return;
-    }
-    let Some(mut oc) = oc_read_ui(ui).await else { return };
-    oc.install_dir = ctx.cfg.lock().unwrap().oneclick.install_dir.clone();
-    // 先落盘：参数以「点按钮这一刻的界面」为准，重启后仍然可用
-    oc_persist(ctx, oc.clone());
-    let _ = ui.upgrade_in_event_loop(|ui| ui.global::<PluginsG>().set_oc_busy(true));
-    let r = oc_start_inner(ctx, ui, &oc).await;
-    let _ = ui.upgrade_in_event_loop(|ui| ui.global::<PluginsG>().set_oc_busy(false));
-    if let Err(e) = r {
-        toast(ui, 2, format!("启动 rclone 失败：{e}"));
-    }
-}
-
-/// 启动的核心流程（也被「运行时自动启动」复用）。
-async fn oc_start_inner(
-    ctx: &Arc<Ctx>,
-    ui: &Weak<MainWindow>,
-    oc: &oneclick::OneClickCfg,
-) -> Result<(), String> {
-    // 1) 已由本程序拉起：重启就先停，否则直接重连
-    if oneclick::running_pid().is_some() {
-        oneclick::stop().map_err(|e| format!("停止旧进程失败：{e}"))?;
-        for _ in 0..30 {
-            if !oneclick::port_open(oc.port).await {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    } else if oneclick::port_open(oc.port).await {
-        // 端口上已经有别人（很可能是用户自己启动的 rclone）：不抢、不杀。
-        // 能连上就直连；连不上才报错让用户改端口。
-        let out = connect_report(ctx).await;
-        apply_conn_view(ui, out.view.clone());
-        if out.view.live {
-            toast(
-                ui,
-                1,
-                format!(
-                    "端口 {} 上已有 rclone 在监听，已直接连接（不是本程序启动的）",
-                    oc.port
-                ),
-            );
-            return Ok(());
-        }
-        return Err(format!(
-            "端口 {} 已被占用且握手失败（{}）。请改端口，或先停止占用它的程序。",
-            oc.port, out.view.error
-        ));
-    }
-
-    // 2) 启动前再校验一次：防止路径在校验之后被替换（TOCTOU）
-    let exe = oc.exe.clone();
-    let check = tokio::task::spawn_blocking(move || oneclick::validate(&exe))
-        .await
-        .map_err(|e| format!("校验线程异常：{e}"))?;
-    if !check.ok {
-        return Err(format!("rclone 校验未通过：{}", check.detail));
-    }
-
-    // 3) 组装参数并启动
-    let plan = oneclick::launch_plan(oc).map_err(|e| format!("{e}"))?;
-    let pid = tokio::task::spawn_blocking(move || oneclick::start(&plan))
-        .await
-        .map_err(|e| format!("启动线程异常：{e}"))?
-        .map_err(|e| format!("{e:#}"))?;
-    let _ = ui.upgrade_in_event_loop(move |ui| {
-        let g = ui.global::<PluginsG>();
-        g.set_oc_running(true);
-        g.set_oc_pid(pid as i32);
-        g.set_oc_status(format!("已启动（PID {pid}），正在等待 RC 就绪…").into());
-    });
-
-    // 4) 等端口就绪；超时就把我们自己拉起的进程收掉，不留孤儿
-    if !oneclick::wait_port(oc.port, std::time::Duration::from_secs(15)).await {
-        let _ = oneclick::stop();
-        return Err(format!(
-            "rclone 已启动（PID {pid}）但端口 {} 在 15 秒内没有就绪，已停止。可取消「静默启动」看控制台日志。",
-            oc.port
-        ));
-    }
-
-    // 5) 把「连接设置」对齐到刚启动的实例，否则握手用的还是旧地址/旧凭据
-    let mut cfg = ctx.cfg.lock().unwrap().clone();
-    cfg.rclone.url = format!("http://127.0.0.1:{}", oc.port);
-    cfg.rclone.user = if oc.no_auth {
-        String::new()
-    } else {
-        oc.rc_user.trim().to_string()
-    };
-    cfg.rclone.pass = if oc.no_auth {
-        String::new()
-    } else {
-        oc.rc_pass.clone()
-    };
-    *ctx.cfg.lock().unwrap() = cfg.clone();
-    if let Err(e) = config::save(&cfg) {
-        eprintln!("[oneclick] 保存连接设置失败: {e}");
-    }
-    let (url, user, pass) = (
-        cfg.rclone.url.clone(),
-        cfg.rclone.user.clone(),
-        cfg.rclone.pass.clone(),
-    );
-    let _ = ui.upgrade_in_event_loop(move |ui| {
-        let s = ui.global::<SettingsG>();
-        s.set_rc_url(url.as_str().into());
-        s.set_rc_user(user.as_str().into());
-        s.set_rc_pass(pass.as_str().into());
-    });
-
-    // 6) 握手（与设置页「连接 / 握手」完全同一条路径）
-    conn_action(ctx, ui, ConnAction::Connect).await;
-    toast(
-        ui,
-        1,
-        format!("rclone 已启动（PID {pid}，端口 {}）", oc.port),
-    );
-    Ok(())
-}
-
-/// 停止本程序拉起的 rclone。
-async fn oneclick_stop(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
-    match oneclick::stop() {
-        Ok(true) => {
-            let _ = ui.upgrade_in_event_loop(|ui| {
-                let g = ui.global::<PluginsG>();
-                g.set_oc_running(false);
-                g.set_oc_pid(0);
-                g.set_oc_uptime("".into());
-                g.set_oc_status("已停止".into());
-            });
-            // 端点已经没了：把连接状态切成「已断开」，别让界面停在绿灯
-            disconnect_now(ctx, ui).await;
-            toast(ui, 1, "已停止由本程序启动的 rclone");
-        }
-        Ok(false) => toast(ui, 0, "没有由本程序启动的 rclone（不会去停你自己启动的实例）"),
-        Err(e) => toast(ui, 2, format!("停止 rclone 失败: {e}")),
-    }
-}
-
-/// 保存（复选框 / 下拉框 / 文本框变更时调用）。只写内存 + 立即落盘一次。
-async fn oneclick_save(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
-    let Some(mut oc) = oc_read_ui(ui).await else { return };
-    let old = ctx.cfg.lock().unwrap().oneclick.clone();
-    oc.install_dir = old.install_dir.clone();
-    if oc.exe != old.exe {
-        // 路径变了：旧版本号与校验结论都不能沿用
-        oc.exe_version.clear();
-        let _ = ui.upgrade_in_event_loop(|ui| {
-            let g = ui.global::<PluginsG>();
-            g.set_oc_verified(false);
-            g.set_oc_checks(ModelRc::from(Rc::new(VecModel::from(Vec::<OcCheck>::new()))));
-            g.set_oc_exe_version("".into());
-        });
-    }
-    // 「运行时自动启动」必须建立在「路径已设置且校验通过」之上（需求第 3 条）
-    if oc.auto_start && (!oc.auto_start_allowed() || oc.exe_version.is_empty()) {
-        oc.auto_start = false;
-        let _ = ui.upgrade_in_event_loop(|ui| {
-            ui.global::<PluginsG>().set_oc_auto_start(false);
-        });
-        toast(ui, 2, "「运行时自动启动」需要先把 rclone 路径设置好并通过校验");
-    }
-    if oc.port == 0 {
-        toast(ui, 2, "端口必须是 1-65535 之间的数字");
-        return;
-    }
-    let warn = oc_auth_warning(&oc);
-    let hint = oc_install_hint(&oc, is_elevated());
-    let _ = ui.upgrade_in_event_loop(move |ui| {
-        let g = ui.global::<PluginsG>();
-        g.set_oc_auth_warning(warn.as_str().into());
-        g.set_oc_install_hint(hint.as_str().into());
-    });
-    oc_persist(ctx, oc);
-}
-
-/// 启动时（或连接失败后）按配置自动拉起 rclone。
-///
-/// 只在 `auto_start = true` 且路径已设置时生效，且每个进程只自动尝试一次
-/// （用户手动点按钮不受这个限制）。
-async fn oneclick_autostart(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) -> bool {
-    let (oc, enabled) = {
-        let c = ctx.cfg.lock().unwrap();
-        (
-            c.oneclick.clone(),
-            c.plugin_enabled.get("onerclone").copied().unwrap_or(true),
-        )
-    };
-    if !enabled || !oc.auto_start || !oc.has_exe() {
-        return false;
-    }
-    if !oneclick::take_auto_start_slot() {
-        return false;
-    }
-    toast(ui, 0, "「一键 rclone」按设置自动启动 rclone…");
-    match oc_start_inner(ctx, ui, &oc).await {
-        Ok(()) => {
-            toast(ui, 1, "rclone 已自动启动并连接");
-            true
-        }
-        Err(e) => {
-            toast(ui, 2, format!("自动启动 rclone 失败：{e}"));
-            false
-        }
-    }
-}
-
-/// 每秒刷新「本程序拉起的 rclone 是否在跑」（运行时状态，不落盘）。
-fn refresh_oc_runtime(ui: &Weak<MainWindow>) {
-    let pid = oneclick::running_pid();
-    let uptime = oneclick::uptime_secs();
-    let _ = ui.upgrade_in_event_loop(move |ui| {
-        let g = ui.global::<PluginsG>();
-        let running = pid.is_some();
-        if g.get_oc_running() != running {
-            g.set_oc_running(running);
-        }
-        let pid_i = pid.unwrap_or(0) as i32;
-        if g.get_oc_pid() != pid_i {
-            g.set_oc_pid(pid_i);
-        }
-        let up = uptime.map(fmt_uptime).unwrap_or_default();
-        if g.get_oc_uptime().to_string() != up {
-            g.set_oc_uptime(up.into());
-        }
-    });
 }
 
 // ---------------- UI 读取辅助 ----------------
@@ -7719,40 +7251,57 @@ fn wire_callbacks(
         }
     });
     // ---- 内置插件「一键 rclone」----
-    ui.on_oneclick_pick_exe({
+    ui.on_plugin_panel_open({
         let tx = tx.clone();
-        move || {
-            let _ = tx.send(Cmd::OneClickPickExe);
+        move |idx| {
+            let _ = tx.send(Cmd::PluginPanelOpen { idx });
         }
     });
-    ui.on_oneclick_revalidate({
+    ui.on_plugin_panel_close({
         let tx = tx.clone();
         move || {
-            let _ = tx.send(Cmd::OneClickRevalidate);
+            let _ = tx.send(Cmd::PluginPanelClose);
         }
     });
-    ui.on_oneclick_install({
+    ui.on_plugin_panel_field({
         let tx = tx.clone();
-        move || {
-            let _ = tx.send(Cmd::OneClickInstall);
+        move |key, value| {
+            let _ = tx.send(Cmd::PluginPanelField {
+                key: key.to_string(),
+                value: value.to_string(),
+            });
         }
     });
-    ui.on_oneclick_start({
+    ui.on_plugin_panel_action({
         let tx = tx.clone();
-        move || {
-            let _ = tx.send(Cmd::OneClickStart);
+        move |action| {
+            let _ = tx.send(Cmd::PluginPanelAction {
+                action: action.to_string(),
+            });
         }
     });
-    ui.on_oneclick_stop({
+    ui.on_plugin_uninstall({
         let tx = tx.clone();
-        move || {
-            let _ = tx.send(Cmd::OneClickStop);
+        move |idx| {
+            let _ = tx.send(Cmd::PluginUninstall { idx });
         }
     });
-    ui.on_oneclick_save({
+    ui.on_plugin_restore({
         let tx = tx.clone();
-        move || {
-            let _ = tx.send(Cmd::OneClickSave);
+        move |idx| {
+            let _ = tx.send(Cmd::PluginRestore { idx });
+        }
+    });
+    ui.on_plugin_restore_by_id({
+        let tx = tx.clone();
+        move |id| {
+            let _ = tx.send(Cmd::PluginRestoreById { id: id.to_string() });
+        }
+    });
+    ui.on_plugin_search({
+        let tx = tx.clone();
+        move |_q| {
+            let _ = tx.send(Cmd::PluginSearch);
         }
     });
     ui.on_settings_save({
