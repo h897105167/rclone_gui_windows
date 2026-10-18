@@ -159,6 +159,12 @@ pub struct AppConfig {
     pub bw_down: String,
     #[serde(default = "d_unit")]
     pub bw_down_unit: i32,
+    /// 内置插件「一键 rclone」的配置（路径 / 版本 / 启动参数 / 自启策略）。
+    ///
+    /// 这是本程序唯一会「拉起 rclone 进程」的地方，完全由用户在该插件页显式开启，
+    /// 默认不自动启动、退出时也不停止（见 `crate::oneclick` 模块头注释）。
+    #[serde(default)]
+    pub oneclick: crate::oneclick::OneClickCfg,
 }
 
 impl Default for AppConfig {
