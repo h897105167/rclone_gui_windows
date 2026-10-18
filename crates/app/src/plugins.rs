@@ -149,13 +149,32 @@ pub fn ensure_builtin(ctx: &Arc<Ctx>) -> Vec<String> {
     installed
 }
 
-/// 恢复被卸载的内置插件：清墓碑 + 重新释放。
+/// 恢复被卸载的随程序插件：清墓碑 + 重新释放。
+///
+/// 两种情况：
+/// - 内置三件套：从 exe 同级 `assets/plugins/<包>/` 复制回插件目录；
+/// - `imagehost`：它是**编进 exe 的**单文件 wasm，重新跑一次
+///   [`crate::embed_plugins`] 就会写回来（那条路径本身不看墓碑）。
 pub fn restore_builtin(ctx: &Arc<Ctx>, id: &str) -> Result<()> {
     {
         let mut cfg = ctx.cfg.lock().unwrap();
         cfg.plugin_removed.retain(|r| r != id);
         cfg.plugin_enabled.insert(id.to_string(), true);
         let _ = config::save(&cfg);
+    }
+    if id == "imagehost" {
+        let removed = ctx
+            .cfg
+            .lock()
+            .map(|c| c.plugin_removed.clone())
+            .unwrap_or_default();
+        crate::embed_plugins(&removed);
+        let p = plugins_dir().join("imagehost.wasm");
+        return if p.is_file() {
+            Ok(())
+        } else {
+            Err(anyhow!("无法恢复 imagehost：内嵌 wasm 写出失败"))
+        };
     }
     let root = builtin_root().ok_or_else(|| anyhow!("找不到内置插件目录（assets/plugins）"))?;
     let mut found = None;
@@ -178,22 +197,54 @@ pub fn restore_builtin(ctx: &Arc<Ctx>, id: &str) -> Result<()> {
     copy_dir(&src, &dest)
 }
 
-/// 卸载插件：删插件目录（含该插件的 kv 数据）+ 清启用记录。
+/// 卸载插件：删插件本体（目录或单文件 .wasm）+ 该插件的 kv 数据 + 清启用记录。
 ///
-/// 内置插件额外写入墓碑，避免下次启动被自动释放回来。
-pub fn uninstall(ctx: &Arc<Ctx>, id: &str) -> Result<PathBuf> {
-    let dir = plugins_dir().join(plugin_host::config::sanitize_dir_name(id));
-    let removed = plugin_host::bundle::uninstall(&dir)?;
-    let is_builtin = builtin_ids().iter().any(|b| b == id);
+/// `path` 是 [`Row::path`] —— 插件在磁盘上的**真实位置**。不能用 id 反推：
+/// - 新格式插件是 `plugins/<id>/` 目录；
+/// - 单文件插件是 `plugins/<id>.wasm`，而 `plugins/<id>/` 是**它的 kv 目录**，
+///   按 id 反推会只删掉 kv、把 wasm 留下来（看起来「卸载了但插件还在」）。
+///
+/// 随程序发布的插件（内置三件套 + 内嵌的 imagehost）额外写墓碑，避免下次启动被
+/// `ensure_builtin` / `embed_plugins` 又释放回来。
+pub fn uninstall(ctx: &Arc<Ctx>, id: &str, path: &str) -> Result<PathBuf> {
+    let removed = remove_plugin_files(Path::new(path), &plugins_dir(), id)?;
     {
         let mut cfg = ctx.cfg.lock().unwrap();
         cfg.plugin_enabled.remove(id);
-        if is_builtin && !cfg.plugin_removed.iter().any(|r| r == id) {
+        if ships_with_app(id) && !cfg.plugin_removed.iter().any(|r| r == id) {
             cfg.plugin_removed.push(id.to_string());
         }
         let _ = config::save(&cfg);
     }
     Ok(removed)
+}
+
+/// 只做文件系统那部分：删插件本体 + 它的 kv 目录。抽出来是为了能单测
+/// （[`uninstall`] 还要动 `Ctx` 里的配置，测试里不好造）。
+fn remove_plugin_files(path: &Path, plugins_root: &Path, id: &str) -> Result<PathBuf> {
+    let removed = if path.is_dir() {
+        plugin_host::bundle::uninstall(path)?
+    } else if path.is_file() {
+        std::fs::remove_file(path).map_err(|e| anyhow!("删除 {} 失败: {e}", path.display()))?;
+        path.to_path_buf()
+    } else {
+        // 路径已不存在：按目录再试一次，仍不行就报错（不要静默成功）
+        plugin_host::bundle::uninstall(&plugins_root.join(plugin_host::config::sanitize_dir_name(id)))?
+    };
+    // 单文件插件的 kv 目录与 wasm 同名，删完本体要顺手清掉
+    let kv_dir = plugins_root.join(plugin_host::config::sanitize_dir_name(id));
+    if kv_dir.is_dir() && !removed.starts_with(&kv_dir) {
+        std::fs::remove_dir_all(&kv_dir).ok();
+    }
+    Ok(removed)
+}
+
+/// 这个 id 是不是「随程序一起发」的（卸载后需要墓碑，否则会被自动释放回来）。
+///
+/// 除内置三件套外，还有一个特例：`imagehost` 是 `include_bytes!` 编进 exe 的
+/// 单文件插件，由 [`crate::embed_plugins`] 在启动时写出，它不在 `assets/plugins` 里。
+pub fn ships_with_app(id: &str) -> bool {
+    id == "imagehost" || builtin_ids().iter().any(|b| b == id)
 }
 
 /// 已被卸载、仍可从安装包里恢复的内置插件：`(id, name, version)`。
@@ -210,21 +261,27 @@ pub fn removed_builtins(ctx: &Arc<Ctx>) -> Vec<(String, String, String)> {
     if removed.is_empty() {
         return Vec::new();
     }
-    let Some(root) = builtin_root() else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&root) {
-        for entry in rd.flatten() {
-            let dir = entry.path();
-            let Some(cfg) = bundle::read_config_lenient(&dir) else {
-                continue;
-            };
-            if !removed.iter().any(|r| r == &cfg.id) {
-                continue;
+    if let Some(root) = builtin_root() {
+        if let Ok(rd) = std::fs::read_dir(&root) {
+            for entry in rd.flatten() {
+                let dir = entry.path();
+                let Some(cfg) = bundle::read_config_lenient(&dir) else {
+                    continue;
+                };
+                if !removed.iter().any(|r| r == &cfg.id) {
+                    continue;
+                }
+                out.push((cfg.id.clone(), cfg.name.clone(), cfg.version.clone()));
             }
-            out.push((cfg.id.clone(), cfg.name.clone(), cfg.version.clone()));
         }
+    }
+    // imagehost 是编进 exe 的单文件插件，不在 assets/plugins 里，
+    // 名字/版本只能就地写死（它就是「图床」，版本跟 wasm 的 manifest 一致）。
+    if removed.iter().any(|r| r == "imagehost")
+        && !out.iter().any(|(id, _, _)| id == "imagehost")
+    {
+        out.push(("imagehost".into(), "图床".into(), String::new()));
     }
     out.sort_by(|a, b| a.1.cmp(&b.1));
     out
@@ -428,13 +485,19 @@ pub async fn scan_rows(ctx: &Arc<Ctx>) -> Vec<Row> {
                     continue;
                 }
                 seen.push(m.id.clone());
-                let has_panel = m.id == "imagehost";
+                // 单文件 wasm 没有 config.json，**没有声明式面板**。
+                // imagehost 的设置面板是 Slint 里历史硬编码的一段（`if p.id == "imagehost"`），
+                // 与通用面板无关：这里若置 true，通用面板会去读不存在的 config.json 并报错。
+                let has_panel = false;
+                // imagehost 是 include_bytes! 编进 exe 的，也算「随程序发布」：
+                // 打上内置徽标，卸载后才有「恢复内置」入口。
+                let ships = m.id == "imagehost";
                 rows.push(Row {
                     enabled: enabled_map.get(&m.id).copied().unwrap_or(true),
                     kind: "wasm".into(),
                     loaded: true,
                     verified: true,
-                    builtin: false,
+                    builtin: ships,
                     has_panel,
                     tags: Vec::new(),
                     author: String::new(),
@@ -1042,5 +1105,61 @@ mod tests {
         rows[1].builtin = true;
         rows.sort_by(|a, b| (!a.builtin, &a.name).cmp(&(!b.builtin, &b.name)));
         assert_eq!(rows[0].id, "onerclone");
+    }
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rcgui-plugins-test-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 单文件插件（imagehost 就是这样装着的）卸载时必须删掉 `.wasm` 本体，
+    /// 而不是只删掉同名的 kv 目录 —— 那会变成「界面上没了、磁盘上还在」。
+    #[test]
+    fn uninstall_removes_single_file_plugin() {
+        let root = tmp_dir("wasm");
+        let wasm = root.join("imagehost.wasm");
+        std::fs::write(&wasm, b"\0asm").unwrap();
+        let kv_dir = root.join("imagehost");
+        std::fs::create_dir_all(&kv_dir).unwrap();
+        std::fs::write(kv_dir.join("kv.json"), b"{}").unwrap();
+
+        let removed = remove_plugin_files(&wasm, &root, "imagehost").unwrap();
+
+        assert_eq!(removed, wasm);
+        assert!(!wasm.exists(), "wasm 本体必须被删");
+        assert!(!kv_dir.exists(), "kv 目录也必须被删");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 目录型插件走 bundle::uninstall，整个包目录连同里面的 kv.json 一起消失。
+    #[test]
+    fn uninstall_removes_package_dir() {
+        let root = tmp_dir("pkg");
+        let dir = root.join("onerclone");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), b"{}").unwrap();
+        std::fs::write(dir.join("kv.json"), b"{}").unwrap();
+
+        let removed = remove_plugin_files(&dir, &root, "onerclone").unwrap();
+
+        assert_eq!(removed, dir);
+        assert!(!dir.exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `imagehost` 是 include_bytes! 编进 exe 的，不满足 `builtin_ids()`
+    /// （它不在 assets/plugins 里）。`ships_with_app` 必须把它算进来，
+    /// 否则卸载后不写墓碑，下次启动 `embed_plugins` 又把 wasm 写回来。
+    #[test]
+    fn imagehost_counts_as_ships_with_app() {
+        assert!(ships_with_app("imagehost"));
     }
 }

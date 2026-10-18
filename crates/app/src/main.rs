@@ -1697,7 +1697,7 @@ fn main() {
     }
 
     // 内置插件释放
-    embed_plugins();
+    embed_plugins(&cfg.plugin_removed);
 
     // 插件宿主
     let host = Arc::new(plugin_host::PluginHost::new().expect("wasm 引擎初始化失败"));
@@ -2081,7 +2081,14 @@ fn rgba_to_hicon(
         }
     }
 }
-fn embed_plugins() {
+/// 释放编进 exe 的单文件插件（目前只有 imagehost）。
+///
+/// **尊重卸载墓碑**：用户卸载过 imagehost 就不要在下次启动时又写回来，
+/// 否则「卸载」按钮等于摆着好看。恢复入口在插件页顶部的「恢复内置」。
+fn embed_plugins(removed: &[String]) {
+    if removed.iter().any(|r| r == "imagehost") {
+        return;
+    }
     const WASM: &[u8] = include_bytes!(concat!(env!("IMAGEHOST_WASM")));
     let dir = config::data_dir().join("plugins");
     let _ = std::fs::create_dir_all(&dir);
@@ -5909,27 +5916,28 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 ui.global::<PluginsG>()
                     .get_rows()
                     .row_data(idx as usize)
-                    .map(|r| (r.id.to_string(), r.name.to_string(), r.builtin))
+                    .map(|r| (r.id.to_string(), r.name.to_string(), r.path.to_string()))
             })
             .await
             .flatten();
-            if let Some((id, name, builtin)) = row {
-                // 先让插件自己收尾（停进程等），再删目录
+            if let Some((id, name, path)) = row {
+                // 先让插件自己收尾（停进程等），再删本体
                 plugins::shutdown_plugin(ctx, &id).await;
-                match plugins::uninstall(ctx, &id) {
+                match plugins::uninstall(ctx, &id, &path) {
                     Ok(removed) => {
-                        let msg = if builtin {
+                        let msg = if plugins::ships_with_app(&id) {
                             format!(
                                 "已卸载「{name}」；如需再次使用，可在插件页点「恢复内置」"
                             )
                         } else {
                             format!("已卸载「{name}」")
                         };
-                        let _ = removed;
+                        eprintln!("[plugin] 已卸载 {id}: {}", removed.display());
                         toast(ui, 1, msg);
                         let _ = ui.upgrade_in_event_loop(|ui| {
                             let g = ui.global::<PluginsG>();
                             g.set_panel_plugin("".into());
+                            g.set_expanded(-1);
                             g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(
                                 Vec::<crate::PanelRow>::new(),
                             ))));
