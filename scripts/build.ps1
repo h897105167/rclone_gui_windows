@@ -63,19 +63,28 @@ $profileArgs = @()
 if ($Release) { $profileArgs += "--release" }
 $profileDir = if ($Release) { "release" } else { "debug" }
 
+# WASM 插件**永远**用 release 构建，与应用 profile 无关。
+#
+# 原因：插件产物会被打包进 crates/app/assets/plugins/ 并随仓库提交（这样直接
+# `cargo build -p rclone-gui` 也能拿到内置插件）。debug 版 wasm 有 5 MB 且每次
+# 编译都变，会让这个提交的二进制文件反复抖动；而插件的调试通常用日志就够，
+# 真要调插件再手动 `cargo build -p oneclick-plugin --target wasm32-wasip1`。
+$wasmProfileArgs = @("--release")
+$wasmProfileDir = "release"
+
 # 1) 先构建 WASM 插件
 Write-Host "`n==> [1/3] 构建 WASM 插件 (imagehost)..." -ForegroundColor Cyan
-Invoke-Native { cargo build -p imagehost-plugin --target wasm32-wasip1 @profileArgs } "imagehost 插件构建"
+Invoke-Native { cargo build -p imagehost-plugin --target wasm32-wasip1 @wasmProfileArgs } "imagehost 插件构建"
 
 Write-Host "`n==> [2/3] 构建 WASM 插件 (oneclick)..." -ForegroundColor Cyan
-Invoke-Native { cargo build -p oneclick-plugin --target wasm32-wasip1 @profileArgs } "oneclick 插件构建"
+Invoke-Native { cargo build -p oneclick-plugin --target wasm32-wasip1 @wasmProfileArgs } "oneclick 插件构建"
 
 # 打包三件套到 assets/plugins/<id>/（config.json + main.wasm + check.sha256）
 Write-Host "`n==> 打包内置插件 oneclick..." -ForegroundColor Cyan
 Invoke-Native {
     & (Join-Path $PSScriptRoot "pack-plugin.ps1") `
         -Name oneclick `
-        -Wasn "target\wasm32-wasip1\$profileDir\oneclick.wasm"
+        -Wasn "target\wasm32-wasip1\$wasmProfileDir\oneclick.wasm"
 } "打包 oneclick 插件"
 
 # 2) 再构建应用（此时 build.rs 能找到 imagehost.wasm 与 assets/plugins）
