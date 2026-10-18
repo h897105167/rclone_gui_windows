@@ -1419,6 +1419,55 @@ where
     rx.await.ok()
 }
 
+/// 从插件列表里就地摘掉一行（乐观更新，必须在 UI 线程内调用）。
+///
+/// 卸载的磁盘动作成功之后，列表里那张卡片立刻就不该存在了。这里不等重扫，
+/// 直接按 id 过滤掉。
+fn remove_plugin_row(ui: &MainWindow, id: &str) {
+    let g = ui.global::<PluginsG>();
+    let model = g.get_rows();
+    let kept: Vec<PluginRow> = (0..model.row_count())
+        .filter_map(|i| model.row_data(i))
+        .collect();
+    let kept = drop_row_by_id(kept, id);
+    g.set_rows(ModelRc::from(Rc::new(VecModel::from(kept))));
+}
+
+/// 按 id 摘掉一行。抽成纯函数以便单测：卸载后列表不刷新是「静默」缺陷，
+/// 一旦回归不会报错，只会让用户看到已经卸载掉的卡片。
+pub(crate) fn drop_row_by_id(rows: Vec<PluginRow>, id: &str) -> Vec<PluginRow> {
+    rows.into_iter().filter(|r| r.id.as_str() != id).collect()
+}
+
+/// 在顶部「已卸载」提示里补一条（幂等，必须在 UI 线程内调用）。
+fn add_removed_builtin(ui: &MainWindow, id: &str, name: &str, version: &str) {
+    let g = ui.global::<PluginsG>();
+    let model = g.get_removed_builtins();
+    let mut out: Vec<crate::RemovedRow> = (0..model.row_count())
+        .filter_map(|i| model.row_data(i))
+        .collect();
+    if out.iter().any(|r| r.id.as_str() == id) {
+        return;
+    }
+    out.push(crate::RemovedRow {
+        id: id.into(),
+        name: name.into(),
+        version: version.into(),
+    });
+    g.set_removed_builtins(ModelRc::from(Rc::new(VecModel::from(out))));
+}
+
+/// 恢复内置后，把顶部那条「已卸载」提示去掉（必须在 UI 线程内调用）。
+fn remove_removed_builtin(ui: &MainWindow, id: &str) {
+    let g = ui.global::<PluginsG>();
+    let model = g.get_removed_builtins();
+    let out: Vec<crate::RemovedRow> = (0..model.row_count())
+        .filter_map(|i| model.row_data(i))
+        .filter(|r| r.id.as_str() != id)
+        .collect();
+    g.set_removed_builtins(ModelRc::from(Rc::new(VecModel::from(out))));
+}
+
 /// 显示路径（"root://name/sub"）→ rclone fs（"name:sub"）；手输的 "name:sub" 原样返回
 #[allow(dead_code)]
 fn display_to_fs(d: &str) -> String {
@@ -5916,33 +5965,53 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 ui.global::<PluginsG>()
                     .get_rows()
                     .row_data(idx as usize)
-                    .map(|r| (r.id.to_string(), r.name.to_string(), r.path.to_string()))
+                    .map(|r| {
+                        (
+                            r.id.to_string(),
+                            r.name.to_string(),
+                            r.path.to_string(),
+                            r.version.to_string(),
+                        )
+                    })
             })
             .await
             .flatten();
-            if let Some((id, name, path)) = row {
+            if let Some((id, name, path, version)) = row {
                 // 先让插件自己收尾（停进程等），再删本体
                 plugins::shutdown_plugin(ctx, &id).await;
                 match plugins::uninstall(ctx, &id, &path) {
                     Ok(removed) => {
-                        let msg = if plugins::ships_with_app(&id) {
-                            format!(
-                                "已卸载「{name}」；如需再次使用，可在插件页点「恢复内置」"
-                            )
+                        let recoverable = plugins::ships_with_app(&id);
+                        let msg = if recoverable {
+                            format!("已卸载「{name}」；如需再次使用，可在插件页点「恢复内置」")
                         } else {
                             format!("已卸载「{name}」")
                         };
                         eprintln!("[plugin] 已卸载 {id}: {}", removed.display());
                         toast(ui, 1, msg);
-                        let _ = ui.upgrade_in_event_loop(|ui| {
+                        // 先在 UI 线程里「乐观」抹掉这一行：卸载的磁盘动作已经成功，
+                        // 列表就不该再显示它。后续重扫只是把这条结果校准成磁盘真相，
+                        // 万一重扫没跑到位，用户也不会看到「已卸载但卡片还在」。
+                        // 注意：这里是「发出就返回」，不能 await——调用方本身就在事件循环里。
+                        let drop_id = id.clone();
+                        let restorable =
+                            recoverable.then(|| (id.clone(), name.clone(), version.clone()));
+                        let _ = ui.upgrade_in_event_loop(move |ui| {
                             let g = ui.global::<PluginsG>();
                             g.set_panel_plugin("".into());
                             g.set_expanded(-1);
                             g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(
                                 Vec::<crate::PanelRow>::new(),
                             ))));
+                            remove_plugin_row(&ui, &drop_id);
+                            // 卡片一走，挂在卡片上的「恢复内置」按钮也跟着没了，
+                            // 顶部那条已卸载提示必须同时出现，否则用户没有回头路。
+                            if let Some((rid, rname, rver)) = restorable {
+                                add_removed_builtin(&ui, &rid, &rname, &rver);
+                            }
                         });
-                        let _ = Box::pin(handle_cmd(ctx, ui, Cmd::PluginsRescan)).await;
+                        // 再按磁盘真相重扫一次（校准条数、已卸载入口、图床面板等）
+                        rescan_plugins(ctx, ui).await;
                     }
                     Err(e) => toast(ui, 2, format!("卸载失败: {e:#}")),
                 }
@@ -5962,7 +6031,12 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
                 match plugins::restore_builtin(ctx, &id) {
                     Ok(()) => {
                         toast(ui, 1, format!("已恢复内置插件「{name}」"));
-                        let _ = Box::pin(handle_cmd(ctx, ui, Cmd::PluginsRescan)).await;
+                        // 与卸载对称：先立刻把顶部那条提示去掉，再重扫把卡片加回来。
+                        let rid = id.clone();
+                        let _ = ui.upgrade_in_event_loop(move |ui| {
+                            remove_removed_builtin(&ui, &rid);
+                        });
+                        rescan_plugins(ctx, ui).await;
                     }
                     Err(e) => toast(ui, 2, format!("恢复失败: {e:#}")),
                 }
@@ -5978,7 +6052,11 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             match plugins::restore_builtin(ctx, &id) {
                 Ok(()) => {
                     toast(ui, 1, format!("已恢复内置插件「{name}」"));
-                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::PluginsRescan)).await;
+                    let rid = id.clone();
+                    let _ = ui.upgrade_in_event_loop(move |ui| {
+                        remove_removed_builtin(&ui, &rid);
+                    });
+                    rescan_plugins(ctx, ui).await;
                 }
                 Err(e) => toast(ui, 2, format!("恢复失败: {e:#}")),
             }
@@ -6275,8 +6353,21 @@ fn gui_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// 重扫栅栏：记录最后发起的重扫序号，保证只有最新的那次能写列表。
+///
+/// 见 [`rescan_plugins`]：它解决「先发起的慢重扫后返回、把旧列表盖回新的上面」。
+static NEXT_RESCAN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn rescan_plugins(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    // 重扫是「先异步扫盘、再回 UI 线程写列表」。如果两次重扫并发（页面刚打开时
+    // 一次、卸载后又一次），先发起的那次可能后返回，把旧列表盖回新的上面——
+    // 表现就是「卸载成功了但卡片还在」，点一下刷新又正常。
+    // 用递增序号做栅栏：只有最后一次发起的重扫才有权写列表。
+    let seq = NEXT_RESCAN_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let all = plugins::scan_rows(ctx).await;
+    if NEXT_RESCAN_SEQ.load(std::sync::atomic::Ordering::SeqCst) != seq {
+        return; // 已有更新的重扫发起，这份结果过期，丢弃
+    }
     let needle = read_ui(ui, |ui| ui.global::<PluginsG>().get_search().to_string())
         .await
         .unwrap_or_default();
@@ -6286,6 +6377,9 @@ async fn rescan_plugins(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     // 已卸载但仍可恢复的内置插件：列表里已经没有它们的卡片，
     // 只能靠顶部这一条入口把「恢复内置」按钮留住。
     let removed = plugins::removed_builtins(ctx);
+    if NEXT_RESCAN_SEQ.load(std::sync::atomic::Ordering::SeqCst) != seq {
+        return; // 期间又有更新的重扫发起，别再往下写
+    }
     // `PluginRow` 含 `ModelRc`（Rc），不是 Send：只把纯数据的 `Row` 移进闭包，
     // 在 UI 线程内部再转成 Slint 结构体。
     let _ = ui.upgrade_in_event_loop(move |ui| {
@@ -8377,5 +8471,42 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------- 插件列表：卸载后的乐观更新 ----------------
+
+    fn plugin_row(id: &str) -> PluginRow {
+        PluginRow {
+            id: id.into(),
+            name: id.into(),
+            ..Default::default()
+        }
+    }
+
+    /// 卸载成功后，被卸载的卡片必须立刻从列表里消失。
+    ///
+    /// 这条测试守的是一个「静默」缺陷：磁盘确实删了、配置也确实改了，
+    /// 只有列表没刷新。用户看到的就是「点了卸载，卡片还在」，
+    /// 而补点一下「刷新」又正常——很容易被当成偶发卡顿放过去。
+    #[test]
+    fn drop_row_removes_only_target() {
+        let rows = vec![plugin_row("onerclone"), plugin_row("imagehost")];
+        let kept = drop_row_by_id(rows, "onerclone");
+        assert_eq!(kept.len(), 1, "只应摘掉被卸载的那一行");
+        assert_eq!(kept[0].id.as_str(), "imagehost");
+    }
+
+    /// 摘掉不存在的 id 不能误删任何行。
+    #[test]
+    fn drop_row_ignores_unknown_id() {
+        let rows = vec![plugin_row("imagehost")];
+        assert_eq!(drop_row_by_id(rows, "nope").len(), 1);
+    }
+
+    /// 空列表摘行不能 panic（卸载最后一张卡片时就是这种情形）。
+    #[test]
+    fn drop_row_handles_empty_list() {
+        let kept: Vec<PluginRow> = drop_row_by_id(Vec::new(), "onerclone");
+        assert!(kept.is_empty());
     }
 }
