@@ -62,6 +62,12 @@ export struct RootRow {
     is-default: bool,
     public-template: string,
 }
+/// 一键 rclone：校验清单的一行（✓ / ✗）
+export struct OcCheck {
+    label: string,
+    value: string,
+    ok: bool,
+}
 export struct TokenRow {
     id: string,
     name: string,
@@ -265,6 +271,51 @@ export global PluginsG {
     in-out property <string> trash-dir: "";
     in-out property <[TokenRow]> tokens: [];
     in-out property <[ImageRow]> images: [];
+
+    // ---------------- 内置插件：一键 rclone ----------------
+    // 该插件由 Rust 侧以「内置」行注入插件列表（id = "onerclone"），
+    // 状态全部由 Rust 单向写入，UI 只读 + 触发回调。
+    /// 插件是否启用（停用时所有动作按钮禁用）
+    in-out property <bool> oc-enabled: true;
+    /// rclone.exe 路径（可手动编辑）
+    in-out property <string> oc-exe: "";
+    /// 最近一次校验得到的版本（如 v1.75.4）
+    in-out property <string> oc-exe-version: "";
+    /// 当前路径是否已通过校验（决定「自动启动」能不能勾选）
+    in-out property <bool> oc-verified: false;
+    /// 校验清单（文件名 / 大小 / PE / 签名 / 版本探测）
+    in-out property <[OcCheck]> oc-checks: [];
+    in-out property <bool> oc-checking: false;
+    /// 版本选项与下载源选项
+    in-out property <[string]> oc-editions: ["官方版", "增强版（rclone-extra）"];
+    in-out property <int> oc-edition-idx: 0;
+    in-out property <[string]> oc-sources: ["GitHub / 官网", "清华镜像源（含国内回退）"];
+    in-out property <int> oc-source-idx: 0;
+    /// 下载安装进度：0..100；-1 表示不确定
+    in-out property <int> oc-progress: 0;
+    in-out property <bool> oc-installing: false;
+    in-out property <string> oc-phase: "";
+    in-out property <string> oc-install-hint: "";
+    /// 启动参数
+    in-out property <string> oc-user: "gui";
+    in-out property <string> oc-pass: "";
+    in-out property <string> oc-port: "5572";
+    in-out property <bool> oc-no-auth: false;
+    in-out property <bool> oc-silent: true;
+    /// 鉴权缺口提示（没勾 no_auth 且用户名密码都空时非空）
+    in-out property <string> oc-auth-warning: "";
+    /// 启动策略
+    in-out property <bool> oc-auto-start: false;
+    in-out property <bool> oc-stop-on-exit: false;
+    /// 本程序拉起的 rclone 是否在跑（与「是否连上」是两件事）
+    in-out property <bool> oc-running: false;
+    in-out property <int> oc-pid: 0;
+    in-out property <string> oc-uptime: "";
+    in-out property <bool> oc-busy: false;
+    /// 一行状态文本（已连接 / 未连接 / 最后错误）
+    in-out property <string> oc-status: "";
+    /// 提示灯：true = 绿灯（已连接），false = 黄灯（未连接）
+    in-out property <bool> oc-conn-live: false;
 }
 
 export global RemotesG {
@@ -2394,6 +2445,13 @@ component PluginsView inherits Rectangle {
     callback add-from-file;
     callback add-from-dir;
     callback open-dir;
+    // 内置插件「一键 rclone」
+    callback oc-pick-exe;
+    callback oc-revalidate;
+    callback oc-install;
+    callback oc-start;
+    callback oc-stop;
+    callback oc-save;
     // 确认弹窗所需的待操作状态
     property <int> tok-idx: -1;
     property <string> tok-name: "";
@@ -2473,11 +2531,11 @@ component PluginsView inherits Rectangle {
                             // 类型 / 校验状态徽标
                             Rectangle {
                                 height: 20px;
-                                width: p.kind == "package" ? 52px : 44px;
+                                width: p.kind == "package" ? 52px : (p.kind == "builtin" ? 48px : 44px);
                                 border-radius: 10px;
                                 background: p.kind == "package" ? ThemeG.panel-2 : ThemeG.accent-soft;
                                 Text {
-                                    text: p.kind == "package" ? "插件包" : "WASM";
+                                    text: p.kind == "package" ? "插件包" : (p.kind == "builtin" ? "内置" : "WASM");
                                     font-size: 10px;
                                     color: p.kind == "package" ? ThemeG.text-dim : ThemeG.accent;
                                     horizontal-alignment: center;
@@ -2494,6 +2552,13 @@ component PluginsView inherits Rectangle {
                             Rectangle {
                                 horizontal-stretch: 1;
                                 Text { text: p.desc; font-size: 12px; color: ThemeG.text-dim; width: parent.width; overflow: elide; vertical-alignment: center; }
+                            }
+                            // 一键 rclone：折叠状态下也能看到提示灯（黄=未连接 / 绿=已连接）
+                            if p.id == "onerclone" : Rectangle {
+                                width: 10px;
+                                height: 10px;
+                                border-radius: 5px;
+                                background: PluginsG.oc-conn-live ? ThemeG.ok : ThemeG.warn;
                             }
                             Text { text: p.enabled ? "已启用" : "已停用"; font-size: 12px; color: p.enabled ? ThemeG.ok : ThemeG.text-dim; vertical-alignment: center; }
                             MdlIcon {
@@ -2515,7 +2580,7 @@ component PluginsView inherits Rectangle {
                         padding-bottom: 16px;
                         spacing: 14px;
                         Rectangle { height: 1px; background: ThemeG.border; }
-                        if p.id != "imagehost" : VerticalLayout {
+                        if p.id != "imagehost" && p.id != "onerclone" : VerticalLayout {
                             spacing: 6px;
                             HorizontalLayout {
                                 spacing: 8px;
@@ -2568,6 +2633,296 @@ component PluginsView inherits Rectangle {
                                 wrap: word-wrap;
                             }
                         }
+                        // ================= 内置插件：一键 rclone =================
+                        // 布局注意：Card 内部 VerticalLayout 的对齐是 start，
+                        // 子元素写 vertical-stretch 拿不到剩余空间，所以每行都给显式高度。
+                        if p.id == "onerclone" : VerticalLayout {
+                            spacing: 12px;
+
+                            // ---- 状态区：提示灯 + 状态 + 启动/停止 ----
+                            Rectangle {
+                                height: 58px;
+                                background: ThemeG.panel-2;
+                                border-radius: ThemeG.radius-s;
+                                HorizontalLayout {
+                                    padding-left: 14px;
+                                    padding-right: 12px;
+                                    spacing: 10px;
+                                    // 提示灯：黄 = 未连接，绿 = 已连接（固定尺寸，避免被拉伸）
+                                    Rectangle {
+                                        width: 12px;
+                                        height: 12px;
+                                        border-radius: 6px;
+                                        background: PluginsG.oc-conn-live ? ThemeG.ok : ThemeG.warn;
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 2px;
+                                        Text {
+                                            text: PluginsG.oc-conn-live ? "已连接 rclone" : "未连接 rclone";
+                                            font-size: 13px;
+                                            font-weight: 600;
+                                            color: PluginsG.oc-conn-live ? ThemeG.ok : ThemeG.warn;
+                                        }
+                                        Text {
+                                            text: PluginsG.oc-status;
+                                            font-size: 11px;
+                                            color: ThemeG.text-dim;
+                                            overflow: elide;
+                                        }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    if PluginsG.oc-running : Text {
+                                        text: "PID " + PluginsG.oc-pid + (PluginsG.oc-uptime != "" ? " · " + PluginsG.oc-uptime : "");
+                                        font-size: 11px;
+                                        color: ThemeG.text-dim;
+                                        vertical-alignment: center;
+                                    }
+                                    PillBtn {
+                                        label: "停止";
+                                        compact: true;
+                                        danger: true;
+                                        disabled: !PluginsG.oc-running || PluginsG.oc-busy;
+                                        clicked => { root.oc-stop(); }
+                                    }
+                                    PillBtn {
+                                        label: PluginsG.oc-running ? "重启 rclone" : "一键启用 rclone";
+                                        compact: false;
+                                        primary: true;
+                                        disabled: PluginsG.oc-busy || !PluginsG.oc-enabled;
+                                        clicked => { root.oc-start(); }
+                                    }
+                                }
+                            }
+
+                            // ---- ① 程序路径 + 校验 ----
+                            VerticalLayout {
+                                spacing: 8px;
+                                Text { text: "① rclone 程序"; font-size: 12px; font-weight: 600; color: ThemeG.text-dim; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    height: 32px;
+                                    LineEdit {
+                                        text <=> PluginsG.oc-exe;
+                                        placeholder-text: "C:\\...\\rclone.exe";
+                                        horizontal-stretch: 1;
+                                        // 手改了路径就作废旧校验结论，避免「显示已验证但其实是另一个文件」
+                                        edited(t) => {
+                                            PluginsG.oc-verified = false;
+                                            PluginsG.oc-status = "路径已修改，尚未校验";
+                                        }
+                                    }
+                                    PillBtn {
+                                        label: "设置 rclone";
+                                        primary: true;
+                                        disabled: PluginsG.oc-checking;
+                                        clicked => { root.oc-pick-exe(); }
+                                    }
+                                    PillBtn {
+                                        label: PluginsG.oc-checking ? "校验中…" : "重新校验";
+                                        disabled: PluginsG.oc-checking || PluginsG.oc-exe == "";
+                                        clicked => { root.oc-revalidate(); }
+                                    }
+                                }
+                                if PluginsG.oc-checks.length == 0 : Text {
+                                    text: "尚未校验。点「设置 rclone」选择文件，或直接粘贴路径后点「重新校验」。";
+                                    font-size: 11px;
+                                    color: ThemeG.text-dim;
+                                    wrap: word-wrap;
+                                }
+                                for c in PluginsG.oc-checks : Rectangle {
+                                    height: 21px;
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: c.ok ? "\u{E73E}" : "\u{E711}";
+                                            font-family: "Segoe MDL2 Assets";
+                                            font-size: 11px;
+                                            width: 14px;
+                                            color: c.ok ? ThemeG.ok : ThemeG.err;
+                                            vertical-alignment: center;
+                                        }
+                                        Text {
+                                            text: c.label;
+                                            font-size: 12px;
+                                            width: 74px;
+                                            color: ThemeG.text-dim;
+                                            vertical-alignment: center;
+                                        }
+                                        Text {
+                                            text: c.value;
+                                            font-size: 12px;
+                                            color: c.ok ? ThemeG.text : ThemeG.err;
+                                            overflow: elide;
+                                            horizontal-stretch: 1;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                                Text {
+                                    text: "「一键启用 / 重启」启动的就是上面这个 rclone.exe；下面的「版本」只影响「一键安装」下载哪一个发行版。";
+                                    font-size: 11px;
+                                    color: ThemeG.text-dim;
+                                    wrap: word-wrap;
+                                }
+                            }
+
+                            Rectangle { height: 1px; background: ThemeG.border; }
+
+                            // ---- ② 一键安装 ----
+                            VerticalLayout {
+                                spacing: 8px;
+                                Text { text: "② 一键安装（下载 → 解压 → 校验 → 自动填入路径）"; font-size: 12px; font-weight: 600; color: ThemeG.text-dim; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    height: 32px;
+                                    FieldLabel { text: "版本"; width: 34px; vertical-alignment: center; }
+                                    ComboBox {
+                                        width: 200px;
+                                        model: PluginsG.oc-editions;
+                                        current-index <=> PluginsG.oc-edition-idx;
+                                        selected(t) => { root.oc-save(); }
+                                    }
+                                    FieldLabel { text: "下载源"; width: 46px; vertical-alignment: center; }
+                                    ComboBox {
+                                        width: 230px;
+                                        model: PluginsG.oc-sources;
+                                        current-index <=> PluginsG.oc-source-idx;
+                                        selected(t) => { root.oc-save(); }
+                                    }
+                                    Rectangle {}
+                                    PillBtn {
+                                        label: PluginsG.oc-installing ? "安装中…" : "一键下载并安装";
+                                        primary: true;
+                                        disabled: PluginsG.oc-installing || !PluginsG.oc-enabled;
+                                        clicked => { root.oc-install(); }
+                                    }
+                                }
+                                // 进度条（-1 = 不确定：服务器没给 Content-Length）
+                                if PluginsG.oc-installing : Rectangle {
+                                    height: 8px;
+                                    border-radius: 4px;
+                                    background: ThemeG.panel-2;
+                                    Rectangle {
+                                        x: 0;
+                                        y: 0;
+                                        height: parent.height;
+                                        border-radius: 4px;
+                                        background: ThemeG.accent;
+                                        width: PluginsG.oc-progress < 0
+                                            ? (parent.width / 3)
+                                            : (parent.width * PluginsG.oc-progress / 100);
+                                    }
+                                }
+                                if PluginsG.oc-phase != "" : Text {
+                                    text: PluginsG.oc-phase;
+                                    font-size: 11px;
+                                    color: ThemeG.text-dim;
+                                    wrap: word-wrap;
+                                }
+                                Text {
+                                    text: PluginsG.oc-install-hint;
+                                    font-size: 11px;
+                                    color: ThemeG.text-dim;
+                                    wrap: word-wrap;
+                                }
+                            }
+
+                            Rectangle { height: 1px; background: ThemeG.border; }
+
+                            // ---- ③ 启动参数 ----
+                            VerticalLayout {
+                                spacing: 8px;
+                                Text { text: "③ 启动参数（rclone rcd --rc-addr 127.0.0.1:端口）"; font-size: 12px; font-weight: 600; color: ThemeG.text-dim; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    height: 32px;
+                                    FieldLabel { text: "用户名"; width: 46px; vertical-alignment: center; }
+                                    LineEdit {
+                                        width: 140px;
+                                        text <=> PluginsG.oc-user;
+                                        enabled: !PluginsG.oc-no-auth;
+                                        placeholder-text: "留空则不带 --rc-user";
+                                        edited(t) => { root.oc-save(); }
+                                    }
+                                    FieldLabel { text: "密码"; width: 34px; vertical-alignment: center; }
+                                    LineEdit {
+                                        width: 140px;
+                                        text <=> PluginsG.oc-pass;
+                                        enabled: !PluginsG.oc-no-auth;
+                                        input-type: InputType.password;
+                                        placeholder-text: "留空则不带 --rc-pass";
+                                        edited(t) => { root.oc-save(); }
+                                    }
+                                    FieldLabel { text: "端口"; width: 34px; vertical-alignment: center; }
+                                    LineEdit {
+                                        width: 86px;
+                                        text <=> PluginsG.oc-port;
+                                        edited(t) => { root.oc-save(); }
+                                    }
+                                    // no_auth：勾选后禁用账号密码输入，并改为 --rc-no-auth
+                                    CheckBox {
+                                        checked <=> PluginsG.oc-no-auth;
+                                        text: "no_auth";
+                                        toggled => { root.oc-save(); }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    height: 26px;
+                                    CheckBox {
+                                        checked <=> PluginsG.oc-silent;
+                                        text: "静默启动（隐藏终端）";
+                                        toggled => { root.oc-save(); }
+                                    }
+                                    Text {
+                                        text: "静默 = CREATE_NO_WINDOW，等价 PowerShell 的 -WindowStyle Hidden；取消勾选会弹出 rclone 自己的控制台窗口";
+                                        font-size: 11px;
+                                        color: ThemeG.text-dim;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                    }
+                                }
+                                if PluginsG.oc-auth-warning != "" : Text {
+                                    text: PluginsG.oc-auth-warning;
+                                    font-size: 11px;
+                                    color: ThemeG.warn;
+                                    wrap: word-wrap;
+                                }
+                            }
+
+                            Rectangle { height: 1px; background: ThemeG.border; }
+
+                            // ---- ④ 启动策略 ----
+                            VerticalLayout {
+                                spacing: 8px;
+                                Text { text: "④ 启动策略"; font-size: 12px; font-weight: 600; color: ThemeG.text-dim; }
+                                HorizontalLayout {
+                                    spacing: 20px;
+                                    height: 26px;
+                                    // 必须先有「已校验的路径」，否则不允许勾选（需求第 3 条）
+                                    CheckBox {
+                                        checked <=> PluginsG.oc-auto-start;
+                                        enabled: PluginsG.oc-verified;
+                                        text: "运行时自动启动 rclone";
+                                        toggled => { root.oc-save(); }
+                                    }
+                                    CheckBox {
+                                        checked <=> PluginsG.oc-stop-on-exit;
+                                        text: "退出时停止 rclone（只停本程序拉起的那个）";
+                                        toggled => { root.oc-save(); }
+                                    }
+                                    if !PluginsG.oc-verified : Text {
+                                        text: "「自动启动」需先设置并通过校验";
+                                        font-size: 11px;
+                                        color: ThemeG.warn;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+
                         if p.id == "imagehost" : VerticalLayout {
                             spacing: 14px;
                             // 存储根
@@ -3382,6 +3737,13 @@ export component MainWindow inherits Window {
     callback plugin-add-from-file();
     callback plugin-add-from-dir();
     callback plugin-open-dir();
+    // 内置插件「一键 rclone」
+    callback oneclick-pick-exe();
+    callback oneclick-revalidate();
+    callback oneclick-install();
+    callback oneclick-start();
+    callback oneclick-stop();
+    callback oneclick-save();
     callback show-toast(int, string);
     callback win-minimize();
     callback win-toggle-maximize();
@@ -3622,6 +3984,12 @@ export component MainWindow inherits Window {
                     add-from-file => { root.plugin-add-from-file(); }
                     add-from-dir => { root.plugin-add-from-dir(); }
                     open-dir => { root.plugin-open-dir(); }
+                    oc-pick-exe => { root.oneclick-pick-exe(); }
+                    oc-revalidate => { root.oneclick-revalidate(); }
+                    oc-install => { root.oneclick-install(); }
+                    oc-start => { root.oneclick-start(); }
+                    oc-stop => { root.oneclick-stop(); }
+                    oc-save => { root.oneclick-save(); }
                 }
                 if NavG.idx == 7 : SettingsView {
                     save => { root.settings-save(); }
