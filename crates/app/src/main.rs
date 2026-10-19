@@ -15,7 +15,9 @@ mod plugins;
 mod profiles;
 mod proxy;
 mod reconcile;
+mod refresh;
 mod script;
+mod state;
 
 use anyhow::anyhow;
 use rcgui_rc::{ConnStatus, Handshake, ListEntry, RcState};
@@ -201,23 +203,23 @@ struct Ctx {
     serves_cache: Arc<std::sync::Mutex<Vec<ServeRow>>>,
     /// 最近一次已下发的全局限速 rate 字符串（避免重复调用 core/bwlimit）
     last_bwlimit: Arc<std::sync::Mutex<String>>,
-    /// 周期任务防重入：上一次未完成则跳过，避免挂起任务无限堆积（内存泄漏）
-    tick_busy: Arc<std::sync::atomic::AtomicBool>,
     /// 瞬时速度采样（上次累计字节, 时刻）。rclone 的 speed 是平均值，看起来不会动。
     speed_meter: Arc<std::sync::Mutex<Option<(f64, std::time::Instant)>>>,
-    /// 窗口是否可见且未最小化（由 UI 线程每 500ms 采样写入）：门控周期轮询
+    /// 窗口是否可见且未最小化（由 UI 线程每 500ms 采样写入）：门控轮询
     visible: Arc<std::sync::atomic::AtomicBool>,
     /// 连接/握手进行中（防止连点重复发起）
     conn_busy: Arc<std::sync::atomic::AtomicBool>,
     /// 已通过「导入预览」校验、等待用户点「应用导入」的文档。
     /// 两步流程本身就是一次确认：预览不写盘，应用才写盘并先备份。
     pending_import: Arc<std::sync::Mutex<Option<rcgui_profile::bundle::RcguiConf>>>,
-    /// 同类刷新单飞闸门：防止重叠请求，保证「旧响应不覆盖新状态」
-    gate_mounts: Arc<std::sync::atomic::AtomicBool>,
-    gate_serves: Arc<std::sync::atomic::AtomicBool>,
-    gate_remotes: Arc<std::sync::atomic::AtomicBool>,
     /// 内嵌 HTTP 服务当前实例：重启前必须优雅关闭旧实例，否则端口仍被占用（os error 10048）
     http_server: Arc<tokio::sync::Mutex<Option<HttpServer>>>,
+    /// 两条更新线路的仲裁器：世代号 + 用户操作闸门 + 已应用快照
+    hub: Arc<state::Hub>,
+    /// 远程用量（`operations/about`）上次抓取时刻：要走网络，不能跟 1s 轮询同频
+    usage_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// 本机 rclone 盘符探测（实例不匹配提示用，带节流）
+    drives: Arc<state::DriveProbe>,
 }
 
 /// 运行中的内嵌 HTTP 服务句柄
@@ -233,26 +235,6 @@ impl Ctx {
             store: self.store.clone(),
             progress: self.progress.clone(),
         })
-    }
-}
-
-/// 单飞闸门：持有期间表示「同类请求正在执行」，作用域结束时自动复位。
-///
-/// 用 Drop 而不是手动复位，是为了让提前 `return`、`?`、panic 都不会把闸门卡死。
-struct GateGuard(Arc<std::sync::atomic::AtomicBool>);
-
-/// 周期任务守卫：即使任务 panic 也能复位，避免轮询永久停摆。
-struct TickGuard(Arc<std::sync::atomic::AtomicBool>);
-
-impl Drop for TickGuard {
-    fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-impl Drop for GateGuard {
-    fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1778,15 +1760,14 @@ fn main() {
         cancelled_mounts: Arc::new(std::sync::Mutex::new(Vec::new())),
         serves_cache: Arc::new(std::sync::Mutex::new(Vec::new())),
         last_bwlimit: Arc::new(std::sync::Mutex::new(String::new())),
-        tick_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         speed_meter: Arc::new(std::sync::Mutex::new(None)),
         visible: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         conn_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         pending_import: Arc::new(std::sync::Mutex::new(None)),
-        gate_mounts: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        gate_serves: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        gate_remotes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         http_server: Arc::new(tokio::sync::Mutex::new(None)),
+        hub: Arc::new(state::Hub::new()),
+        usage_at: Arc::new(std::sync::Mutex::new(None)),
+        drives: Arc::new(state::DriveProbe::default()),
     });
 
     {
@@ -2869,87 +2850,64 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
     // 关键：所有耗时操作（RC 请求/网络 IO）全部 spawn 出去执行，
     // select 循环只负责收命令和派发，保证 UI 命令永远即时响应，
     // 不会因某个慢请求（如失效远程的 list 挂起）导致全部功能无响应。
+    //
+    // 更新只有两条线路（见 state.rs）：
+    //   ① 轮询：前台、无用户操作、上一轮取数已完成 → 每秒取一份完整快照；
+    //   ② 用户输入：命令进来时暂停轮询、动手前后各对齐一次（见 handle_cmd 包装）。
+    // 窗口最小化 / 隐藏时两条线路都停，回到前台先立即对齐一次。
     let mut tick: u64 = 0;
     let mut last_dark: Option<bool> = None;
     // 可见性状态迁移检测：不可见 → 可见时立即补一次刷新
     let mut was_visible = true;
-    // 看门狗：万一周期任务异常退出未复位，30s 后强制解锁，避免轮询永久停摆
-    let tick_watchdog: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(1000));
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 tick += 1;
-                // 轮询纪律（指南 §6）：窗口最小化/隐藏到托盘时暂停周期任务。
-                // 暂停期间不产生任何 RC 请求，避免后台空转。
+                // 后台（最小化 / 隐藏到托盘）：**停止一切轮询与 UI 写入**。
+                // 这里连本地进度泵都不跑 —— 界面看不见，没有必要合成帧。
                 if !ctx.visible.load(std::sync::atomic::Ordering::Relaxed) {
                     was_visible = false;
                     continue;
                 }
+                // 回到前台：先立即对齐一次，再恢复轮询
                 if !was_visible {
                     was_visible = true;
-                    // 恢复可见：立即刷新一次，并更新时间戳
                     let ctx2 = ctx.clone();
                     let ui2 = ui.clone();
                     tokio::spawn(async move {
-                        let _ = Box::pin(handle_cmd(&ctx2, &ui2, Cmd::RefreshDashboard)).await;
-                        let _ = Box::pin(handle_cmd(&ctx2, &ui2, Cmd::MountsRefresh)).await;
-                        let _ = Box::pin(handle_cmd(&ctx2, &ui2, Cmd::ServesRefresh)).await;
+                        refresh::refresh_state(&ctx2, &ui2, true).await;
                     });
                 }
                 // 本地进程状态（不产生任何 RC 请求，也不受「未连接」影响）：
                 // 插件长任务进度（下载 / 解压 / 安装）+ 插件子进程存活灯
                 caps::pump_progress(&ctx.progress);
-                // 防重入：上一轮周期任务未完成则跳过本轮，避免 rclone 慢/挂时挂起任务无限堆积。
-                {
-                    let mut wd = tick_watchdog.lock().unwrap();
-                    if ctx.tick_busy.load(std::sync::atomic::Ordering::SeqCst) {
-                        match *wd {
-                            Some(t) if t.elapsed().as_secs() >= 60 => {
-                                ctx.tick_busy.store(false, std::sync::atomic::Ordering::SeqCst);
-                                *wd = None;
-                                eprintln!("[tick] 周期任务卡死超过 60s，已强制复位");
-                            }
-                            None => *wd = Some(std::time::Instant::now()),
-                            Some(_) => {}
-                        }
-                    } else {
-                        *wd = None;
-                    }
-                }
-                // 未连接时不轮询（离线模式零 RC 请求），但主题跟随等本地逻辑继续执行。
-                if ctx.rc.is_live()
-                    && !ctx.tick_busy.swap(true, std::sync::atomic::Ordering::SeqCst)
+                // 周期任务门控：用户操作进行中 → 轮询让位；上一轮取数未完成 → 不叠加。
+                let live = ctx.rc.is_live();
+                if ctx.hub.status(true, live) == crate::state::PollStatus::Running
+                    && !ctx.hub.fetch_in_flight()
                 {
                     let ctx2 = ctx.clone();
                     let ui2 = ui.clone();
                     let t = tick;
                     tokio::spawn(async move {
-                        // 守卫：panic 也能复位（否则轮询会永久停摆）。
-                        let _tick_guard = TickGuard(ctx2.tick_busy.clone());
-                        // 整体 30s 超时：rclone 挂起时快速放弃（drop future 即取消底层 reqwest 请求），
-                        // 避免 tick_busy 被 reqwest 默认 600s 超时长期持有导致仪表盘停更
-                        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                            // 挂载计数是较重的调用，降到 5s 一次；统计本身仍 1s 一次
-                            poll_stats(&ctx2, &ui2, t % 5 == 0).await;
-                            // 传输页：后台任务列表 + 全局限速（每 10s，core_transferred 响应大，不宜频繁）
-                            if t % 10 == 0 {
-                                build_tasks(&ctx2, &ui2).await;
-                            }
-                            // 限速只在配置值变化时下发（apply_global_limit 内部已判重）
-                            if t % 2 == 0 {
-                                apply_global_limit(&ctx2, &ui2).await;
-                            }
-                            // 已连接时更新「上次刷新」时间戳
-                            if t % 5 == 0 && ctx2.rc.status().await.is_live() {
-                                let ts = now_hms();
-                                let _ = ui2.upgrade_in_event_loop(move |ui| {
-                                    ui.global::<SettingsG>().set_conn_last_refresh(ts.into());
-                                });
-                            }
-                        })
-                        .await;
-                        ctx2.tick_busy.store(false, std::sync::atomic::Ordering::SeqCst);
+                        // 线路①：一份完整快照 → 计数与三个列表同一帧更新
+                        refresh::refresh_state(&ctx2, &ui2, false).await;
+                        // 传输页：后台任务列表（每 10s，core_transferred 响应大，不宜频繁）
+                        if t % 10 == 0 {
+                            build_tasks(&ctx2, &ui2).await;
+                        }
+                        // 限速只在配置值变化时下发（apply_global_limit 内部已判重）
+                        if t % 2 == 0 {
+                            apply_global_limit(&ctx2, &ui2).await;
+                        }
+                        // 已连接时更新「上次刷新」时间戳
+                        if t % 5 == 0 {
+                            let ts = now_hms();
+                            let _ = ui2.upgrade_in_event_loop(move |ui| {
+                                ui.global::<SettingsG>().set_conn_last_refresh(ts.into());
+                            });
+                        }
                     });
                 }
                 // 主题跟随系统（每 3s 检查）
@@ -3281,69 +3239,6 @@ async fn stop_http(ctx: &Arc<Ctx>) {
     }
 }
 
-async fn poll_stats(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, count_mounts: bool) {
-    let client = ctx.rc.client().await;
-    let Ok(Ok(stats)) = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        client.core_stats(),
-    )
-    .await
-    else {
-        return;
-    };
-    // rclone 的 core/stats.speed 是「本次会话平均值」，空闲时几乎不动，
-    // 因此用累计字节差 / 时间差算瞬时速度；真正空闲时归零。
-    let idle = stats.transferring.is_empty();
-    let now = std::time::Instant::now();
-    let inst = {
-        let mut g = ctx.speed_meter.lock().unwrap();
-        let inst = match *g {
-            Some((last_bytes, last_at)) => {
-                let dt = now.duration_since(last_at).as_secs_f64();
-                let db = (stats.bytes - last_bytes).max(0.0);
-                if dt >= 0.2 { db / dt } else { 0.0 }
-            }
-            None => 0.0,
-        };
-        *g = Some((stats.bytes, now));
-        inst
-    };
-    let speed = if idle && inst < 1.0 { 0.0 } else if inst > 0.0 { inst } else { stats.speed };
-    let bytes = stats.bytes;
-    let transferring = stats.transferring;
-    // 挂载计数较贵（mount/listmounts 会遍历全部挂载），按调用方给的节奏抓取
-    let mounts = if count_mounts {
-        tokio::time::timeout(std::time::Duration::from_secs(10), client.mounts())
-            .await
-            .map(|r| r.map(|m| m.len()).unwrap_or(0))
-            .unwrap_or(0)
-    } else {
-        0
-    };
-    let _ = ui.upgrade_in_event_loop(
-        move |ui| {
-            let g = ui.global::<DashboardG>();
-            g.set_speed(format!("{}/s", fmt_bytes(speed)).into());
-            g.set_total_bytes(fmt_bytes(bytes).into());
-            g.set_transfers(transferring.len() as i32);
-            if count_mounts {
-                g.set_mounts(mounts as i32);
-            }
-            let rows: Vec<XferRow> = transferring
-                .iter()
-                .map(|t| XferRow {
-                    name: t.name.clone().into(),
-                    size: fmt_bytes(t.bytes).into(),
-                    speed: format!("{}/s", fmt_bytes(t.speed)).into(),
-                    percent: t.percentage.clamp(0.0, 100.0) as i32,
-                })
-                .collect();
-            let model = ModelRc::from(Rc::new(VecModel::from(rows)));
-            g.set_xfers(model);
-        },
-    );
-}
-
 
 /// 把导入的配置真正应用到**当前连接的本地 rclone**：
 /// - 远程：`config/create`（不存在）或 `config/update`（已存在）；
@@ -3562,7 +3457,52 @@ async fn files_navigate(
     });
 }
 
+/// 命令入口：**用户操作**按「暂停轮询 → 动手前对齐 → 执行 → 动手后再对齐」走。
+///
+/// 为什么动手前必须对齐一次：用户看到的列表可能已经过期（比如 T: 刚被别的工具挂上、
+/// 或服务已被外部停掉），基于旧状态做的判断（盘符占用、名称冲突）会做错事。
+/// rclone 才是真相，命令发布前先读一次。
+///
+/// 只读命令（切页、搜索、浏览文件……）不进这条路径：它们本来就只是「读」。
 async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
+    if !cmd.mutates_rclone_state() {
+        return handle_cmd_inner(ctx, ui, cmd).await;
+    }
+    // 守卫：期间轮询让位（Drop 时恢复，任何提前 return / panic 都不会卡住轮询）
+    let _op = state::UserOpGuard::begin(&ctx.hub);
+    // ① 动手前对齐：用 rclone 的真实状态覆盖界面里的旧状态
+    refresh::refresh_state(ctx, ui, true).await;
+    let quit = handle_cmd_inner(ctx, ui, cmd).await;
+    // ② 动手后对齐：结果异步落地（挂载盘符出现、服务端口监听）也在这一步收敛到界面
+    refresh::refresh_state(ctx, ui, true).await;
+    quit
+}
+
+impl Cmd {
+    /// 这条命令会不会改变 rclone 的运行状态（挂载 / 服务 / 远程 / 代理 / 连接）。
+    ///
+    /// 只有这类命令需要「暂停轮询 + 动手前后各对齐一次」；纯读命令直接执行。
+    fn mutates_rclone_state(&self) -> bool {
+        matches!(
+            self,
+            Cmd::MountAdd
+                | Cmd::MountRemove { .. }
+                | Cmd::ServeStart
+                | Cmd::ServeStop { .. }
+                | Cmd::RemoteSave
+                | Cmd::RemoteDelete { .. }
+                | Cmd::ProxyBind { .. }
+                | Cmd::ProxySave
+                | Cmd::ProxyDelete { .. }
+                | Cmd::ConfApply
+                | Cmd::Connect
+                | Cmd::Disconnect
+                | Cmd::Reconnect
+        )
+    }
+}
+
+async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
     match cmd {
         Cmd::Quit => {
             // 关闭 GUI 只做三件事：停止轮询、释放连接、退出事件循环。
@@ -3619,31 +3559,8 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             true
         }
         Cmd::RefreshDashboard => {
-            // 离线/已断开：保留上次快照，不用失败结果覆盖界面
-            if !ctx.rc.is_live() {
-                return false;
-            }
-            let client = ctx.rc.client().await;
-            let ver_info = client.version().await.unwrap_or_default();
-            let version = ver_info.version;
-            let os_info = format!("{} / {}", ver_info.os, ver_info.arch);
-            let remotes = client.list_remotes().await.map(|r| r.len()).unwrap_or(0);
-            let errs = client.core_stats().await.map(|s| s.errors).unwrap_or(0);
-            let managed = false; // RCGUI 已无「托管模式」：永远连接外部实例
-            let url = ctx.cfg.lock().unwrap().rclone.url.clone();
-            let running = version.starts_with('v');
-            let _ = ui.upgrade_in_event_loop(
-                move |ui| {
-                    let g = ui.global::<DashboardG>();
-                    g.set_version(version.into());
-                    g.set_os_info(os_info.into());
-                    g.set_remotes(remotes as i32);
-                    g.set_errors(errs as i32);
-                    g.set_running(running);
-                    g.set_managed(managed);
-                    g.set_url(url.into());
-                },
-            );
+            // 仪表盘不再单独取数：所有数字都来自同一份状态快照
+            refresh::refresh_state(ctx, ui, true).await;
             false
         }
         Cmd::FilesInit => {
@@ -4073,57 +3990,10 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::MountsRefresh => {
-            // 离线/已断开：保留上次快照（指南 §3），只标记陈旧，不清空列表
-            if !ctx.rc.is_live() {
-                return false;
-            }
-            // 单飞：已有同类刷新在跑时**等待它结束再跑一次**，而不是直接丢弃本次请求。
-            //
-            // 早期实现是「有在跑就 return」，问题是刷新请求会丢：用户点挂载后，
-            // 若恰好撞上 5s 周期刷新，这次「摘掉 pending 后重绘」的刷新会被吞掉，
-            // 界面就停在 spinner 上，直到用户切页触发下一次刷新。
-            if ctx.gate_mounts.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                while ctx.gate_mounts.load(std::sync::atomic::Ordering::SeqCst)
-                    && tokio::time::Instant::now() < deadline
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-                // 仍在其它刷新里：放弃（避免叠加），下一次周期刷新会纠正
-                if ctx.gate_mounts.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    return false;
-                }
-            }
-            let _gate = GateGuard(ctx.gate_mounts.clone());
-            let client = ctx.rc.client().await;
-            let mounts = client.mounts().await.unwrap_or_default();
-            let mut rows: Vec<MountRow> = mounts
-                .iter()
-                .map(|m| MountRow {
-                    fs: m.fs.clone().into(),
-                    mount_point: m.mount_point.clone().into(),
-                    pending: false,
-                })
-                .collect();
-            // 合并“正在挂载中”的条目；已被真实列表收录的则自动摘掉。
-            // 必须用 mount_key 归一化比较：pending 里存的是 "T:\"（规范化后的配置值），
-            // 而 rclone 的 listmounts 回报的是 "T:"。直接字符串比较永远不相等，
-            // 结果就是同一个盘符在界面上出现两条（一条 pending + 一条真实）。
-            {
-                let mut pending = ctx.pending_mounts.lock().unwrap();
-                pending.retain(|(_, pt)| !rows.iter().any(|r| mount_key(&r.mount_point) == mount_key(pt)));
-                for (fs, pt) in pending.iter() {
-                    if !rows.iter().any(|r| mount_key(&r.mount_point) == mount_key(pt)) {
-                        rows.push(MountRow {
-                            fs: fs.clone().into(),
-                            mount_point: pt.clone().into(),
-                            pending: true,
-                        });
-                    }
-                }
-            }
-            *ctx.mounts_cache.lock().unwrap() = rows.clone();
-            apply_mounts_filter(ui, &rows).await;
+            // 刷新 = 「现在就去 rclone 取一份状态并重画」。
+            // 它和轮询共用同一条路径，所以计数（仪表盘 / 状态栏）与挂载页列表
+            // 永远出自同一份快照，不会再出现「列表 1 条、计数 0」。
+            refresh::refresh_state(ctx, ui, true).await;
             false
         }
         Cmd::MountAdd => {
@@ -4474,86 +4344,10 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::RemotesRefresh => {
-            if !ctx.rc.is_live() {
-                return false;
-            }
-            if ctx.gate_remotes.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                return false;
-            }
-            let _gate = GateGuard(ctx.gate_remotes.clone());
-            let client = ctx.rc.client().await;
-            let names = client.list_remotes().await.unwrap_or_default();
-            let dump = client.config_dump().await.unwrap_or(json!({}));
-            let mut full: Vec<(String, String, String)> = Vec::with_capacity(names.len());
-            {
-                let cache = ctx.remotes_cache.lock().unwrap();
-                for n in &names {
-                    let ty = dump
-                        .get(n)
-                        .and_then(|e| e.get("type"))
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("?")
-                        .to_string();
-                    let usage = cache
-                        .iter()
-                        .find(|(cn, _, _)| cn == n)
-                        .map(|(_, _, u)| u.clone())
-                        .unwrap_or_else(|| "—".into());
-                    full.push((n.clone(), ty, usage));
-                }
-            }
-            *ctx.remotes_cache.lock().unwrap() = full.clone();
-            // 本地副本（仅名字/类型/用量，不含凭据）：离线时也能看到「有哪些远程」
-            profiles::set_remotes(&full);
-            apply_remotes_filter(ui, &full).await;
-            // 同步仓库下拉框（挂载须 服务页）与挂载、服务预设列行
-            let names_ui: Vec<slint::SharedString> =
-                full.iter().map(|(n, _, _)| n.as_str().into()).collect();
-            let _ = ui.upgrade_in_event_loop(move |ui| {
-                let m = ModelRc::from(Rc::new(VecModel::from(names_ui)));
-                ui.global::<MountsG>().set_remotes(m.clone());
-                ui.global::<ServesG>().set_remotes(m);
-            });
-            // 异步加载用量
-            for n in names {
-                let client = client.clone();
-                let ctx2 = ctx.clone();
-                let ui2 = ui.clone();
-                tokio::spawn(async move {
-                    let usage = match client.about(&format!("{n}:")).await {
-                        Ok(v) => {
-                            let total = v.get("total").and_then(|x| x.as_f64());
-                            let used = v.get("used").and_then(|x| x.as_f64());
-                            match (total, used) {
-                                (Some(t), Some(u)) => format!("{} / {}", fmt_bytes(u), fmt_bytes(t)),
-                                (None, Some(u)) => format!("已用 {}", fmt_bytes(u)),
-                                _ => "—".into(),
-                            }
-                        }
-                        Err(_) => "—".into(),
-                    };
-                    {
-                        let mut cache = ctx2.remotes_cache.lock().unwrap();
-                        if let Some(e) = cache.iter_mut().find(|(cn, _, _)| cn == &n) {
-                            e.2 = usage.clone();
-                        }
-                    }
-                    let _ = ui2.upgrade_in_event_loop(move |ui| {
-                        let g = ui.global::<RemotesG>();
-                        let rows = g.get_rows();
-                        for i in 0..rows.row_count() {
-                            if let Some(mut r) = rows.row_data(i) {
-                                if r.name.as_str() == n.as_str() {
-                                    r.usage = usage.clone().into();
-                                    rows.set_row_data(i, r);
-                                }
-                            }
-                        }
-                    });
-                    let full2 = ctx2.remotes_cache.lock().unwrap().clone();
-                    apply_remotes_filter(&ui2, &full2).await;
-                });
-            }
+            // 与挂载/服务页同一个入口：强制取一份快照并重画。
+            // 远程页额外需要「每个远程的用量」（about 会真的连后端），由 refresh 内部按
+            // 30s 节流异步补，不跟着 1s 轮询跑。
+            refresh::refresh_state(ctx, ui, true).await;
             false
         }
         Cmd::SearchApply { scope } => {
@@ -5253,72 +5047,8 @@ async fn handle_cmd(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
             false
         }
         Cmd::ServesRefresh => {
-            if !ctx.rc.is_live() {
-                return false;
-            }
-            // 同 MountsRefresh：等前一单飞结束再刷新，避免「服务已启动但列表没更新」
-            if ctx.gate_serves.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                while ctx.gate_serves.load(std::sync::atomic::Ordering::SeqCst)
-                    && tokio::time::Instant::now() < deadline
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-                if ctx.gate_serves.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    return false;
-                }
-            }
-            let _gate = GateGuard(ctx.gate_serves.clone());
-            let client = ctx.rc.client().await;
-            let v = client.serve_list().await.unwrap_or(json!({}));
-            let items = v
-                .get("list")
-                .and_then(|x| x.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let rows: Vec<ServeRow> = items
-                .iter()
-                .filter(|it| {
-                    // 只显示运行中的服务（已停止的不留在列表里）
-                    it.get("running").and_then(|x| x.as_bool()).unwrap_or(true)
-                })
-                .map(|it| {
-                    let id = it
-                        .get("id")
-                        .and_then(|x| {
-                            x.as_str()
-                                .map(|s| s.to_string())
-                                .or_else(|| x.as_i64().map(|n| n.to_string()))
-                        })
-                        .unwrap_or_default();
-                    let params = it.get("params").cloned().unwrap_or(json!({}));
-                    let getp = |keys: &[&str]| -> String {
-                        for k in keys {
-                            if let Some(v) = params.get(*k).and_then(|x| x.as_str()) {
-                                return v.to_string();
-                            }
-                            if let Some(v) = it.get(*k).and_then(|x| x.as_str()) {
-                                return v.to_string();
-                            }
-                        }
-                        String::new()
-                    };
-                    // 协议位于 params.type（顶层没有 type 字段），修复协议列空白
-                    let ty = getp(&["type", "Type"]);
-                    let fs = getp(&["fs", "Fs"]);
-                    let addr = getp(&["addr", "Addr", "listen", "Listen"]);
-                    let name = ensure_serve_name(ctx, &ty, &fs, &addr);
-                    ServeRow {
-                        id: id.into(),
-                        name: name.into(),
-                        stype: ty.into(),
-                        fs: fs.into(),
-                        addr: addr.into(),
-                    }
-                })
-                .collect();
-            *ctx.serves_cache.lock().unwrap() = rows.clone();
-            apply_serves_filter(ui, &rows).await;
+            // 与挂载页同一个入口：一份快照同时更新服务列表与仪表盘里的计数
+            refresh::refresh_state(ctx, ui, true).await;
             false
         }
         Cmd::ServeStart => {

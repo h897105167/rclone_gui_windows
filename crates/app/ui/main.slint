@@ -250,6 +250,7 @@ export global DashboardG {
     in-out property <int> transfers: 0;
     in-out property <[XferRow]> xfers: [];
     in-out property <int> mounts: 0;
+    in-out property <int> serves: 0;
     in-out property <int> errors: 0;
 }
 
@@ -287,6 +288,9 @@ export global FilesG {
 
 export global MountsG {
     in-out property <[MountRow]> mounts: [];
+    /// 实例不匹配提示：当前端点报告「没有挂载」，但本机存在 rclone 盘符时才有内容。
+    /// 由 Rust 侧按同一份状态快照计算（非空才显示）。
+    in-out property <string> instance-hint: "";
     // 仓库（远程）列表 + 选中项；子路径相对仓库根
     in-out property <[string]> remotes: [];
     in-out property <int> remote-idx: 0;
@@ -826,7 +830,7 @@ component DashboardView inherits Rectangle {
                 StatTile {
                     label: "资源总览";
                     value: DashboardG.remotes + " 远程";
-                    sub: "挂载 " + DashboardG.mounts + " 个";
+                    sub: "挂载 " + DashboardG.mounts + " 个 · 服务 " + DashboardG.serves + " 个";
                     tint: ThemeG.ok;
                 }
             }
@@ -1987,6 +1991,22 @@ component MountsView inherits Rectangle {
                 spacing: 10px;
                 Text { text: "⚠"; font-size: 16px; vertical-alignment: center; }
                 Text { text: MountsG.winfsp-msg; font-size: 12px; color: ThemeG.warn; wrap: word-wrap; vertical-alignment: center; }
+            }
+        }
+        // 实例不匹配：当前端点报告没有挂载，但本机确有 rclone 盘符（属于另一个实例）。
+        // 这条不是错误、也不该让用户以为界面坏了，所以用中性面板色而不是错误色。
+        if MountsG.instance-hint != "" : Rectangle {
+            height: 56px;
+            background: ThemeG.panel-2;
+            border-radius: ThemeG.radius;
+            border-width: 1px;
+            border-color: ThemeG.accent;
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 14px;
+                spacing: 10px;
+                Text { text: "提示"; font-size: 12px; font-weight: 700; color: ThemeG.accent; vertical-alignment: center; }
+                Text { text: MountsG.instance-hint; font-size: 12px; color: ThemeG.text; wrap: word-wrap; vertical-alignment: center; }
             }
         }
         Card {
