@@ -2962,16 +2962,15 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
     }
 
     // 2) 内嵌 HTTP
+    //
+    // **不要再往 `DashboardG.url` 里写 HTTP 端口**：那个属性在界面上是
+    // 「RC 地址」（仪表盘 + 底部状态栏两处），语义是**rclone RC 端点**。
+    // 早先这里写过 `http://127.0.0.1:{http_port}`，只要开了内嵌 HTTP
+    // （默认开、端口 5273），就会把上面刚设好的 RC 地址覆盖掉 ——
+    // 表现为「连上 rclone 了但 RC 地址显示 5273」，会话 11 实测踩到。
     let http_cfg = ctx.cfg.lock().unwrap().http.clone();
     if http_cfg.enabled {
-        let port = http_cfg.port;
-        spawn_http(&ctx, port, ui.clone()).await;
-        let _ = ui.upgrade_in_event_loop(
-            move |ui| {
-                ui.global::<DashboardG>()
-                    .set_url(format!("http://127.0.0.1:{port}").into());
-            },
-        );
+        spawn_http(&ctx, http_cfg.port, ui.clone()).await;
     }
 
     // 3) 单实例 IPC（收到 show → 显示窗口）
