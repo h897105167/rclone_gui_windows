@@ -166,6 +166,8 @@ enum Cmd {
     AdminCancel,
     /// 托盘图标注册失败：把原因告知用户（不能静默）
     TrayFailed(String),
+    /// 窗口从后台回到前台：立即对齐一次状态（不等下一次轮询）
+    Foregrounded,
     Quit,
 }
 
@@ -1792,9 +1794,14 @@ fn main() {
     //
     // 只采样、不做任何 RC 操作，因此可以在 UI 线程上每 500ms 跑一次；
     // 后台线程只读 AtomicBool，不需要跨线程调用 winit。
+    //
+    // 从「不可见」回到「可见」的那一拍**立刻**发一条 Foregrounded 命令：
+    // 轮询间隔是 1s，等下一拍再对齐最多要 1.5s，用户会觉得「切回来还是旧数字」。
     {
         let vis = visible_flag;
         let ui_weak = ui.as_weak();
+        let tx_fg = tx.clone();
+        let mut was_shown = true;
         let vis_timer = Box::leak(Box::new(slint::Timer::default()));
         vis_timer.start(
             slint::TimerMode::Repeated,
@@ -1812,6 +1819,11 @@ fn main() {
                     // 取不到窗口状态时按「可见」处理：宁可多轮询，也不要让界面停更
                     .unwrap_or(true);
                 vis.store(shown, std::sync::atomic::Ordering::Relaxed);
+                if shown && !was_shown {
+                    // 回到前台：马上对齐一次（轮询会在之后继续，不重复发）
+                    let _ = tx_fg.send(Cmd::Foregrounded);
+                }
+                was_shown = shown;
             },
         );
     }
@@ -2857,8 +2869,6 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
     // 窗口最小化 / 隐藏时两条线路都停，回到前台先立即对齐一次。
     let mut tick: u64 = 0;
     let mut last_dark: Option<bool> = None;
-    // 可见性状态迁移检测：不可见 → 可见时立即补一次刷新
-    let mut was_visible = true;
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(1000));
     loop {
         tokio::select! {
@@ -2866,18 +2876,10 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
                 tick += 1;
                 // 后台（最小化 / 隐藏到托盘）：**停止一切轮询与 UI 写入**。
                 // 这里连本地进度泵都不跑 —— 界面看不见，没有必要合成帧。
+                // 回到前台那一下由 UI 线程的可见性采样直接发 `Cmd::Foregrounded`，
+                // 不走这条 1s 的节拍（否则最多要等 1.5s 才对齐）。
                 if !ctx.visible.load(std::sync::atomic::Ordering::Relaxed) {
-                    was_visible = false;
                     continue;
-                }
-                // 回到前台：先立即对齐一次，再恢复轮询
-                if !was_visible {
-                    was_visible = true;
-                    let ctx2 = ctx.clone();
-                    let ui2 = ui.clone();
-                    tokio::spawn(async move {
-                        refresh::refresh_state(&ctx2, &ui2, true).await;
-                    });
                 }
                 // 本地进程状态（不产生任何 RC 请求，也不受「未连接」影响）：
                 // 插件长任务进度（下载 / 解压 / 安装）+ 插件子进程存活灯
@@ -3560,6 +3562,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         }
         Cmd::RefreshDashboard => {
             // 仪表盘不再单独取数：所有数字都来自同一份状态快照
+            refresh::refresh_state(ctx, ui, true).await;
+            false
+        }
+        Cmd::Foregrounded => {
+            // 回到前台的第一件事：用 rclone 的真实状态覆盖界面（后台期间它可能变了）
             refresh::refresh_state(ctx, ui, true).await;
             false
         }
