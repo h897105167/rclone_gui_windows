@@ -879,7 +879,16 @@ component DashboardView inherits Rectangle {
                         HorizontalLayout {
                             height: 20px;
                             Text { text: "RC 地址"; font-size: 12px; color: ThemeG.text-dim; width: 64px; vertical-alignment: center; }
-                            Text { text: DashboardG.url; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
+                            // 没连过 rclone 时不显示地址：那只是「将要连的」配置值，
+                            // 摆在「系统信息」里会被误读成当前连接目标（会话 11 用户指出）。
+                            // 连上过、现在断了（stale）仍显示，因为上面已标「显示上次快照」。
+                            Text {
+                                text: (DashboardG.running || DashboardG.stale) ? DashboardG.url : "—";
+                                font-size: 12px;
+                                color: (DashboardG.running || DashboardG.stale) ? ThemeG.text : ThemeG.text-dim;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
                         }
                     }
                 }
@@ -3363,8 +3372,12 @@ component SettingsView inherits Rectangle {
                             color: SettingsG.conn-live ? ThemeG.ok : (SettingsG.conn-stale ? ThemeG.warn : ThemeG.text-dim);
                             vertical-alignment: center;
                         }
+                        // 只在真正连上（或显示上次快照）时显示端点：
+                        // 未连接时 `conn-endpoint` 是 `Endpoint::loopback_default()` 的占位值，
+                        // 和上面「RC 地址」输入框里的配置值不是一回事，露出来会误导
+                        // （会话 11 用户指出：未连接时不该显示 RC 地址）。
                         Text {
-                            text: SettingsG.conn-endpoint;
+                            text: (SettingsG.conn-live || SettingsG.conn-stale) ? SettingsG.conn-endpoint : "";
                             font-size: 12px;
                             color: ThemeG.text-dim;
                             vertical-alignment: center;
@@ -4207,7 +4220,15 @@ export component MainWindow inherits Window {
                     padding-left: 14px;
                     padding-right: 14px;
                     spacing: 16px;
-                    Text { text: DashboardG.url; font-size: 11px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
+                    // 同样只在真正连上（或显示上次快照）时才露出 RC 地址，
+                    // 否则状态栏会显示一个「将要连的」地址，看起来像已连上。
+                    Text {
+                        text: (DashboardG.running || DashboardG.stale) ? DashboardG.url : "未连接";
+                        font-size: 11px;
+                        color: ThemeG.text-dim;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
                     Rectangle {}
                     // 状态栏三项都可点击（鼠标变手形以提示可点）：
                     // - 传输 / 挂载 → 跳到对应导航页
