@@ -122,6 +122,17 @@ pub struct AppConfig {
     pub autostart: bool,
     #[serde(default)]
     pub silent_start: bool,
+    /// 关闭窗口时隐藏到托盘（而不是退出）。
+    ///
+    /// 首次关闭时由弹层询问用户，用户的选择写进这里；之后按此值执行。
+    #[serde(default)]
+    pub close_to_tray: bool,
+    /// 用户是否已经就「关闭行为」做过选择（确认 / 取消 / 直接关闭，或手动改过复选框）。
+    ///
+    /// 为 true 时不再弹首次提示框。注意它与 `close_to_tray` 是两件事：
+    /// 用户可能选过「直接关闭」（`close_to_tray=false`），此时也不该再问。
+    #[serde(default)]
+    pub close_prompt_done: bool,
     #[serde(default)]
     pub http: HttpCfg,
     /// 插件启用表

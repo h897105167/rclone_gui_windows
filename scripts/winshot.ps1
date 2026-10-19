@@ -16,6 +16,7 @@ param(
     [string]$Wheel = "",
     [int]$Wait = 900,
     [string]$ProcName = "rclone-gui",
+    [int]$ProcId = 0,
     [int]$Width = 1400,
     [int]$Height = 900
 )
@@ -83,8 +84,12 @@ public class WinCap {
 
 [WinCap]::SetProcessDpiAwarenessContext([IntPtr](-4)) | Out-Null
 
-$target = Get-Process $ProcName -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $target) { throw "process not found: $ProcName" }
+$target = if ($ProcId -gt 0) {
+    Get-Process -Id $ProcId -ErrorAction SilentlyContinue
+} else {
+    Get-Process $ProcName -ErrorAction SilentlyContinue | Select-Object -First 1
+}
+if (-not $target) { throw "process not found: $ProcName (id=$ProcId)" }
 $h = $target.MainWindowHandle
 if ($h -eq [IntPtr]::Zero) { throw "no main window for $ProcName" }
 

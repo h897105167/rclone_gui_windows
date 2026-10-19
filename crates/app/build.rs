@@ -97,16 +97,31 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
         let to = dst.join(entry.file_name());
         if from.is_dir() {
             copy_dir(&from, &to)?;
-        } else {
-            let same_len = std::fs::metadata(&to)
-                .ok()
-                .zip(std::fs::metadata(&from).ok())
-                .map(|(a, b)| a.len() == b.len())
-                .unwrap_or(false);
-            if !same_len {
-                std::fs::copy(&from, &to)?;
-            }
+        } else if needs_copy(&from, &to) {
+            std::fs::copy(&from, &to)?;
         }
     }
     Ok(())
+}
+
+/// 目标文件是否需要覆盖。
+///
+/// 只看长度是**不够的**：`check.sha256` 的内容是「哈希 + 两个空格 + 文件名」，
+/// 重新打包后长度几乎必然还是同一个值（本项目的清单固定 154 字节）。
+/// 只比长度会让清单永远停在旧版本，而 `main.wasm` / `config.json` 已经更新 ——
+/// 装到用户目录后哈希对不上，插件显示「校验失败」且无法启用。
+/// 因此同时比较修改时间：任一不同就复制。
+fn needs_copy(from: &Path, to: &Path) -> bool {
+    let (Ok(a), Ok(b)) = (std::fs::metadata(from), std::fs::metadata(to)) else {
+        return true;
+    };
+    if a.len() != b.len() {
+        return true;
+    }
+    let mtime = |m: &std::fs::Metadata| m.modified().ok();
+    match (mtime(&a), mtime(&b)) {
+        (Some(x), Some(y)) => x != y,
+        // 拿不到时间戳时宁可多复制一次，也不要留下旧文件
+        _ => true,
+    }
 }

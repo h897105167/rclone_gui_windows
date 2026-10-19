@@ -97,6 +97,7 @@ export struct PanelBtn {
 ///   progress—— 进度条（progress: 0..100，-1 表示不确定）
 ///   check   —— 校验清单行（label + value + ok）
 ///   divider —— 分隔线
+/// 通用插件面板里的一个字段行。
 export struct PanelRow {
     kind: string,
     key: string,
@@ -106,6 +107,7 @@ export struct PanelRow {
     // "text" | "password" | "number" | "bool" | "select" | "path"
     field-kind: string,
     placeholder: string,
+    // select 字段：下拉选项；path 字段：路径历史（非空时右侧出现 ▾）
     options: [string],
     // select 字段的当前选中项下标（由宿主按 value 在 options 里的位置算好）
     selected-index: int,
@@ -223,6 +225,12 @@ export global ToastG {
     /// 历史里是否包含错误（用于把标题染红，提醒有失败项）。
     /// 用 in-out 而不是 out：out 属性没有 setter，Rust 侧改不了。
     in-out property <bool> has-errors: false;
+    /// 历史里**当前还留着**的错误条数。
+    ///
+    /// 只数「界面上真实存在的错误」：历史超过上限被截断、或用户点「清空」后，
+    /// 这个数会跟着回退，与列表里能看到的内容始终一致。
+    /// 底部状态栏把它和 rclone 的累计错误数相加展示。
+    in-out property <int> error-count: 0;
     /// 底部「错误」按钮弹出的错误面板是否可见。
     in-out property <bool> error-panel: false;
 }
@@ -441,6 +449,10 @@ export global SettingsG {
     in-out property <int> accent-idx: 0;
     in-out property <bool> autostart: false;
     in-out property <bool> silent: false;
+    /// 关闭窗口时隐藏到托盘（而非退出）。首次关闭时由弹层询问，之后按此值执行。
+    in-out property <bool> close-to-tray: false;
+    /// 首次关闭的「三选一」提示是否显示（只在 close_prompt_done = false 时出现）
+    in-out property <bool> close-prompt-show: false;
     /// 「以管理员身份运行」：反映当前进程真实权限（由 Rust 在启动时读取令牌）
     in-out property <bool> run-as-admin: false;
     /// 切换权限前确认弹窗的正文（“软件将重启”）
@@ -899,6 +911,9 @@ component DashboardView inherits Rectangle {
                             clicked => {
                                 ToastG.history = [];
                                 ToastG.has-errors = false;
+                                // 清空后「错误」计数必须跟着回退：
+                                // 这个数只统计界面上还留着的错误，不能变成只增不减的累计值。
+                                ToastG.error-count = 0;
                             }
                         }
                     }
@@ -910,6 +925,10 @@ component DashboardView inherits Rectangle {
                         border-color: ThemeG.border;
                         ScrollView {
                             VerticalLayout {
+                                // 同错误面板：内容区必须定宽，否则带 wrap 的 Text
+                                // 会按「一行排开」的宽度撑开，永远不换行。
+                                width: parent.width;
+                                alignment: start;
                                 padding: 8px;
                                 spacing: 3px;
                                 for l in ToastG.history : HorizontalLayout {
@@ -2503,6 +2522,12 @@ component PluginsView inherits Rectangle {
     callback panel-close;
     // 字段改动：key 来自 config.json 的控件 key
     callback panel-field(string, string);
+    /// 从下拉（如路径历史）**选中**一个值。
+    ///
+    /// 与 `panel-field` 分开的原因：输入框逐字符编辑时重拉面板会打断输入，
+    /// 而「选中下拉项」必须在写盘后立刻重拉 —— 否则输入框里的 `text` 仍绑在
+    /// 旧模型值上，用户点了历史条目却看不到任何变化。
+    callback panel-pick(string, string);
     // 动作按钮：key 来自 config.json 的 action 控件 key
     callback panel-action(string);
     // 卸载插件（会删插件目录与该插件的 kv 数据）
@@ -2522,6 +2547,10 @@ component PluginsView inherits Rectangle {
     property <string> cb-name: "";
     property <length> pop-ax;
     property <length> pop-ay;
+    // 路径历史下拉：当前展开的是哪个字段（空 = 收起）与它的候选列表。
+    // 候选由插件返回（`options` 非空的 path 字段），这里只负责显示与回填。
+    property <string> path-drop-key: "";
+    property <[string]> path-drop-options: [];
     ScrollView {
         VerticalLayout {
             padding: 24px;
@@ -2942,6 +2971,35 @@ component PluginsView inherits Rectangle {
                                                 placeholder-text: r.placeholder;
                                                 edited(t) => { root.panel-field(r.key, t); }
                                             }
+                                            // 路径历史下拉：`options` 非空时右侧出现 ▾，
+                                            // 点开在下方展开候选（历史里通过校验的路径）。
+                                            // 用内联展开而不是 PopupWindow：面板本身在 ScrollView 里，
+                                            // 弹出层的定位会随滚动漂移，内联列表更稳。
+                                            if r.field-kind == "path" && r.options.length > 0 : Rectangle {
+                                                width: 26px;
+                                                height: 26px;
+                                                border-radius: ThemeG.radius-s;
+                                                background: hta2.has-hover ? ThemeG.hover : ThemeG.panel-2;
+                                                Text {
+                                                    text: "\u{E70D}";
+                                                    font-family: "Segoe MDL2 Assets";
+                                                    font-size: 12px;
+                                                    color: ThemeG.text-dim;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+                                                hta2 := TouchArea {
+                                                    mouse-cursor: pointer;
+                                                    clicked => {
+                                                        if root.path-drop-key == r.key {
+                                                            root.path-drop-key = "";
+                                                        } else {
+                                                            root.path-drop-key = r.key;
+                                                            root.path-drop-options = r.options;
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             if r.field-kind == "number" : LineEdit {
                                                 width: 120px;
                                                 text: r.value;
@@ -2963,6 +3021,41 @@ component PluginsView inherits Rectangle {
                                                 enabled: r.enabled && p.enabled;
                                                 placeholder-text: r.placeholder;
                                                 edited(t) => { root.panel-field(r.key, t); }
+                                            }
+                                        }
+                                        // 历史下拉展开区（仅 path 字段、且点了 ▾ 时）
+                                        if root.path-drop-key != "" && root.path-drop-key == r.key : Rectangle {
+                                            background: ThemeG.panel-2;
+                                            border-radius: ThemeG.radius-s;
+                                            border-width: 1px;
+                                            border-color: ThemeG.border;
+                                            height: Math.min(180px, root.path-drop-options.length * 26px + 8px);
+                                            VerticalLayout {
+                                                padding: 4px;
+                                                spacing: 0px;
+                                                for opt in root.path-drop-options : Rectangle {
+                                                    height: 26px;
+                                                    border-radius: ThemeG.radius-s;
+                                                    background: ota.has-hover ? ThemeG.hover : transparent;
+                                                    HorizontalLayout {
+                                                        padding-left: 6px;
+                                                        padding-right: 6px;
+                                                        Text {
+                                                            text: opt;
+                                                            font-size: 12px;
+                                                            color: ThemeG.text;
+                                                            vertical-alignment: center;
+                                                            overflow: elide;
+                                                        }
+                                                    }
+                                                    ota := TouchArea {
+                                                        mouse-cursor: pointer;
+                                                        clicked => {
+                                                            root.panel-pick(r.key, opt);
+                                                            root.path-drop-key = "";
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -3428,6 +3521,11 @@ component SettingsView inherits Rectangle {
                             height: 28px;
                             CheckBox { checked <=> SettingsG.autostart; text: "开机自启"; toggled => { root.save(); } }
                             CheckBox { checked <=> SettingsG.silent; text: "静默启动（仅托盘）"; toggled => { root.save(); } }
+                            CheckBox {
+                                checked <=> SettingsG.close-to-tray;
+                                text: "关闭窗口时隐藏到托盘区";
+                                toggled => { root.save(); }
+                            }
                         }
                         // 以管理员身份运行：切换即提示「软件将重启」，确认后按目标权限重启
                         HorizontalLayout {
@@ -3818,6 +3916,8 @@ export component MainWindow inherits Window {
     callback plugin-panel-open(int);
     callback plugin-panel-close();
     callback plugin-panel-field(string, string);
+    /// 从下拉（路径历史）选中一个值：写盘后需要重拉面板
+    callback plugin-panel-pick(string, string);
     callback plugin-panel-action(string);
     callback plugin-uninstall(int);
     callback plugin-restore(int);
@@ -3827,6 +3927,10 @@ export component MainWindow inherits Window {
     callback win-minimize();
     callback win-toggle-maximize();
     callback win-close();
+    /// 首次关闭提示的三个选项（由 Rust 决定后果：勾选并隐藏 / 什么都不做 / 取消勾选并退出）
+    callback close-prompt-confirm();
+    callback close-prompt-cancel();
+    callback close-prompt-quit();
 
 
     // 内置控件（LineEdit / ComboBox / CheckBox / TextEdit / ScrollView）的文字与背景色
@@ -4067,6 +4171,7 @@ export component MainWindow inherits Window {
                     panel-open(i) => { root.plugin-panel-open(i); }
                     panel-close => { root.plugin-panel-close(); }
                     panel-field(k, v) => { root.plugin-panel-field(k, v); }
+                    panel-pick(k, v) => { root.plugin-panel-pick(k, v); }
                     panel-action(a) => { root.plugin-panel-action(a); }
                     plugin-uninstall(i) => { root.plugin-uninstall(i); }
                     plugin-restore(i) => { root.plugin-restore(i); }
@@ -4127,7 +4232,7 @@ export component MainWindow inherits Window {
                         width: 68px;
                         height: 22px;
                         clicked => { ToastG.error-panel = !ToastG.error-panel; }
-                        Text { text: "错误 " + DashboardG.errors; font-size: 11px; color: DashboardG.errors > 0 ? ThemeG.err : ThemeG.text-dim; horizontal-alignment: center; vertical-alignment: center; }
+                        Text { text: "错误 " + (ToastG.error-count + DashboardG.errors); font-size: 11px; color: (ToastG.error-count + DashboardG.errors) > 0 ? ThemeG.err : ThemeG.text-dim; horizontal-alignment: center; vertical-alignment: center; }
                     }
                 }
                 Rectangle {
@@ -4166,7 +4271,7 @@ export component MainWindow inherits Window {
                     vertical-alignment: center;
                 }
                 Text {
-                    text: "（共 " + ToastG.history.length + " 条历史中的错误）";
+                    text: "（当前 " + ToastG.error-count + " 条错误记录）";
                     font-size: 11px;
                     color: ThemeG.text-dim;
                     vertical-alignment: center;
@@ -4178,6 +4283,7 @@ export component MainWindow inherits Window {
                     clicked => {
                         ToastG.history = [];
                         ToastG.has-errors = false;
+                        ToastG.error-count = 0;
                         ToastG.error-panel = false;
                     }
                 }
@@ -4195,30 +4301,122 @@ export component MainWindow inherits Window {
                 border-color: ThemeG.border;
                 ScrollView {
                     VerticalLayout {
+                        // 必须显式定宽：ScrollView 的内容区宽度默认按「子项首选宽度」算，
+                        // 而带 `wrap` 的 Text 首选宽度是**整段文字一行排开**的宽度，
+                        // 于是内容比视口还宽 → 永远不换行、只出现横向滚动。
+                        // 绑到视口宽度后 Text 才有确定的换行宽度（这就是多行文本
+                        // 被裁成一行、或干脆只有第一行的根因）。
+                        width: parent.width;
+                        // 内容少时不要垂直居中：默认会把唯一一行压到面板底部
+                        alignment: start;
                         padding: 8px;
                         spacing: 4px;
                         // 历史里只要错误项（kind == "2"）。
-                        // Slint 的 `for` 没有 filter，所以非错误项渲染成 0 高度并隐藏。
-                        // 行高用固定值：在 `height` 里引用同级的 `eline` 会有求值顺序问题。
-                        for l in ToastG.history : Rectangle {
-                            height: l.kind == "2" ? 20px : 0px;
-                            visible: l.kind == "2";
-                            HorizontalLayout {
-                                spacing: 8px;
-                                eline := Text {
-                                    text: l.time + "   " + l.msg;
-                                    font-size: 12px;
-                                    color: ThemeG.err;
-                                    horizontal-stretch: 1;
-                                    wrap: word-wrap;
-                                }
-                            }
-                        }
-                        if !ToastG.has-errors : Text {
+                        //
+                        // 这里**不能用固定行高**：旧写法给每行写死 20px，多行文本
+                        // 换行后会被卡片裁掉（用户看到的就是「只有第一行，其余被遮住」）。
+                        // 现在行高交给内容：Text 自动换行 → HorizontalLayout 自动变高；
+                        // 非错误项用 visible=false 排除（Slint 不会为它保留布局空间）。
+                        if ToastG.error-count == 0 : Text {
                             text: "暂无错误记录";
                             font-size: 12px;
                             color: ThemeG.text-dim;
                         }
+                        for l in ToastG.history : Rectangle {
+                            visible: l.kind == "2";
+                            HorizontalLayout {
+                                spacing: 8px;
+                                padding-top: 2px;
+                                padding-bottom: 2px;
+                                Text {
+                                    text: l.time;
+                                    font-size: 11px;
+                                    color: ThemeG.text-dim;
+                                    width: 58px;
+                                    vertical-alignment: top;
+                                }
+                                Rectangle {
+                                    width: 3px;
+                                    background: ThemeG.err;
+                                    border-radius: 2px;
+                                }
+                                Text {
+                                    text: l.msg;
+                                    font-size: 12px;
+                                    color: ThemeG.err;
+                                    horizontal-stretch: 1;
+                                    wrap: word-wrap;
+                                    vertical-alignment: top;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 首次关闭窗口：询问「隐藏到托盘 / 直接关闭」。
+    //
+    // 只在 `close-prompt-done = false` 时由 Rust 侧置为显示；三个按钮的后果都由
+    // Rust 决定（勾选并隐藏 / 什么都不做 / 取消勾选并退出），这里只负责问。
+    // 用页面内遮罩而不是 PopupWindow：关闭动作本身会隐藏窗口，弹层若依赖窗口
+    // 焦点，容易被「窗口已经没了」打断。
+    if SettingsG.close-prompt-show : Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: #00000066;
+        TouchArea {}  // 拦截底层点击（防止用户点到背后的按钮）
+        Rectangle {
+            x: parent.width / 2 - self.width / 2;
+            y: parent.height / 2 - self.height / 2;
+            width: 420px;
+            height: 200px;
+            background: ThemeG.panel;
+            border-radius: ThemeG.radius;
+            border-width: 1px;
+            border-color: ThemeG.border;
+            VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "关闭窗口";
+                    font-size: 15px;
+                    font-weight: 700;
+                    color: ThemeG.text;
+                }
+                Text {
+                    text: "你希望关闭窗口时隐藏到托盘区（程序继续在后台运行），还是直接退出程序？"
+                        + "选「取消」不做任何操作，下次关闭还会再问。";
+                    // 必须定宽：只写 wrap 不约束宽度时 preferred-height 会按单行估算，
+                    // 长文案换行后会把按钮挤出卡片。
+                    width: 376px;
+                    font-size: 13px;
+                    color: ThemeG.text-dim;
+                    wrap: word-wrap;
+                }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    PillBtn {
+                        label: "取消";
+                        compact: true;
+                        clicked => { root.close-prompt-cancel(); }
+                    }
+                    PillBtn {
+                        label: "直接关闭";
+                        compact: true;
+                        danger: true;
+                        clicked => { root.close-prompt-quit(); }
+                    }
+                    PillBtn {
+                        label: "确认";
+                        compact: true;
+                        primary: true;
+                        clicked => { root.close-prompt-confirm(); }
                     }
                 }
             }
