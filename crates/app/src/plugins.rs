@@ -777,6 +777,21 @@ fn hint_text(body: &Value, key: &str, fallback: &str) -> String {
         .to_string()
 }
 
+/// 某个字段的下拉候选（插件通过 `body.choices.<key>` 提供）。
+///
+/// 目前只有 path 字段用它（历史路径）；返回空列表时前端不显示 ▾。
+fn choices_for(body: &Value, key: &str) -> Vec<String> {
+    body.get("choices")
+        .and_then(|c| c.get(key))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 
 /// 合成面板行：声明式控件 + 插件运行时状态 → 一维列表。
 fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, id: &str) -> Vec<PanelData> {
@@ -909,14 +924,23 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, id:
                     .position(|o| o == &value)
                     .map(|i| i as i32)
                     .unwrap_or(0);
+                // 路径字段的候选来自插件运行时（`choices.<key>`，如历史路径）。
+                // 静态 `options` 只对 select 有意义，这里不能混用：select 用
+                // `selected_index` 定位，path 只是给个下拉候选。
+                let field_kind = FieldKind::as_str(c.field_enum().unwrap_or(FieldKind::Text));
+                let options = if field_kind == "path" {
+                    choices_for(body, &c.key)
+                } else {
+                    c.options.clone()
+                };
                 out.push(PanelData {
                     kind: "field".into(),
                     key: c.key.clone(),
                     label: c.label.clone(),
                     value,
-                    field_kind: FieldKind::as_str(c.field_enum().unwrap_or(FieldKind::Text)).into(),
+                    field_kind: field_kind.into(),
                     placeholder: c.placeholder.clone(),
-                    options: c.options.clone(),
+                    options,
                     selected_index: sel,
                     enabled: control_enabled(body, &c.key, c.enabled),
                     ..Default::default()

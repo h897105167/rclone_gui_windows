@@ -121,6 +121,8 @@ enum Cmd {
     PluginPanelClose,
     /// 面板里某个输入字段被改动
     PluginPanelField { key: String, value: String },
+    /// 从面板的下拉里**选中**一项（写盘后必须重拉面板，否则输入框显示旧值）
+    PluginPanelPick { key: String, value: String },
     /// 面板里某个按钮被点击
     PluginPanelAction { action: String },
     /// 卸载插件（删目录 + 清启用记录；内置插件留墓碑）
@@ -168,6 +170,14 @@ enum Cmd {
     TrayFailed(String),
     /// 窗口从后台回到前台：立即对齐一次状态（不等下一次轮询）
     Foregrounded,
+    /// 用户点了窗口的关闭按钮：按「关闭到托盘」设置决定隐藏 / 询问 / 退出
+    WindowClose,
+    /// 首次关闭提示里选了「确认」：勾选并隐藏到托盘
+    CloseToTrayConfirm,
+    /// 首次关闭提示里选了「取消」：什么都不做（下次关闭还会问）
+    CloseToTrayCancel,
+    /// 首次关闭提示里选了「直接关闭」：取消勾选并退出
+    CloseToTrayQuit,
     Quit,
 }
 
@@ -338,8 +348,12 @@ fn push_log_history(ui: &MainWindow, kind: i32, msg: &str) {
         }
     }
     let has_err = v.iter().any(|r| r.kind.as_str() == "2");
+    // 「错误」计数只统计**界面上还留着**的错误条数（用户选的是这个语义）：
+    // 历史超过上限被截断、或点「清空」后，这个数会跟着回退，不会变成只增不减的累计值。
+    let err_count = v.iter().filter(|r| r.kind.as_str() == "2").count() as i32;
     g.set_history(ModelRc::from(Rc::new(VecModel::from(v))));
     g.set_has_errors(has_err);
+    g.set_error_count(err_count);
 }
 
 fn toast_ui(ui: &MainWindow, kind: i32, msg: impl Into<String>) {
@@ -366,6 +380,16 @@ fn toast_ui(ui: &MainWindow, kind: i32, msg: impl Into<String>) {
 fn toast(ui: &Weak<MainWindow>, kind: i32, msg: impl Into<String>) {
     let msg = msg.into();
     let _ = ui.upgrade_in_event_loop(move |ui| toast_ui(&ui, kind, msg));
+}
+
+/// 把主窗口藏到托盘（并同步 `visible` 标志，让轮询立刻停下）。
+///
+/// 用 `hide()` 而不是最小化：最小化会在任务栏留一个按钮，而「隐藏到托盘区」
+/// 的语义是任务栏里看不到它、只能从托盘图标唤起。
+fn hide_to_tray(ui: &Weak<MainWindow>) {
+    let _ = ui.upgrade_in_event_loop(|ui| {
+        ui.hide().ok();
+    });
 }
 
 /// 该 remote 绑定的代理地址（`host:port`）；未绑定返回 `None`。
@@ -576,6 +600,29 @@ fn join_path(dir: &str, name: &str) -> String {
     } else {
         format!("{dir}/{name}")
     }
+}
+
+/// 在已有名字里挑一个没被占用的：`新建文件夹` → `新建文件夹 (1)` → `新建文件夹 (2)`…
+///
+/// 用**半角括号 + 空格**（` (1)`），与 Windows 资源管理器的习惯一致，也方便用户
+/// 直接看出这是自动加的后缀。比较时大小写不敏感（部分后端不区分大小写，
+/// 用 `New` 和 `new` 会撞名）。
+///
+/// 抽成纯函数是为了单测：重名覆盖是「静默」缺陷 —— 不报错，只是创建失败或
+/// 悄悄写到别人身上，一旦回归没人会立刻发现。
+pub(crate) fn unique_dir_name(base: &str, existing: &[String]) -> String {
+    let taken = |name: &str| existing.iter().any(|e| e.eq_ignore_ascii_case(name));
+    if !taken(base) {
+        return base.to_string();
+    }
+    // 上限只为防呆：目录里真有一万个同名文件夹时不要无限循环
+    for n in 1..=9999 {
+        let candidate = format!("{base} ({n})");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    format!("{base} (9999)")
 }
 
 fn split_name(name: &str) -> (String, String) {
@@ -1682,6 +1729,13 @@ fn fmt_mtime(mod_time: &str) -> String {
 /// build.rs 生成：真正嵌入可执行文件的内置 rclone 字节（未内置时为空切片）
 
 
+/// 后台 tokio runtime 的 worker 栈大小。
+///
+/// tokio 默认 2 MB，而这台机器上最深的调用链（命令 → 插件 16 轮能力协商 →
+/// 能力实现）会把它撑爆，进程直接 abort 且没有回溯。16 MB 是虚拟内存预留，
+/// 不占物理页。详见 `main()` 里使用处的注释。
+const BACKEND_THREAD_STACK: usize = 16 * 1024 * 1024;
+
 // ---------------- 主入口 ----------------
 
 fn main() {
@@ -1713,6 +1767,7 @@ fn main() {
     ui.global::<SettingsG>().set_accent_idx(cfg.accent_idx as i32);
     ui.global::<SettingsG>().set_autostart(get_autostart());
     ui.global::<SettingsG>().set_silent(cfg.silent_start);
+    ui.global::<SettingsG>().set_close_to_tray(cfg.close_to_tray);
     ui.global::<SettingsG>().set_http_enabled(cfg.http.enabled);
     ui.global::<SettingsG>().set_http_port(cfg.http.port.to_string().into());
     ui.global::<SettingsG>()
@@ -1778,6 +1833,21 @@ fn main() {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
+                // 后台线程栈必须显式放大。
+                //
+                // tokio 默认只给 worker **2 MB**，而后台线程要跑的是最深的调用链：
+                // `handle_cmd` → 插件动作 → `invoke_with`（16 轮能力协商循环）
+                // → `cap_call`（30 多个分支，每个分支的局部变量都在同一帧里）
+                // → 具体能力实现。
+                //
+                // 代价是这条链的**单帧**合并后相当大；实测插件里调用一次
+                // `fs.search_exe` 就会把 2 MB 的 worker 栈撑爆，进程直接 abort，
+                // 日志只有 `thread 'tokio-rt-worker' has overflowed its stack`，
+                // 连 Rust 回溯都没有（`RUST_MIN_STACK=64M` 跑同一操作则正常，
+                // 说明是「深但有限」而不是死循环）。
+                //
+                // 16 MB 对这条链足够，且只是虚拟内存预留，不占物理页。
+                .thread_stack_size(BACKEND_THREAD_STACK)
                 .enable_all()
                 .build()
                 .expect("tokio runtime 启动失败");
@@ -1828,12 +1898,16 @@ fn main() {
         );
     }
 
-    // 窗口关闭 → 优雅退出（卸载挂载 / 停止服务 / 退出 rclone 进程）
+    // 窗口关闭：交给命令循环按「关闭到托盘」设置决定（隐藏 / 弹首次提示 / 退出）。
+    //
+    // 这里**必须返回 KeepWindowShown**：返回 HideWindow 会让窗口在这一刻就被藏起来，
+    // 首次关闭的提示框根本没机会显示（实测：点关闭后窗口直接消失、配置也没写）。
+    // 真正的隐藏/退出都由命令处理。
     {
         let tx_c = tx.clone();
         ui.window().on_close_requested(move || {
-            let _ = tx_c.send(Cmd::Quit);
-            slint::CloseRequestResponse::HideWindow
+            let _ = tx_c.send(Cmd::WindowClose);
+            slint::CloseRequestResponse::KeepWindowShown
         });
     }
 
@@ -2218,6 +2292,52 @@ fn is_elevated() -> bool {
     }
 }
 
+/// 当前进程的完整性级别 RID（`0x1000`=Low、`0x2000`=Medium、`0x3000`=High）。
+///
+/// 托盘图标由 explorer.exe（Medium）托管：进程若是 Low，
+/// `Shell_NotifyIconW(NIM_ADD)` 会返回 `拒绝访问 (5)`。诊断日志里带上这个值，
+/// 下次再遇到「托盘图标不见了」就能一眼看出是不是完整性问题。
+fn integrity_rid() -> Option<u32> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
+        TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return None;
+        }
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(token, TokenIntegrityLevel, None, 0, &mut needed);
+        let mut buf = vec![0u8; needed as usize];
+        let ok = needed > 0
+            && GetTokenInformation(
+                token,
+                TokenIntegrityLevel,
+                Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+                needed,
+                &mut needed,
+            )
+            .is_ok();
+        let _ = CloseHandle(token);
+        if !ok {
+            return None;
+        }
+        let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        let sid = label.Label.Sid;
+        if sid.is_invalid() {
+            return None;
+        }
+        let count = *GetSidSubAuthorityCount(sid) as u32;
+        if count == 0 {
+            return None;
+        }
+        Some(*GetSidSubAuthority(sid, count - 1))
+    }
+}
+
 /// 按 Windows 命令行规则给参数加引号（用于 ShellExecuteW 的参数串）。
 fn quote_win_arg(a: &str) -> String {
     if a.is_empty() {
@@ -2326,6 +2446,20 @@ fn now_hms() -> String {
     use chrono::Timelike as _;
     let n = chrono::Local::now();
     format!("{:02}:{:02}:{:02}", n.hour(), n.minute(), n.second())
+}
+
+/// 「启动时未自动连接」这一支要显示的 RC 地址。
+///
+/// 未连接时 `RcState` 里的端点是占位默认值（5572），而用户配置的可能是别的端口；
+/// 仪表盘必须显示**将要连的**那个，否则关掉自动连接后会看到一个自己没配过的地址。
+/// 空/空白配置视为「没配」，回落到占位值。
+fn startup_endpoint_url(configured: &str, fallback: &str) -> String {
+    let t = configured.trim();
+    if t.is_empty() {
+        fallback.to_string()
+    } else {
+        t.to_string()
+    }
 }
 
 fn apply_conn_view(ui: &Weak<MainWindow>, v: ConnView) {
@@ -2743,6 +2877,11 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
         connect_report(&ctx).await
     } else {
         let mut v = snapshot_view(&ctx).await;
+        // 没连过时 `RcState` 里的端点是 `Endpoint::loopback_default()`（5572），
+        // 而用户配的可能是别的地址。仪表盘的「RC 地址」必须显示**将要连的**那个，
+        // 否则关掉「启动时自动连接」后会看到一个自己没配过的端口（会话 11 实测踩到）。
+        let saved = ctx.cfg.lock().unwrap().rclone.url.clone();
+        v.endpoint_url = startup_endpoint_url(&saved, &v.endpoint_url);
         v.error = "启动时未自动连接（可在设置里点「连接 / 握手」）".to_string();
         ConnOutcome {
             view: v,
@@ -3570,6 +3709,66 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             refresh::refresh_state(ctx, ui, true).await;
             false
         }
+        Cmd::WindowClose => {
+            let (close_to_tray, prompt_done) = {
+                let c = ctx.cfg.lock().unwrap();
+                (c.close_to_tray, c.close_prompt_done)
+            };
+            if !prompt_done {
+                // 首次关闭：弹三选一提示，由用户决定。此时候选框还没被用户动过，
+                // 所以**不改任何配置**，只把界面里的复选框同步成当前真实值。
+                let _ = ui.upgrade_in_event_loop(|ui| {
+                    ui.global::<SettingsG>().set_close_prompt_show(true);
+                });
+                return false;
+            }
+            if close_to_tray {
+                hide_to_tray(ui);
+            } else {
+                let _ = ui.upgrade_in_event_loop(|ui| {
+                    ui.hide().ok();
+                });
+                return Box::pin(handle_cmd(ctx, ui, Cmd::Quit)).await;
+            }
+            false
+        }
+        Cmd::CloseToTrayConfirm => {
+            // 勾选 + 记住「问过了」→ 隐藏到托盘
+            {
+                let mut cfg = ctx.cfg.lock().unwrap();
+                cfg.close_to_tray = true;
+                cfg.close_prompt_done = true;
+                let _ = config::save(&cfg);
+            }
+            let _ = ui.upgrade_in_event_loop(|ui| {
+                ui.global::<SettingsG>().set_close_to_tray(true);
+                ui.global::<SettingsG>().set_close_prompt_show(false);
+            });
+            hide_to_tray(ui);
+            false
+        }
+        Cmd::CloseToTrayCancel => {
+            // 什么都不做：不写配置、不隐藏。下次关闭还会问。
+            let _ = ui.upgrade_in_event_loop(|ui| {
+                ui.global::<SettingsG>().set_close_prompt_show(false);
+            });
+            false
+        }
+        Cmd::CloseToTrayQuit => {
+            // 取消勾选 + 记住「问过了」→ 退出（托盘图标随进程一起消失）
+            {
+                let mut cfg = ctx.cfg.lock().unwrap();
+                cfg.close_to_tray = false;
+                cfg.close_prompt_done = true;
+                let _ = config::save(&cfg);
+            }
+            let _ = ui.upgrade_in_event_loop(|ui| {
+                ui.global::<SettingsG>().set_close_to_tray(false);
+                ui.global::<SettingsG>().set_close_prompt_show(false);
+                ui.hide().ok();
+            });
+            Box::pin(handle_cmd(ctx, ui, Cmd::Quit)).await
+        }
         Cmd::FilesInit => {
             let client = ctx.rc.client().await;
             let remotes = client.list_remotes().await.unwrap_or_default();
@@ -3883,16 +4082,33 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let (remote, path) = ui_files_pos(ui).await;
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
-            let res = client.mkdir(&fs, &join_path(&path, "新建文件夹")).await;
+            // 先列出当前目录，挑一个没被占用的名字。
+            //
+            // 旧实现固定用「新建文件夹」，目录里已存在同名文件夹时 rclone 会
+            // 报 `directory already exists`，用户就只能自己先去改名再重试。
+            // 现在按「新建文件夹」「新建文件夹 (1)」「新建文件夹 (2)」… 递增。
+            let existing: Vec<String> = match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                client.list(&fs, &path, None),
+            )
+            .await
+            {
+                Ok(Ok(entries)) => entries.into_iter().map(|e| e.name).collect(),
+                // 列目录失败不阻断创建：退回默认名，让 rclone 自己判断
+                _ => Vec::new(),
+            };
+            let name = unique_dir_name("新建文件夹", &existing);
+            let res = client.mkdir(&fs, &join_path(&path, &name)).await;
             match res {
                 Ok(_) => {
+                    let chosen = name.clone();
                     let _ = ui.upgrade_in_event_loop(
-                        |ui| {
-                            ui.global::<FilesG>().set_rename_name("新建文件夹".into());
+                        move |ui| {
+                            ui.global::<FilesG>().set_rename_name(chosen.into());
                         },
                     );
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
-                    toast(ui, 1, "文件夹已创建（选中后可重命名）");
+                    toast(ui, 1, format!("文件夹已创建：{name}（选中后可重命名）"));
                 }
                 Err(e) => toast(ui, 2, format!("创建失败: {e}")),
             }
@@ -5662,6 +5878,28 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             }
             false
         }
+        Cmd::PluginPanelPick { key, value } => {
+            let id = read_ui(ui, |ui| {
+                ui.global::<PluginsG>().get_panel_plugin().to_string()
+            })
+            .await
+            .unwrap_or_default();
+            if id.is_empty() || key.is_empty() {
+                return false;
+            }
+            // 落盘 + 立刻重拉面板：输入框的 text 绑在面板模型上，
+            // 不重拉就会继续显示旧值（用户点了历史条目却看不到变化）。
+            plugins::set_form_field(&ctx.store, &id, &key, &value);
+            if let Ok(rows) = plugins::build_panel(ctx, &id).await {
+                let _ = ui.upgrade_in_event_loop(move |ui| {
+                    let g = ui.global::<PluginsG>();
+                    let list = plugins::panel_to_slint(&rows);
+                    g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(list))));
+                    g.set_panel_loading(false);
+                });
+            }
+            false
+        }
         Cmd::PluginPanelAction { action } => {
             let id = read_ui(ui, |ui| {
                 ui.global::<PluginsG>().get_panel_plugin().to_string()
@@ -5831,6 +6069,13 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     cfg.accent_idx = s.get_accent_idx() as u8;
                     cfg.autostart = s.get_autostart();
                     cfg.silent_start = s.get_silent();
+                    // 用户在设置页动过「关闭到托盘」复选框 = 已经做过选择，
+                    // 之后关窗不再弹首次提示（用户明确要求：操作过就置 flag）。
+                    let want_tray = s.get_close_to_tray();
+                    if want_tray != cfg.close_to_tray {
+                        cfg.close_to_tray = want_tray;
+                        cfg.close_prompt_done = true;
+                    }
                     cfg.http.enabled = s.get_http_enabled();
                     cfg.http.port = s.get_http_port().parse().unwrap_or(5273);
                     set_autostart(cfg.autostart, cfg.silent_start);
@@ -7061,8 +7306,27 @@ fn wire_callbacks(
     ui.on_win_close({
         let tx = tx.clone();
         move || {
-            // 与系统关闭按钮一致：走 Quit（卸载挂载 / 停服务 / 退出 rclone）
-            let _ = tx.send(Cmd::Quit);
+            // 标题栏的关闭按钮与系统关闭按钮走同一条路：
+            // 由 WindowClose 按「关闭到托盘」设置决定隐藏 / 询问 / 退出
+            let _ = tx.send(Cmd::WindowClose);
+        }
+    });
+    ui.on_close_prompt_confirm({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::CloseToTrayConfirm);
+        }
+    });
+    ui.on_close_prompt_cancel({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::CloseToTrayCancel);
+        }
+    });
+    ui.on_close_prompt_quit({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::CloseToTrayQuit);
         }
     });
     ui.on_plugin_toggle({
@@ -7106,6 +7370,15 @@ fn wire_callbacks(
         let tx = tx.clone();
         move |key, value| {
             let _ = tx.send(Cmd::PluginPanelField {
+                key: key.to_string(),
+                value: value.to_string(),
+            });
+        }
+    });
+    ui.on_plugin_panel_pick({
+        let tx = tx.clone();
+        move |key, value| {
+            let _ = tx.send(Cmd::PluginPanelPick {
                 key: key.to_string(),
                 value: value.to_string(),
             });
@@ -7321,6 +7594,11 @@ fn spawn_tray(ui: Weak<MainWindow>, tx: mpsc::UnboundedSender<Cmd>) {
                 }
             };
             tray_log("tray: icon created");
+            // 完整性级别是托盘能否注册的**决定性因素**，先记下来。
+            match integrity_rid() {
+                Some(rid) => tray_log(&format!("tray: process integrity RID=0x{rid:X}")),
+                None => tray_log("tray: process integrity unknown"),
+            }
 
             // 菜单：主界面 / 退出
             let menu = Menu::new();
@@ -7345,26 +7623,54 @@ fn spawn_tray(ui: Weak<MainWindow>, tx: mpsc::UnboundedSender<Cmd>) {
                 Err(e) => {
                     // 托盘注册失败要**明确告知用户**，不能静默。
                     //
-                    // 实测最常见的失败是 `拒绝访问 (os error 5)`：托盘图标由
-                    // 高完整性的 explorer.exe 托管，若本进程或所在目录被打了
-                    // **低完整性（Low Mandatory Level）** 标签，Shell_NotifyIconW
-                    // 会被拒。用户看到的现象就是「托盘图标不见了」，但完全不知道原因。
+                    // 根因（会话 11 实测确认）：托盘图标由 explorer.exe 托管，
+                    // 若 **exe 文件本身或所在目录被打了低完整性标签**
+                    // （Mandatory Label = Low，SACL 里 `LABEL=0x1000`），
+                    // `Shell_NotifyIconW(NIM_ADD)` 直接返回 FALSE + `拒绝访问 (5)`。
+                    // 对照实验：同一份 exe 放在 Medium 目录下托盘成功、
+                    // 放在 Low 目录下必失败；进程自身 IL 也随之是 0x1000。
+                    // 注意 `Shell_NotifyIconW` 失败时并不保证刷新 last error，
+                    // 所以 `os error 5` 只是「最可能」而非「必然」的取值。
                     let msg = format!(
                         "托盘图标注册失败（{e}）。若系统托盘里没有 RCGUI：\
-                         通常是因为程序所在目录被标记为低完整性、或以受限权限运行；\
-                         已尝试把目录完整性调整为普通级别。"
+                         通常是程序所在文件/目录被标记为低完整性（Low），\
+                         或程序以受限权限运行。已尝试把文件与目录完整性调回普通级别，\
+                         若提示里出现「成功」，请**退出并重新启动本程序**后托盘才会出现。"
                     );
                     tray_log(&format!("tray: build FAILED: {e}"));
-                    // 尝试自愈：把目录完整性调回 Medium（需要所有者权限）
+                    // 自愈：exe 与目录都调回 Medium。
+                    //
+                    // 只调目录不够：文件可能自己带着 Low 标签（复制/解压时继承，
+                    // 或旧的 setintegritylevel 只作用于目录）。而且**当前进程的
+                    // 完整性在启动时就定了**，改标签不会让本进程变回 Medium，
+                    // 必须重启程序才生效 —— 提示语里已经写明。
+                    //
+                    // 若本进程已是 Low，icacls 自己也会被拒（实测 exit 1299），
+                    // 这种情况只能如实记录，让用户手动处理。
                     if let Ok(exe) = std::env::current_exe() {
+                        use std::os::windows::process::CommandExt;
+                        let mut targets = vec![exe.clone()];
                         if let Some(dir) = exe.parent() {
-                            use std::os::windows::process::CommandExt;
-                            let _ = std::process::Command::new("icacls")
-                                .arg(dir)
+                            targets.push(dir.to_path_buf());
+                        }
+                        for t in targets {
+                            match std::process::Command::new("icacls")
+                                .arg(&t)
                                 .arg("/setintegritylevel")
                                 .arg("Medium")
                                 .creation_flags(0x08000000) // CREATE_NO_WINDOW
-                                .output();
+                                .output()
+                            {
+                                Ok(o) => tray_log(&format!(
+                                    "tray: heal {} -> {:?}",
+                                    t.display(),
+                                    o.status
+                                )),
+                                Err(err) => tray_log(&format!(
+                                    "tray: heal {} spawn failed: {err}",
+                                    t.display()
+                                )),
+                            }
                         }
                     }
                     let _ = tx.send(Cmd::TrayFailed(msg));
@@ -7909,6 +8215,69 @@ mod tests {
     fn mount_key_handles_directory_mounts() {
         assert_eq!(mount_key("C:\\mnt\\data\\"), "C:\\MNT\\DATA");
         assert_eq!(mount_key("C:\\mnt\\data"), "C:\\MNT\\DATA");
+    }
+
+    /// 「启动时未自动连接」时仪表盘要显示配置里的地址，而不是占位默认值。
+    ///
+    /// 会话 11 实测：关掉自动连接后仪表盘显示 `:5572`（`Endpoint::loopback_default()`），
+    /// 用户配的却是 `:5601` —— 界面在展示一个用户没配过的端口。
+    #[test]
+    fn startup_endpoint_prefers_configured_url() {
+        assert_eq!(
+            startup_endpoint_url("http://127.0.0.1:5601", "http://127.0.0.1:5572"),
+            "http://127.0.0.1:5601"
+        );
+        // 前后空白要去掉：配置里手输时很容易带
+        assert_eq!(
+            startup_endpoint_url("  http://127.0.0.1:5602  ", "http://127.0.0.1:5572"),
+            "http://127.0.0.1:5602"
+        );
+        // 没配 → 回落占位值（不显示空白）
+        assert_eq!(
+            startup_endpoint_url("", "http://127.0.0.1:5572"),
+            "http://127.0.0.1:5572"
+        );
+        assert_eq!(
+            startup_endpoint_url("   ", "http://127.0.0.1:5572"),
+            "http://127.0.0.1:5572"
+        );
+    }
+
+    /// 新建文件夹的重名处理：半角括号 + 空格后缀，大小写不敏感。
+    #[test]
+    fn unique_dir_name_uses_halfwidth_bracket_suffix() {
+        let none: Vec<String> = Vec::new();
+        assert_eq!(unique_dir_name("新建文件夹", &none), "新建文件夹");
+
+        let one = vec!["新建文件夹".to_string()];
+        assert_eq!(unique_dir_name("新建文件夹", &one), "新建文件夹 (1)");
+
+        let two = vec!["新建文件夹".to_string(), "新建文件夹 (1)".to_string()];
+        assert_eq!(unique_dir_name("新建文件夹", &two), "新建文件夹 (2)");
+    }
+
+    #[test]
+    fn unique_dir_name_skips_taken_suffixes() {
+        // (1) 被占但 (2) 空着：必须跳到 (2)，不能重复用 (1)
+        let taken = vec!["新建文件夹".into(), "新建文件夹 (1)".into()];
+        assert_eq!(unique_dir_name("新建文件夹", &taken), "新建文件夹 (2)");
+    }
+
+    #[test]
+    fn unique_dir_name_is_case_insensitive() {
+        // 部分后端不区分大小写，用 NewFolder 与 newfolder 撞名会让 mkdir 失败
+        let taken = vec!["newfolder".into()];
+        assert_eq!(unique_dir_name("NewFolder", &taken), "NewFolder (1)");
+    }
+
+    #[test]
+    fn unique_dir_name_ignores_unrelated_names() {
+        let taken = vec!["docs".into(), "新建文件夹 (1)".into()];
+        assert_eq!(
+            unique_dir_name("新建文件夹", &taken),
+            "新建文件夹",
+            "只有同名才算占用"
+        );
     }
 
     /// 回归：pending 里的 "T:\" 必须能与 rclone 回报的 "T:" 匹配上。

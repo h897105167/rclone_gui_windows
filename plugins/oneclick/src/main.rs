@@ -104,6 +104,12 @@ fn dispatch(id: u64, p: &Value) -> Value {
         "state" => on_state(id, &rq),
         // 选一个 rclone.exe 并校验
         "pick_exe" => on_pick(id, &rq),
+        // 自动搜索本机 rclone.exe（快扫；一个都没找到时把决定权交回用户）
+        "search_exe" => on_search(id, &rq),
+        // 快扫没找到时的「深度扫描」（用户点了才做，避免一次点击就翻全盘）
+        "search_deep" => on_search_deep(id),
+        // 从历史记录里选一个路径（右侧 ▾ 下拉）
+        "pick_history" => on_pick_history(id, &rq),
         // 重新校验当前路径
         "revalidate" => on_revalidate(id, &rq),
         // 下载 / 解压 / 校验 / 安装
@@ -311,10 +317,17 @@ fn state_body(form: &Value, kv: &Value, meta: &Value, proc: &Value) -> Value {
     let mut body = json!({
         "status": status,
         "lamp": lamp,
+        // 路径历史：宿主的 path 字段会把它渲染成输入框右侧的 ▾ 下拉
+        "choices": { "exe": exe_history(kv) },
         "enabled": {
             "start": !running && !exe.is_empty(),
             "stop": running,
             "revalidate": !exe.is_empty(),
+            // 快扫没找到时，面板会显示「深度扫描」按钮
+            "search_deep": kv_state(kv)
+                .get("search_deep_offered")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         },
     });
     if !checks.is_null() {
@@ -339,9 +352,15 @@ fn fmt_uptime(ms: i64) -> String {
 
 // ---------------- 校验 ----------------
 
-/// 一次问齐四项证据：存在性 / PE 头 / 数字签名 / `rclone version`。
+/// 一次问齐五项证据：存在性 / PE 头 / 数字签名 / `rclone version` / 现有 kv。
+///
+/// kv 一并取回是为了**合并**写 `_state`：早期版本校验完成后直接
+/// `kv.set _state {checks, exe_version}`，会把同一份 `_state` 里的 `proc`
+/// （进程句柄）和 `exe_history`（路径历史）一起抹掉 —— 表现为「校验完就
+/// 不知道 rclone 还在不在跑」。
 fn verify_needs(exe: &str) -> Vec<Value> {
     vec![
+        json!({ "cap": "kv.get_all", "key": "kv" }),
         json!({ "cap": "fs.meta", "key": "meta", "params": { "path": exe } }),
         json!({ "cap": "fs.pe_info", "key": "pe", "params": { "path": exe } }),
         json!({ "cap": "fs.signature", "key": "sig", "params": { "path": exe } }),
@@ -422,12 +441,12 @@ fn finish_verify(id: u64, form: &Value, exe: &str, provided: &Value) -> Value {
         &got(provided, "sig"),
         &got(provided, "run"),
     );
-    let ops = vec![json!({
-        "op": "kv.set",
-        "key": "_state",
-        "value": json!({ "checks": v.checks, "exe_version": v.version }),
-    })];
+    let kv = got(provided, "kv");
     if !v.ok {
+        let checks = json!(v.checks);
+        let ops = vec![state_op(&kv, |s| {
+            s.insert("checks".into(), checks);
+        })];
         return done_ops(
             id,
             ops,
@@ -436,13 +455,22 @@ fn finish_verify(id: u64, form: &Value, exe: &str, provided: &Value) -> Value {
                 "lamp": "err",
                 "checks": v.checks,
                 "values": { "exe": exe },
+                "choices": { "exe": exe_history(&kv) },
                 "toast": { "level": "err", "message": format!("rclone 校验未通过：{}", v.detail) },
                 "enabled": { "start": false, "stop": false, "revalidate": true },
             }),
         );
     }
-    let running = false;
-    let _ = running;
+    // 通过校验的路径进历史（用户要求：只有校验通过的才记，最多 10 条）
+    let mut hist = exe_history(&kv);
+    history_push(&mut hist, exe);
+    let checks = json!(v.checks);
+    let version = v.version.clone();
+    let ops = vec![state_op(&kv, |s| {
+        s.insert("checks".into(), checks);
+        s.insert("exe_version".into(), json!(version));
+        s.insert("exe_history".into(), json!(hist.clone()));
+    })];
     done_ops(
         id,
         ops,
@@ -451,6 +479,7 @@ fn finish_verify(id: u64, form: &Value, exe: &str, provided: &Value) -> Value {
             "lamp": "warn",
             "checks": v.checks,
             "values": { "exe": exe },
+            "choices": { "exe": hist },
             "toast": { "level": "info", "message": format!("已通过校验：rclone {}", v.version) },
             "enabled": {
                 "start": !exe.is_empty() && !form.is_null(),
@@ -458,6 +487,167 @@ fn finish_verify(id: u64, form: &Value, exe: &str, provided: &Value) -> Value {
                 "revalidate": true,
             },
         }),
+    )
+}
+
+// ---------------- search：自动搜索本机 rclone.exe ----------------
+
+/// 历史路径上限（用户要求最多 10 条）。
+const HISTORY_CAP: usize = 10;
+
+/// 读取已记录的历史路径（最新的在前）。
+fn exe_history(kv: &Value) -> Vec<String> {
+    kv_state(kv)
+        .get("exe_history")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 把一条路径放进历史：去重（大小写不敏感）、最新的在前、最多 10 条。
+fn history_push(list: &mut Vec<String>, path: &str) {
+    let path = path.trim();
+    if path.is_empty() {
+        return;
+    }
+    list.retain(|p| !p.eq_ignore_ascii_case(path));
+    list.insert(0, path.to_string());
+    list.truncate(HISTORY_CAP);
+}
+
+/// 搜索本机 rclone.exe。
+///
+/// 两阶段（用户选的方案 C）：
+/// 1. 快扫（PATH + 常见安装目录 + 固定盘 3 层）；
+/// 2. 快扫一个都没找到 → 返回 `need_deep`，让面板显示「深度扫描」按钮，
+///    用户点了才做全盘（避免一次点击就把磁盘翻个底朝天）。
+fn on_search(id: u64, rq: &Rq) -> Value {
+    let st = step_of(&rq.state);
+
+    if st.is_empty() {
+        // 快扫：depth=3，预算 8 秒
+        return need(
+            id,
+            json!({ "step": "scan" }),
+            vec![
+                json!({ "cap": "kv.get_all", "key": "kv" }),
+                json!({
+                    "cap": "fs.search_exe",
+                    "key": "scan",
+                    "params": { "name": "rclone.exe", "max_depth": 3, "timeout_ms": 8000 }
+                }),
+            ],
+        );
+    }
+    if st == "scan" {
+        let kv = got(&rq.provided, "kv");
+        let paths = paths_of(got(&rq.provided, "scan"));
+        if !paths.is_empty() {
+            return finish_search(id, &rq.form, &kv, &paths);
+        }
+        // 快扫没找到：交给用户决定要不要深度扫描（方案 C）
+        return done_ops(
+            id,
+            vec![state_op(&kv, |s| {
+                s.insert("search_deep_offered".into(), json!(true));
+            })],
+            json!({
+                "status": "快扫没有找到 rclone.exe",
+                "lamp": "warn",
+                "toast": {
+                    "level": "warn",
+                    "message": "快扫没有找到 rclone.exe，可以点「深度扫描」再找一次（较慢）"
+                },
+            }),
+        );
+    }
+    // st == "deep"：全盘结果收尾（depth=6，预算 25 秒）
+    let kv = got(&rq.provided, "kv");
+    let paths = paths_of(got(&rq.provided, "scan"));
+    if paths.is_empty() {
+        return done(
+            id,
+            json!({
+                "status": "没有找到 rclone.exe（已深度扫描）",
+                "lamp": "err",
+                "toast": { "level": "err", "message": "没有找到 rclone.exe，请手动选择路径" },
+            }),
+        );
+    }
+    finish_search(id, &rq.form, &kv, &paths)
+}
+
+/// 深度扫描的第一步（用户点了「深度扫描」按钮）：发一次更深的搜索。
+fn on_search_deep(id: u64) -> Value {
+    need(
+        id,
+        json!({ "step": "deep" }),
+        vec![
+            json!({ "cap": "kv.get_all", "key": "kv" }),
+            json!({
+                "cap": "fs.search_exe",
+                "key": "scan",
+                "params": { "name": "rclone.exe", "max_depth": 6, "timeout_ms": 25000 }
+            }),
+        ],
+    )
+}
+
+fn paths_of(v: Value) -> Vec<String> {
+    v.get("paths")
+        .and_then(|p| p.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 搜索结果收尾：第一条放进输入框（等待校验），其余先记进历史。
+fn finish_search(id: u64, form: &Value, kv: &Value, paths: &[String]) -> Value {
+    let first = paths.first().cloned().unwrap_or_default();
+    let mut hist = exe_history(kv);
+    for p in paths {
+        history_push(&mut hist, p);
+    }
+    let _ = form;
+    let mut body = json!({
+        "values": { "exe": first },
+        "status": format!("找到 {} 个候选，正在校验第一个…", paths.len()),
+        "lamp": "warn",
+        "choices": { "exe": hist.clone() },
+    });
+    if paths.len() > 1 {
+        body["toast"] = json!({
+            "level": "info",
+            "message": format!("找到 {} 个 rclone.exe，已把其余 {} 个加入路径历史", paths.len(), paths.len() - 1)
+        });
+    }
+    done_ops(
+        id,
+        vec![state_op(kv, |s| {
+            s.insert("exe_history".into(), json!(hist));
+        })],
+        body,
+    )
+}
+
+/// 从历史里选了一条：写回输入框并立即校验。
+fn on_pick_history(id: u64, rq: &Rq) -> Value {
+    let picked = fstr(&rq.form, "exe");
+    if picked.trim().is_empty() {
+        return fail(id, "历史里没有可用的路径");
+    }
+    need(
+        id,
+        json!({ "step": "judge", "exe": picked }),
+        verify_needs(&picked),
     )
 }
 
@@ -838,15 +1028,25 @@ fn on_start(id: u64, rq: &Rq, auto: bool) -> Value {
                 json!({
                     "status": format!("正在运行（PID {pid}）"),
                     "lamp": "ok",
-                    "rc": {
-                        "url": format!("http://127.0.0.1:{port}"),
-                        "user": user,
-                        "pass": pass,
-                        "connect": true,
+                    // 「自动连接」勾选时，把本次启动用的地址/用户名/密码交给宿主写进设置并连接；
+                    // 不勾选就完全不动设置页（用户可能连的是别的实例）。
+                    "rc": if fbool(form, "auto_connect", true) {
+                        json!({
+                            "url": format!("http://127.0.0.1:{port}"),
+                            "user": user,
+                            "pass": pass,
+                            "connect": true,
+                        })
+                    } else {
+                        Value::Null
                     },
                     "toast": {
                         "level": "info",
-                        "message": format!("已启动 rclone（端口 {port}），正在连接…")
+                        "message": if fbool(form, "auto_connect", true) {
+                            format!("已启动 rclone（端口 {port}），正在连接…")
+                        } else {
+                            format!("已启动 rclone（端口 {port}）")
+                        }
                     },
                     "enabled": { "start": false, "stop": true },
                 }),
@@ -905,11 +1105,16 @@ fn launch_decision(
             json!({
                 "status": format!("端口 {port} 上已有 rclone 在响应，已直接连接"),
                 "lamp": "ok",
-                "rc": {
-                    "url": format!("http://127.0.0.1:{port}"),
-                    "user": user,
-                    "pass": pass,
-                    "connect": true,
+                // 「自动连接」勾选时把地址与凭据交给宿主写进设置并连接
+                "rc": if fbool(form, "auto_connect", true) {
+                    json!({
+                        "url": format!("http://127.0.0.1:{port}"),
+                        "user": user,
+                        "pass": pass,
+                        "connect": true,
+                    })
+                } else {
+                    Value::Null
                 },
                 "enabled": { "start": false, "stop": false },
             }),

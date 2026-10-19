@@ -399,6 +399,43 @@ pub fn local_rclone_drives() -> Vec<String> {
     Vec::new()
 }
 
+/// 本机的**固定**盘符（`C:`、`D:` …），用于「搜索本机程序」时限定扫描范围。
+///
+/// 只返回 `DRIVE_FIXED`：网络盘（`DRIVE_REMOTE`）和可移动盘不扫 —— 搜索一个
+/// 可执行文件没有理由去挂载点或 U 盘上逐个目录翻，那会把一次点击变成几分钟的等待。
+#[cfg(windows)]
+pub fn local_fixed_drives() -> Vec<String> {
+    use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    const DRIVE_FIXED: u32 = 3;
+    let mut out = Vec::new();
+    // SAFETY: 只读系统状态，无缓冲区。
+    unsafe {
+        let mask = GetLogicalDrives();
+        if mask == 0 {
+            return out;
+        }
+        for i in 0..26u32 {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
+            let letter = (b'A' + i as u8) as char;
+            let root: Vec<u16> = format!("{letter}:\\")
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            if GetDriveTypeW(windows::core::PCWSTR(root.as_ptr())) == DRIVE_FIXED {
+                out.push(format!("{letter}:"));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+pub fn local_fixed_drives() -> Vec<String> {
+    Vec::new()
+}
+
 /// 盘符提示的节流：卷信息查询本身很便宜，但网络盘在断线时可能变慢，因此限频。
 pub struct DriveProbe {
     last: Mutex<Option<(Instant, Vec<String>)>>,

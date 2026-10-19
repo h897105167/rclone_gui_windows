@@ -451,6 +451,45 @@ impl CapProvider for HostCaps {
                 })
                 .await
             }
+            // 搜索本机可执行文件：只扫本地固定盘 + PATH / 常见安装目录。
+            //
+            // 为什么由宿主做而不是插件做：盘符枚举、跳过系统目录、总时限这些
+            // 「本机知识」放在宿主里，插件只声明要找什么名字（如 rclone.exe）。
+            // 时限是硬约束：网络盘或超大目录不能让插件调用一直挂着。
+            "fs.search_exe" => {
+                let name = Self::p_str(&params, "name");
+                let name = if name.is_empty() { "rclone.exe".to_string() } else { name };
+                let depth = {
+                    let d = Self::p_u64(&params, "max_depth");
+                    if d == 0 { 3 } else { d.min(6) as usize }
+                };
+                let budget_ms = {
+                    let d = Self::p_u64(&params, "timeout_ms");
+                    if d == 0 { 8000 } else { d.min(30000) }
+                };
+                let hub = self.progress.clone();
+                hub.begin("正在搜索本机程序…");
+                // 用**专用大栈线程**而不是 tokio 的 blocking 池：
+                // 后者默认栈只有 2MB，而搜索要遍历深层目录、每层都留一份
+                // read_dir 迭代器与 PathBuf；实测在 `C:\` 上会直接把 worker 栈撑爆
+                // （进程直接 abort，日志只有 "has overflowed its stack"）。
+                let (tx, rx) = std::sync::mpsc::channel::<Result<Value>>();
+                let name2 = name.clone();
+                std::thread::Builder::new()
+                    .name("rcgui-search-exe".into())
+                    .stack_size(16 * 1024 * 1024)
+                    .spawn(move || {
+                        let found = search_exe(&name2, depth, Duration::from_millis(budget_ms));
+                        let _ = tx.send(Ok(json!({ "paths": found, "count": found.len() })));
+                    })
+                    .map_err(|e| anyhow!("无法启动搜索线程: {e}"))?;
+                let r = tokio::task::spawn_blocking(move || rx.recv())
+                    .await
+                    .map_err(|e| anyhow!("等待搜索结果失败: {e}"))
+                    .and_then(|inner| inner.map_err(|e| anyhow!("搜索结果丢失: {e}")));
+                hub.finish();
+                r?
+            }
             "fs.unzip" => {
                 let zip_path = Self::p_str(&params, "zip");
                 let dest = Self::p_str(&params, "dest");
@@ -908,6 +947,165 @@ fn find_file(root: &Path, want_lower: &str, max_depth: usize) -> Option<String> 
     }
     None
 }
+
+/// 搜索本机可执行文件（如 `rclone.exe`）。
+///
+/// 扫描策略（快扫，不碰网络盘）：
+/// 1. `PATH` 里的每个目录；
+/// 2. 常见安装位置（Program Files / Program Files (x86) / LOCALAPPDATA / 用户目录）；
+/// 3. 每个**固定盘**根目录下按 `depth` 层广度优先（默认 3 层）。
+///
+/// 跳过：系统目录（Windows / System32 / WinSxS 等，命中只可能是伪装或误判）、
+/// 隐藏/系统属性目录、以及 junction 造成的重复（用规范化路径去重）。
+///
+/// 硬时限：网络盘或超大目录不能让一次插件调用挂住；超时后返回已找到的结果。
+/// 一次搜索最多看多少个目录条目。
+///
+/// 时限之外再加一道硬上限：某些目录（巨型构建产物、Windows 组件存储）
+/// 单次 `read_dir` 就能返回几十万条，光枚举就够把一次点击拖成「卡死」。
+/// 超限后**停止向下扩展**，返回已找到的结果。
+const SEARCH_MAX_ENTRIES: usize = 200_000;
+
+fn search_exe(want: &str, depth: usize, budget: Duration) -> Vec<String> {
+    use std::collections::HashSet;
+
+    let start = Instant::now();
+    let want_lower = want.to_ascii_lowercase();
+    let mut hits: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut scanned: usize = 0;
+
+    // ---- 1) PATH ----
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(';').filter(|s| !s.trim().is_empty()) {
+            let p = Path::new(dir).join(want);
+            if p.is_file() {
+                record_hit(&p, &mut hits, &mut seen);
+            }
+        }
+    }
+
+    // ---- 2) 常见安装位置（只扫这几层，命中率最高） ----
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for var in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA", "USERPROFILE"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.trim().is_empty() {
+                roots.push(PathBuf::from(v));
+            }
+        }
+    }
+    // ---- 3) 本地固定盘根目录 ----
+    #[cfg(windows)]
+    for d in crate::state::local_fixed_drives() {
+        roots.push(PathBuf::from(format!("{d}\\")));
+    }
+
+    let mut level: Vec<PathBuf> = roots;
+    for _ in 0..depth {
+        if start.elapsed() >= budget || scanned >= SEARCH_MAX_ENTRIES {
+            break;
+        }
+        let mut next: Vec<PathBuf> = Vec::new();
+        for dir in &level {
+            if start.elapsed() >= budget || scanned >= SEARCH_MAX_ENTRIES {
+                break;
+            }
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                scanned += 1;
+                if scanned >= SEARCH_MAX_ENTRIES {
+                    break;
+                }
+                let p = e.path();
+                if p.is_dir() {
+                    if skip_dir(&p) {
+                        continue;
+                    }
+                    next.push(p);
+                    continue;
+                }
+                if e.file_name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    == want_lower
+                {
+                    record_hit(&p, &mut hits, &mut seen);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        level = next;
+    }
+    hits
+}
+
+/// 记下一个命中（规范化路径去重：junction / 8.3 短名会让同一文件出现两次）。
+fn record_hit(p: &Path, hits: &mut Vec<String>, seen: &mut std::collections::HashSet<String>) {
+    let key = std::fs::canonicalize(p)
+        .map(|c| c.display().to_string().to_ascii_lowercase())
+        .unwrap_or_else(|_| p.display().to_string().to_ascii_lowercase());
+    if seen.insert(key) {
+        hits.push(p.display().to_string());
+    }
+}
+
+/// 搜索时要跳过的目录：系统目录 + 明显不可能放 rclone 的地方。
+///
+/// 跳过 `Windows` 是为了避免把 `C:\Windows\System32\...` 里的同名伪装文件
+/// 当成候选（用户会以为找到了真的 rclone）；跳过 `$Recycle.Bin` 等纯属省时间。
+fn skip_dir(p: &Path) -> bool {
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(
+        name.as_str(),
+        "windows"
+            | "winsxs"
+            | "system32"
+            | "syswow64"
+            | "$recycle.bin"
+            | "system volume information"
+            | "node_modules"
+            | ".git"
+            | "temp"
+            | "tmp"
+            | "cache"
+    ) {
+        return true;
+    }
+    // 重解析点（junction / 符号链接）：Windows 上 `Documents and Settings` 指向
+    // `Users`、`Application Data` 指回自己。跟随它们会重复遍历同一棵子树，
+    // 甚至绕成环 —— 这正是「搜索时栈溢出」的来源。
+    if is_reparse_point(p) {
+        return true;
+    }
+    false
+}
+
+/// 是否重解析点（符号链接 / junction / 挂载点）。
+///
+/// 只看 `FILE_ATTRIBUTE_REPARSE_POINT`，不解析目标：目的只是「不跟进去」。
+#[cfg(windows)]
+fn is_reparse_point(p: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    std::fs::symlink_metadata(p)
+        .map(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(p: &Path) -> bool {
+    std::fs::symlink_metadata(p)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 fn tail_log(path: &str, max_lines: usize) -> String {
     let Ok(text) = std::fs::read_to_string(path) else {
         return String::new();
@@ -1056,4 +1254,72 @@ fn chrono_ts() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}{}", now.as_millis(), now.subsec_nanos())
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    /// 搜索本身不能崩：这是回归测试 —— 之前点「搜索本机」会让进程栈溢出。
+    #[test]
+    fn search_exe_terminates_and_finds_nothing_for_bogus_name() {
+        let got = search_exe("definitely-not-a-real-exe-xyz.exe", 2, Duration::from_millis(1500));
+        assert!(got.is_empty(), "不存在的名字不该有命中");
+    }
+
+    #[test]
+    fn search_exe_respects_budget() {
+        let t = Instant::now();
+        let _ = search_exe("rclone.exe", 3, Duration::from_millis(800));
+        assert!(
+            t.elapsed() < Duration::from_secs(6),
+            "搜索必须有硬时限，实际 {:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn skip_dir_rejects_system_and_temp() {
+        assert!(skip_dir(Path::new("C:\\Windows")));
+        assert!(skip_dir(Path::new("C:\\Windows\\System32")));
+        assert!(skip_dir(Path::new("C:\\Users\\x\\AppData\\Local\\Temp")));
+        assert!(!skip_dir(Path::new("C:\\Program Files\\Rclone")));
+    }
+
+    /// 真实场景复现：插件那次调用是 depth=3 / 8000ms。
+    /// 关键差异是**在 tokio worker 线程（2MB 默认栈）上跑**，测试主线程栈更大。
+    #[test]
+    fn search_exe_on_tokio_blocking_pool_does_not_overflow() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let out = tokio::task::spawn_blocking(|| {
+                search_exe("rclone.exe", 3, Duration::from_millis(8000))
+            })
+            .await
+            .unwrap();
+            // 本机装了 rclone，应该至少命中一个；这里只断言「没崩、能返回」
+            let _ = out;
+        });
+    }
+
+    /// 同样跑在 worker 线程上，但故意用更深/更长时间的快照参数。
+    #[test]
+    fn search_exe_deep_on_tokio_worker_returns() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _ = tokio::task::spawn_blocking(|| {
+                search_exe("rclone.exe", 6, Duration::from_millis(25000))
+            })
+            .await
+            .unwrap();
+        });
+    }
 }

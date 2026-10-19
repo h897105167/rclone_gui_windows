@@ -375,12 +375,27 @@ async fn exec_ops(
     Ok(())
 }
 
+/// 单次插件调用的线程栈大小。
+///
+/// tokio 的 blocking 池默认只有 **2MB** 栈，而 wasmtime 实例化 + WASI preview1
+/// 的调用链本身就要吃掉相当一部分；插件里再嵌一层「搜索 / 解压 / 下载」这类
+/// 递归或深调用时，就会把 worker 栈撑爆 —— 现象是进程直接 abort，日志只有
+/// `thread 'tokio-rt-worker' has overflowed its stack`，没有任何 Rust 回溯。
+/// 给 16MB 是一次性买断这类问题，代价只是每个并发插件调用多占一点虚拟内存。
+const PLUGIN_THREAD_STACK: usize = 16 * 1024 * 1024;
+
 async fn run_module(engine: &Engine, module: &Module, stdin: Vec<u8>) -> Result<Vec<u8>> {
     let engine = engine.clone();
     let module = module.clone();
-    tokio::task::spawn_blocking(move || run_module_sync(&engine, &module, stdin))
-        .await
-        .map_err(|e| anyhow!("wasm 运行线程异常: {e}"))?
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<Vec<u8>>>();
+    std::thread::Builder::new()
+        .name("rcgui-plugin".into())
+        .stack_size(PLUGIN_THREAD_STACK)
+        .spawn(move || {
+            let _ = tx.send(run_module_sync(&engine, &module, stdin));
+        })
+        .map_err(|e| anyhow!("无法启动插件执行线程: {e}"))?;
+    rx.await.map_err(|e| anyhow!("插件执行线程异常退出: {e}"))?
 }
 
 fn run_module_sync(engine: &Engine, module: &Module, stdin: Vec<u8>) -> Result<Vec<u8>> {

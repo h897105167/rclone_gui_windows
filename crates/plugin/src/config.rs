@@ -57,7 +57,7 @@ pub fn cap_of_op(op: &str) -> Option<&'static str> {
 
         "fs.meta" | "fs.sha256" | "fs.read_text" | "fs.write_text" | "fs.copy" | "fs.mkdir"
         | "fs.remove" | "fs.list_dir" | "fs.find" | "fs.unzip" | "fs.pick_file" | "fs.pick_dir"
-        | "fs.open_dir" | "fs.pe_info" | "fs.signature" => "fs",
+        | "fs.open_dir" | "fs.pe_info" | "fs.signature" | "fs.search_exe" => "fs",
         // 早期命名，保留兼容
         "fs.inspect_exe" | "fs.write_file" | "fs.remove_dir" => "fs",
 
