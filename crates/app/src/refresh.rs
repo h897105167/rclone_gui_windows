@@ -313,13 +313,16 @@ pub async fn refresh_state(ctx: &Arc<Ctx>, ui: &slint::Weak<MainWindow>, force: 
     // 计数与列表同源：列表里有几行（含正在挂载的 pending），这里就是几
     let mounts_n = snapshot.mount_count(pending_n);
     let serves_n = snapshot.serve_count();
-    let serve_rows_ui = serve_rows.clone();
+    let version_ui = version.clone();
+    let os_info_ui = os_info.clone();
+    let url_ui = url.clone();
+    let hint_ui = hint.clone();
 
     let _ = ui.upgrade_in_event_loop(move |ui| {
         // 仪表盘 / 状态栏：数值全部来自同一份快照
         let d = ui.global::<crate::DashboardG>();
-        d.set_version(version.clone().into());
-        d.set_os_info(os_info.clone().into());
+        d.set_version(version_ui.clone().into());
+        d.set_os_info(os_info_ui.clone().into());
         d.set_remotes(remotes_n as i32);
         d.set_mounts(mounts_n as i32);
         d.set_serves(serves_n as i32);
@@ -329,7 +332,7 @@ pub async fn refresh_state(ctx: &Arc<Ctx>, ui: &slint::Weak<MainWindow>, force: 
         d.set_total_bytes(fmt_bytes(stats.bytes).into());
         d.set_running(running);
         d.set_managed(false);
-        d.set_url(url.clone().into());
+        d.set_url(url_ui.clone().into());
         let rows: Vec<crate::XferRow> = stats
             .xfers
             .iter()
@@ -344,20 +347,14 @@ pub async fn refresh_state(ctx: &Arc<Ctx>, ui: &slint::Weak<MainWindow>, force: 
             slint::VecModel::from(rows),
         )));
 
-        // 三个列表
-        ui.global::<MountsG>()
-            .set_mounts(slint::ModelRc::from(std::rc::Rc::new(
-                slint::VecModel::from(mount_rows.clone()),
-            )));
-        ui.global::<MountsG>().set_instance_hint(hint.clone().into());
-        ui.global::<ServesG>()
-            .set_rows(slint::ModelRc::from(std::rc::Rc::new(
-                slint::VecModel::from(serve_rows_ui.clone()),
-            )));
+        // 「实例不匹配」提示：与列表同一份快照算出来
+        ui.global::<MountsG>().set_instance_hint(hint_ui.clone().into());
     });
 
-    // 以下两个带筛选/异步步骤，走各自的既有实现
+    // 三个列表都走既有的「筛选」实现：搜索框里的词必须继续生效，
+    // 否则 1s 轮询会把用户过滤后的列表又刷回全量。
     crate::apply_remotes_filter(ui, &remotes_full).await;
+    crate::apply_mounts_filter(ui, &mount_rows).await;
     crate::apply_serves_filter(ui, &serve_rows).await;
 
     // 档案里的远程列表同步一份（离线也能看到「有哪些远程」）
