@@ -170,6 +170,10 @@ export struct FieldRow {
     help: string,
     is-advanced: bool,
     options: string,    // select 类型的选项，逗号分隔
+    /// 密码字段：rclone 里已存有密钥（界面不回显密文）
+    secret-set: bool,
+    /// 密码字段：用户点了「更改密码」，正在输入新值
+    secret-editing: bool,
 }
 export struct ServeRow {
     id: string,
@@ -1542,12 +1546,34 @@ component RemotesView inherits Rectangle {
                                                 RemotesG.edit-fields[i].value = self.checked ? "true" : "false";
                                             }
                                         }
-                                        if f.kind != "bool" : LineEdit {
+                                        // 已存密钥：rclone 里存的是混淆后的密文，
+                                        // 回显出来就是「一串哈希」，既看不懂又容易被
+                                        // 原样写回。默认锁住，只显示「已设置」。
+                                        if f.kind == "password" && f.secret-set && !f.secret-editing : Text {
+                                            horizontal-stretch: 1;
+                                            text: "已设置（留空不修改）";
+                                            font-size: 12px;
+                                            color: ThemeG.text-dim;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+                                        if f.kind != "bool" && !(f.kind == "password" && f.secret-set && !f.secret-editing) : LineEdit {
                                             horizontal-stretch: 1;
                                             text: f.value;
                                             input-type: f.kind == "password" ? InputType.password : InputType.text;
+                                            placeholder-text: f.kind != "password" ? ""
+                                                : f.secret-set ? "输入新密码（留空不修改）"
+                                                : "输入密码";
                                             edited(t) => {
                                                 RemotesG.edit-fields[i].value = t;
+                                            }
+                                        }
+                                        if f.kind == "password" && f.secret-set : PillBtn {
+                                            compact: true;
+                                            label: f.secret-editing ? "取消更改" : "更改密码";
+                                            clicked => {
+                                                RemotesG.edit-fields[i].secret-editing = !RemotesG.edit-fields[i].secret-editing;
+                                                RemotesG.edit-fields[i].value = "";
                                             }
                                         }
                                     }

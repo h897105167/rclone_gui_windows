@@ -1336,7 +1336,15 @@ fn build_fields_from_provider(providers: &Value, type_name: &str) -> (String, Ve
         let ty = opt.get("Type").and_then(|t| t.as_str()).unwrap_or("string");
         let required = opt.get("Required").and_then(|r| r.as_bool()).unwrap_or(false);
         let advanced = opt.get("Advanced").and_then(|a| a.as_bool()).unwrap_or(false);
-        let sensitive = opt.get("Sensitive").and_then(|s| s.as_bool()).unwrap_or(false);
+        // 是否遮住输入只看 IsPassword。
+        //
+        // rclone 里两个标记互不蕴含：
+        // - IsPassword：这个值是密码，交互式输入时要遮住（fs/registry.go）；
+        // - Sensitive：导出 / `rclone config redacted` 时要抹掉。
+        // 之前用 `sensitive || ty == "password"` 判断，于是 webdav 的 `user`
+        // （Sensitive=true、IsPassword=false）被当成密码遮住，而真正的 `pass`
+        // （IsPassword=true、Sensitive=false）落成 "text" 明文显示 —— 掩码反了。
+        let is_password = opt.get("IsPassword").and_then(|s| s.as_bool()).unwrap_or(false);
         let default = opt.get("Default").and_then(|d| match d {
             Value::String(s) => Some(s.clone()),
             Value::Bool(b) => Some(b.to_string()),
@@ -1345,7 +1353,7 @@ fn build_fields_from_provider(providers: &Value, type_name: &str) -> (String, Ve
         }).unwrap_or_default();
         let kind = if ty == "bool" {
             "bool"
-        } else if sensitive || ty == "password" {
+        } else if is_password {
             "password"
         } else if ty == "int" || ty == "float" || ty == "Duration" || ty == "SizeSuffix" {
             "number"
@@ -1367,17 +1375,30 @@ fn build_fields_from_provider(providers: &Value, type_name: &str) -> (String, Ve
             help: help.into(),
             is_advanced: advanced,
             options: String::new().into(),
+            // 新建远程时还没有已存密钥；编辑已有远程时由
+            // fill_fields_with_existing 按实际情况置位。
+            secret_set: false,
+            secret_editing: false,
         });
     }
     (desc, fields)
 }
 
 /// 把 FieldRow 列表转为 rclone config 参数 JSON
+///
+/// 密码字段（kind == "password"，即 rclone 的 IsPassword）有一条额外规则：
+/// **空值永远不发送**。已存密钥没被重填时发空串，rclone 会把空密码写进配置
+/// （实测：`config/update {"pass": ""}` 会存下一个 reveal 为空串的密钥），
+/// 这正是「保存后访问失败」的成因之一。跳过空密码 = 保持原值不变。
 fn fields_to_params(fields: &[FieldRow]) -> Value {
     let mut map = serde_json::Map::new();
     for f in fields {
         let val = f.value.to_string();
         let val = val.trim();
+        // 密码留空表示「不修改」，无论是否必填都不写空串。
+        if f.kind.as_str() == "password" && val.is_empty() {
+            continue;
+        }
         match f.kind.as_str() {
             // 布尔必须显式写出 true/false：只在 true 时插入会导致
             // 用户取消勾选后旧值仍保留在 rclone 配置里，永远无法改回 false。
@@ -1420,9 +1441,22 @@ fn fields_to_params(fields: &[FieldRow]) -> Value {
 }
 
 /// 用现有远程参数值填充 FieldRow 列表
+///
+/// 密码字段（IsPassword）特殊处理：rclone 在配置里存的是**混淆后的密文**，
+/// 直接塞进可编辑输入框，用户就会看到一串哈希，还以为密码被改坏了。这里
+/// 不把密文交给 UI，只把 `secret_set` 置位，让界面显示「已设置」并等用户
+/// 主动点「更改密码」再输入新值。
 fn fill_fields_with_existing(fields: &mut [FieldRow], existing: &serde_json::Map<String, Value>) {
     for f in fields.iter_mut() {
         if let Some(v) = existing.get(f.name.as_str()) {
+            if f.kind.as_str() == "password" {
+                // 只要 rclone 里有这个键（哪怕空串），就说明「已设置」，
+                // 不在界面上回显密文。
+                f.value = "".into();
+                f.secret_set = true;
+                f.secret_editing = false;
+                continue;
+            }
             f.value = match v {
                 Value::String(s) => s.clone().into(),
                 Value::Bool(b) => b.to_string().into(),
@@ -8192,6 +8226,8 @@ mod tests {
             help: String::new().into(),
             is_advanced: false,
             options: String::new().into(),
+            secret_set: false,
+            secret_editing: false,
         }
     }
 
@@ -8370,6 +8406,90 @@ mod tests {
     fn value_is_trimmed() {
         let out = fields_to_params(&[field("name", "text", "  hello  ", false)]);
         assert_eq!(out["name"], Value::String("hello".into()));
+    }
+
+    /// 密码留空 = 不修改，即使必填也不能写空串。
+    ///
+    /// 写空串的后果实测过：rclone 会把空密码混淆后存进配置，于是「保存后
+    /// 访问失败」。这里必须整条键都不发。
+    #[test]
+    fn empty_password_is_never_emitted() {
+        let out = fields_to_params(&[
+            field("pass", "password", "", true),
+            field("pass2", "password", "   ", false),
+        ]);
+        assert!(out.get("pass").is_none(), "空密码不该发送，实际 {}", out["pass"]);
+        assert!(out.get("pass2").is_none());
+    }
+
+    /// 用户真的输入了新密码时照常发送。
+    #[test]
+    fn typed_password_is_emitted() {
+        let out = fields_to_params(&[field("pass", "password", " s3cret ", false)]);
+        assert_eq!(out["pass"], Value::String("s3cret".into()));
+    }
+
+    /// 打开已有远程时，密码字段不能把 rclone 的混淆密文塞进输入框。
+    #[test]
+    fn existing_password_is_not_echoed() {
+        let mut fields = vec![field("pass", "password", "", false)];
+        let mut existing = serde_json::Map::new();
+        // 形如 rclone obscure 产物的合成值，不是任何真实凭据。
+        existing.insert(
+            "pass".into(),
+            Value::String("ObScUrEd-FiXtUrE-vAlUe-NoT-a-ReAl-SeCrEt".into()),
+        );
+        fill_fields_with_existing(&mut fields, &existing);
+        assert_eq!(fields[0].value.as_str(), "", "密文不该回显到输入框");
+        assert!(fields[0].secret_set, "应标记为已设置");
+        assert!(!fields[0].secret_editing);
+        // 未改动就保存 → 不发送 pass，rclone 保持原值
+        let out = fields_to_params(&fields);
+        assert!(out.get("pass").is_none());
+    }
+
+    /// 非密码的 Sensitive 字段（webdav 的 user、s3 的 api_key）必须原样回显：
+    /// 它们在配置里是明文，隐藏起来用户就没法改。
+    #[test]
+    fn existing_sensitive_field_is_echoed() {
+        let mut fields = vec![field("user", "text", "", false)];
+        let mut existing = serde_json::Map::new();
+        existing.insert("user".into(), Value::String("demo-user".into()));
+        fill_fields_with_existing(&mut fields, &existing);
+        assert_eq!(fields[0].value.as_str(), "demo-user");
+        assert!(!fields[0].secret_set);
+    }
+
+    /// 掩码只看 IsPassword，不看 Sensitive。
+    ///
+    /// webdav 的 user 是 Sensitive（导出时抹掉）但不是 IsPassword（不是密码），
+    /// pass 反过来。之前用 Sensitive 判断，导致用户名被遮、密码明文。
+    #[test]
+    fn password_kind_follows_is_password_only() {
+        let providers = serde_json::json!({
+            "providers": [{
+                "Name": "webdav",
+                "Description": "WebDAV",
+                "Options": [
+                    {"Name": "user", "Type": "string", "Sensitive": true, "IsPassword": false, "Default": ""},
+                    {"Name": "pass", "Type": "string", "Sensitive": false, "IsPassword": true, "Default": ""},
+                    {"Name": "bearer_token", "Type": "string", "Sensitive": true, "Default": ""},
+                    {"Name": "url", "Type": "string", "Default": ""}
+                ]
+            }]
+        });
+        let (_desc, fields) = build_fields_from_provider(&providers, "webdav");
+        let kind = |n: &str| {
+            fields
+                .iter()
+                .find(|f| f.name.as_str() == n)
+                .map(|f| f.kind.to_string())
+                .unwrap_or_default()
+        };
+        assert_eq!(kind("pass"), "password");
+        assert_eq!(kind("user"), "text");
+        assert_eq!(kind("bearer_token"), "text");
+        assert_eq!(kind("url"), "text");
     }
 
     /// 直链路径必须先规范化，防止 `..` 穿越到图床根目录之外。
