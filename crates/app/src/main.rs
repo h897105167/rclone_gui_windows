@@ -1301,6 +1301,115 @@ async fn apply_global_limit(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     set_effective(ui, disp);
 }
 
+/// 把 rclone `Duration` 的纳秒数格式化成带单位文本（"10ms"、"1h30m"、"off"）
+///
+/// 必须带单位：`fs.ParseDuration` 把无单位数字当**秒**，所以裸数字
+/// `10000000` 会被读成 10⁷ 秒（115 天），webdav 的 pacer 直接饿死。
+fn fmt_duration_ns(ns: i64) -> String {
+    // DurationOff：rclone 用 math.MaxInt64 表示 "off"
+    if ns == i64::MAX {
+        return "off".to_string();
+    }
+    if ns == 0 {
+        return "0s".to_string();
+    }
+    let neg = ns < 0;
+    let u = ns.unsigned_abs();
+    let mut out = String::new();
+    if u < 1_000 {
+        out.push_str(&format!("{u}ns"));
+    } else {
+        // 从大到小拼接，Go 的 time.Duration.String() 同款顺序
+        let units: [(&str, u64); 5] = [
+            ("h", 3_600_000_000_000),
+            ("m", 60_000_000_000),
+            ("s", 1_000_000_000),
+            ("ms", 1_000_000),
+            ("us", 1_000),
+        ];
+        let mut rest = u;
+        for (suffix, scale) in units {
+            if rest >= scale {
+                let n = rest / scale;
+                rest %= scale;
+                out.push_str(&format!("{n}{suffix}"));
+            }
+        }
+        if rest > 0 {
+            out.push_str(&format!("{rest}ns"));
+        }
+    }
+    if neg {
+        format!("-{out}")
+    } else {
+        out
+    }
+}
+
+/// 把 rclone `SizeSuffix` 的字节数格式化成带单位文本（"10Mi"、"512Mi"、"10B"）
+///
+/// 必须带单位：`SizeSuffix.Set` 把无单位数字当 **KiB**，所以裸数字
+/// `10485760` 会被读成 10 GiB 而不是 10 MiB。
+fn fmt_size_bytes(bytes: i64) -> String {
+    // 负数是 rclone 的 "off"
+    if bytes < 0 {
+        return "off".to_string();
+    }
+    if bytes == 0 {
+        return "0".to_string();
+    }
+    const UNITS: [(&str, i64); 6] = [
+        ("Ei", 1 << 60),
+        ("Pi", 1 << 50),
+        ("Ti", 1 << 40),
+        ("Gi", 1 << 30),
+        ("Mi", 1 << 20),
+        ("Ki", 1 << 10),
+    ];
+    for (suffix, scale) in UNITS {
+        if bytes >= scale {
+            let whole = bytes / scale;
+            let rem = bytes % scale;
+            if rem == 0 {
+                return format!("{whole}{suffix}");
+            }
+            // 非整除时保留三位小数，与 rclone 的 %.3f 对齐
+            let val = bytes as f64 / scale as f64;
+            let s = format!("{val:.3}");
+            let s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+            return format!("{s}{suffix}");
+        }
+    }
+    // 小于 1 KiB：裸数字会被当 KiB 放大，必须带 B
+    format!("{bytes}B")
+}
+
+/// 把字段里的「无单位裸数字」按 rclone `config/providers` 的基础单位换算
+///
+/// 注意这里刻意**不**沿用 rclone.conf 的文本约定（Duration 无单位=秒、
+/// SizeSuffix 无单位=KiB）：字段的初值来自 provider 元数据，那里的 Duration
+/// 是纳秒、SizeSuffix 是字节，用户看到的也是 `10ms` / `10Mi` 这种带单位文本。
+/// 裸数字按基础单位解释，既与初值一致，也能把历史遗留的 `1e+07` 这类被写坏的
+/// 值顺手修回 `10ms`。
+fn parse_bare_duration_ns(s: &str) -> Option<i64> {
+    // 能直接当浮点数读 = 无单位裸数字（含历史遗留的 `1e+07`）。
+    // "10ms" / "1h30m" / "off" 都读不成浮点数，原样交给 rclone。
+    let ns: f64 = s.parse().ok()?;
+    if !ns.is_finite() {
+        return None;
+    }
+    Some(ns as i64)
+}
+
+/// 把字段里的「无单位裸数字」按字节解释，见 [`parse_bare_duration_ns`]
+fn parse_bare_size_bytes(s: &str) -> Option<i64> {
+    let n: f64 = s.parse().ok()?;
+    if !n.is_finite() {
+        return None;
+    }
+    Some(n as i64)
+}
+
 /// 从 config/providers 响应中提取指定类型的字段列表
 fn build_fields_from_provider(providers: &Value, type_name: &str) -> (String, Vec<FieldRow>) {
     let empty = (String::new(), Vec::new());
@@ -1345,17 +1454,39 @@ fn build_fields_from_provider(providers: &Value, type_name: &str) -> (String, Ve
         // （Sensitive=true、IsPassword=false）被当成密码遮住，而真正的 `pass`
         // （IsPassword=true、Sensitive=false）落成 "text" 明文显示 —— 掩码反了。
         let is_password = opt.get("IsPassword").and_then(|s| s.as_bool()).unwrap_or(false);
-        let default = opt.get("Default").and_then(|d| match d {
-            Value::String(s) => Some(s.clone()),
-            Value::Bool(b) => Some(b.to_string()),
-            Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        }).unwrap_or_default();
+        // rclone 的 Default 对 Duration 是**纳秒数**、对 SizeSuffix 是**字节数**，
+        // 直接 to_string 会得到 "10000000" / "10485760" 这种无单位裸数字，回写时
+        // 被 rclone 按秒 / KiB 解析。这里先格式化成带单位的规范文本。
+        let default = match opt.get("Default") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Bool(b)) => b.to_string(),
+            Some(Value::Number(n)) => {
+                let raw = n.as_i64().or_else(|| n.as_f64().map(|f| f as i64));
+                match (ty, raw) {
+                    ("Duration", Some(ns)) => fmt_duration_ns(ns),
+                    ("SizeSuffix", Some(bytes)) => fmt_size_bytes(bytes),
+                    _ => n.to_string(),
+                }
+            }
+            _ => String::new(),
+        };
+        // Duration / SizeSuffix 单独成一类，不能混进 "number"。
+        //
+        // rclone 的 `updateRemote` 对 JSON 值一律 `fmt.Sprint(v)` 落盘，数字会被
+        // 打印成 `1e+07` 这种科学计数法；而 `fs.ParseDuration` 对无单位数字按
+        // **秒**解析、`SizeSuffix.Set` 对无单位数字按 **KiB** 解析。于是默认值
+        // 10000000ns（10ms）会变成 10⁷ 秒（115 天），webdav 的 pacer 第二次调用
+        // 就永久阻塞 —— 表现为「打开根目录后断连」。所以这两类必须输出带单位的
+        // 规范文本，见 fields_to_params 里的格式化分支。
         let kind = if ty == "bool" {
             "bool"
         } else if is_password {
             "password"
-        } else if ty == "int" || ty == "float" || ty == "Duration" || ty == "SizeSuffix" {
+        } else if ty == "Duration" {
+            "duration"
+        } else if ty == "SizeSuffix" {
+            "size"
+        } else if ty == "int" || ty == "float" {
             "number"
         } else {
             "text"
@@ -1405,6 +1536,34 @@ fn fields_to_params(fields: &[FieldRow]) -> Value {
             "bool" => {
                 map.insert(f.name.to_string(), Value::Bool(val == "true"));
             }
+            // Duration / SizeSuffix：一律按字符串传，并且补上单位。
+            //
+            // 这两类绝不能走数字分支：rclone 落盘时 `fmt.Sprint(float64)` 会写出
+            // `1e+07` 这样的科学计数法，而回读时无单位数字按秒 / KiB 解析，
+            // 数值被放大若干个数量级（webdav 的 pacer_min_sleep 就是这样把
+            // 第二次列目录永久卡死的）。裸数字在这里补齐单位再发。
+            "duration" => {
+                if val.is_empty() {
+                    if f.required {
+                        map.insert(f.name.to_string(), Value::String(String::new()));
+                    }
+                } else if let Some(ns) = parse_bare_duration_ns(val) {
+                    map.insert(f.name.to_string(), Value::String(fmt_duration_ns(ns)));
+                } else {
+                    map.insert(f.name.to_string(), Value::String(val.to_string()));
+                }
+            }
+            "size" => {
+                if val.is_empty() {
+                    if f.required {
+                        map.insert(f.name.to_string(), Value::String(String::new()));
+                    }
+                } else if let Some(bytes) = parse_bare_size_bytes(val) {
+                    map.insert(f.name.to_string(), Value::String(fmt_size_bytes(bytes)));
+                } else {
+                    map.insert(f.name.to_string(), Value::String(val.to_string()));
+                }
+            }
             "number" => {
                 if val.is_empty() {
                     // 空值：非必填则跳过（保持 rclone 默认），必填则传空串让 rclone 报错提示
@@ -1414,7 +1573,7 @@ fn fields_to_params(fields: &[FieldRow]) -> Value {
                 } else if let Ok(n) = val.parse::<i64>() {
                     map.insert(f.name.to_string(), Value::Number(n.into()));
                 } else if let Ok(x) = val.parse::<f64>() {
-                    // Duration / SizeSuffix / float 等：能解析为数字就用数字
+                    // int/float 选项：能解析为数字就用数字（fmt.Sprint 落盘无损）
                     if let Some(n) = serde_json::Number::from_f64(x) {
                         map.insert(f.name.to_string(), Value::Number(n));
                     } else {
@@ -1463,6 +1622,23 @@ fn fill_fields_with_existing(fields: &mut [FieldRow], existing: &serde_json::Map
                 Value::Number(n) => n.to_string().into(),
                 _ => v.to_string().into(),
             };
+            // Duration / SizeSuffix：把历史遗留的裸数字（含被写坏的 `1e+07`）
+            // 就地换成带单位的规范文本，用户打开编辑器就能看到并顺手修好。
+            match f.kind.as_str() {
+                "duration" => {
+                    let cur = f.value.to_string();
+                    if let Some(ns) = parse_bare_duration_ns(&cur) {
+                        f.value = fmt_duration_ns(ns).into();
+                    }
+                }
+                "size" => {
+                    let cur = f.value.to_string();
+                    if let Some(bytes) = parse_bare_size_bytes(&cur) {
+                        f.value = fmt_size_bytes(bytes).into();
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -8490,6 +8666,119 @@ mod tests {
         assert_eq!(kind("user"), "text");
         assert_eq!(kind("bearer_token"), "text");
         assert_eq!(kind("url"), "text");
+    }
+
+    /// Duration / SizeSuffix 必须与 int/float 分开成独立 kind：
+    /// 混在 "number" 里会被当成 JSON 数字发出，rclone 用 fmt.Sprint 落盘成
+    /// `1e+07`，回读时按秒/KiB 解释，数值被放大若干数量级。
+    #[test]
+    fn duration_and_size_are_not_number_kind() {
+        let providers = serde_json::json!({
+            "providers": [{
+                "Name": "webdav",
+                "Description": "WebDAV",
+                "Options": [
+                    {"Name": "pacer_min_sleep", "Type": "Duration", "Default": 10000000},
+                    {"Name": "nextcloud_chunk_size", "Type": "SizeSuffix", "Default": 10485760},
+                    {"Name": "page_size", "Type": "int", "Default": 200},
+                    {"Name": "ratio", "Type": "float", "Default": 1.5}
+                ]
+            }]
+        });
+        let (_desc, fields) = build_fields_from_provider(&providers, "webdav");
+        let get = |n: &str| fields.iter().find(|f| f.name.as_str() == n).cloned();
+        assert_eq!(get("pacer_min_sleep").unwrap().kind.to_string(), "duration");
+        assert_eq!(get("nextcloud_chunk_size").unwrap().kind.to_string(), "size");
+        assert_eq!(get("page_size").unwrap().kind.to_string(), "number");
+        assert_eq!(get("ratio").unwrap().kind.to_string(), "number");
+    }
+
+    /// 默认值（纳秒）必须在建表单时就格式化成带单位文本，
+    /// 否则用户看到的是裸数字，保存出去又变成科学计数法。
+    #[test]
+    fn duration_default_is_formatted_with_unit() {
+        let providers = serde_json::json!({
+            "providers": [{
+                "Name": "webdav",
+                "Description": "WebDAV",
+                "Options": [
+                    {"Name": "pacer_min_sleep", "Type": "Duration", "Default": 10000000}
+                ]
+            }]
+        });
+        let (_desc, fields) = build_fields_from_provider(&providers, "webdav");
+        assert_eq!(fields[0].value.to_string(), "10ms");
+    }
+
+    /// 默认值（字节）同理，必须带 Mi/Gi 之类的单位后缀。
+    #[test]
+    fn size_default_is_formatted_with_unit() {
+        let providers = serde_json::json!({
+            "providers": [{
+                "Name": "teldrive",
+                "Description": "Teldrive",
+                "Options": [
+                    {"Name": "chunk_size", "Type": "SizeSuffix", "Default": 536870912}
+                ]
+            }]
+        });
+        let (_desc, fields) = build_fields_from_provider(&providers, "teldrive");
+        assert_eq!(fields[0].value.to_string(), "512Mi");
+    }
+
+    /// 字段里的裸数字按基础单位（纳秒/字节）解释，并补上单位后发出。
+    #[test]
+    fn bare_numbers_are_emitted_with_units() {
+        let out = fields_to_params(&[
+            field("pacer_min_sleep", "duration", "10000000", false),
+            field("nextcloud_chunk_size", "size", "10485760", false),
+        ]);
+        assert_eq!(out["pacer_min_sleep"], serde_json::json!("10ms"));
+        assert_eq!(out["nextcloud_chunk_size"], serde_json::json!("10Mi"));
+    }
+
+    /// 已经带单位的写法原样透传，不要自作聪明再换算。
+    #[test]
+    fn values_with_units_pass_through() {
+        let out = fields_to_params(&[
+            field("idle_timeout", "duration", "1m0s", false),
+            field("upload_cutoff", "size", "200Mi", false),
+        ]);
+        assert_eq!(out["idle_timeout"], serde_json::json!("1m0s"));
+        assert_eq!(out["upload_cutoff"], serde_json::json!("200Mi"));
+    }
+
+    /// rclone 用 math.MaxInt64 / 负数表示 "off"，必须原样传回去。
+    #[test]
+    fn duration_off_is_preserved() {
+        assert_eq!(fmt_duration_ns(i64::MAX), "off");
+        assert_eq!(fmt_size_bytes(-1), "off");
+        let out = fields_to_params(&[field("wait_archive", "duration", "off", false)]);
+        assert_eq!(out["wait_archive"], serde_json::json!("off"));
+    }
+
+    /// 小于 1KiB 的字节数必须带 B：裸数字会被 rclone 当成 KiB 放大 1024 倍。
+    #[test]
+    fn small_size_keeps_byte_suffix() {
+        assert_eq!(fmt_size_bytes(512), "512B");
+        assert_eq!(fmt_size_bytes(0), "0");
+    }
+
+    /// 打开已有远程时，把历史遗留的被写坏的裸数字就地修成规范文本，
+    /// 这样用户只要打开编辑器保存一次，配置就自愈了。
+    #[test]
+    fn poisoned_existing_values_are_repaired_on_load() {
+        let mut fields = vec![
+            field("pacer_min_sleep", "duration", "", false),
+            field("nextcloud_chunk_size", "size", "", false),
+        ];
+        let existing = serde_json::json!({
+            "pacer_min_sleep": "1e+07",
+            "nextcloud_chunk_size": "1.048576e+07",
+        });
+        fill_fields_with_existing(&mut fields, existing.as_object().unwrap());
+        assert_eq!(fields[0].value.to_string(), "10ms");
+        assert_eq!(fields[1].value.to_string(), "10Mi");
     }
 
     /// 直链路径必须先规范化，防止 `..` 穿越到图床根目录之外。
