@@ -2740,13 +2740,10 @@ async fn handshake_only(ctx: &Arc<Ctx>) -> ConnOutcome {
             let mut notes = Vec::new();
             if hs.auth_unset {
                 // 连上了但对端没配 RC 鉴权：除 core/version 外全是 403，
-                // 挂载 / 服务 / 参数读取都做不了。必须说得比「能力受限」更明确。
+                // 挂载 / 服务 / 参数读取都做不了。状态说得比「能力受限」更明确；
+                // 具体文案由握手自己塞进 warnings（下面统一并入 notes），
+                // 这里不要再补一条，否则同一件事在界面上会被说两遍。
                 view.status = "已连接（对端未配置鉴权）".to_string();
-                notes.push(
-                    "对端 rclone 未启用 RC 认证：挂载、服务、运行参数都会返回 403。\
-                     请用 --rc-user/--rc-pass 或 --rc-no-auth 重启 rclone 后点「重新握手」"
-                        .to_string(),
-                );
             } else if !hs.is_compatible() {
                 view.status = "已连接（能力受限）".to_string();
                 notes.push(format!("缺少必需能力：{}", hs.missing_text()));
