@@ -296,6 +296,32 @@ export global FilesG {
     in-out property <bool> move-busy: false;
     /// 浏览请求序号：迟到的旧结果按序号丢弃
     in-out property <int> move-seq: 0;
+    // ---------------- 多选 / 排序 / 上传 ----------------
+    /// 多选模式：进入后工具栏露出 全选/反选/下载到本机/删除，列表左侧出现勾选框
+    in-out property <bool> multi: false;
+    /// 与 entries 一一对应：该行是否被勾选。每次列目录后由 Rust 侧重建为全 false。
+    in-out property <[bool]> checked: [];
+    /// 排序键："name" | "size"（目录始终排在文件前）
+    in-out property <string> sort-key: "name";
+    /// 是否反向排序
+    in-out property <bool> sort-desc: false;
+    /// 上传 / 批量操作进行中：相关按钮置灰，避免重复触发
+    in-out property <bool> busy: false;
+    /// 已勾选行数（Rust 侧维护，用于确认框文案与按钮置灰）
+    in-out property <int> checked-count: 0;
+    /// Shift 连选的锚点行（-1 = 无）；由 Rust 维护，避免把区间计算塞进回调
+    in-out property <int> anchor: -1;
+}
+
+// 本机窗格（文件页双栏的左半）。
+// 列目录走 std::fs，不经 rclone：本机浏览不应该产生任何 RC 请求。
+export global LocalG {
+    in-out property <string> path: "";
+    in-out property <[FileRow]> entries: [];
+    in-out property <int> sel: -1;
+    in-out property <bool> loading: false;
+    /// 本机操作（列目录 / 上传）进行中：按钮置灰
+    in-out property <bool> busy: false;
 }
 
 export global MountsG {
@@ -979,6 +1005,138 @@ component DashboardView inherits Rectangle {
     }
 }
 
+// ---- 本机窗格：文件页双栏的左半（请求 ⑧）----
+// 只做三件事：浏览本机目录、选中、把某一项传到右侧远程当前目录。
+// 列目录走 std::fs，不经 rclone —— 本机浏览不应该产生任何 RC 请求。
+component LocalPane inherits Rectangle {
+    callback refresh();
+    callback open-row(int);
+    callback go-up();
+    callback choose-dir();
+    callback upload-row(int);
+    background: transparent;
+    VerticalLayout {
+        padding-top: 24px;
+        padding-bottom: 24px;
+        padding-left: 18px;
+        padding-right: 4px;
+        spacing: 12px;
+        HorizontalLayout {
+            height: 36px;
+            spacing: 6px;
+            Text { text: "本机"; font-size: 14px; font-weight: 600; color: ThemeG.text; vertical-alignment: center; }
+            IconBtn { label: "\u{E74A}"; clicked => { root.go-up(); } }
+            Rectangle {
+                horizontal-stretch: 1;
+                min-width: 50px;
+                background: ThemeG.panel;
+                border-radius: ThemeG.radius-s;
+                border-width: 1px;
+                border-color: ThemeG.border;
+                clip: true;
+                Text {
+                    x: 8px;
+                    width: parent.width - 16px;
+                    height: parent.height;
+                    text: LocalG.path;
+                    font-size: 12px;
+                    color: ThemeG.text-dim;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+            PillBtn { label: "选择…"; compact: true; disabled: LocalG.busy; clicked => { root.choose-dir(); } }
+            IconBtn { label: "\u{E72C}"; clicked => { root.refresh(); } }
+        }
+        Card {
+            pad: 0px;
+            fill: true;
+            vertical-stretch: 1;
+            VerticalLayout {
+                Rectangle {
+                    height: 30px;
+                    background: ThemeG.panel-2;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            Text { text: "名称"; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        }
+                        Text { text: "大小"; font-size: 12px; color: ThemeG.text-dim; width: 70px; vertical-alignment: center; }
+                        Rectangle { width: 30px; }
+                    }
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                    ListView {
+                        for row[i] in LocalG.entries : Rectangle {
+                            height: 38px;
+                            background: LocalG.sel == i ? ThemeG.accent-soft : (lta.has-hover ? ThemeG.hover : transparent);
+                            lta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { LocalG.sel = i; }
+                                double-clicked => { root.open-row(i); }
+                            }
+                            MdlIcon {
+                                x: 8px;
+                                y: 9px;
+                                width: 20px;
+                                height: 20px;
+                                glyph: row.is-dir ? "\u{E8B7}" : "\u{E8A5}";
+                                color: LocalG.sel == i ? ThemeG.accent : ThemeG.text-dim;
+                            }
+                            Text {
+                                x: 32px;
+                                width: parent.width - 76px;
+                                height: parent.height;
+                                text: row.name;
+                                font-size: 13px;
+                                color: ThemeG.text;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Text {
+                                x: parent.width - 118px;
+                                width: 62px;
+                                height: parent.height;
+                                text: row.is-dir ? "—" : row.size;
+                                font-size: 12px;
+                                color: ThemeG.text-dim;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
+                            // 「传到右侧」按钮：常显而不是悬停才出现。
+                            // 踩过的坑：按钮写在 `if lta.has-hover` 里时，鼠标移到按钮上
+                            // 行的 has-hover 变 false、按钮在按下前就消失，单击永远打不中，
+                            // 必须先用一次点击选中行才行 —— 实测三次点击才成功一次。
+                            Rectangle {
+                                x: parent.width - 36px;
+                                y: 4px;
+                                width: 30px;
+                                height: 30px;
+                                background: transparent;
+                                local-up := IconBtn {
+                                    x: 0px;
+                                    y: 0px;
+                                    label: "\u{E898}";
+                                    clicked => { root.upload-row(i); }
+                                }
+                                Tooltip { text: @markdown("上传到右侧远程的当前目录"); }
+                            }
+                            Rectangle {
+                                y: parent.height - 1px;
+                                height: 1px;
+                                background: ThemeG.border;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 component FilesView inherits Rectangle {
     background: transparent;
     callback refresh;
@@ -1001,6 +1159,18 @@ component FilesView inherits Rectangle {
     callback move-up;
     callback move-root;
     callback move-confirm;
+    // 上传：打开资源管理器选文件，上传到当前目录（支持多选）
+    callback upload-pick;
+    // 排序：key = "name" | "size"；再次点同一键反向
+    callback sort-by(string);
+    // 多选模式开关 / 全选 / 反选 / 勾选单行（shift 表示范围选择）
+    callback multi-toggle;
+    callback select-all;
+    callback select-invert;
+    callback check-row(int, bool);
+    // 批量下载到本机 / 批量删除（选定后确认）
+    callback download-many;
+    callback del-many;
     // 右键菜单 / 弹窗所需的待操作状态
     property <int> op-idx: -1;
     property <string> op-name: "";
@@ -1009,6 +1179,8 @@ component FilesView inherits Rectangle {
     property <length> menu-ay;
     property <length> dlg-ax;
     property <length> dlg-ay;
+    /// 最近一次点击是否按住 shift（多选范围选择用；clicked 不带修饰键）
+    property <bool> last-shift: false;
     VerticalLayout {
         padding: 24px;
         spacing: 12px;
@@ -1024,6 +1196,12 @@ component FilesView inherits Rectangle {
                     root.refresh();
                 }
             }
+            // 远程名右侧：上传按钮（资源管理器选文件 → 传到当前目录）
+            PillBtn {
+                label: "上传文件";
+                disabled: FilesG.busy;
+                clicked => { root.upload-pick(); }
+            }
             Rectangle { width: 4px; }
             IconBtn { label: "\u{E74A}"; clicked => { root.go-up(); } }
             // 路径面包屑：每一级可点，点击退回该级（像资源管理器）。
@@ -1032,6 +1210,9 @@ component FilesView inherits Rectangle {
             pathbox := Rectangle {
                 horizontal-stretch: 1;
                 min-width: 120px;
+                // 必须给固定 preferred-width：否则布局按「面包屑全文」的偏好宽度参与计算，
+                // 双栏 + 多选模式下工具条会被撑得比窗口还宽，右侧按钮与列被挤出可视区。
+                preferred-width: 200px;
                 background: ThemeG.panel;
                 border-radius: ThemeG.radius-s;
                 border-width: 1px;
@@ -1090,8 +1271,44 @@ component FilesView inherits Rectangle {
             }
             // 让路径框吃满中间剩余宽度（唯一 stretch 项，宽度不随面包屑内容变化）
             Rectangle { horizontal-stretch: 0; }
+            // 多选入口；进入后动作按钮出现在下面单独一行（宽度不够时不至于挤爆工具条）
+            if !FilesG.multi : PillBtn { label: "多选"; clicked => { root.multi-toggle(); } }
             PillBtn { label: "新建文件夹"; clicked => { root.mkdir(); } }
             IconBtn { label: "\u{E72C}"; clicked => { root.refresh(); } }
+        }
+        // 多选动作条：只在多选模式出现，独占一行，宽度不参与主工具条的挤压计算
+        if FilesG.multi : Rectangle {
+            height: 34px;
+            background: ThemeG.accent-soft;
+            border-radius: ThemeG.radius-s;
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 8px;
+                Text {
+                    text: "已选 " + FilesG.checked-count + " 项";
+                    font-size: 13px;
+                    color: ThemeG.accent;
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; }
+                PillBtn { label: "全选"; compact: true; clicked => { root.select-all(); } }
+                PillBtn { label: "反选"; compact: true; clicked => { root.select-invert(); } }
+                PillBtn {
+                    label: "下载到本机";
+                    compact: true;
+                    disabled: FilesG.busy;
+                    clicked => { root.download-many(); }
+                }
+                PillBtn {
+                    label: "删除";
+                    compact: true;
+                    danger: true;
+                    disabled: FilesG.busy || FilesG.checked-count == 0;
+                    clicked => { delmp.show(); }
+                }
+                PillBtn { label: "退出多选"; compact: true; clicked => { root.multi-toggle(); } }
+            }
         }
         Card {
             pad: 0px;
@@ -1101,6 +1318,17 @@ component FilesView inherits Rectangle {
                 Rectangle {
                     height: 34px;
                     background: ThemeG.panel-2;
+                    // 空白处右键（表头这一段）：刷新 / 排序 / 上传
+                    head-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        pointer-event(e) => {
+                            if (e.button == PointerEventButton.right && e.kind == PointerEventKind.up) {
+                                root.menu-ax = Math.max(0px, Math.min(self.absolute-position.x + self.mouse-x - root.absolute-position.x, root.width - 200px));
+                                root.menu-ay = Math.min(self.absolute-position.y + self.mouse-y - root.absolute-position.y, 150px);
+                                bmp.show();
+                            }
+                        }
+                    }
                     HorizontalLayout {
                         padding-left: 14px;
                         padding-right: 14px;
@@ -1117,12 +1345,24 @@ component FilesView inherits Rectangle {
                     ListView {
                         for row[i] in FilesG.entries : Rectangle {
                             height: 38px;
-                            background: FilesG.sel == i ? ThemeG.accent-soft : (ta.has-hover ? ThemeG.hover : transparent);
+                            background: (FilesG.multi && FilesG.checked[i]) ? ThemeG.accent-soft : (FilesG.sel == i ? ThemeG.accent-soft : (ta.has-hover ? ThemeG.hover : transparent));
                             ta := TouchArea {
                                 mouse-cursor: pointer;
-                                clicked => { FilesG.sel = i; FilesG.rename-name = row.name; }
+                                clicked => {
+                                    if (FilesG.multi) {
+                                        // 多选模式：单击切换勾选（shift 做范围选择）
+                                        root.check-row(i, root.last-shift);
+                                    } else {
+                                        FilesG.sel = i;
+                                        FilesG.rename-name = row.name;
+                                    }
+                                }
                                 double-clicked => { root.open-row(i); }
                                 pointer-event(e) => {
+                                    // 记下修饰键：clicked 回调本身不带修饰键信息
+                                    if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.down) {
+                                        root.last-shift = e.modifiers.shift;
+                                    }
                                     if (e.button == PointerEventButton.right && e.kind == PointerEventKind.up) {
                                         FilesG.sel = i;
                                         FilesG.rename-name = row.name;
@@ -1135,8 +1375,21 @@ component FilesView inherits Rectangle {
                                     }
                                 }
                             }
+                            // 多选模式：左侧勾选框（MDL2 E739 空框 / E73A 勾选）
+                            if FilesG.multi : Text {
+                                x: 4px;
+                                width: 20px;
+                                height: parent.height;
+                                text: FilesG.checked[i] ? "\u{E73A}" : "\u{E739}";
+                                font-family: "Segoe MDL2 Assets";
+                                font-size: 14px;
+                                color: FilesG.checked[i] ? ThemeG.accent : ThemeG.text-dim;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
                             HorizontalLayout {
-                                padding-left: 14px;
+                                // 多选时左移一点，给绝对定位的勾选框（x 4..24px）让位
+                                padding-left: FilesG.multi ? 28px : 14px;
                                 padding-right: 14px;
                                 Rectangle {
                                     horizontal-stretch: 1;
@@ -1169,6 +1422,22 @@ component FilesView inherits Rectangle {
                             }
                         }
                     }
+                    // 列表下方的空白区：右键出「刷新 / 排序 / 上传」菜单。
+                    // 放在 ListView 之后（更靠上层）并且只覆盖最后一行以下的部分，
+                    // 这样既不会被 ListView 自己的滚动处理吃掉事件，也不挡行点击。
+                    blank-ta := TouchArea {
+                        y: Math.min(FilesG.entries.length * 38px, parent.height);
+                        width: parent.width;
+                        height: parent.height - self.y;
+                        mouse-cursor: pointer;
+                        pointer-event(e) => {
+                            if (e.button == PointerEventButton.right && e.kind == PointerEventKind.up) {
+                                root.menu-ax = Math.max(0px, Math.min(self.absolute-position.x + self.mouse-x - root.absolute-position.x, root.width - 200px));
+                                root.menu-ay = Math.min(self.absolute-position.y + self.mouse-y - root.absolute-position.y, 150px);
+                                bmp.show();
+                            }
+                        }
+                    }
                     // 加载遮罩：目录请求期间禁用文件点击 + spinner，防止拼出不存在的路径
                     if FilesG.loading : Rectangle {
                         background: #80808033;
@@ -1194,6 +1463,12 @@ component FilesView inherits Rectangle {
     }
     // 右键菜单（原点击工具栏功能全部集成于此）
     ctx := PopupWindow {
+        // PopupWindow 不会自动采用内容的 preferred-size：宽高必须显式给出。
+        // 只写内部 card 的宽度、不给高度时，弹窗可点区域会塌成一条窄缝——
+        // 文字靠溢出绘制还看得见，但按钮落在窗口之外，鼠标不移上去、点了也没反应，
+        // 看起来就像「被别的控件遮住了」。
+        width: ctxcard.width;
+        height: ctxcard.preferred-height;
         x: root.menu-ax;
         y: root.menu-ay;
         close-policy: PopupClosePolicy.close-on-click-outside;
@@ -1254,7 +1529,9 @@ component FilesView inherits Rectangle {
         x: root.menu-ax;
         y: root.menu-ay;
         close-policy: PopupClosePolicy.close-on-click-outside;
-        Rectangle {
+        width: cpmcard.width;
+        height: cpmcard.preferred-height;
+        cpmcard := Rectangle {
             width: 220px;
             background: ThemeG.panel;
             border-radius: ThemeG.radius-s;
@@ -1273,6 +1550,8 @@ component FilesView inherits Rectangle {
     }
     // 重命名弹窗
     rnp := PopupWindow {
+        width: rnpcard.width;
+        height: rnpcard.preferred-height;
         x: root.menu-ax;
         y: root.menu-ay + 36px;
         close-policy: PopupClosePolicy.close-on-click-outside;
@@ -1301,10 +1580,15 @@ component FilesView inherits Rectangle {
     }
     // 「移动到…」对话框：在同一远程内浏览目标目录
     mvp := PopupWindow {
+        // 用户报的「移动对话框所有控件都不能点、点任意位置就退出」就是这个原因：
+        // 没有宽高的弹窗可点区域塌成窄缝，任何点击都落在弹窗外 →
+        // close-on-click-outside 立刻关闭它。
+        width: mvpcard.width;
+        height: mvpcard.preferred-height;
         x: root.dlg-ax;
         y: root.dlg-ay;
         close-policy: PopupClosePolicy.close-on-click-outside;
-        Rectangle {
+        mvpcard := Rectangle {
             width: 560px;
             background: ThemeG.panel;
             border-radius: ThemeG.radius;
@@ -1408,6 +1692,46 @@ component FilesView inherits Rectangle {
         x: root.menu-ax;
         y: root.menu-ay;
         confirmed => { root.del-row(root.op-idx); }
+    }
+    // 空白处右键菜单：刷新 / 排序（名称, 大小）/ 上传
+    bmp := PopupWindow {
+        // 与 ctx 同一个坑：PopupWindow 必须显式给出宽高，否则可点区域塌成窄缝
+        width: bmpcard.width;
+        height: bmpcard.preferred-height;
+        x: root.menu-ax;
+        y: root.menu-ay;
+        close-policy: PopupClosePolicy.close-on-click-outside;
+        bmpcard := Rectangle {
+            width: 210px;
+            background: ThemeG.panel;
+            border-radius: ThemeG.radius-s;
+            border-width: 1px;
+            border-color: ThemeG.border;
+            VerticalLayout {
+                padding: 4px;
+                spacing: 2px;
+                MenuItemBtn { glyph: "\u{E72C}"; label: "刷新"; clicked => { bmp.close(); root.refresh(); } }
+                MenuItemBtn {
+                    glyph: FilesG.sort-key == "name" ? "\u{E73E}" : "\u{E8CB}";
+                    label: FilesG.sort-key == "name" ? (FilesG.sort-desc ? "按名称排序（Z→A）" : "按名称排序（A→Z）") : "按名称排序";
+                    clicked => { bmp.close(); root.sort-by("name"); }
+                }
+                MenuItemBtn {
+                    glyph: FilesG.sort-key == "size" ? "\u{E73E}" : "\u{E8CB}";
+                    label: FilesG.sort-key == "size" ? (FilesG.sort-desc ? "按大小排序（大→小）" : "按大小排序（小→大）") : "按大小排序";
+                    clicked => { bmp.close(); root.sort-by("size"); }
+                }
+                MenuItemBtn { glyph: "\u{E898}"; label: "上传文件到此处…"; clicked => { bmp.close(); root.upload-pick(); } }
+            }
+        }
+    }
+    // 批量删除确认（多选模式）
+    delmp := ConfirmPop {
+        title: "删除";
+        msg: "确认删除选中的 " + FilesG.checked-count + " 项？（文件夹将整体删除）";
+        x: Math.max(0px, (root.width - 360px) / 2);
+        y: 120px;
+        confirmed => { root.del-many(); }
     }
 }
 
@@ -2482,12 +2806,12 @@ component TransfersView inherits Rectangle {
                         padding-left: 14px;
                         padding-right: 14px;
                         spacing: 8px;
-                        Text { text: "任务ID"; width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: "文件"; width: 220px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                         Text { text: "标签"; horizontal-stretch: 1; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                         Text { text: "状态"; width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                         Text { text: "耗时"; width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                         Text { text: "速度"; width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                        Text { text: "操作"; width: 64px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: "操作"; width: 150px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                     }
                 }
                 Rectangle {
@@ -2501,7 +2825,22 @@ component TransfersView inherits Rectangle {
                                 padding-left: 14px;
                                 padding-right: 14px;
                                 spacing: 8px;
-                                Text { text: "#" + t.id; width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text; vertical-alignment: center; }
+                                // 有文件名就显示文件名（任务 ID 保留在悬停提示里）；取不到名字时退回 #ID
+                                Rectangle {
+                                    width: 220px;
+                                    clip: true;
+                                    Text {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        text: t.path != "" ? t.path : ("#" + t.id);
+                                        horizontal-alignment: left;
+                                        font-size: 12px;
+                                        color: ThemeG.text;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                    Tooltip { text: @markdown("任务 #\{t.id}\n\{t.path}"); }
+                                }
                                 Rectangle {
                                     horizontal-stretch: 1;
                                     VerticalLayout {
@@ -2522,8 +2861,23 @@ component TransfersView inherits Rectangle {
                                 Text { text: t.duration; width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                                 Text { text: t.speed; width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.accent; vertical-alignment: center; }
                                 HorizontalLayout {
-                                    width: 64px;
-                                    VerticalLayout { alignment: center; if !t.done : PillBtn { label: "停止"; compact: true; danger: true; clicked => { root.job-stop(t.id); } } }
+                                    width: 150px;
+                                    spacing: 6px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            // 取消 = RC 的 job/stop（rclone 侧会中断该任务的传输）
+                                            if !t.done : PillBtn { label: "取消"; compact: true; danger: true; clicked => { root.job-stop(t.id); } }
+                                            // 暂停：rclone RC 没有「暂停单个任务」的接口，置灰并说明原因
+                                            if !t.done : Rectangle {
+                                                width: 58px;
+                                                height: 26px;
+                                                PillBtn { label: "暂停"; compact: true; disabled: true; width: 58px; height: 26px; }
+                                                Tooltip { text: @markdown("rclone RC 不支持暂停单个任务；可先取消，或用「网速与限速」整体降速"); }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             Rectangle { y: parent.height - 1px; height: 1px; background: ThemeG.border; opacity: 0.5; }
@@ -3867,6 +4221,8 @@ export component MainWindow inherits Window {
 
     property <[string]> page-names: ["仪表盘", "文件", "远程", "挂载", "服务", "传输", "插件", "设置"];
     property <[string]> nav-icons: ["\u{E80F}", "\u{E8B7}", "\u{E753}", "\u{E8CE}", "\u{E909}", "\u{E895}", "\u{EA86}", "\u{E713}"];
+    // 侧栏「传输」呼吸灯相位：没有后台任务时恒为 0（不读 animation-tick，静止不重绘）
+    property <float> nav-pulse: DashboardG.transfers > 0 ? (mod(animation-tick(), 1.6s) / 1.6s) : 0;
 
     callback refresh-dashboard();
     callback nav-select(int);
@@ -3878,6 +4234,21 @@ export component MainWindow inherits Window {
     callback files-rename(int);
     callback files-copy(int);
     callback files-copy-link(int);
+    // 上传 / 排序 / 多选（会话 18）
+    callback files-upload-pick();
+    callback files-sort-by(string);
+    callback files-multi-toggle();
+    callback files-select-all();
+    callback files-select-invert();
+    callback files-check-row(int, bool);
+    callback files-download-many();
+    callback files-del-many();
+    // 本机窗格（文件页双栏的左半）
+    callback local-refresh();
+    callback local-open(int);
+    callback local-up();
+    callback local-choose-dir();
+    callback local-upload(int);
     callback files-crumb-nav(string);
     callback files-crumb-refit(length);
     callback files-download(int);
@@ -4020,6 +4391,17 @@ export component MainWindow inherits Window {
                         mouse-cursor: pointer;
                         clicked => { NavG.idx = i; root.nav-select(i); }
                     }
+                    // 有后台传输任务时，「传输」入口右上角亮一个呼吸点：
+                    // 不切页也能看出还有任务在跑（请求 ⑦ 附带的效果）
+                    if i == 5 && DashboardG.transfers > 0 : Rectangle {
+                        x: 44px;
+                        y: 9px;
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: ThemeG.accent;
+                        opacity: 0.25 + 0.75 * Math.abs(sin(180deg * root.nav-pulse));
+                    }
                     VerticalLayout {
                         alignment: center;
                         spacing: 3px;
@@ -4132,7 +4514,18 @@ export component MainWindow inherits Window {
                 if NavG.idx == 0 : DashboardView {
                     refresh => { root.refresh-dashboard(); }
                 }
-                if NavG.idx == 1 : FilesView {
+                // 文件页 = 双栏：左「本机」右「远程」（请求 ⑧）
+                if NavG.idx == 1 : HorizontalLayout {
+                    LocalPane {
+                        width: 400px;
+                        refresh => { root.local-refresh(); }
+                        open-row(i) => { root.local-open(i); }
+                        go-up => { root.local-up(); }
+                        choose-dir => { root.local-choose-dir(); }
+                        upload-row(i) => { root.local-upload(i); }
+                    }
+                    FilesView {
+                    horizontal-stretch: 1;
                     refresh => { root.files-refresh(); }
                     open-row(i) => { root.files-open(i); }
                     go-up => { root.files-up(); }
@@ -4149,6 +4542,15 @@ export component MainWindow inherits Window {
                     move-up => { root.files-move-up(); }
                     move-root => { root.files-move-root(); }
                     move-confirm => { root.files-move-confirm(); }
+                    upload-pick => { root.files-upload-pick(); }
+                    sort-by(k) => { root.files-sort-by(k); }
+                    multi-toggle => { root.files-multi-toggle(); }
+                    select-all => { root.files-select-all(); }
+                    select-invert => { root.files-select-invert(); }
+                    check-row(i, sh) => { root.files-check-row(i, sh); }
+                    download-many => { root.files-download-many(); }
+                    del-many => { root.files-del-many(); }
+                    }
                 }
                 if NavG.idx == 2 : RemotesView {
                     viewport-h: root.height;

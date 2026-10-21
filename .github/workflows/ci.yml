@@ -1,0 +1,60 @@
+name: ci
+
+# 会话 18 的「本地 ↔ GitHub Actions」通信实验：
+# 云端 runner 只做「构建 + 单元测试 + 产物上传」，本机用 gh 拉日志/产物回来看。
+# 图形界面（Slint 弹窗、拖拽、真实 rclone 交互）无法在无头 runner 上验证，仍在本机做。
+on:
+  push:
+    branches:
+      - 'session-*'
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust toolchain (stable + wasm32-wasip1)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # build.rs 会去 target/wasm32-wasip1/<profile>/imagehost.wasm 找插件字节，
+      # 缺了会直接报错（刻意加的构建期护栏），所以测试前先出 debug wasm。
+      - name: Build wasm plugins (debug)
+        shell: pwsh
+        run: cargo build -p imagehost-plugin -p oneclick-plugin --target wasm32-wasip1
+
+      - name: Unit tests
+        shell: pwsh
+        run: cargo test --workspace --no-fail-fast 2>&1 | Tee-Object -FilePath test-log.txt
+
+      - name: Release build (plugins + app)
+        shell: pwsh
+        run: ./scripts/build.ps1 -Release 2>&1 | Tee-Object -FilePath build-log.txt
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rclone-gui-windows-release
+          path: |
+            target/release/rclone-gui.exe
+            test-log.txt
+            build-log.txt
+          if-no-files-found: warn
