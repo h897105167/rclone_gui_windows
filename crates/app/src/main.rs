@@ -2738,7 +2738,16 @@ async fn handshake_only(ctx: &Arc<Ctx>) -> ConnOutcome {
             view.config_path = if p.is_empty() { "—".to_string() } else { p };
             // 能力告警与缺失能力分开描述（不要把「能力缺失」说成「连接失败」）
             let mut notes = Vec::new();
-            if !hs.is_compatible() {
+            if hs.auth_unset {
+                // 连上了但对端没配 RC 鉴权：除 core/version 外全是 403，
+                // 挂载 / 服务 / 参数读取都做不了。必须说得比「能力受限」更明确。
+                view.status = "已连接（对端未配置鉴权）".to_string();
+                notes.push(
+                    "对端 rclone 未启用 RC 认证：挂载、服务、运行参数都会返回 403。\
+                     请用 --rc-user/--rc-pass 或 --rc-no-auth 重启 rclone 后点「重新握手」"
+                        .to_string(),
+                );
+            } else if !hs.is_compatible() {
                 view.status = "已连接（能力受限）".to_string();
                 notes.push(format!("缺少必需能力：{}", hs.missing_text()));
             }
@@ -2836,25 +2845,38 @@ async fn conn_action(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, which: ConnAction) {
             toast(ui, 2, err);
         }
         // 连上后自动恢复上次的挂载/服务（rclone 自己不持久化 mount/serve）。
-        // 放到独立线程 + 独立 runtime：conn_action 会被主循环的 Send future await，
-        // 而 replay 内部要拿 std Mutex 与 Slint Weak，直接 tokio::spawn 会破坏 Send 约束。
-        //
-        // 代理的「待应用」也在同一处补下发：它同样依赖 std Mutex，
-        // 且必须在 replay 之前完成 —— 否则刚重建的挂载/服务会用到旧代理。
-        let ctx2 = ctx.clone();
-        let ui2 = ui.clone();
-        std::thread::spawn(move || {
-            match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(rt) => rt.block_on(async move {
-                    replay_pending_proxies(&ctx2, &ui2).await;
-                    persist::replay(&ctx2, &ui2).await;
-                }),
-                Err(_) => {}
-            }
-        });
+        // 代理的「待应用」也在同一处补下发，且必须先于 replay 完成 ——
+        // 否则刚重建的挂载/服务会用到旧代理。
+        spawn_restore(ctx, ui);
     } else {
         toast(ui, 2, format!("连接失败：{err}"));
     }
+}
+
+/// 连接成功后自动恢复上次的挂载/服务（含「待应用」的代理绑定）。
+///
+/// 必须放到独立线程 + 独立 runtime：调用方可能是被主循环 await 的 Send future，
+/// 而 replay 内部要拿 std Mutex 与 Slint Weak，直接 `tokio::spawn` 会破坏 Send 约束。
+///
+/// 调用点：
+/// - 用户手动「连接 / 重新握手」（`conn_action`）；
+/// - **插件拉起 rclone 之后的自动连接**（`plugins::apply_rc`）。这一条是会话 16 补的：
+///   冷启动时 rclone 还没起来，启动流程里 `ready == false` 会走「让插件去启动」的分支，
+///   那条分支原本不 replay；插件把 rclone 拉起来并回传 rc 凭据后，挂载/服务就再也没人
+///   恢复，用户看到的是「一键 rclone 启动成功，但挂载列表空的」。
+///   （`main` 的启动流程在 `ready == true` 时自己内联了同样的动作，只多一步 `startup_flow`。）
+pub(crate) fn spawn_restore(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    let ctx2 = ctx.clone();
+    let ui2 = ui.clone();
+    std::thread::spawn(move || {
+        match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt.block_on(async move {
+                replay_pending_proxies(&ctx2, &ui2).await;
+                persist::replay(&ctx2, &ui2).await;
+            }),
+            Err(_) => {}
+        }
+    });
 }
 
 /// 连接成功后补下发「待应用」的代理绑定。

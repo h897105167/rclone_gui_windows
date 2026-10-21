@@ -134,6 +134,16 @@ pub async fn replay(ctx: &Arc<Ctx>, ui: &slint::Weak<crate::MainWindow>) {
     // 因此上面先 clone 出数据、立刻释放锁，再进入异步调用。
     let client = ctx.rc.client().await;
 
+    // 对端没配 RC 鉴权时，除 `core/version` 之类的免鉴权接口外一律 403。继续往下走
+    // 只会得到一句「自动恢复有 5 项失败：… authentication must be set up …」的复读提示，
+    // 而真正的诊断已经写在连接状态里（「已连接（对端未配置鉴权）」）。
+    // 用 `rc/noopauth`（NoAuth:false、无副作用）探一次，命中就直接跳过，不刷假失败。
+    if let Err(e) = client.noopauth().await {
+        if e.is_auth_not_configured() {
+            return;
+        }
+    }
+
     // 已挂载的盘符 / 已在监听的服务地址：避免重复创建
     let live_mounts: Vec<(String, String)> = client
         .mounts()

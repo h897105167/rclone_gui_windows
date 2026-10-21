@@ -299,12 +299,17 @@ fn state_body(form: &Value, kv: &Value, meta: &Value, proc: &Value) -> Value {
     };
 
     let mut hints = Map::new();
-    if !fbool(form, "no_auth", false)
-        && (fstr(form, "rc_user").is_empty() || fstr(form, "rc_pass").is_empty())
-    {
+    // 只有**用户名**为空才致命：`--rc-user gui`（不带 `--rc-pass`）时 rclone 照样
+    // 开启鉴权，客户端发 `Basic gui:`（空密码）就能通过（已实测）。
+    // 原来的条件把「密码留空」也算进去、文案也说成会拒绝连接，是错的，
+    // 会把用户误导到勾「本地不校验」上，反而把实例变成谁都能操作。
+    if !fbool(form, "no_auth", false) && fstr(form, "rc_user").is_empty() {
         hints.insert(
             "auth_warning".into(),
-            json!("⚠ 未填写用户名或密码：rclone 会拒绝没有凭据的连接，请补齐或勾选「本地不校验」"),
+            json!(
+                "⚠ 未填写用户名：这样启动的 rclone 会拒绝挂载 / 服务 / 参数读取等所有接口（403）。\
+                 请填用户名（密码可留空），或勾选「本地不校验」"
+            ),
         );
     }
     if verified_version(kv).is_empty() {
@@ -1140,6 +1145,22 @@ fn launch_decision(
             id,
             json!({ "status": "自动启动已跳过：rclone 尚未通过校验", "lamp": "warn" }),
         );
+    }
+
+    // 拒绝拉起一个「谁都指挥不动」的实例。
+    //
+    // rclone rc 只放行注册为 NoAuth 的接口（core/version、rc/list…），其余接口一律
+    // 要求服务端配置了鉴权，否则 403。实测无鉴权实例的 options/get、config/paths、
+    // mount/mount、serve/start 全部 403，在宿主侧表现为「握手成功，但 5 项自动恢复
+    // 全失败」。这种进程对宿主毫无用处，早失败 + 说清原因，比留下一个僵尸实例好。
+    if !fbool(form, "no_auth", false) && fstr(form, "rc_user").is_empty() {
+        let msg = "未填写 RC 用户名：这样启动的 rclone 会拒绝挂载 / 服务 / 参数读取等所有接口（403）。\
+                   请填用户名（密码可留空），或勾选「本地不校验（--rc-no-auth）」。";
+        return if auto {
+            done(id, json!({ "status": msg, "lamp": "warn" }))
+        } else {
+            fail(id, msg)
+        };
     }
 
     let mut args = vec![

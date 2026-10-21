@@ -73,6 +73,9 @@ pub struct Handshake {
     pub warnings: Vec<String>,
     /// 版本低于门槛。
     pub too_old: bool,
+    /// 对端**没有配置** RC 鉴权：除 `NoAuth` 接口（`core/version`、`rc/list`…）外
+    /// 全部返回 403，挂载/服务/参数读取都不可用。属于阻断状态。
+    pub auth_unset: bool,
 }
 
 impl Handshake {
@@ -92,6 +95,33 @@ impl Handshake {
                 MIN_MAJOR,
                 MIN_MINOR
             ));
+        }
+
+        // 鉴权探测：`core/version` 是 NoAuth 接口，它答得上来**不代表能干活**。
+        //
+        // 对端没配置 RC 鉴权时，除少数 NoAuth 接口外全部 403。不在这里判定，就会
+        // 表现成「握手成功，然后挂载 / 服务 / 参数读取零散失败」——实测踩过：
+        // 5 项自动恢复 + options/get + config/paths 一起报
+        // `authentication must be set up on the rc server…`。
+        let mut auth_unset = false;
+        match client.noopauth().await {
+            Ok(_) => {}
+            Err(e) if e.is_auth_not_configured() => auth_unset = true,
+            // 老版本没有 rc/noopauth：探测不了，不能当成「没配鉴权」（否则会把好实例判死）
+            Err(e) if e.is_unsupported() => {}
+            Err(e) => hs.warnings.push(format!("鉴权探测失败：{}", e.describe())),
+        }
+        if auth_unset {
+            // 后面每个调用都会 403，索性只报这一个原因，不再堆一串误导性的
+            // 「读取配置文件路径：鉴权失败」「该实例不支持特性探测」。
+            hs.auth_unset = true;
+            hs.warnings.push(
+                "对端 rclone 没有配置 RC 鉴权：除 core/version 外的接口都会返回 403，\
+                 挂载、服务、运行参数全部不可用。请用 --rc-user/--rc-pass 或 --rc-no-auth \
+                 重启 rclone 后重新握手（内置插件「一键 rclone」默认会带上用户名）"
+                    .to_string(),
+            );
+            return Ok(hs);
         }
 
         // 配置路径：可选能力，失败不阻断
@@ -139,9 +169,12 @@ impl Handshake {
         Ok(hs)
     }
 
-    /// 主功能是否可用（版本与必需方法都满足）。
+    /// 主功能是否可用（版本、必需方法、对端鉴权都满足）。
+    ///
+    /// `auth_unset` 也是阻断项：对端没配置 RC 鉴权时，挂载、服务、参数读取
+    /// 全部 403，UI 必须说清「连上了但用不了」，而不是显示成正常连接。
     pub fn is_compatible(&self) -> bool {
-        !self.too_old && self.missing_required.is_empty()
+        !self.too_old && !self.auth_unset && self.missing_required.is_empty()
     }
 
     /// 判断某方法是否可用。方法表未知时返回 true（不做无谓阻断）。
@@ -199,6 +232,9 @@ impl Handshake {
         if let Some(n) = self.methods.as_ref().map(|m| m.len()) {
             s.push_str(&format!(" · {n} 个 RC 方法"));
         }
+        if self.auth_unset {
+            s.push_str(" · 对端未配置 RC 鉴权");
+        }
         if !self.missing_required.is_empty() {
             s.push_str(&format!(" · 缺 {} 项必需能力", self.missing_required.len()));
         }
@@ -244,6 +280,108 @@ mod tests {
         assert!(hs.is_compatible());
     }
 
+    /// 对端没配置鉴权是**阻断**状态：即使方法表里挂载/服务接口齐全也不能算可用。
+    ///
+    /// 实测场景：一键 rclone 启动的无鉴权实例，`core/version` 与 `rc/list` 都正常
+    /// （NoAuth 接口），但 5 项自动恢复全部 403。旧代码在这里判成「已连接」。
+    #[test]
+    fn auth_unset_blocks_compatibility() {
+        let mut hs = hs_with(Some(&["mount/mount", "serve/start", "config/listremotes"]), (1, 75));
+        assert!(hs.is_compatible());
+        hs.auth_unset = true;
+        assert!(!hs.is_compatible(), "对端未配置 RC 鉴权时必须判为不可用");
+        assert!(hs.summary().contains("未配置 RC 鉴权"), "摘要要点明原因：{}", hs.summary());
+    }
+
+    /// 起一个假的 RC 服务器，`core/version` 永远答 200，其余接口按 `mode` 回答：
+    /// - `noauth`：403 + rclone 原文（服务端**没有配置**鉴权，这正是故障现场）
+    /// - `ok`：200 `{}`（配置了鉴权、凭据也对）
+    /// - `old`：404（老版本根本没有 `rc/noopauth` 这个方法）
+    fn spawn_fake_rc(mode: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = req
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                let (status, body) = if path.ends_with("/core/version") {
+                    (
+                        "200 OK",
+                        r#"{"version":"v1.76.0","decomposed":[1,76,0]}"#.to_string(),
+                    )
+                } else if path.ends_with("/rc/noopauth") && mode == "old" {
+                    (
+                        "404 Not Found",
+                        r#"{"error":"couldn't find method \"rc/noopauth\""}"#.to_string(),
+                    )
+                } else if mode == "noauth" {
+                    (
+                        "403 Forbidden",
+                        r#"{"error":"authentication must be set up on the rc server to use \"this method\" or the --rc-no-auth flag must be in use"}"#
+                            .to_string(),
+                    )
+                } else {
+                    ("200 OK", "{}".to_string())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// 现场复现：服务端只配了 `--rc-addr`（无鉴权）时，`core/version`（NoAuth 接口）
+    /// 照常 200，但握手必须判定「连上了也用不了」，而不是报成正常连接。
+    #[tokio::test]
+    async fn handshake_flags_server_without_auth() {
+        let url = spawn_fake_rc("noauth");
+        let c = RcClient::new(url, None, None);
+        let hs = Handshake::perform(&c)
+            .await
+            .expect("core/version 能答上来，就不该报成连接失败");
+        assert!(hs.auth_unset, "必须判定为「对端未配置鉴权」");
+        assert!(!hs.is_compatible(), "这种实例挂载/服务/参数全做不了，不能算可用");
+        assert!(
+            hs.warnings.iter().any(|w| w.contains("没有配置 RC 鉴权")),
+            "必须给出可操作提示，实际: {:?}",
+            hs.warnings
+        );
+        assert!(hs.methods.is_none(), "已判定不可用，不必再做特性探测");
+    }
+
+    /// 配置了鉴权且凭据正确时，探测不能误报。
+    #[tokio::test]
+    async fn handshake_accepts_authenticated_server() {
+        let url = spawn_fake_rc("ok");
+        let c = RcClient::new(url, Some("gui".to_string()), Some(String::new()));
+        let hs = Handshake::perform(&c).await.expect("应握手成功");
+        assert!(!hs.auth_unset, "凭据正确时不能误判为未配置鉴权");
+    }
+
+    /// 老版本没有 `rc/noopauth`（404 → Unsupported）：探测不到 ≠ 没配鉴权，
+    /// 否则「升级前的 rclone」会被整片判死。
+    #[tokio::test]
+    async fn missing_noopauth_method_is_not_treated_as_no_auth() {
+        let url = spawn_fake_rc("old");
+        let c = RcClient::new(url, None, None);
+        let hs = Handshake::perform(&c).await.expect("应握手成功");
+        assert!(!hs.auth_unset, "探测方法不存在时不能判定对端未配置鉴权");
+    }
+
     #[test]
     fn detects_missing_required_via_alternatives() {
         // 只有旧名 mount/list，没有 mount/listmounts：仍应满足要求
@@ -254,8 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn version_threshold() {
-        assert!(hs_with(None, (1, 75)).version.at_least(MIN_MAJOR, MIN_MINOR));
+    fn version_threshold() {        assert!(hs_with(None, (1, 75)).version.at_least(MIN_MAJOR, MIN_MINOR));
         assert!(!hs_with(None, (1, 40)).version.at_least(MIN_MAJOR, MIN_MINOR));
     }
 

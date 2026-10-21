@@ -42,7 +42,7 @@
       { "kind": "group", "key": "g_args", "label": "③ 启动参数" },
       { "kind": "field", "key": "rc_user", "label": "用户名", "field": "text", "default": "gui" },
       { "kind": "field", "key": "rc_pass", "label": "密码", "field": "password",
-        "placeholder": "留空则 rclone 会拒绝没有凭据的连接" },
+        "placeholder": "可留空：只要用户名非空，rclone 就会启用鉴权（空密码按 Basic 用户:空密码 校验）" },
       { "kind": "field", "key": "port", "label": "端口", "field": "number", "default": "5572" },
       { "kind": "field", "key": "no_auth", "label": "本地不校验", "field": "bool", "default": "false" },
       { "kind": "field", "key": "silent", "label": "静默启动", "field": "bool", "default": "true" },

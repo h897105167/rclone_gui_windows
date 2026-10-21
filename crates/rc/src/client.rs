@@ -127,6 +127,18 @@ impl RcClient {
         Ok(serde_json::from_value(v).unwrap_or_default())
     }
 
+    /// 探测对端是否配置了 RC 鉴权（`rc/noopauth`）。
+    ///
+    /// 这个方法存在的意义就是「要求鉴权、但没有任何副作用」：rclone 把它注册为
+    /// `NoAuth: false`，因此服务端未配置鉴权时返回 403（文案见
+    /// [`RcError::is_auth_not_configured`]），配置了鉴权且凭据正确时原样回显参数。
+    ///
+    /// 注意：极老的版本可能没有这个方法（404 → `Unsupported`），调用方应据此跳过探测，
+    /// 而不是把「探测不了」当成「没配鉴权」。
+    pub async fn noopauth(&self) -> RcResult<Value> {
+        self.call("rc/noopauth", &json!({})).await
+    }
+
     /// 优雅退出 rclone（会自动卸载挂载、停止服务）。
     ///
     /// **legacy**：重构指南禁止 RCGUI 主动终止 rclone 进程，阶段 7 会移除该调用点。

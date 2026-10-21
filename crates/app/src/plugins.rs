@@ -563,6 +563,50 @@ pub fn form_of(store: &KvStore, id: &str) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
+/// 任意 JSON 值按字符串取（表单里的值统一按字符串用）。
+fn value_as_str(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// 传给插件的**有效表单**：声明式 `default` 打底，kv 里真正存过的非空值覆盖。
+///
+/// 为什么不能只传 [`form_of`]：面板渲染在字段为空时用控件 `default` 兜底
+/// （见 `compose` 的 `Field` 分支），所以界面上「用户名 gui」看起来是填好的；
+/// 但插件拿到的一直是 kv 里存过的键，声明式默认值从没进过 form。插件按空值行动，
+/// 就会启动一个**没有任何鉴权**的 rclone —— rc 只放行 `NoAuth` 接口
+/// （`core/version` / `rc/list`），挂载、服务、参数读取全部 403。
+/// 实测：一键 rclone 的 `rc_user` 默认值 `"gui"` 就是这样丢的，5 项自动恢复全失败。
+///
+/// 规则与渲染兜底**保持一致**：空串视同未填（回落 `default`），
+/// 这样 UI 显示什么、插件就收到什么。默认值只在内存里合并，**不写回磁盘**
+/// —— 写回会把「用户没填过」变成「用户填过」，以后改插件默认值就再也生效不了。
+pub fn effective_form(setting: &PluginSetting, store: &KvStore, id: &str) -> Map<String, Value> {
+    let stored = form_of(store, id);
+    let mut form = Map::new();
+    for c in &setting.controls {
+        if c.default.is_empty() {
+            continue;
+        }
+        let filled = stored
+            .get(&c.key)
+            .map(value_as_str)
+            .filter(|s| !s.is_empty());
+        let v = filled.unwrap_or_else(|| c.default.clone());
+        if !v.is_empty() {
+            form.insert(c.key.clone(), Value::String(v));
+        }
+    }
+    // 控件没声明默认值、但 form 里已经存在的键（用户填过的、插件 `values` 回写的）
+    // 一律原样带上，不能被合并过程吃掉。
+    for (k, v) in stored {
+        form.entry(k).or_insert(v);
+    }
+    form
+}
+
 /// 写一个表单字段（用户输入时立刻落盘，避免崩溃丢配置）。
 pub fn set_form_field(store: &KvStore, id: &str, key: &str, value: &str) {
     let mut form = form_of(store, id);
@@ -594,7 +638,9 @@ async fn call_plugin(
     }
     let mut params = json!({
         "action": action,
-        "form": Value::Object(form_of(&ctx.store, id)),
+        // 必须是合并过声明式默认值的有效表单：插件看到的要和界面显示的一致，
+        // 否则「界面上填好了、插件收到空值」（见 effective_form 的说明）。
+        "form": Value::Object(effective_form(&cfg.plugin_setting, &ctx.store, id)),
     });
     if let Some(obj) = params.as_object_mut() {
         if let Some(extra) = extra.as_object() {
@@ -694,10 +740,7 @@ fn apply_body(ctx: &Arc<Ctx>, id: &str, body: &Value) -> Option<(i32, String)> {
     if let Some(values) = body.get("values").and_then(|v| v.as_object()) {
         let mut form = form_of(&ctx.store, id);
         for (k, v) in values {
-            let s = match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
+            let s = value_as_str(v);
             form.insert(k.clone(), Value::String(s));
         }
         let _ = ctx.store.set(id, "form", Value::Object(form));
@@ -739,7 +782,11 @@ fn apply_body(ctx: &Arc<Ctx>, id: &str, body: &Value) -> Option<(i32, String)> {
 }
 
 /// 把 `rc` 声明应用到连接设置（插件决定该连哪里，宿主只负责执行）。
-async fn apply_rc(ctx: &Arc<Ctx>, body: &Value) -> Result<()> {
+async fn apply_rc(
+    ctx: &Arc<Ctx>,
+    ui: &slint::Weak<crate::MainWindow>,
+    body: &Value,
+) -> Result<()> {
     let Some(rc) = body.get("rc") else { return Ok(()) };
     let url = rc.get("url").and_then(|v| v.as_str()).unwrap_or("");
     if url.is_empty() {
@@ -755,7 +802,17 @@ async fn apply_rc(ctx: &Arc<Ctx>, body: &Value) -> Result<()> {
         let _ = config::save(&cfg);
     }
     if rc.get("connect").and_then(|v| v.as_bool()).unwrap_or(false) {
-        let _ = crate::connect_report(ctx).await;
+        // 插件把 rclone 拉起来之后由它给出 rc 端点，宿主负责连上——并且**必须**顺手
+        // 恢复档案里记住的挂载/服务：冷启动时 rclone 还没起来，启动流程里的
+        // `if ready` 分支被跳过（那时 `ready == false`，走的是「让插件去启动」），
+        // 于是 replay 再也没人调用，用户看到的是「一键 rclone 启动成功，但挂载/服务
+        // 列表是空的」（会话 16 宿主实测）。
+        let out = crate::connect_report(ctx).await;
+        let live = out.view.live;
+        crate::apply_conn_view(ui, out.view);
+        if live {
+            crate::spawn_restore(ctx, ui);
+        }
     }
     Ok(())
 }
@@ -912,10 +969,7 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, id:
                 flush(&mut out, &mut pending, &mut pending_line);
                 let value = form
                     .get(&c.key)
-                    .map(|v| match v {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    })
+                    .map(value_as_str)
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| c.default.clone());
                 let sel = c
@@ -996,7 +1050,8 @@ pub async fn build_panel(ctx: &Arc<Ctx>, id: &str) -> Result<Vec<PanelData>> {
         // 取状态失败不该让面板整个消失：仍然渲染声明式控件，只是没有运行时状态
         Err(e) => json!({ "status": format!("{e:#}"), "lamp": "err" }),
     };
-    let form = form_of(&ctx.store, id);
+    // 与传给插件的同一份有效表单：界面显示的值必须等于插件实际拿到的值
+    let form = effective_form(&cfg.plugin_setting, &ctx.store, id);
     Ok(compose(&cfg.plugin_setting, &body, &form, id))
 }
 
@@ -1019,7 +1074,7 @@ pub async fn run_action(
     if let Some((kind, msg)) = apply_body(ctx, id, &body) {
         crate::toast(ui, kind, msg);
     }
-    apply_rc(ctx, &body).await?;
+    apply_rc(ctx, ui, &body).await?;
     Ok(())
 }
 
@@ -1039,7 +1094,7 @@ pub async fn autostart(ctx: &Arc<Ctx>, ui: &slint::Weak<crate::MainWindow>) {
                 if let Some((kind, msg)) = apply_body(ctx, &r.id, &body) {
                     crate::toast(ui, kind, msg);
                 }
-                if let Err(e) = apply_rc(ctx, &body).await {
+                if let Err(e) = apply_rc(ctx, ui, &body).await {
                     eprintln!("自动连接失败: {e:#}");
                 }
             }
@@ -1185,5 +1240,61 @@ mod tests {
     #[test]
     fn imagehost_counts_as_ships_with_app() {
         assert!(ships_with_app("imagehost"));
+    }
+
+    /// 声明式默认值必须真的进到传给插件的 form 里。
+    ///
+    /// 这是「界面上用户名 gui 显示得好好的、插件却收到空值」那个 bug 的根因：
+    /// 插件据此启动了**无鉴权**的 rclone，除 core/version 外全部接口 403，
+    /// 5 项自动恢复（挂载 T:/Z:/E:、webdav 8080/8081）全失败。
+    #[test]
+    fn effective_form_merges_declared_defaults() {
+        let dir = tmp_dir("form");
+        let store = KvStore::new(dir.clone());
+        let setting: PluginSetting = serde_json::from_value(json!({
+            "controls": [
+                {"kind": "field", "key": "rc_user", "label": "用户名", "field": "text", "default": "gui"},
+                {"kind": "field", "key": "port", "label": "端口", "field": "number", "default": "5572"},
+                {"kind": "field", "key": "no_auth", "label": "本地不校验", "field": "bool", "default": "false"},
+                {"kind": "field", "key": "exe", "label": "程序路径", "field": "path"},
+                {"kind": "status", "key": "conn", "label": "运行状态", "lamp": true}
+            ]
+        }))
+        .unwrap();
+
+        // ① 什么都没存过：拿到全部默认值，且默认值绝不落盘
+        let f = effective_form(&setting, &store, "onerclone");
+        assert_eq!(f.get("rc_user").unwrap(), "gui");
+        assert_eq!(f.get("port").unwrap(), "5572");
+        assert_eq!(f.get("no_auth").unwrap(), "false");
+        assert!(!f.contains_key("exe"), "没有默认值的字段不该凭空造键");
+        assert!(form_of(&store, "onerclone").is_empty(), "默认值不能写回磁盘");
+
+        // ② 用户填过：用户值优先，其余字段仍走默认值
+        store
+            .set(
+                "onerclone",
+                "form",
+                json!({"rc_user": "alice", "exe": "C:\\rclone.exe"}),
+            )
+            .unwrap();
+        let f = effective_form(&setting, &store, "onerclone");
+        assert_eq!(f.get("rc_user").unwrap(), "alice");
+        assert_eq!(f.get("exe").unwrap(), "C:\\rclone.exe");
+        assert_eq!(f.get("port").unwrap(), "5572");
+
+        // ③ 空串按「未填」处理，与面板渲染的兜底语义一致（显示什么就传什么）
+        store
+            .set("onerclone", "form", json!({"rc_user": ""}))
+            .unwrap();
+        let f = effective_form(&setting, &store, "onerclone");
+        assert_eq!(f.get("rc_user").unwrap(), "gui");
+
+        // ④ 控件没声明、form 里已有的键原样带出去（插件 values 回写、自定义字段）
+        store.set("onerclone", "form", json!({"extra": 7})).unwrap();
+        let f = effective_form(&setting, &store, "onerclone");
+        assert_eq!(f.get("extra").unwrap(), &json!(7));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
