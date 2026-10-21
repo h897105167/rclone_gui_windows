@@ -92,6 +92,23 @@ impl RcError {
         matches!(self.kind, RcErrorKind::Connect | RcErrorKind::Timeout)
     }
 
+    /// 是「对端**没有配置** RC 鉴权」，而不是「我们的凭据不对」。
+    ///
+    /// rclone 的 rcserver 只对注册为 `NoAuth` 的接口放行；服务端没配置鉴权时，
+    /// 其余接口返回 **403** + 固定文案 `authentication must be set up on the rc server
+    /// to use "..." or the --rc-no-auth flag must be in use`。凭据错误的形态是
+    /// HTTP 层的 **401**。rclone 没有用状态码区分这两种情况，所以判定必须看文案。
+    ///
+    /// 用途：握手时区分「连上了但没法用」（403）与「密码打错了」（401），
+    /// 前者要明确告诉用户怎么重启 rclone，后者要提示去改凭据。
+    pub fn is_auth_not_configured(&self) -> bool {
+        self.kind == RcErrorKind::Auth
+            && self
+                .detail
+                .to_ascii_lowercase()
+                .contains("authentication must be set up")
+    }
+
     /// 单行完整描述，形如 `config/listremotes: rclone 返回错误: …`。
     pub fn describe(&self) -> String {
         format!("{}: {}（{}）", self.method, self.detail, self.kind.label())
@@ -169,5 +186,25 @@ mod tests {
         assert!(e.describe().contains("无法连接"));
         assert!(e.is_unreachable());
         assert!(!e.is_unsupported());
+    }
+
+    /// 「对端没配鉴权」(403 + 固定文案) 必须与「凭据不对」(401) 分开。
+    #[test]
+    fn detects_server_without_auth() {
+        let real = RcError::new(
+            RcErrorKind::Auth,
+            "options/get",
+            "authentication must be set up on the rc server to use \"options/get\" \
+             or the --rc-no-auth flag must be in use",
+        );
+        assert!(real.is_auth_not_configured());
+
+        // 401（密码错）：类别相同，但绝不能判成「服务端没配鉴权」
+        let bad_creds = RcError::new(RcErrorKind::Auth, "rc/noopauth", "HTTP 401");
+        assert!(!bad_creds.is_auth_not_configured());
+
+        // 其它类别的错误即使文案撞上了也不算
+        let other = RcError::new(RcErrorKind::Api, "rc/noopauth", "authentication must be set up");
+        assert!(!other.is_auth_not_configured());
     }
 }
