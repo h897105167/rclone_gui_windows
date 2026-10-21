@@ -812,6 +812,10 @@ async fn apply_rc(
         crate::apply_conn_view(ui, out.view);
         if live {
             crate::spawn_restore(ctx, ui);
+        } else {
+            // 插件刚 spawn 出来的 rclone 可能还没 bind 上端口（TCG 客机实测能慢
+            // 20 秒）：交给后台按间隔重试，连上后自动补挂载/服务恢复。
+            crate::spawn_connect_retry(ctx, ui);
         }
     }
     Ok(())
