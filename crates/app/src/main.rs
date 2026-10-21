@@ -1465,6 +1465,12 @@ fn build_fields_from_provider(providers: &Value, type_name: &str) -> (String, Ve
                 match (ty, raw) {
                     ("Duration", Some(ns)) => fmt_duration_ns(ns),
                     ("SizeSuffix", Some(bytes)) => fmt_size_bytes(bytes),
+                    // Bits（位图）默认是 0，直接 to_string 得到 "0"；用户看到
+                    // 一个填 0 的数字框，不知道该填什么。rclone 自己的 Help 和
+                    // 配置文件里都用 `off` 表示「一个都不选」（`Use Off to
+                    // disable`），且 `Bits.Set` 接受 `off` 并原样落盘，所以默认
+                    // 值统一显示成 off。典型例子：s3 的 sdk_log_mode。
+                    ("Bits", Some(0)) => "off".to_string(),
                     _ => n.to_string(),
                 }
             }
@@ -8757,6 +8763,26 @@ mod tests {
         });
         let (_desc, fields) = build_fields_from_provider(&providers, "webdav");
         assert_eq!(fields[0].value.to_string(), "10ms");
+    }
+
+    /// Bits（位图）默认值 0 显示成 off：rclone 的 Help 写的是 `Use Off to
+    /// disable`，配置文件里也存 off，给用户看一个 0 的数字框没有意义。
+    #[test]
+    fn bits_default_zero_shows_as_off() {
+        let providers = serde_json::json!({
+            "providers": [{
+                "Name": "s3",
+                "Description": "Amazon S3 Compliant Storage Providers",
+                "Options": [
+                    {"Name": "sdk_log_mode", "Type": "Bits", "Default": 0, "Advanced": true},
+                    {"Name": "sdk_log_mode_set", "Type": "Bits", "Default": 3}
+                ]
+            }]
+        });
+        let (_desc, fields) = build_fields_from_provider(&providers, "s3");
+        assert_eq!(fields[0].value.to_string(), "off");
+        // 非 0 的位图保持数字，不能被一并改成 off。
+        assert_eq!(fields[1].value.to_string(), "3");
     }
 
     /// 默认值（字节）同理，必须带 Mi/Gi 之类的单位后缀。
