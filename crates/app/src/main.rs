@@ -2879,6 +2879,36 @@ pub(crate) fn spawn_restore(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     });
 }
 
+/// 插件刚拉起 rclone 之后的重连：按 2 秒间隔最多试 40 秒，连上就补挂载/服务恢复。
+///
+/// 为什么需要：插件回传 rc 端点时 rclone 可能还没 bind 上端口。会话 16 QEMU 客机
+/// 实测（TCG 慢机器）：宿主只连一次，rclone 二十秒后才开始监听，界面就永远停在
+/// 「未连接」，`apply_rc` 里那次 `spawn_restore` 也不会执行 —— 其实 `serve/start`
+/// 不需要 WinFsp，本来能成功。宿主（快机器）碰不到这个竞态。
+///
+/// 重试期间界面保持上一次的结果（不刷错误事件），连上后自动补恢复。
+pub(crate) fn spawn_connect_retry(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    let ctx2 = ctx.clone();
+    let ui2 = ui.clone();
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(40);
+            while tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let out = connect_report(&ctx2).await;
+                if out.view.live {
+                    apply_conn_view(&ui2, out.view);
+                    spawn_restore(&ctx2, &ui2);
+                    return;
+                }
+            }
+        });
+    });
+}
+
 /// 连接成功后补下发「待应用」的代理绑定。
 ///
 /// 与 `persist::replay` 分开的原因：代理下发**不需要**重建挂载/服务，
