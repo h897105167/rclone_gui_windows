@@ -1527,9 +1527,12 @@ component RemotesView inherits Rectangle {
                                 spacing: 2px;
                                 if !f.is-advanced || RemotesG.show-advanced : VerticalLayout {
                                     spacing: 4px;
+                                    // 行高不钉死 30px：标签改成自动换行后，两行以上的
+                                    // 标签会把这个 HorizontalLayout 撑高，写死高度会把
+                                    // 第二行裁掉（rclone 的 Help 首句经常很长，例如 s3 的
+                                    // env_auth、use_presigned_request）。
                                     HorizontalLayout {
                                         spacing: 8px;
-                                        height: 30px;
                                         // 标签
                                         Text {
                                             text: f.label + (f.required ? " *" : "");
@@ -1537,7 +1540,7 @@ component RemotesView inherits Rectangle {
                                             color: f.required ? ThemeG.text : ThemeG.text-dim;
                                             width: 180px;
                                             vertical-alignment: center;
-                                            overflow: elide;
+                                            wrap: word-wrap;
                                         }
                                         // 输入控件
                                         if f.kind == "bool" : CheckBox {
