@@ -42,11 +42,15 @@ jobs:
 
       - name: Unit tests
         shell: pwsh
-        run: cargo test --workspace --no-fail-fast 2>&1 | Tee-Object -FilePath test-log.txt
+        run: |
+          cargo test --workspace --no-fail-fast 2>&1 | Tee-Object -FilePath test-log.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Release build (plugins + app)
         shell: pwsh
-        run: ./scripts/build.ps1 -Release 2>&1 | Tee-Object -FilePath build-log.txt
+        run: |
+          ./scripts/build.ps1 -Release 2>&1 | Tee-Object -FilePath build-log.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload artifacts
         if: always()
