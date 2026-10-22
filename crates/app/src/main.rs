@@ -4834,7 +4834,16 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 }
                 existing.push(cand.clone());
                 let src_fs = local_fs(p.parent().unwrap_or(Path::new(".")));
-                match client.copyfile(&src_fs, &base, &dst_fs, &cand).await {
+                // 本机拖进来/选中的可能是文件夹：copyfile 只收单个文件，传目录必失败，
+                // 所以目录走 sync/copy 递归复制（拖一个文件夹上去 = 整个文件夹）。
+                // sync/* 没有 srcRemote/dstRemote，目标路径要直接拼进 fs 串。
+                let res = if p.is_dir() {
+                    let dir_dst = format!("{remote}:{}", join_path(&path, &cand));
+                    client.sync_copy(&local_fs(p), &dir_dst, true).await
+                } else {
+                    client.copyfile(&src_fs, &base, &dst_fs, &cand).await
+                };
+                match res {
                     Ok(_) => ok += 1,
                     Err(e) => failed.push(format!("{base}: {e}")),
                 }
@@ -4854,7 +4863,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 } else {
                     String::new()
                 };
-                toast(ui, 1, format!("已上传 {ok}/{total} 个文件到 {where_}{extra}"));
+                toast(ui, 1, format!("已上传 {ok}/{total} 项到 {where_}{extra}"));
             } else {
                 toast(
                     ui,
@@ -8215,10 +8224,29 @@ fn wire_callbacks(
             if g.get_loading() {
                 return;
             }
+            // 面包屑点进来的是规范路径；路径框手输的要宽松处理：
+            // 去首尾空白、反斜杠转正斜杠、去掉「远程名:」前缀与开头的 "/"。
+            let mut p = path.trim().replace('\\', "/");
+            let cur_remote = g
+                .get_remotes()
+                .row_data(g.get_remote_idx().max(0) as usize)
+                .map(|r| r.to_string())
+                .unwrap_or_default();
+            if !cur_remote.is_empty() {
+                if let Some(rest) = p.strip_prefix(&format!("{cur_remote}:")) {
+                    p = rest.to_string();
+                }
+            }
+            while let Some(rest) = p.strip_prefix('/') {
+                p = rest.to_string();
+            }
+            while p.len() > 1 && p.ends_with('/') {
+                p.pop();
+            }
             g.set_loading(true);
             g.set_seq(g.get_seq() + 1);
             let _ = tx.send(Cmd::FilesJump {
-                path: path.to_string(),
+                path: p,
                 seq: g.get_seq(),
             });
         }

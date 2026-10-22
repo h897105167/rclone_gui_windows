@@ -1261,30 +1261,6 @@ component LocalPane inherits Rectangle {
                         for row[i] in LocalG.entries : Rectangle {
                             height: 38px;
                             background: (LocalG.multi && LocalG.checked[i]) ? ThemeG.accent-soft : (LocalG.sel == i ? ThemeG.accent-soft : (lta.has-hover ? ThemeG.hover : transparent));
-                            lta := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => {
-                                    if (LocalG.multi) {
-                                        root.check-row(i, root.last-shift);
-                                    } else {
-                                        LocalG.sel = i;
-                                    }
-                                }
-                                double-clicked => {
-                                    if (!LocalG.multi) { root.open-row(i); }
-                                }
-                                pointer-event(e) => {
-                                    root.last-shift = e.modifiers.shift;
-                                    if (e.button == PointerEventButton.right && e.kind == PointerEventKind.up) {
-                                        root.op-idx = i;
-                                        root.op-name = row.name;
-                                        root.op-is-dir = row.is-dir;
-                                        root.menu-ax = Math.max(0px, Math.min(self.absolute-position.x + self.mouse-x - root.absolute-position.x, root.width - 200px));
-                                        root.menu-ay = Math.max(0px, Math.min(self.absolute-position.y + self.mouse-y - root.absolute-position.y, root.height - 140px));
-                                        lcm.show();
-                                    }
-                                }
-                            }
                             // 多选勾选框：只做视觉，真正的状态在 LocalG.checked
                             if LocalG.multi : Text {
                                 x: 6px;
@@ -1326,31 +1302,21 @@ component LocalPane inherits Rectangle {
                                 horizontal-alignment: right;
                                 vertical-alignment: center;
                             }
-                            // 「传到右侧」按钮：常显而不是悬停才出现。
-                            // 踩过的坑：按钮写在 `if lta.has-hover` 里时，鼠标移到按钮上
-                            // 行的 has-hover 变 false、按钮在按下前就消失，单击永远打不中。
-                            // 多选模式下隐藏它：此时只留动作条上的「上传」一个按钮。
-                            if !LocalG.multi : Rectangle {
-                                x: parent.width - 36px;
-                                y: 4px;
-                                width: 30px;
-                                height: 30px;
-                                background: transparent;
-                                local-up := IconBtn {
-                                    x: 0px;
-                                    y: 0px;
-                                    label: "\u{E898}";
-                                    clicked => { root.upload-row(i); }
-                                }
-                                Tooltip { text: @markdown("上传到右侧远程的当前目录"); }
-                            }
                             Rectangle {
                                 y: parent.height - 1px;
                                 height: 1px;
                                 background: ThemeG.border;
                             }
-                            // 拖拽源：本机 → 远程。点击不受影响（DragArea 只吞掉超过
-                            // 8px 的移动，Press 仍然向下传给 lta）。
+                            // 拖拽源：本机 → 远程。
+                            // 会话 20 定位的坑：DragArea 作为「行的兄弟节点」放在最上层时，
+                            // 它的 input_event 对 MouseEvent::Pressed 直接返回 EventAccepted，
+                            // Slint 的兄弟遍历（FrontToBack）随即 abort —— 下面的 lta 和行内
+                            // 上传按钮永远收不到 Press，双击导航 / 单击选中 / 行内上传全部失效。
+                            // 「Press 会向下传」只对 DragArea 的子节点成立，对兄弟节点不成立。
+                            // 可靠结构：把可交互元素嵌进 DragArea 当子节点 ——
+                            // press_drag_filter 先返回 ForwardAndInterceptGrab 把 Press 正常下发，
+                            // 指针移动超过阈值后改返回 Intercept，由 DragArea 自己接管并 StartDrag，
+                            // 于是点击与拖拽共存。
                             DragArea {
                                 x: 0px;
                                 y: 0px;
@@ -1358,6 +1324,48 @@ component LocalPane inherits Rectangle {
                                 height: parent.height;
                                 allow-copy: true;
                                 data: root.make-transfer("local:" + i);
+                                lta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        if (LocalG.multi) {
+                                            root.check-row(i, root.last-shift);
+                                        } else {
+                                            LocalG.sel = i;
+                                        }
+                                    }
+                                    double-clicked => {
+                                        if (!LocalG.multi) { root.open-row(i); }
+                                    }
+                                    pointer-event(e) => {
+                                        root.last-shift = e.modifiers.shift;
+                                        if (e.button == PointerEventButton.right && e.kind == PointerEventKind.up) {
+                                            root.op-idx = i;
+                                            root.op-name = row.name;
+                                            root.op-is-dir = row.is-dir;
+                                            root.menu-ax = Math.max(0px, Math.min(self.absolute-position.x + self.mouse-x - root.absolute-position.x, root.width - 200px));
+                                            root.menu-ay = Math.max(0px, Math.min(self.absolute-position.y + self.mouse-y - root.absolute-position.y, root.height - 140px));
+                                            lcm.show();
+                                        }
+                                    }
+                                }
+                                // 「传到右侧」按钮：常显而不是悬停才出现。
+                                // 踩过的坑：按钮写在 `if lta.has-hover` 里时，鼠标移到按钮上
+                                // 行的 has-hover 变 false、按钮在按下前就消失，单击永远打不中。
+                                // 多选模式下隐藏它：此时只留动作条上的「上传」一个按钮。
+                                if !LocalG.multi : Rectangle {
+                                    x: parent.width - 36px;
+                                    y: 4px;
+                                    width: 30px;
+                                    height: 30px;
+                                    background: transparent;
+                                    local-up := IconBtn {
+                                        x: 0px;
+                                        y: 0px;
+                                        label: "\u{E898}";
+                                        clicked => { root.upload-row(i); }
+                                    }
+                                    Tooltip { text: @markdown("上传到右侧远程的当前目录"); }
+                                }
                             }
                         }
                     }
@@ -1656,6 +1664,10 @@ component FilesView inherits Rectangle {
     property <length> dlg-ay;
     /// 最近一次点击是否按住 shift（多选范围选择用；clicked 不带修饰键）
     property <bool> last-shift: false;
+    /// 路径框手动输入模式（点铅笔进入；回车跳转，Esc 取消）
+    property <bool> path-edit: false;
+    /// 输入框里正在编辑的文本（进入编辑时预填当前路径）
+    property <string> path-text: "";
     // 排序子菜单（空白右键菜单用）
     property <bool> sub-open: false;
     property <bool> sub-left: false;
@@ -1748,6 +1760,53 @@ component FilesView inherits Rectangle {
                         }
                     }
                 }
+                // 手动输入路径：面包屑被输入框覆盖；回车跳转，Esc 取消。
+                // 用 if 而不是 visible，是为了每次进入编辑都重建输入框（init 里抢焦点 + 全选）。
+                if root.path-edit : Rectangle {
+                    x: 0px;
+                    y: 0px;
+                    width: parent.width;
+                    height: parent.height;
+                    background: ThemeG.panel;
+                    path-input := TextInput {
+                        x: 6px;
+                        y: 0px;
+                        width: parent.width - 12px;
+                        height: parent.height;
+                        single-line: true;
+                        font-size: 13px;
+                        color: ThemeG.text;
+                        vertical-alignment: center;
+                        text <=> root.path-text;
+                        init => {
+                            self.focus();
+                            self.select-all();
+                        }
+                        accepted => {
+                            if (root.path-text == "") {
+                                root.path-edit = false;
+                                return;
+                            }
+                            root.crumb-nav(root.path-text);
+                            root.path-edit = false;
+                        }
+                        key-pressed(event) => {
+                            if (event.text == Key.Escape) {
+                                root.path-edit = false;
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+                }
+            }
+            // 手动输入路径入口：铅笔按钮（再点一次 = 取消）
+            IconBtn {
+                label: "\u{E70F}";
+                clicked => {
+                    root.path-text = FilesG.path;
+                    root.path-edit = !root.path-edit;
+                }
             }
             // 让路径框吃满中间剩余宽度（唯一 stretch 项，宽度不随面包屑内容变化）
             Rectangle { horizontal-stretch: 0; }
@@ -1826,35 +1885,6 @@ component FilesView inherits Rectangle {
                         for row[i] in FilesG.entries : Rectangle {
                             height: 38px;
                             background: (FilesG.multi && FilesG.checked[i]) ? ThemeG.accent-soft : (FilesG.sel == i ? ThemeG.accent-soft : (ta.has-hover ? ThemeG.hover : transparent));
-                            ta := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => {
-                                    if (FilesG.multi) {
-                                        // 多选模式：单击切换勾选（shift 做范围选择）
-                                        root.check-row(i, root.last-shift);
-                                    } else {
-                                        FilesG.sel = i;
-                                        FilesG.rename-name = row.name;
-                                    }
-                                }
-                                double-clicked => { root.open-row(i); }
-                                pointer-event(e) => {
-                                    // 记下修饰键：clicked 回调本身不带修饰键信息
-                                    if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.down) {
-                                        root.last-shift = e.modifiers.shift;
-                                    }
-                                    if (e.button == PointerEventButton.right && e.kind == PointerEventKind.up) {
-                                        FilesG.sel = i;
-                                        FilesG.rename-name = row.name;
-                                        root.op-idx = i;
-                                        root.op-name = row.name;
-                                        root.op-is-dir = row.is-dir;
-                                        root.menu-ax = Math.max(0px, Math.min(self.absolute-position.x + self.mouse-x - root.absolute-position.x, root.width - 190px));
-                                        root.menu-ay = Math.min(self.absolute-position.y + self.mouse-y - root.absolute-position.y, 120px);
-                                        ctx.show();
-                                    }
-                                }
-                            }
                             // 多选模式：左侧勾选框（MDL2 E739 空框 / E73A 勾选）
                             if FilesG.multi : Text {
                                 x: 4px;
@@ -1900,8 +1930,14 @@ component FilesView inherits Rectangle {
                                 background: ThemeG.border;
                                 opacity: 0.5;
                             }
-                            // 拖拽源：远程 → 本机。放最上层，Press 会向下传给 ta（点击照常），
-                            // 只有移动超过 8px 才变成拖拽。
+                            // 拖拽源：远程 → 本机。
+                            // 会话 20 定位的坑：DragArea 作为「行的兄弟节点」放在最上层时，
+                            // 它的 input_event 对 MouseEvent::Pressed 直接返回 EventAccepted，
+                            // Slint 的兄弟遍历（FrontToBack）随即 abort —— 下面的 ta 永远收不到
+                            // Press，双击导航 / 单击选中全部失效（右键菜单还能用，因为非左键
+                            // Press 走 ForwardAndIgnore）。所以必须把 ta 嵌进 DragArea 当子节点：
+                            // press_drag_filter 先 ForwardAndInterceptGrab 下发 Press，移动超过
+                            // 阈值后改 Intercept 由 DragArea 接管并 StartDrag。
                             DragArea {
                                 x: 0px;
                                 y: 0px;
@@ -1909,6 +1945,35 @@ component FilesView inherits Rectangle {
                                 height: parent.height;
                                 allow-copy: true;
                                 data: root.make-transfer("remote:" + i);
+                                ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        if (FilesG.multi) {
+                                            // 多选模式：单击切换勾选（shift 做范围选择）
+                                            root.check-row(i, root.last-shift);
+                                        } else {
+                                            FilesG.sel = i;
+                                            FilesG.rename-name = row.name;
+                                        }
+                                    }
+                                    double-clicked => { root.open-row(i); }
+                                    pointer-event(e) => {
+                                        // 记下修饰键：clicked 回调本身不带修饰键信息
+                                        if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.down) {
+                                            root.last-shift = e.modifiers.shift;
+                                        }
+                                        if (e.button == PointerEventButton.right && e.kind == PointerEventKind.up) {
+                                            FilesG.sel = i;
+                                            FilesG.rename-name = row.name;
+                                            root.op-idx = i;
+                                            root.op-name = row.name;
+                                            root.op-is-dir = row.is-dir;
+                                            root.menu-ax = Math.max(0px, Math.min(self.absolute-position.x + self.mouse-x - root.absolute-position.x, root.width - 190px));
+                                            root.menu-ay = Math.min(self.absolute-position.y + self.mouse-y - root.absolute-position.y, 120px);
+                                            ctx.show();
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
