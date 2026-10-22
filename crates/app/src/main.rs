@@ -50,7 +50,11 @@ enum Cmd {
     FilesCopy { name: String, is_dir: bool },
     FilesCopyLink { name: String },
     /// 上传本机文件到当前远程目录（同名自动加序号，不覆盖）
-    FilesUpload { paths: Vec<PathBuf> },
+    /// dest 为 Some 时上传到指定远程目录（「上传到…」对话框），否则用当前目录
+    FilesUpload {
+        paths: Vec<PathBuf>,
+        dest: Option<String>,
+    },
     /// 多选模式勾选：shift 为真时从上次点击行到本行做范围勾选
     FilesCheck { idx: i32, shift: bool },
     /// 多选模式批量选择：0=清空 1=全选 2=反选 3=进入/退出多选模式
@@ -67,6 +71,16 @@ enum Cmd {
     LocalChooseDir,
     /// 本机窗格的某一项上传到远程当前目录
     LocalUpload { name: String, is_dir: bool },
+    /// 本机多选勾选：shift 为真时从上次点击行到本行做范围勾选
+    LocalCheck { idx: i32, shift: bool },
+    /// 本机多选批量选择：0=清空 1=全选 2=反选 3=进入/退出多选模式
+    LocalSelect { mode: i32 },
+    /// 本机排序（"name" / "size" / "mtime"）：同键再点切换升降序后重新列目录
+    LocalSort { key: String },
+    /// 「上传到…」：列出远程目标目录下的子文件夹
+    LocalUploadToList { path: String, seq: i32 },
+    /// 「上传到…」：把本机勾选项上传到指定远程目录
+    LocalUploadTo { dest: String },
     /// 批量下载到本机目录（勾选项）
     FilesDownloadMany {
         items: Vec<(String, bool)>,
@@ -827,7 +841,7 @@ fn apply_crumbs(ui: &MainWindow, all: Vec<CrumbRow>) {
 
 /// 把 `operations/list` 的结果转成表格行。
 ///
-/// 目录始终排在文件前；同类按 `key`（"name" / "size"）排序，`desc` 为真时反向。
+/// 目录始终排在文件前；同类按 `key`（"name" / "size" / "mtime"）排序，`desc` 为真时反向。
 /// 排序放在这里（而不是 Slint 里）是因为文件大小在 UI 上是格式化后的字符串
 /// （"1.1 KB"），拿它排序会把 "9 KB" 排到 "10 KB" 后面。
 fn file_rows(entries: &[ListEntry], key: &str, desc: bool) -> Vec<FileRow> {
@@ -836,6 +850,12 @@ fn file_rows(entries: &[ListEntry], key: &str, desc: bool) -> Vec<FileRow> {
         b.is_dir.cmp(&a.is_dir).then_with(|| {
             let ord = if key == "size" {
                 a.size.cmp(&b.size).then_with(|| a.name.cmp(&b.name))
+            } else if key == "mtime" {
+                // rclone 给的 mod_time 是 RFC3339 字符串，字典序即时间序，
+                // 不必解析成时间点；同秒时退回名字比较，保证顺序稳定。
+                a.mod_time
+                    .cmp(&b.mod_time)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             } else {
                 // 名字排序大小写不敏感：Windows 用户对 a.txt / B.txt 混排有直觉预期
                 a.name.to_lowercase().cmp(&b.name.to_lowercase())
@@ -876,11 +896,11 @@ fn unique_file_name(name: &str, existing: &[String]) -> String {
     format!("{base} (9999){ext}")
 }
 
-/// 本机目录列表（双栏左半用）：目录在前，同类按名字不区分大小写。
+/// 本机目录列表（双栏左半用）：目录在前，同类按 `key`（"name" / "size" / "mtime"）。
 ///
 /// 完全走 `std::fs`：浏览本机不该产生 RC 请求；读不到元数据的项（权限/竞态）跳过，
 /// 不让一行坏数据毁掉整个目录。
-fn local_rows(dir: &Path) -> anyhow::Result<Vec<FileRow>> {
+fn local_rows(dir: &Path, key: &str, desc: bool) -> anyhow::Result<Vec<FileRow>> {
     let mut items: Vec<(String, bool, u64, std::time::SystemTime)> = Vec::new();
     for ent in std::fs::read_dir(dir)? {
         let Ok(ent) = ent else { continue };
@@ -892,8 +912,24 @@ fn local_rows(dir: &Path) -> anyhow::Result<Vec<FileRow>> {
         items.push((name, is_dir, size, mtime));
     }
     items.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+        b.1.cmp(&a.1).then_with(|| {
+            // 与远程侧同一套语义：大小/时间相同时退回名字，保证顺序稳定。
+            // `SystemTime` 可以直接比较（内部是 Duration since UNIX_EPOCH）。
+            let ord = if key == "size" {
+                a.2.cmp(&b.2)
+                    .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+            } else if key == "mtime" {
+                a.3.cmp(&b.3)
+                    .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+            } else {
+                a.0.to_lowercase().cmp(&b.0.to_lowercase())
+            };
+            if desc {
+                ord.reverse()
+            } else {
+                ord
+            }
+        })
     });
     Ok(items
         .into_iter()
@@ -944,7 +980,24 @@ fn checked_items(ui: &MainWindow) -> Vec<(String, bool)> {
     out
 }
 
-/// 本地目录下不冲突的落盘路径：`name`、`name (1)`、`name (2)`…
+/// 本机窗格当前被勾选的条目（本机多选「上传」用）。
+fn local_checked_items(ui: &MainWindow) -> Vec<(String, bool)> {
+    let g = ui.global::<LocalG>();
+    let entries = g.get_entries();
+    let checked = g.get_checked();
+    let mut out = Vec::new();
+    for i in 0..entries.row_count() {
+        if !checked.row_data(i).unwrap_or(false) {
+            continue;
+        }
+        if let Some(r) = entries.row_data(i) {
+            out.push((r.name.to_string(), r.is_dir));
+        }
+    }
+    out
+}
+
+/// 本机目录下不冲突的落盘路径：`name`、`name (1)`、`name (2)`…
 ///
 /// 右键「下载到…」用文件夹选择器，没有「是否覆盖」的原生确认框，
 /// 因此这里一律避开已存在的文件，宁可多一个副本也不悄悄覆盖。
@@ -3980,7 +4033,8 @@ async fn files_navigate(
                 let key = g.get_sort_key().to_string();
                 let desc = g.get_sort_desc();
                 // 走 set_file_entries：新建/切换目录后勾选态必须清空且长度对齐
-                set_file_entries(&ui, file_rows(&entries, &key, desc));
+                let rows = file_rows(&entries, &key, desc);
+                set_file_entries(&ui, rows);
             }
             Err(e) => {
                 let msg = crate::proxy::annotate_error(
@@ -4736,20 +4790,24 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
             false
         }
-        Cmd::FilesUpload { paths } => {
+        Cmd::FilesUpload { paths, dest } => {
             // 上传本机文件到当前远程目录（请求 ③④ 的落点）。
             //
             // 与下载方向相反，但 copyfile 的用法完全对称：
             //   本机 fs = 选中文件的父目录 + 文件名，远程 fs = "remote:当前目录" + 目标名。
             // 同名一律改名（`a.txt` → `a (1).txt`）：copyfile 默认直接覆盖，
             // 而「把新版本传上去」是最常见的同名场景，静默覆盖不是安全的默认行为。
-            let (remote, path) = ui_files_pos(ui).await;
+            let (remote, mut path) = ui_files_pos(ui).await;
             if remote.is_empty() {
                 toast(ui, 2, "请先选择远程仓库");
                 return false;
             }
             if paths.is_empty() {
                 return false;
+            }
+            // 「上传到…」指定了目标目录：用它的路径，但仍留在当前列表里（不跳转）
+            if let Some(d) = dest {
+                path = d;
             }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
@@ -5008,11 +5066,20 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         }
         Cmd::LocalRefresh { path } => {
             // 本机窗格：读一层目录。纯本机操作（std::fs），不发任何 RC 请求。
+            // 排序偏好和路径一起读：一次 read_ui 拿到，避免额外往返。
+            let (cur, sort_key, sort_desc) = read_ui(ui, |ui| {
+                let g = ui.global::<LocalG>();
+                (
+                    g.get_path().to_string(),
+                    g.get_sort_key().to_string(),
+                    g.get_sort_desc(),
+                )
+            })
+            .await
+            .unwrap_or_default();
             let cur = match path {
                 Some(p) => p,
-                None => read_ui(ui, |ui| ui.global::<LocalG>().get_path().to_string())
-                    .await
-                    .unwrap_or_default(),
+                None => cur,
             };
             // 首次进入没有路径：从用户主目录开始（比 C:\ 更接近用户想传的东西）
             let cur = if cur.trim().is_empty() {
@@ -5020,12 +5087,16 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             } else {
                 cur
             };
-            let res = local_rows(Path::new(&cur));
+            let res = local_rows(Path::new(&cur), &sort_key, sort_desc);
             let _ = ui.upgrade_in_event_loop(move |ui| {
                 let g = ui.global::<LocalG>();
                 match res {
                     Ok(rows) => {
                         g.set_path(cur.clone().into());
+                        // 与远程侧同理：勾选数组按行数重建，否则 Slint 的 checked[i] 越界
+                        let n = rows.len();
+                        g.set_checked(ModelRc::from(Rc::new(VecModel::from(vec![false; n]))));
+                        g.set_checked_count(0);
                         g.set_entries(ModelRc::from(Rc::new(VecModel::from(rows))));
                         g.set_sel(-1);
                     }
@@ -5157,6 +5228,234 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     toast(ui, 1, format!("已上传 {cand}{extra}"));
                 }
                 Err(e) => toast(ui, 2, format!("上传失败: {e}")),
+            }
+            false
+        }
+        Cmd::LocalCheck { idx, shift } => {
+            // 本机多选勾选。逻辑与远程侧 FilesCheck 完全一致，只是换成 LocalG。
+            let (n, anchor, cur) = read_ui(ui, move |ui| {
+                let g = ui.global::<LocalG>();
+                let cur = g
+                    .get_checked()
+                    .row_data(idx.max(0) as usize)
+                    .unwrap_or(false);
+                (g.get_entries().row_count() as i32, g.get_anchor(), cur)
+            })
+            .await
+            .unwrap_or((0, -1, false));
+            if idx < 0 || idx >= n {
+                return false;
+            }
+            let (lo, hi, value, new_anchor) = if shift && anchor >= 0 && anchor < n {
+                (anchor.min(idx), anchor.max(idx), true, anchor)
+            } else {
+                (idx, idx, !cur, idx)
+            };
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                let g = ui.global::<LocalG>();
+                let mut flags: Vec<bool> = (0..n as usize)
+                    .map(|i| g.get_checked().row_data(i).unwrap_or(false))
+                    .collect();
+                for i in lo..=hi {
+                    flags[i as usize] = value;
+                }
+                let hits = flags.iter().filter(|v| **v).count() as i32;
+                g.set_checked(ModelRc::from(Rc::new(VecModel::from(flags))));
+                g.set_checked_count(hits);
+                g.set_anchor(new_anchor);
+            });
+            false
+        }
+        Cmd::LocalSelect { mode } => {
+            // mode: 0=清空 1=全选 2=反选 3=进入/退出本机多选模式
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                let g = ui.global::<LocalG>();
+                let n = g.get_entries().row_count();
+                match mode {
+                    3 => {
+                        let on = !g.get_multi();
+                        g.set_multi(on);
+                        if !on {
+                            g.set_checked(ModelRc::from(Rc::new(VecModel::from(vec![false; n]))));
+                            g.set_checked_count(0);
+                            g.set_anchor(-1);
+                        }
+                    }
+                    0 => {
+                        g.set_checked(ModelRc::from(Rc::new(VecModel::from(vec![false; n]))));
+                        g.set_checked_count(0);
+                        g.set_anchor(-1);
+                    }
+                    1 => {
+                        g.set_checked(ModelRc::from(Rc::new(VecModel::from(vec![true; n]))));
+                        g.set_checked_count(n as i32);
+                    }
+                    _ => {
+                        let flags: Vec<bool> = (0..n)
+                            .map(|i| !g.get_checked().row_data(i).unwrap_or(false))
+                            .collect();
+                        let hits = flags.iter().filter(|v| **v).count() as i32;
+                        g.set_checked(ModelRc::from(Rc::new(VecModel::from(flags))));
+                        g.set_checked_count(hits);
+                    }
+                }
+            });
+            false
+        }
+        Cmd::LocalSort { key } => {
+            // 与远程侧 FilesSort 同规则：点同一个键切换升降序，换键则回到升序。
+            let (same, desc) = read_ui(ui, {
+                let key = key.clone();
+                move |ui| {
+                    let g = ui.global::<LocalG>();
+                    (g.get_sort_key() == key, g.get_sort_desc())
+                }
+            })
+            .await
+            .unwrap_or((false, false));
+            let new_desc = if same { !desc } else { false };
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                let g = ui.global::<LocalG>();
+                g.set_sort_key(key.into());
+                g.set_sort_desc(new_desc);
+            });
+            let _ = Box::pin(handle_cmd(
+                ctx,
+                ui,
+                Cmd::LocalRefresh { path: None },
+            ))
+            .await;
+            false
+        }
+        Cmd::LocalUploadToList { path, seq } => {
+            // 「上传到…」对话框：只列远程的子文件夹（和 FilesMoveList 一个套路）。
+            let (remote, _) = ui_files_pos(ui).await;
+            if remote.is_empty() {
+                let _ = ui.upgrade_in_event_loop(move |ui| {
+                    ui.global::<LocalG>().set_up_busy(false);
+                });
+                return false;
+            }
+            let client = ctx.rc.client().await;
+            let fs = format!("{remote}:");
+            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<LocalG>().set_up_busy(true));
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                client.list(&fs, &path, None),
+            )
+            .await;
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                let g = ui.global::<LocalG>();
+                // seq 竞态：用户连点几次目录时，只应用最后一次的结果
+                if g.get_up_seq() != seq {
+                    return;
+                }
+                g.set_up_busy(false);
+                match res {
+                    Ok(Ok(items)) => {
+                        let dirs: Vec<MoveDir> = items
+                            .into_iter()
+                            .filter(|e| e.is_dir)
+                            .map(|e| MoveDir {
+                                name: e.name.into(),
+                            })
+                            .collect();
+                        let mut dirs = dirs;
+                        dirs.sort_by(|a, b| {
+                            a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                        });
+                        g.set_up_dirs(ModelRc::from(Rc::new(VecModel::from(dirs))));
+                        g.set_up_path(path.clone().into());
+                    }
+                    Ok(Err(e)) => toast_ui(&ui, 2, format!("读取远程目录失败: {e}")),
+                    Err(_) => toast_ui(&ui, 2, "读取远程目录超时"),
+                }
+            });
+            false
+        }
+        Cmd::LocalUploadTo { dest } => {
+            // 「上传到…」：把本机勾选项（没有勾选时是右键那一项）传到指定远程目录。
+            let (remote, _) = ui_files_pos(ui).await;
+            if remote.is_empty() {
+                toast(ui, 2, "请先选择远程仓库");
+                return false;
+            }
+            let (cur, items) = read_ui(ui, |ui| {
+                let g = ui.global::<LocalG>();
+                let entries = g.get_entries();
+                let checked = g.get_checked();
+                // 不看 multi：右键单项时回调已经把它勾上了，勾选态就是唯一的数据来源
+                let mut out: Vec<(String, bool)> = Vec::new();
+                for i in 0..entries.row_count() {
+                    if !checked.row_data(i).unwrap_or(false) {
+                        continue;
+                    }
+                    if let Some(r) = entries.row_data(i) {
+                        out.push((r.name.to_string(), r.is_dir));
+                    }
+                }
+                (g.get_path().to_string(), out)
+            })
+            .await
+            .unwrap_or_default();
+            if cur.trim().is_empty() || items.is_empty() {
+                return false;
+            }
+            let client = ctx.rc.client().await;
+            let fs = format!("{remote}:");
+            let entries = client.list(&fs, &dest, None).await.unwrap_or_default();
+            let mut existing: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+            let total = items.len();
+            let mut ok = 0usize;
+            let mut failed: Vec<String> = Vec::new();
+            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<LocalG>().set_busy(true));
+            for (name, is_dir) in &items {
+                let src = Path::new(&cur).join(name);
+                let cand = if *is_dir {
+                    unique_dir_name(name, &existing)
+                } else {
+                    unique_file_name(name, &existing)
+                };
+                existing.push(cand.clone());
+                let dst_fs = format!("{remote}:{}", join_path(&dest, &cand));
+                let src_fs = if *is_dir {
+                    local_fs(&src)
+                } else {
+                    local_fs(src.parent().unwrap_or(Path::new(".")))
+                };
+                let res = if *is_dir {
+                    client.sync_copy(&src_fs, &dst_fs, true).await
+                } else {
+                    client.copyfile(&src_fs, name, &dst_fs, &cand).await
+                };
+                match res {
+                    Ok(_) => ok += 1,
+                    Err(e) => failed.push(format!("{name}: {e}")),
+                }
+            }
+            let _ = ui.upgrade_in_event_loop(|ui| {
+                let g = ui.global::<LocalG>();
+                let n = g.get_entries().row_count();
+                g.set_busy(false);
+                // 上传完成退出多选并清空勾选（与远程侧批量删除后的处理一致）
+                g.set_multi(false);
+                g.set_checked(ModelRc::from(Rc::new(VecModel::from(vec![false; n]))));
+                g.set_checked_count(0);
+                g.set_anchor(-1);
+            });
+            let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
+            if failed.is_empty() {
+                toast(ui, 1, format!("已上传 {ok}/{total} 项到 {dest}"));
+            } else {
+                toast(
+                    ui,
+                    2,
+                    format!(
+                        "上传完成 {ok}/{total}，失败 {}：{}",
+                        failed.len(),
+                        failed.join("；")
+                    ),
+                );
             }
             false
         }
@@ -7798,7 +8097,7 @@ fn wire_callbacks(
             if paths.is_empty() {
                 return;
             }
-            let _ = tx.send(Cmd::FilesUpload { paths });
+            let _ = tx.send(Cmd::FilesUpload { paths, dest: None });
         }
     });
     ui.on_files_sort_by({
@@ -8012,13 +8311,294 @@ fn wire_callbacks(
             });
         }
     });
+    // ---- 会话 19：右键「下载到当前本地目录」/ 本机多选 / 本机排序 / 上传到… / 拖拽 ----
+    ui.on_files_download_here({
+        let tx = tx.clone();
+        let ui = ui.as_weak();
+        move || {
+            let Some(ui) = ui.upgrade() else { return };
+            let fg = ui.global::<FilesG>();
+            let lg = ui.global::<LocalG>();
+            let dir = PathBuf::from(lg.get_path().to_string());
+            if dir.as_os_str().is_empty() {
+                toast_ui(&ui, 2, "左侧本机目录还是空的，请先选择目录");
+                return;
+            }
+            // 右键点的是已勾选的一行 → 下整组；否则只下这一行（修「多选只下一个」的 bug）
+            let multi_take = fg.get_multi()
+                && fg
+                    .get_checked()
+                    .row_data(fg.get_op_idx().max(0) as usize)
+                    .unwrap_or(false);
+            if multi_take {
+                let items = checked_items(&ui);
+                if items.is_empty() {
+                    return;
+                }
+                let _ = tx.send(Cmd::FilesDownloadMany { items, dir });
+                return;
+            }
+            let idx = fg.get_op_idx();
+            let Some(row) = fg.get_entries().row_data(idx.max(0) as usize) else {
+                return;
+            };
+            let _ = tx.send(Cmd::FilesDownloadToDir {
+                name: row.name.to_string(),
+                dir,
+                is_dir: row.is_dir,
+            });
+        }
+    });
+    ui.on_local_check_row({
+        let tx = tx.clone();
+        move |idx, shift| {
+            let _ = tx.send(Cmd::LocalCheck { idx, shift });
+        }
+    });
+    ui.on_local_multi_toggle({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::LocalSelect { mode: 3 });
+        }
+    });
+    ui.on_local_select_all({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::LocalSelect { mode: 1 });
+        }
+    });
+    ui.on_local_select_invert({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::LocalSelect { mode: 2 });
+        }
+    });
+    ui.on_local_sort_by({
+        let tx = tx.clone();
+        move |key| {
+            let _ = tx.send(Cmd::LocalSort { key: key.to_string() });
+        }
+    });
+    // 本机多选「上传」：勾选项一次性传到远程当前目录
+    ui.on_local_upload_many({
+        let tx = tx.clone();
+        let ui = ui.as_weak();
+        move || {
+            let Some(ui) = ui.upgrade() else { return };
+            let items = local_checked_items(&ui);
+            if items.is_empty() {
+                return;
+            }
+            // 复用「上传到当前远程目录」：拼成本机绝对路径交给 FilesUpload
+            let cur = PathBuf::from(ui.global::<LocalG>().get_path().to_string());
+            let paths: Vec<PathBuf> = items
+                .iter()
+                .map(|(name, _)| cur.join(name))
+                .collect();
+            let _ = tx.send(Cmd::FilesUpload { paths, dest: None });
+        }
+    });
+    // 「上传到…」对话框：列出远程子目录
+    let up_go = {
+        let tx = tx.clone();
+        let ui = ui.as_weak();
+        move |path: String| {
+            let Some(ui) = ui.upgrade() else { return };
+            let g = ui.global::<LocalG>();
+            g.set_up_busy(true);
+            g.set_up_seq(g.get_up_seq() + 1);
+            let _ = tx.send(Cmd::LocalUploadToList {
+                path,
+                seq: g.get_up_seq(),
+            });
+        }
+    };
+    ui.on_local_upload_to({
+        let up_go = up_go.clone();
+        let ui = ui.as_weak();
+        move |i| {
+            let Some(ui) = ui.upgrade() else { return };
+            let lg = ui.global::<LocalG>();
+            // 勾选了多项就传整组，否则只传右键点的那一行
+            let hits = lg.get_checked_count();
+            lg.set_op_idx(i);
+            let name = lg
+                .get_entries()
+                .row_data(i.max(0) as usize)
+                .map(|r| (r.name.to_string(), r.is_dir));
+            let Some((name, is_dir)) = name else { return };
+            lg.set_op_name(name.as_str().into());
+            lg.set_op_is_dir(is_dir);
+            if hits <= 0 {
+                // 单选：先把自己勾上，让「上传到…」只有一个统一的数据来源
+                let n = lg.get_entries().row_count();
+                let mut flags: Vec<bool> = (0..n)
+                    .map(|k| lg.get_checked().row_data(k).unwrap_or(false))
+                    .collect();
+                flags[i.max(0) as usize] = true;
+                let cnt = flags.iter().filter(|v| **v).count() as i32;
+                lg.set_checked(ModelRc::from(Rc::new(VecModel::from(flags))));
+                lg.set_checked_count(cnt);
+            }
+            let count = lg.get_checked_count().max(1);
+            lg.set_up_count(count);
+            lg.set_up_dirs(ModelRc::from(Rc::new(VecModel::from(Vec::<MoveDir>::new()))));
+            lg.set_up_path("".into());
+            // 从远程根开始浏览
+            up_go(String::new());
+        }
+    });
+    ui.on_local_upload_to_list({
+        let up_go = up_go.clone();
+        move |path| up_go(path.to_string())
+    });
+    ui.on_local_upload_to_enter({
+        let up_go = up_go.clone();
+        let ui = ui.as_weak();
+        move |name| {
+            let path = ui
+                .upgrade()
+                .map(|ui| join_path(&ui.global::<LocalG>().get_up_path(), &name))
+                .unwrap_or_default();
+            up_go(path);
+        }
+    });
+    ui.on_local_upload_to_up({
+        let up_go = up_go.clone();
+        let ui = ui.as_weak();
+        move || {
+            let path = ui
+                .upgrade()
+                .map(|ui| parent_path(&ui.global::<LocalG>().get_up_path()))
+                .unwrap_or_default();
+            up_go(path);
+        }
+    });
+    ui.on_local_upload_to_root({
+        let up_go = up_go.clone();
+        move || up_go(String::new())
+    });
+    ui.on_local_upload_to_confirm({
+        let tx = tx.clone();
+        let ui = ui.as_weak();
+        move || {
+            let Some(ui) = ui.upgrade() else { return };
+            let lg = ui.global::<LocalG>();
+            let dest = lg.get_up_path().to_string();
+            // 勾选项（单选时 on_local_upload_to 已经把自己勾上了）
+            let items = local_checked_items(&ui);
+            if items.is_empty() {
+                return;
+            }
+            // 直接走「上传到指定目录」的命令，避免二次弹框
+            let _ = tx.send(Cmd::LocalUploadTo { dest });
+        }
+    });
+    // ---- 拖拽 ----
+    // 载荷只携带 "local:<行号>" / "remote:<行号>" 这样的描述串，真正的用途列表在落点
+    // 回调里按当前勾选状态展开。这样「拖一个已勾选的行 = 拖整组」只有一处实现，
+    // 也不依赖 DragArea 在渲染期就能拿到完整路径列表。
+    ui.on_local_make_transfer(|token| {
+        let mut dt = slint::DataTransfer::default();
+        dt.set_plain_text(token);
+        dt
+    });
+    ui.on_local_accept_remote(|dt| {
+        dt.plain_text()
+            .map(|t| t.starts_with("remote:"))
+            .unwrap_or(false)
+    });
+    ui.on_local_drop_remote({
+        let tx = tx.clone();
+        let ui = ui.as_weak();
+        move |dt| {
+            let Some(ui) = ui.upgrade() else { return };
+            let text = dt.plain_text().unwrap_or_default();
+            let Ok(idx) = text.trim_start_matches("remote:").parse::<i32>() else {
+                return;
+            };
+            let fg = ui.global::<FilesG>();
+            let lg = ui.global::<LocalG>();
+            let dir = PathBuf::from(lg.get_path().to_string());
+            if dir.as_os_str().is_empty() {
+                toast_ui(&ui, 2, "左侧本机目录还是空的，请先选择目录");
+                return;
+            }
+            // 拖的是已勾选的行 → 整组；否则只拖这一行
+            let items = if fg.get_multi()
+                && fg
+                    .get_checked()
+                    .row_data(idx.max(0) as usize)
+                    .unwrap_or(false)
+            {
+                checked_items(&ui)
+            } else {
+                fg.get_entries()
+                    .row_data(idx.max(0) as usize)
+                    .map(|r| vec![(r.name.to_string(), r.is_dir)])
+                    .unwrap_or_default()
+            };
+            if items.is_empty() {
+                return;
+            }
+            let _ = tx.send(Cmd::FilesDownloadMany { items, dir });
+        }
+    });
+    ui.on_files_make_transfer(|token| {
+        let mut dt = slint::DataTransfer::default();
+        dt.set_plain_text(token);
+        dt
+    });
+    ui.on_files_accept_local(|dt| {
+        dt.plain_text()
+            .map(|t| t.starts_with("local:"))
+            .unwrap_or(false)
+    });
+    ui.on_files_drop_local({
+        let tx = tx.clone();
+        let ui = ui.as_weak();
+        move |dt| {
+            let Some(ui) = ui.upgrade() else { return };
+            let text = dt.plain_text().unwrap_or_default();
+            let Ok(idx) = text.trim_start_matches("local:").parse::<i32>() else {
+                return;
+            };
+            let lg = ui.global::<LocalG>();
+            let cur = PathBuf::from(lg.get_path().to_string());
+            if cur.as_os_str().is_empty() {
+                toast_ui(&ui, 2, "请先在左侧选择一个本机目录");
+                return;
+            }
+            // 拖的是已勾选的行 → 整组；否则只拖这一行
+            let names: Vec<String> = if lg.get_multi()
+                && lg
+                    .get_checked()
+                    .row_data(idx.max(0) as usize)
+                    .unwrap_or(false)
+            {
+                local_checked_items(&ui)
+                    .into_iter()
+                    .map(|(n, _)| n)
+                    .collect()
+            } else {
+                lg.get_entries()
+                    .row_data(idx.max(0) as usize)
+                    .map(|r| vec![r.name.to_string()])
+                    .unwrap_or_default()
+            };
+            if names.is_empty() {
+                return;
+            }
+            let paths: Vec<PathBuf> = names.iter().map(|n| cur.join(n)).collect();
+            let _ = tx.send(Cmd::FilesUpload { paths, dest: None });
+        }
+    });
     ui.on_mounts_refresh({
         let tx = tx.clone();
         move || {
             let _ = tx.send(Cmd::MountsRefresh);
         }
-    });
-    ui.on_mount_add({
+    });    ui.on_mount_add({
         let tx = tx.clone();
         move || {
             let _ = tx.send(Cmd::MountAdd);

@@ -301,7 +301,7 @@ export global FilesG {
     in-out property <bool> multi: false;
     /// 与 entries 一一对应：该行是否被勾选。每次列目录后由 Rust 侧重建为全 false。
     in-out property <[bool]> checked: [];
-    /// 排序键："name" | "size"（目录始终排在文件前）
+    /// 排序键："name" | "size" | "mtime"（目录始终排在文件前）
     in-out property <string> sort-key: "name";
     /// 是否反向排序
     in-out property <bool> sort-desc: false;
@@ -311,6 +311,10 @@ export global FilesG {
     in-out property <int> checked-count: 0;
     /// Shift 连选的锚点行（-1 = 无）；由 Rust 维护，避免把区间计算塞进回调
     in-out property <int> anchor: -1;
+    /// 右键命中的行（下载到当前本地目录等回调要读）
+    in-out property <int> op-idx: -1;
+    in-out property <string> op-name: "";
+    in-out property <bool> op-is-dir: false;
 }
 
 // 本机窗格（文件页双栏的左半）。
@@ -322,6 +326,31 @@ export global LocalG {
     in-out property <bool> loading: false;
     /// 本机操作（列目录 / 上传）进行中：按钮置灰
     in-out property <bool> busy: false;
+    // ---------------- 多选 / 排序（会话 19）----------------
+    /// 多选模式：进入后工具条露出「上传」，列表左侧出现勾选框。
+    /// 本机侧刻意只提供「上传」——移动/删除本机文件不在这条路径上。
+    in-out property <bool> multi: false;
+    /// 与 entries 一一对应；每次列目录后由 Rust 重建为全 false
+    in-out property <[bool]> checked: [];
+    in-out property <int> checked-count: 0;
+    /// Shift 连选锚点（-1 = 无）
+    in-out property <int> anchor: -1;
+    /// 排序键："name" | "size" | "mtime"（目录始终在文件前）
+    in-out property <string> sort-key: "name";
+    in-out property <bool> sort-desc: false;
+    // ---------------- 「上传到…」对话框（本机项 → 指定远程目录）----------------
+    in-out property <[MoveDir]> up-dirs: [];
+    /// 当前浏览到的远程目标目录（相对远程根）
+    in-out property <string> up-path: "";
+    /// 待上传项数（标题用）
+    in-out property <int> up-count: 0;
+    in-out property <bool> up-busy: false;
+    /// 浏览请求序号：迟到的旧结果按序号丢弃
+    in-out property <int> up-seq: 0;
+    /// 右键命中的本机行（「上传到…」回调要读）
+    in-out property <int> op-idx: -1;
+    in-out property <string> op-name: "";
+    in-out property <bool> op-is-dir: false;
 }
 
 export global MountsG {
@@ -733,11 +762,21 @@ component ConfirmPop inherits PopupWindow {
 }
 
 // 右键菜单项
+//
+// `has-submenu` 只画一个右向箭头：子菜单面板由调用方在同一个 PopupWindow 里
+// 用绝对定位排出来（见 SortSubmenu）。不用第二个 PopupWindow，是因为
+// `WindowInner::show_popup` 会先关掉同一 parent_item 的所有兄弟弹层，
+// 而「鼠标移进子菜单」在父弹层看来就是「点到了外面」，父菜单会先消失。
 component MenuItemBtn inherits Rectangle {
     in property <string> glyph;
     in property <string> label;
+    // 右侧灰色补充说明（如排序方向 A→Z）
+    in property <string> hint: "";
     in property <bool> danger: false;
+    in property <bool> has-submenu: false;
     callback clicked;
+    // 鼠标进入本项：用于折叠/展开同一弹层里的子菜单面板
+    callback entered;
     height: 32px;
     border-radius: ThemeG.radius-s;
     background: mta.has-hover ? ThemeG.hover : transparent;
@@ -757,10 +796,72 @@ component MenuItemBtn inherits Rectangle {
             color: root.danger ? ThemeG.err : ThemeG.text;
             vertical-alignment: center;
         }
+        Rectangle { horizontal-stretch: 1; }
+        if root.hint != "" : Text {
+            text: root.hint;
+            font-size: 11px;
+            color: ThemeG.text-dim;
+            vertical-alignment: center;
+        }
+        if root.has-submenu : MdlIcon {
+            glyph: "\u{E76C}";
+            width: 12px;
+            font-size: 10px;
+            color: ThemeG.text-dim;
+        }
     }
     mta := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
+        pointer-event(e) => {
+            // 只有 Moved 会连续发；用 has-hover 的上升沿更省事，但 TouchArea
+            // 没有 hover 变化回调，只能靠 Moved 判进入。
+            if (e.kind == PointerEventKind.move) { root.entered(); }
+        }
+    }
+}
+
+// 「排序」子菜单面板：名称 / 大小 / 修改时间。
+//
+// 与父菜单共处一个 PopupWindow，靠绝对定位贴在卡片右（或左）侧；
+// 打开方向由调用方按剩余宽度决定（`无空间就翻到左边`）。
+//
+// hover 展开：MenuItemBtn 的 entered 只在 Moved 时触发，用户从父项移进子面板的
+// 过程中会经过中间空隙，因此「离开父项」不能立刻收起，只能等鼠标进入同级的其它
+// 菜单项（`entered`）再切。父菜单卡片本身是同一个 PopupWindow，鼠标在空隙里时
+// 指针仍在弹窗矩形内，不会被 CloseOnClickOutside 关掉。
+component SortSubmenu inherits Rectangle {
+    in property <string> key: "name";
+    in property <bool> desc: false;
+    callback pick(string);
+    width: 168px;
+    // 3 行 * 32px + padding 4*2 + spacing 2*2
+    height: 108px;
+    background: ThemeG.panel;
+    border-radius: ThemeG.radius-s;
+    border-width: 1px;
+    border-color: ThemeG.border;
+    VerticalLayout {
+        padding: 4px;
+        spacing: 2px;
+        MenuItemBtn {
+            glyph: root.key == "name" ? "\u{E73E}" : "";
+            label: "名称";
+            hint: root.key == "name" ? (root.desc ? "Z→A" : "A→Z") : "";
+            clicked => { root.pick("name"); }
+        }
+        MenuItemBtn {
+            glyph: root.key == "size" ? "\u{E73E}" : "";
+            label: "大小";
+            hint: root.key == "size" ? (root.desc ? "大→小" : "小→大") : "";
+            clicked => { root.pick("size"); }
+        }
+        MenuItemBtn {
+            glyph: root.key == "mtime" ? "\u{E73E}" : "";
+            label: "修改时间";
+            hint: root.key == "mtime" ? (root.desc ? "新→旧" : "旧→新") : "";
+            clicked => { root.pick("mtime"); }
+        }
     }
 }
 
@@ -1009,12 +1110,54 @@ component DashboardView inherits Rectangle {
 // 只做三件事：浏览本机目录、选中、把某一项传到右侧远程当前目录。
 // 列目录走 std::fs，不经 rclone —— 本机浏览不应该产生任何 RC 请求。
 component LocalPane inherits Rectangle {
+    background: transparent;
     callback refresh();
     callback open-row(int);
     callback go-up();
     callback choose-dir();
+    /// 行尾按钮：把这一项上传到右侧远程的当前目录
     callback upload-row(int);
-    background: transparent;
+    // ---------------- 多选（会话 19）----------------
+    // 本机侧刻意只提供「上传」：移动 / 删除本机文件不在这个程序的职责里，
+    // 因此多选动作条上除了选择控件就只有上传。
+    callback check-row(int, bool);
+    callback multi-toggle();
+    callback select-all();
+    callback select-invert();
+    callback upload-many();
+    // ---------------- 排序 ----------------
+    callback sort-by(string);
+    // ---------------- 「上传到…」对话框 ----------------
+    callback upload-to(int);
+    callback upload-to-list(string);
+    callback upload-to-enter(string);
+    callback upload-to-up();
+    callback upload-to-root();
+    callback upload-to-confirm();
+    // ---------------- 拖拽（会话 19）----------------
+    // 载荷在 .slint 里只传递一个描述串（"local:<行号>"），真正的路径列表由 Rust
+    // 侧按当前勾选状态算，因为「拖一个已勾选的行 = 拖整组」这条规则只有 Rust 知道。
+    pure callback make-transfer(string) -> data-transfer;
+    /// 本机窗格只接受来自远程窗格的拖拽
+    pure callback accept-remote(data-transfer) -> bool;
+    callback drop-remote(data-transfer);
+
+    // 右键菜单 / 弹层定位（全部是窗格本地坐标）
+    in-out property <length> menu-ax: 0px;
+    in-out property <length> menu-ay: 0px;
+    // 右键命中的行：绑定到 LocalG，Rust 侧回调要读它（组件私有属性 Rust 看不到）
+    in-out property <int> op-idx <=> LocalG.op-idx;
+    in-out property <bool> op-is-dir <=> LocalG.op-is-dir;
+    in-out property <string> op-name <=> LocalG.op-name;
+    // 排序子菜单是否展开 / 是否翻到左侧
+    in-out property <bool> sub-open: false;
+    in-out property <bool> sub-left: false;
+    // Shift 连选：记上一次点击时是否按着 Shift
+    in-out property <bool> last-shift: false;
+
+    // 行内左侧缩进：多选时给勾选框让位
+    private property <length> lead: LocalG.multi ? 52px : 32px;
+
     VerticalLayout {
         padding-top: 24px;
         padding-bottom: 24px;
@@ -1046,7 +1189,40 @@ component LocalPane inherits Rectangle {
                 }
             }
             PillBtn { label: "选择…"; compact: true; disabled: LocalG.busy; clicked => { root.choose-dir(); } }
+            if !LocalG.multi : PillBtn {
+                label: "多选";
+                compact: true;
+                clicked => { root.multi-toggle(); }
+            }
             IconBtn { label: "\u{E72C}"; clicked => { root.refresh(); } }
+        }
+        // 多选动作条：与右侧远程文件页同款，但只留「上传」
+        if LocalG.multi : Rectangle {
+            height: 34px;
+            background: ThemeG.accent-soft;
+            border-radius: ThemeG.radius-s;
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 8px;
+                spacing: 8px;
+                Text {
+                    text: "已选 " + LocalG.checked-count + " 项";
+                    font-size: 12px;
+                    color: ThemeG.text;
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; }
+                PillBtn { label: "全选"; compact: true; clicked => { root.select-all(); } }
+                PillBtn { label: "反选"; compact: true; clicked => { root.select-invert(); } }
+                PillBtn {
+                    label: "上传";
+                    compact: true;
+                    primary: true;
+                    disabled: LocalG.busy || LocalG.checked-count == 0;
+                    clicked => { root.upload-many(); }
+                }
+                PillBtn { label: "退出多选"; compact: true; clicked => { root.multi-toggle(); } }
+            }
         }
         Card {
             pad: 0px;
@@ -1057,14 +1233,26 @@ component LocalPane inherits Rectangle {
                     height: 30px;
                     background: ThemeG.panel-2;
                     HorizontalLayout {
-                        padding-left: 12px;
+                        padding-left: LocalG.multi ? 16px : 12px;
                         padding-right: 12px;
                         Rectangle {
                             horizontal-stretch: 1;
                             Text { text: "名称"; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                         }
-                        Text { text: "大小"; font-size: 12px; color: ThemeG.text-dim; width: 70px; vertical-alignment: center; }
-                        Rectangle { width: 30px; }
+                        Text { text: "大小"; font-size: 12px; color: ThemeG.text-dim; width: 62px; vertical-alignment: center; }
+                        Rectangle { width: 38px; }
+                    }
+                    // 表头右键同样给出刷新 / 排序
+                    head-ta := TouchArea {
+                        pointer-event(e) => {
+                            if (e.button == PointerEventButton.right && e.kind == PointerEventKind.up) {
+                                root.menu-ax = Math.max(0px, Math.min(self.absolute-position.x + self.mouse-x - root.absolute-position.x, root.width - 200px));
+                                root.menu-ay = Math.max(0px, Math.min(self.absolute-position.y + self.mouse-y - root.absolute-position.y, root.height - 140px));
+                                root.sub-open = false;
+                                root.sub-left = (root.menu-ax + 190px + 168px) > root.width;
+                                lmp.show();
+                            }
+                        }
                     }
                 }
                 Rectangle {
@@ -1072,14 +1260,46 @@ component LocalPane inherits Rectangle {
                     ListView {
                         for row[i] in LocalG.entries : Rectangle {
                             height: 38px;
-                            background: LocalG.sel == i ? ThemeG.accent-soft : (lta.has-hover ? ThemeG.hover : transparent);
+                            background: (LocalG.multi && LocalG.checked[i]) ? ThemeG.accent-soft : (LocalG.sel == i ? ThemeG.accent-soft : (lta.has-hover ? ThemeG.hover : transparent));
                             lta := TouchArea {
                                 mouse-cursor: pointer;
-                                clicked => { LocalG.sel = i; }
-                                double-clicked => { root.open-row(i); }
+                                clicked => {
+                                    if (LocalG.multi) {
+                                        root.check-row(i, root.last-shift);
+                                    } else {
+                                        LocalG.sel = i;
+                                    }
+                                }
+                                double-clicked => {
+                                    if (!LocalG.multi) { root.open-row(i); }
+                                }
+                                pointer-event(e) => {
+                                    root.last-shift = e.modifiers.shift;
+                                    if (e.button == PointerEventButton.right && e.kind == PointerEventKind.up) {
+                                        root.op-idx = i;
+                                        root.op-name = row.name;
+                                        root.op-is-dir = row.is-dir;
+                                        root.menu-ax = Math.max(0px, Math.min(self.absolute-position.x + self.mouse-x - root.absolute-position.x, root.width - 200px));
+                                        root.menu-ay = Math.max(0px, Math.min(self.absolute-position.y + self.mouse-y - root.absolute-position.y, root.height - 140px));
+                                        lcm.show();
+                                    }
+                                }
+                            }
+                            // 多选勾选框：只做视觉，真正的状态在 LocalG.checked
+                            if LocalG.multi : Text {
+                                x: 6px;
+                                y: 9px;
+                                width: 20px;
+                                height: 20px;
+                                text: LocalG.checked[i] ? "\u{E73A}" : "\u{E739}";
+                                font-family: "Segoe MDL2 Assets";
+                                font-size: 14px;
+                                color: LocalG.checked[i] ? ThemeG.accent : ThemeG.text-dim;
+                                vertical-alignment: center;
+                                horizontal-alignment: center;
                             }
                             MdlIcon {
-                                x: 8px;
+                                x: LocalG.multi ? 28px : 8px;
                                 y: 9px;
                                 width: 20px;
                                 height: 20px;
@@ -1087,8 +1307,8 @@ component LocalPane inherits Rectangle {
                                 color: LocalG.sel == i ? ThemeG.accent : ThemeG.text-dim;
                             }
                             Text {
-                                x: 32px;
-                                width: parent.width - 76px;
+                                x: root.lead;
+                                width: parent.width - root.lead - 100px;
                                 height: parent.height;
                                 text: row.name;
                                 font-size: 13px;
@@ -1097,7 +1317,7 @@ component LocalPane inherits Rectangle {
                                 overflow: elide;
                             }
                             Text {
-                                x: parent.width - 118px;
+                                x: parent.width - 106px;
                                 width: 62px;
                                 height: parent.height;
                                 text: row.is-dir ? "—" : row.size;
@@ -1108,9 +1328,9 @@ component LocalPane inherits Rectangle {
                             }
                             // 「传到右侧」按钮：常显而不是悬停才出现。
                             // 踩过的坑：按钮写在 `if lta.has-hover` 里时，鼠标移到按钮上
-                            // 行的 has-hover 变 false、按钮在按下前就消失，单击永远打不中，
-                            // 必须先用一次点击选中行才行 —— 实测三次点击才成功一次。
-                            Rectangle {
+                            // 行的 has-hover 变 false、按钮在按下前就消失，单击永远打不中。
+                            // 多选模式下隐藏它：此时只留动作条上的「上传」一个按钮。
+                            if !LocalG.multi : Rectangle {
                                 x: parent.width - 36px;
                                 y: 4px;
                                 width: 30px;
@@ -1129,7 +1349,256 @@ component LocalPane inherits Rectangle {
                                 height: 1px;
                                 background: ThemeG.border;
                             }
+                            // 拖拽源：本机 → 远程。点击不受影响（DragArea 只吞掉超过
+                            // 8px 的移动，Press 仍然向下传给 lta）。
+                            DragArea {
+                                x: 0px;
+                                y: 0px;
+                                width: parent.width;
+                                height: parent.height;
+                                allow-copy: true;
+                                data: root.make-transfer("local:" + i);
+                            }
                         }
+                    }
+                    // 空列表区域仍然要能右键（刷新 / 排序）与接收拖入
+                    blank-ta := TouchArea {
+                        y: Math.min(LocalG.entries.length * 38px, parent.height);
+                        width: parent.width;
+                        height: parent.height - self.y;
+                        pointer-event(e) => {
+                            if (e.button == PointerEventButton.right && e.kind == PointerEventKind.up) {
+                                root.menu-ax = Math.max(0px, Math.min(self.absolute-position.x + self.mouse-x - root.absolute-position.x, root.width - 200px));
+                                root.menu-ay = Math.max(0px, Math.min(self.absolute-position.y + self.mouse-y - root.absolute-position.y, root.height - 140px));
+                                root.sub-open = false;
+                                root.sub-left = (root.menu-ax + 190px + 168px) > root.width;
+                                lmp.show();
+                            }
+                        }
+                    }
+                    // 拖入目标：远程文件拖过来 → 下载到本机当前目录
+                    drop := DropArea {
+                        x: 0px;
+                        y: 0px;
+                        width: parent.width;
+                        height: parent.height;
+                        can-drop(event) => { root.accept-remote(event.data) ? DragAction.copy : DragAction.none; }
+                        dropped(event) => {
+                            root.drop-remote(event.data);
+                            return event.proposed-action;
+                        }
+                    }
+                    // 拖入反馈：整块列表染色（不挡事件，DropArea 只吃 DragMove/Drop）
+                    if drop.has-drag : Rectangle {
+                        background: ThemeG.accent-soft;
+                        opacity: 0.35;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------- 右键菜单 ----------------
+    // 空白 / 表头：刷新 + 排序（子菜单）
+    lmp := PopupWindow {
+        // 弹窗必须显式给宽高，否则可点区域塌成窄缝（这个坑已经踩过两次）
+        width: lmp-root.width;
+        height: lmp-root.height;
+        x: root.menu-ax;
+        y: root.menu-ay;
+        close-policy: PopupClosePolicy.close-on-click-outside;
+        lmp-root := Rectangle {
+            // 同 bmp 的坑：弹窗可命中矩形 = 内容 layout 的 preferred 尺寸，
+            // 绝对定位探出去的子面板不算在内，点上去只会被判定「点在弹窗外」而关菜单。
+            // 所以用真实 HorizontalLayout 把子面板纳入布局。
+            width: root.sub-open ? 358px : 190px;
+            height: 146px;
+            background: transparent;
+            HorizontalLayout {
+                spacing: 0px;
+                if root.sub-open && root.sub-left : VerticalLayout {
+                    spacing: 0px;
+                    Rectangle { height: 38px; }
+                    SortSubmenu {
+                        key: LocalG.sort-key;
+                        desc: LocalG.sort-desc;
+                        pick(k) => { root.sort-by(k); root.sub-open = false; lmp.close(); }
+                    }
+                }
+                Rectangle {
+                    width: 190px;
+                    height: 146px;
+                    background: transparent;
+                    Rectangle {
+                        x: 0px;
+                        y: 0px;
+                        width: 190px;
+                        height: 108px;
+                        background: ThemeG.panel;
+                        border-radius: ThemeG.radius-s;
+                        border-width: 1px;
+                        border-color: ThemeG.border;
+                        VerticalLayout {
+                            padding: 4px;
+                            spacing: 2px;
+                            MenuItemBtn {
+                                glyph: "\u{E72C}";
+                                label: "刷新";
+                                // 不要在其它项上收起子菜单：鼠标从「排序」斜向滑进子面板时
+                                // 必然会扫过相邻行，一旦在那里收起，子面板会在指针到达前消失，
+                                // 用户永远点不中它（实测复现）。
+                                clicked => { lmp.close(); root.refresh(); }
+                            }
+                            MenuItemBtn {
+                                glyph: "\u{E8CB}";
+                                label: "排序";
+                                has-submenu: true;
+                                entered => { root.sub-open = true; }
+                                clicked => { root.sub-open = !root.sub-open; }
+                            }
+                            // 占位：让「排序」下方的空白属于卡片，鼠标滑向子菜单时不会掉出去
+                            Rectangle { height: 32px; }
+                        }
+                    }
+                }
+                if root.sub-open && !root.sub-left : VerticalLayout {
+                    spacing: 0px;
+                    Rectangle { height: 38px; }
+                    SortSubmenu {
+                        key: LocalG.sort-key;
+                        desc: LocalG.sort-desc;
+                        pick(k) => { root.sort-by(k); root.sub-open = false; lmp.close(); }
+                    }
+                }
+            }
+        }
+    }
+    // 文件行：上传到… / 上传到当前远程目录
+    lcm := PopupWindow {
+        width: 200px;
+        height: lcm-card.preferred-height;
+        x: root.menu-ax;
+        y: root.menu-ay;
+        close-policy: PopupClosePolicy.close-on-click-outside;
+        lcm-card := Rectangle {
+            width: 200px;
+            background: ThemeG.panel;
+            border-radius: ThemeG.radius-s;
+            border-width: 1px;
+            border-color: ThemeG.border;
+            VerticalLayout {
+                padding: 4px;
+                spacing: 2px;
+                MenuItemBtn {
+                    glyph: "\u{E898}";
+                    label: root.op-is-dir ? "上传此文件夹到…" : "上传此文件到…";
+                    // 弹窗由 Slint 自己 show：Rust 侧只能填数据，无法打开组件内弹层
+                    clicked => { lcm.close(); upmp.show(); root.upload-to(root.op-idx); }
+                }
+                MenuItemBtn {
+                    glyph: "\u{E898}";
+                    label: "上传到当前远程目录";
+                    clicked => { lcm.close(); root.upload-row(root.op-idx); }
+                }
+            }
+        }
+    }
+    // 「上传到…」：在远程里挑一个目标目录
+    upmp := PopupWindow {
+        width: 520px;
+        height: upcard.preferred-height;
+        x: Math.max(0px, (root.width - 520px) / 2);
+        y: 56px;
+        close-policy: PopupClosePolicy.close-on-click-outside;
+        upcard := Rectangle {
+            width: 520px;
+            background: ThemeG.panel;
+            border-radius: ThemeG.radius;
+            border-width: 1px;
+            border-color: ThemeG.border;
+            VerticalLayout {
+                padding: 14px;
+                spacing: 10px;
+                Text {
+                    text: "上传 " + LocalG.up-count + " 项到远程：";
+                    font-size: 13px;
+                    color: ThemeG.text;
+                    overflow: elide;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 30px;
+                    PillBtn { label: "↑ 上级"; compact: true; clicked => { root.upload-to-up(); } }
+                    PillBtn { label: "根目录"; compact: true; clicked => { root.upload-to-root(); } }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                Rectangle {
+                    height: 30px;
+                    background: ThemeG.panel-2;
+                    border-radius: ThemeG.radius-s;
+                    border-width: 1px;
+                    border-color: ThemeG.border;
+                    clip: true;
+                    Text {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        text: "/" + LocalG.up-path;
+                        font-size: 12px;
+                        color: ThemeG.text-dim;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+                Rectangle {
+                    height: 220px;
+                    background: ThemeG.panel-2;
+                    border-radius: ThemeG.radius-s;
+                    border-width: 1px;
+                    border-color: ThemeG.border;
+                    VerticalLayout {
+                        if LocalG.up-dirs.length == 0 : Text {
+                            text: LocalG.up-busy ? "加载中…" : "（没有子文件夹）";
+                            font-size: 12px;
+                            color: ThemeG.text-dim;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        ListView {
+                            for d[i] in LocalG.up-dirs : Rectangle {
+                                height: 30px;
+                                background: upta.has-hover ? ThemeG.hover : transparent;
+                                upta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.upload-to-enter(d.name); }
+                                }
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 8px;
+                                    MdlIcon { glyph: "\u{E8B7}"; font-size: 13px; color: ThemeG.accent; width: 16px; }
+                                    Text {
+                                        text: d.name;
+                                        font-size: 12px;
+                                        color: ThemeG.text;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    PillBtn { label: "取消"; clicked => { upmp.close(); } }
+                    PillBtn {
+                        label: "上传到此处";
+                        primary: true;
+                        disabled: LocalG.up-busy;
+                        clicked => { upmp.close(); root.upload-to-confirm(); }
                     }
                 }
             }
@@ -1171,16 +1640,27 @@ component FilesView inherits Rectangle {
     // 批量下载到本机 / 批量删除（选定后确认）
     callback download-many;
     callback del-many;
-    // 右键菜单 / 弹窗所需的待操作状态
-    property <int> op-idx: -1;
-    property <string> op-name: "";
-    property <bool> op-is-dir: false;
+    /// 右键「下载到当前本地目录」：单行或多选里右键点中的那一项
+    callback download-here;
+    /// 拖拽：远程行 → 本机窗格（载荷串描述拖的是哪几项，Rust 侧解析）
+    pure callback make-transfer(string) -> data-transfer;
+    pure callback accept-local(data-transfer) -> bool;
+    callback drop-local(data-transfer);
+    // 右键菜单 / 弹窗所需的待操作状态（绑定到 FilesG：Rust 侧回调要读 op-idx）
+    property <int> op-idx <=> FilesG.op-idx;
+    property <string> op-name <=> FilesG.op-name;
+    property <bool> op-is-dir <=> FilesG.op-is-dir;
     property <length> menu-ax;
     property <length> menu-ay;
     property <length> dlg-ax;
     property <length> dlg-ay;
     /// 最近一次点击是否按住 shift（多选范围选择用；clicked 不带修饰键）
     property <bool> last-shift: false;
+    // 排序子菜单（空白右键菜单用）
+    property <bool> sub-open: false;
+    property <bool> sub-left: false;
+    /// 排序面板宽度（SortSubmenu 固定 168px，卡片 190px）
+    property <length> sub-w: 168px;
     VerticalLayout {
         padding: 24px;
         spacing: 12px;
@@ -1420,7 +1900,33 @@ component FilesView inherits Rectangle {
                                 background: ThemeG.border;
                                 opacity: 0.5;
                             }
+                            // 拖拽源：远程 → 本机。放最上层，Press 会向下传给 ta（点击照常），
+                            // 只有移动超过 8px 才变成拖拽。
+                            DragArea {
+                                x: 0px;
+                                y: 0px;
+                                width: parent.width;
+                                height: parent.height;
+                                allow-copy: true;
+                                data: root.make-transfer("remote:" + i);
+                            }
                         }
+                    }
+                    // 拖入目标：本机文件拖过来 → 上传到当前远程目录
+                    drop-local := DropArea {
+                        x: 0px;
+                        y: 0px;
+                        width: parent.width;
+                        height: parent.height;
+                        can-drop(event) => { root.accept-local(event.data) ? DragAction.copy : DragAction.none; }
+                        dropped(event) => {
+                            root.drop-local(event.data);
+                            return event.proposed-action;
+                        }
+                    }
+                    if drop-local.has-drag : Rectangle {
+                        background: ThemeG.accent-soft;
+                        opacity: 0.25;
                     }
                     // 列表下方的空白区：右键出「刷新 / 排序 / 上传」菜单。
                     // 放在 ListView 之后（更靠上层）并且只覆盖最后一行以下的部分，
@@ -1434,6 +1940,8 @@ component FilesView inherits Rectangle {
                             if (e.button == PointerEventButton.right && e.kind == PointerEventKind.up) {
                                 root.menu-ax = Math.max(0px, Math.min(self.absolute-position.x + self.mouse-x - root.absolute-position.x, root.width - 200px));
                                 root.menu-ay = Math.min(self.absolute-position.y + self.mouse-y - root.absolute-position.y, 150px);
+                                root.sub-open = false;
+                                root.sub-left = (root.menu-ax + 190px + 168px) > root.width;
                                 bmp.show();
                             }
                         }
@@ -1481,6 +1989,11 @@ component FilesView inherits Rectangle {
             VerticalLayout {
                 padding: 4px;
                 spacing: 2px;
+                MenuItemBtn {
+                    glyph: "\u{E896}";
+                    label: "下载到当前本地目录";
+                    clicked => { ctx.close(); root.download-here(); }
+                }
                 MenuItemBtn {
                     glyph: "\u{E896}";
                     label: "下载到…";
@@ -1693,35 +2206,96 @@ component FilesView inherits Rectangle {
         y: root.menu-ay;
         confirmed => { root.del-row(root.op-idx); }
     }
-    // 空白处右键菜单：刷新 / 排序（名称, 大小）/ 上传
+    // 空白处/表头右键菜单：刷新 / 排序（子菜单：名称、大小、修改时间）/ 上传
+    //
+    // 排序做成子菜单而不是平铺三项，是因为再加「修改时间」后菜单太长。
+    // 子菜单必须落在**同一个 PopupWindow 的矩形内**：另开一个 PopupWindow 时，
+    // 鼠标移到子菜单上就离开了父弹窗的矩形，父弹窗会被 close-on-click-outside
+    // 判为「点在外面」而先关掉（Slint 的 PopupWindow 也没有 Menu 那种父子联动）。
+    // 所以这里让卡片宽度随展开状态变化，子面板用绝对定位贴在右侧或左侧，
+    // 由 `sub-left` 决定方向（右侧放不下就翻到左边）。
     bmp := PopupWindow {
         // 与 ctx 同一个坑：PopupWindow 必须显式给出宽高，否则可点区域塌成窄缝
         width: bmpcard.width;
-        height: bmpcard.preferred-height;
+        height: bmpcard.height;
         x: root.menu-ax;
         y: root.menu-ay;
         close-policy: PopupClosePolicy.close-on-click-outside;
         bmpcard := Rectangle {
-            width: 210px;
-            background: ThemeG.panel;
-            border-radius: ThemeG.radius-s;
-            border-width: 1px;
-            border-color: ThemeG.border;
-            VerticalLayout {
-                padding: 4px;
-                spacing: 2px;
-                MenuItemBtn { glyph: "\u{E72C}"; label: "刷新"; clicked => { bmp.close(); root.refresh(); } }
-                MenuItemBtn {
-                    glyph: FilesG.sort-key == "name" ? "\u{E73E}" : "\u{E8CB}";
-                    label: FilesG.sort-key == "name" ? (FilesG.sort-desc ? "按名称排序（Z→A）" : "按名称排序（A→Z）") : "按名称排序";
-                    clicked => { bmp.close(); root.sort-by("name"); }
+            // 关键：PopupWindow 的可点/可命中矩形由**内容的 layout preferred** 决定
+            // （Slint 的 update_popup_properties 会用 layout 尺寸覆盖窗口尺寸），
+            // 绝对定位撑出去的子面板不会被算进去，于是点在子面板上会被判为
+            // 「点在弹窗外」，只会关掉菜单。所以这里用真实的 HorizontalLayout
+            // 把子面板纳入布局：展开时弹窗宽度真的变成 378。
+            width: root.sub-open ? 378px : 210px;
+            height: 146px;
+            background: transparent;
+            HorizontalLayout {
+                spacing: 0px;
+                // 右侧放不下时子面板翻到左边（布局顺序决定视觉方向）
+                if root.sub-open && root.sub-left : VerticalLayout {
+                    spacing: 0px;
+                    Rectangle { height: 38px; }
+                    SortSubmenu {
+                        key: FilesG.sort-key;
+                        desc: FilesG.sort-desc;
+                        pick(k) => {
+                            bmp.close();
+                            root.sub-open = false;
+                            root.sort-by(k);
+                        }
+                    }
                 }
-                MenuItemBtn {
-                    glyph: FilesG.sort-key == "size" ? "\u{E73E}" : "\u{E8CB}";
-                    label: FilesG.sort-key == "size" ? (FilesG.sort-desc ? "按大小排序（大→小）" : "按大小排序（小→大）") : "按大小排序";
-                    clicked => { bmp.close(); root.sort-by("size"); }
+                Rectangle {
+                    // 菜单卡片所在列（固定 210 宽，卡片只占顶部 108）
+                    width: 210px;
+                    height: 146px;
+                    background: transparent;
+                    Rectangle {
+                        x: 0px;
+                        y: 0px;
+                        width: 210px;
+                        height: 108px;
+                        background: ThemeG.panel;
+                        border-radius: ThemeG.radius-s;
+                        border-width: 1px;
+                        border-color: ThemeG.border;
+                        VerticalLayout {
+                            padding: 4px;
+                            spacing: 2px;
+                            MenuItemBtn {
+                                glyph: "\u{E72C}";
+                                label: "刷新";
+                                clicked => { bmp.close(); root.refresh(); }
+                            }
+                            MenuItemBtn {
+                                glyph: "\u{E8CB}";
+                                label: "排序";
+                                has-submenu: true;
+                                entered => { root.sub-open = true; }
+                                clicked => { root.sub-open = !root.sub-open; }
+                            }
+                            MenuItemBtn {
+                                glyph: "\u{E898}";
+                                label: "上传文件到此处…";
+                                clicked => { bmp.close(); root.upload-pick(); }
+                            }
+                        }
+                    }
                 }
-                MenuItemBtn { glyph: "\u{E898}"; label: "上传文件到此处…"; clicked => { bmp.close(); root.upload-pick(); } }
+                if root.sub-open && !root.sub-left : VerticalLayout {
+                    spacing: 0px;
+                    Rectangle { height: 38px; }
+                    SortSubmenu {
+                        key: FilesG.sort-key;
+                        desc: FilesG.sort-desc;
+                        pick(k) => {
+                            root.sort-by(k);
+                            root.sub-open = false;
+                            bmp.close();
+                        }
+                    }
+                }
             }
         }
     }
@@ -4243,12 +4817,35 @@ export component MainWindow inherits Window {
     callback files-check-row(int, bool);
     callback files-download-many();
     callback files-del-many();
+    /// 右键「下载到当前本地目录」（会话 19）：多选时下整组，否则只下右键点中的那一项
+    callback files-download-here();
+    // 拖拽（会话 19）：载荷只传描述串，真正的项列表在 Rust 侧按勾选状态算
+    pure callback files-make-transfer(string) -> data-transfer;
+    pure callback files-accept-local(data-transfer) -> bool;
+    callback files-drop-local(data-transfer);
     // 本机窗格（文件页双栏的左半）
     callback local-refresh();
     callback local-open(int);
     callback local-up();
     callback local-choose-dir();
     callback local-upload(int);
+    // 本机多选 / 排序（会话 19）
+    callback local-check-row(int, bool);
+    callback local-multi-toggle();
+    callback local-select-all();
+    callback local-select-invert();
+    callback local-upload-many();
+    callback local-sort-by(string);
+    // 本机 → 指定远程目录（「上传到…」）
+    callback local-upload-to(int);
+    callback local-upload-to-list(string);
+    callback local-upload-to-enter(string);
+    callback local-upload-to-up();
+    callback local-upload-to-root();
+    callback local-upload-to-confirm();
+    pure callback local-make-transfer(string) -> data-transfer;
+    pure callback local-accept-remote(data-transfer) -> bool;
+    callback local-drop-remote(data-transfer);
     callback files-crumb-nav(string);
     callback files-crumb-refit(length);
     callback files-download(int);
@@ -4523,6 +5120,21 @@ export component MainWindow inherits Window {
                         go-up => { root.local-up(); }
                         choose-dir => { root.local-choose-dir(); }
                         upload-row(i) => { root.local-upload(i); }
+                        check-row(i, sh) => { root.local-check-row(i, sh); }
+                        multi-toggle => { root.local-multi-toggle(); }
+                        select-all => { root.local-select-all(); }
+                        select-invert => { root.local-select-invert(); }
+                        upload-many => { root.local-upload-many(); }
+                        sort-by(k) => { root.local-sort-by(k); }
+                        upload-to(i) => { root.local-upload-to(i); }
+                        upload-to-list(p) => { root.local-upload-to-list(p); }
+                        upload-to-enter(n) => { root.local-upload-to-enter(n); }
+                        upload-to-up => { root.local-upload-to-up(); }
+                        upload-to-root => { root.local-upload-to-root(); }
+                        upload-to-confirm => { root.local-upload-to-confirm(); }
+                        make-transfer(seed) => { root.local-make-transfer(seed); }
+                        accept-remote(data) => { root.local-accept-remote(data); }
+                        drop-remote(data) => { root.local-drop-remote(data); }
                     }
                     FilesView {
                     horizontal-stretch: 1;
@@ -4550,6 +5162,10 @@ export component MainWindow inherits Window {
                     check-row(i, sh) => { root.files-check-row(i, sh); }
                     download-many => { root.files-download-many(); }
                     del-many => { root.files-del-many(); }
+                    download-here => { root.files-download-here(); }
+                    make-transfer(seed) => { root.files-make-transfer(seed); }
+                    accept-local(data) => { root.files-accept-local(data); }
+                    drop-local(data) => { root.files-drop-local(data); }
                     }
                 }
                 if NavG.idx == 2 : RemotesView {
