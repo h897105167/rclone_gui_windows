@@ -1,7 +1,7 @@
 {
   "id": "onerclone",
   "name": "一键 rclone",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "entry": "main.wasm",
   "description": "搜索 / 检测 / 安装 / 启动本机 rclone（rcd），并按启动参数自动连接",
   "author": "内置",

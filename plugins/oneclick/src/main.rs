@@ -258,9 +258,12 @@ fn on_state(id: u64, rq: &Rq) -> Value {
     if st == "read" {
         let handle = proc_handle(&kv);
         if !handle.is_empty() {
+            // 要进第三轮就必须把 kv 一起带过去：第三轮的 provided 里只有 `proc`，
+            // 这里只 keep meta 的话，`exe_history(&Null)` 会返回空数组，宿主就
+            // 不再渲染路径下拉 —— 表现正是「rclone 在跑时历史不见了」。
             return need(
                 id,
-                keep(json!({ "step": "proc" }), "meta", meta.clone()),
+                keep(keep(json!({ "step": "proc" }), "meta", meta.clone()), "kv", kv),
                 vec![json!({
                     "cap": "proc.status",
                     "key": "proc",
@@ -271,6 +274,7 @@ fn on_state(id: u64, rq: &Rq) -> Value {
         return done(id, state_body(&rq.form, &kv, &meta, &Value::Null));
     }
     let meta = rq.state.get("meta").cloned().unwrap_or(meta);
+    let kv = rq.state.get("kv").cloned().unwrap_or(kv);
     let proc = got(&rq.provided, "proc");
     done(id, state_body(&rq.form, &kv, &meta, &proc))
 }
