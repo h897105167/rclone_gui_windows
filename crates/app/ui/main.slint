@@ -3486,7 +3486,14 @@ component TransfersView inherits Rectangle {
                                         alignment: center;
                                         HorizontalLayout {
                                             spacing: 6px;
-                                    if t.op != "" : TagPill { label: t.op; tint: t.op == "上传" ? ThemeG.ok : ThemeG.accent; }
+                                    // 标签配色：绿=上传、蓝=下载、橙=改名/移动（不搬数据）、红=删除
+                                    if t.op != "" : TagPill {
+                                        label: t.op;
+                                        tint: t.op == "上传" ? ThemeG.ok
+                                            : t.op == "下载" ? ThemeG.accent
+                                            : t.op == "删除" ? ThemeG.err
+                                            : ThemeG.warn;
+                                    }
                                     if t.remote != "" : TagPill {
                                         label: t.remote;
                                         tint: ThemeG.text-dim;

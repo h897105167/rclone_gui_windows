@@ -1313,6 +1313,47 @@ fn match_serve_for_task(
     String::new().into()
 }
 
+/// core/transferred 单项的派生信息（构建后台任务行用）
+struct TItem {
+    name: String,
+    src: String,
+    dst: String,
+    bytes: f64,
+    size: f64,
+    what: String,
+}
+
+/// 由 core/transferred 单项推断任务操作标签。
+///
+/// rclone 的记账约定（v1.76 实测）：
+/// - 真的搬了数据：bytes > 0（上传/下载/复制）；
+/// - 服务端改名或移动：bytes == 0，且 srcFs/dstFs 都有值——两者相同即同一目录改名，不同即移动；
+/// - 删除：what == "deleting"，此时不记 srcFs/dstFs。
+/// 0 字节文件的上传/复制在数据上与改名无法区分，这类不推断标签，避免误标；
+/// 改名/移动还要求两端 fs 非空——旧版 rclone 没有 what 字段时，删除条目只剩空 srcFs/dstFs。
+fn task_op(it: &TItem) -> String {
+    let src_remote = remote_name_of(&it.src);
+    let dst_remote = remote_name_of(&it.dst);
+    if it.what == "deleting" {
+        return "删除".to_string();
+    }
+    if it.bytes == 0.0 && it.size > 0.0 && !it.src.is_empty() && !it.dst.is_empty() {
+        if it.src == it.dst {
+            return "重命名".to_string();
+        }
+        if src_remote.is_some() && dst_remote.is_some() {
+            return "移动".to_string();
+        }
+    }
+    if dst_remote.is_some() && src_remote.is_none() {
+        return "上传".to_string();
+    }
+    if src_remote.is_some() && dst_remote.is_none() {
+        return "下载".to_string();
+    }
+    String::new()
+}
+
 /// 构建「后台任务」列表（job/list + job/status + core/transferred 关联推导）
 async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let client = ctx.rc.client().await;
@@ -1329,8 +1370,7 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     // job_list 返回全部 id 的 JSON 响应本身就很大，job_status 还会嵌套历史 job 输出，导致内存暴涨。
     // 改为完全不用 job_list/job_status：core/transferred 返回实际传输文件（group=job/xxx），
     // core/stats.transferring 提供运行中速度，两者结合即可构建任务列表。
-    let mut tmap: std::collections::HashMap<String, (String, String, String, f64)> =
-        std::collections::HashMap::new();
+    let mut tmap: std::collections::HashMap<String, TItem> = std::collections::HashMap::new();
     if let Ok(v) = client.core_transferred().await {
         let arr = v
             .get("transferred")
@@ -1343,7 +1383,19 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             let src = it.get("srcFs").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let dst = it.get("dstFs").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let bytes = it.get("bytes").and_then(|x| x.as_f64()).unwrap_or(0.0);
-            tmap.insert(group, (name, src, dst, bytes));
+            let size = it.get("size").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let what = it.get("what").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            tmap.insert(
+                group,
+                TItem {
+                    name,
+                    src,
+                    dst,
+                    bytes,
+                    size,
+                    what,
+                },
+            );
         }
     }
 
@@ -1377,26 +1429,19 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let serves = ctx.serves_cache.lock().unwrap().clone();
     let mut rows: Vec<TaskRow> = Vec::new();
     // 从 core/transferred 构建任务列表（只包含实际传输的文件，不含内部操作 job）
-    for (group, (fname, src, dst, bytes)) in &tmap {
+    for (group, it) in &tmap {
         // group 格式: "job/12345"，提取数字 id
         let id = group
             .strip_prefix("job/")
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0) as i32;
 
-        let src_remote = remote_name_of(&src);
-        let dst_remote = remote_name_of(&dst);
-        let (op, remote) = if dst_remote.is_some() && src_remote.is_none() {
-            ("上传".to_string(), dst_remote.unwrap())
-        } else if src_remote.is_some() && dst_remote.is_none() {
-            ("下载".to_string(), src_remote.unwrap())
-        } else if let Some(r) = dst_remote.or(src_remote) {
-            (String::new(), r)
-        } else {
-            (String::new(), String::new())
-        };
+        let op = task_op(it);
+        let remote = remote_name_of(&it.dst)
+            .or_else(|| remote_name_of(&it.src))
+            .unwrap_or_default();
 
-        let svc = match_serve_for_task(&serves, &src, &dst);
+        let svc = match_serve_for_task(&serves, &it.src, &it.dst);
 
         let running = rmap.contains_key(group);
         if hide && !running {
@@ -1405,7 +1450,7 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         let status = if running { "运行中" } else { "已完成" }.to_string();
         let speed = if running {
             rmap.get(group).map(|v| fmt_speed(*v)).unwrap_or_else(|| "—".into())
-        } else if *bytes > 0.0 {
+        } else if it.bytes > 0.0 {
             // 无 duration 信息，无法计算历史速度
             "—".into()
         } else {
@@ -1415,7 +1460,7 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             id,
             op: op.into(),
             remote: remote.into(),
-            path: fname.clone().into(),
+            path: it.name.clone().into(),
             svc: svc.into(),
             status: status.into(),
             duration: "—".into(),
