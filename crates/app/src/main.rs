@@ -271,6 +271,8 @@ struct Ctx {
     usage_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// 本机 rclone 盘符探测（实例不匹配提示用，带节流）
     drives: Arc<state::DriveProbe>,
+    /// GUI 自己发起的「移动 / 重命名」登记（core/transferred 分不清这两者，见 `OpHints`）
+    op_hints: Arc<std::sync::Mutex<OpHints>>,
 }
 
 /// 运行中的内嵌 HTTP 服务句柄
@@ -1313,6 +1315,72 @@ fn match_serve_for_task(
     String::new().into()
 }
 
+/// GUI 自己发起的「移动 / 重命名」登记。
+///
+/// 为什么需要登记：`core/transferred` 只给出 srcFs/dstFs 两个 fs 串，
+/// - 文件级 `operations/movefile` 两侧传的是同一个 root（`testlocal:`），
+///   于是「同目录改名」与「换目录移动」在记账上完全同形（srcFs == dstFs）；
+/// - 目录级 `sync/move` 若走服务端 DirMove，一条都不记；逐文件搬时才记，
+///   此时 srcFs 是源目录（`testlocal:dirA`），与文件级形状又不一样。
+/// 光看记账猜不出，就由发起的一侧把真实操作记下来，构建列表时优先采用。
+#[derive(Default, Clone)]
+struct OpHints {
+    /// (fs, 相对路径, 标签, 登记时刻)
+    items: std::collections::VecDeque<(String, String, String, std::time::Instant)>,
+}
+
+impl OpHints {
+    /// 登记一次操作：`fs` 是 RC 调用里用的 fs 串（`remote:`），`path` 是相对它的路径。
+    fn put(&mut self, fs: &str, path: &str, kind: &str) {
+        // 只用来给最近的操作贴标签，过期即弃，避免旧登记误标后来的同名路径
+        const TTL: std::time::Duration = std::time::Duration::from_secs(900);
+        self.items.retain(|(_, _, _, t)| t.elapsed() < TTL);
+        self.items.push_back((
+            fs.to_string(),
+            path.to_string(),
+            kind.to_string(),
+            std::time::Instant::now(),
+        ));
+        while self.items.len() > 256 {
+            self.items.pop_front();
+        }
+    }
+
+    /// 按记账条目反查：`src_fs` / `name` 取自 core/transferred。
+    ///
+    /// 记账里的 srcFs 有两种形态，都要能对上：
+    /// - 远程名：`testlocal:dirA`（真正的远程后端）；
+    /// - 后端解析后的本机路径：`//?/D:/.../dirA`（alias / local 这类 remote 会被解析，实测如此）。
+    /// Windows 路径大小写不敏感，统一按「正斜杠 + 小写」比较。
+    fn lookup(&self, src_fs: &str, name: &str) -> Option<&str> {
+        let low = |s: &str| s.replace('\\', "/").to_lowercase();
+        let src = low(src_fs);
+        let name_low = low(name);
+        let joined = format!("{}/{}", src.trim_end_matches('/'), name_low);
+        self.items
+            .iter()
+            .rev()
+            .find(|(fs, path, _, _)| {
+                let fs_low = low(fs);
+                let path_low = low(path);
+                let path_low = path_low.trim_end_matches('/');
+                // 文件级：srcFs 就是登记的 fs，name 落在登记路径之下
+                if src == fs_low
+                    && (name_low == path_low || name_low.starts_with(&format!("{path_low}/")))
+                {
+                    return true;
+                }
+                // 目录级：srcFs == fs + path（逐文件搬时以源目录为 fs）
+                if src == format!("{fs_low}{path_low}") || joined == format!("{fs_low}{path_low}") {
+                    return true;
+                }
+                // 解析成本机路径的形态：只比对路径尾巴（`.../dirA`、`.../dirA/x.txt`）
+                src.ends_with(&format!("/{path_low}")) || joined.ends_with(&format!("/{path_low}"))
+            })
+            .map(|(_, _, kind, _)| kind.as_str())
+    }
+}
+
 /// core/transferred 单项的派生信息（构建后台任务行用）
 struct TItem {
     name: String,
@@ -1331,11 +1399,19 @@ struct TItem {
 /// - 删除：what == "deleting"，此时不记 srcFs/dstFs。
 /// 0 字节文件的上传/复制在数据上与改名无法区分，这类不推断标签，避免误标；
 /// 改名/移动还要求两端 fs 非空——旧版 rclone 没有 what 字段时，删除条目只剩空 srcFs/dstFs。
-fn task_op(it: &TItem) -> String {
+///
+/// `hint` 是 GUI 自己发起时登记的标签（见 [`OpHints`]）：同一 root 下的改名与换目录移动
+/// 在记账里同形，只有发起方知道到底是哪一种，所以 bytes == 0 时优先照登记来。
+fn task_op(it: &TItem, hint: Option<&str>) -> String {
     let src_remote = remote_name_of(&it.src);
     let dst_remote = remote_name_of(&it.dst);
     if it.what == "deleting" {
         return "删除".to_string();
+    }
+    if it.bytes == 0.0 {
+        if let Some(kind) = hint {
+            return kind.to_string();
+        }
     }
     if it.bytes == 0.0 && it.size > 0.0 && !it.src.is_empty() && !it.dst.is_empty() {
         if it.src == it.dst {
@@ -1427,6 +1503,8 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     }
 
     let serves = ctx.serves_cache.lock().unwrap().clone();
+    // GUI 自己发起的移动/改名登记：记账分辨不出这两者，能对上就照登记贴标签
+    let hints = ctx.op_hints.lock().unwrap().clone();
     let mut rows: Vec<TaskRow> = Vec::new();
     // 从 core/transferred 构建任务列表（只包含实际传输的文件，不含内部操作 job）
     for (group, it) in &tmap {
@@ -1436,7 +1514,7 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0) as i32;
 
-        let op = task_op(it);
+        let op = task_op(it, hints.lookup(&it.src, &it.name));
         let remote = remote_name_of(&it.dst)
             .or_else(|| remote_name_of(&it.src))
             .unwrap_or_default();
@@ -2268,6 +2346,7 @@ fn main() {
         hub: Arc::new(state::Hub::new()),
         usage_at: Arc::new(std::sync::Mutex::new(None)),
         drives: Arc::new(state::DriveProbe::default()),
+        op_hints: Arc::new(std::sync::Mutex::new(OpHints::default())),
     });
 
     {
@@ -4527,6 +4606,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let ui2 = ui.clone();
                 let src_fs = format!("{remote}:{src}");
                 let dst_fs = format!("{remote}:{dst}");
+                // 先登记再动手：core/transferred 分不清目录改名与目录移动（见 OpHints）
+                ctx.op_hints.lock().unwrap().put(&fs, &src, "移动");
                 // 用「独立线程 + current_thread runtime」而不是 tokio::spawn：
                 // 目录移动完成后要复用 `handle_cmd` 刷新列表，而它整体不是 Send。
                 std::thread::spawn(move || {
@@ -4558,6 +4639,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 });
                 return false;
             }
+            // 先登记再动手：同一 root 下的改名与移动在记账里同形（见 OpHints）
+            ctx.op_hints.lock().unwrap().put(&fs, &src, "移动");
             // 文件移动通常很快，直接等待，失败可立即提示
             let res = tokio::time::timeout(
                 std::time::Duration::from_secs(120),
@@ -4665,6 +4748,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let ui2 = ui.clone();
                 let src_fs = format!("{remote}:{}", join_path(&path, &from));
                 let dst_fs = format!("{remote}:{}", join_path(&path, &to));
+                // 先登记再动手：core/transferred 分不清目录改名与目录移动（见 OpHints）
+                ctx.op_hints
+                    .lock()
+                    .unwrap()
+                    .put(&fs, &join_path(&path, &from), "重命名");
                 // 与目录移动同样的理由：可能很久，放后台线程，
                 // 用 current_thread runtime 复用 `handle_cmd`（它不是 Send）。
                 std::thread::spawn(move || {
@@ -4699,6 +4787,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 });
                 return false;
             }
+            // 先登记再动手：同一 root 下的改名与移动在记账里同形（见 OpHints）
+            ctx.op_hints
+                .lock()
+                .unwrap()
+                .put(&fs, &join_path(&path, &from), "重命名");
             let res = client
                 .movefile(&fs, &join_path(&path, &from), &fs, &join_path(&path, &to))
                 .await;
