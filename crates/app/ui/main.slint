@@ -392,6 +392,28 @@ export global PluginsG {
     in-out property <string> trash-dir: "";
     in-out property <[TokenRow]> tokens: [];
     in-out property <[ImageRow]> images: [];
+    // ---------------- 图床面板（上传 → 直链 → 短链）----------------
+    // 这些字段与 imagehost 插件的 roots/tokens 同屏，但配置由 Rust 侧存 kv
+    // （插件只管存储根/命名/令牌，直链与短链需要 rclone CLI + 外部 HTTP）。
+    in-out property <[string]> bed-remotes: [];
+    in-out property <int> bed-remote-idx: -1;
+    in-out property <string> bed-path: "";
+    in-out property <string> bed-upload-path: "";
+    in-out property <string> bed-link: "";
+    in-out property <string> bed-short: "";
+    in-out property <bool> bed-busy: false;
+    // 短链模板（0 = 不选择；不选择时只出直链）
+    in-out property <[string]> bed-templates: ["不选择", "模板一"];
+    in-out property <int> bed-tpl-idx: 0;
+    // 短链模板一
+    in-out property <[string]> bed-formats: ["无", "JSON", "JSONP"];
+    in-out property <int> bed-fmt-idx: 0;
+    in-out property <string> bed-callback: "callback";
+    in-out property <string> bed-short-url: "";
+    in-out property <[string]> bed-methods: ["GET", "POST"];
+    in-out property <int> bed-method-idx: 0;
+    in-out property <string> bed-rate: "4";
+    in-out property <string> bed-key: "";
 
     // ---------------- 通用插件设置面板 ----------------
     // 面板内容完全由插件 config.json 的 plugin_setting 决定：Slint 侧不认识任何
@@ -3548,6 +3570,13 @@ component PluginsView inherits Rectangle {
     callback revoke-token(int);
     callback copy-token(string);
     callback images-refresh;
+    // ---- 图床工具（上传 → 直链 → 短链）：配置与动作都在宿主 Rust 侧 ----
+    callback bed-save;
+    callback bed-pick;
+    callback bed-run;
+    callback bed-refresh-remotes;
+    callback bed-make-short;
+    callback bed-copy(string);
     callback image-del(int);
     callback copy-url(int);
     callback plugin-toggle(int);
@@ -4153,6 +4182,114 @@ component PluginsView inherits Rectangle {
                                     PillBtn { label: "＋ 添加根（默认第一个远程）"; clicked => { root.add-root(); } }
                                     Rectangle {}
                                     PillBtn { label: "保存图床配置"; primary: true; clicked => { root.save-config(); } }
+                                }
+                            }
+                            // 图床工具：上传 → 直链 → 短链
+                            //
+                            // 与下面几块的分工：存储根/命名/令牌是 imagehost 插件的配置；
+                            // 这一块是「拿一张图换一条能贴出去的链接」的操作台，
+                            // 配置存在 Rust 侧 kv（imagehost/bed），上传走 rclone copyfile。
+                            VerticalLayout {
+                                spacing: 8px;
+                                Text { text: "图床工具（上传 → 直链 → 短链）"; font-size: 12px; font-weight: 600; color: ThemeG.text-dim; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    height: 32px;
+                                    FieldLabel { text: "存储的远程"; width: 80px; vertical-alignment: center; }
+                                    ComboBox {
+                                        width: 200px;
+                                        model: PluginsG.bed-remotes;
+                                        current-index <=> PluginsG.bed-remote-idx;
+                                    }
+                                    PillBtn { label: "刷新远程"; compact: true; clicked => { root.bed-refresh-remotes(); } }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    height: 32px;
+                                    FieldLabel { text: "路径"; width: 80px; vertical-alignment: center; }
+                                    LineEdit { text <=> PluginsG.bed-path; enabled: PluginsG.bed-remote-idx >= 0; placeholder-text: "如 img，留空 = 远程根"; }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    height: 32px;
+                                    FieldLabel { text: "上传图片路径"; width: 80px; vertical-alignment: center; }
+                                    LineEdit { text <=> PluginsG.bed-upload-path; placeholder-text: "本机图片文件的完整路径"; }
+                                    PillBtn { label: "选择文件…"; compact: true; clicked => { root.bed-pick(); } }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    height: 32px;
+                                    FieldLabel { text: "短链模板"; width: 80px; vertical-alignment: center; }
+                                    ComboBox { width: 160px; model: PluginsG.bed-templates; current-index <=> PluginsG.bed-tpl-idx; }
+                                    Text { text: "选「模板一」才会在上传后用直链换短链"; font-size: 11px; color: ThemeG.text-dim; vertical-alignment: center; }
+                                }
+                                // 短链模板一：只有选了模板一才展开
+                                if PluginsG.bed-tpl-idx == 1 : Rectangle {
+                                    background: ThemeG.panel-2;
+                                    border-radius: ThemeG.radius-s;
+                                    VerticalLayout {
+                                        padding: 10px;
+                                        spacing: 8px;
+                                        Text { text: "短链模板一"; font-size: 12px; font-weight: 600; color: ThemeG.text-dim; }
+                                        // 两行拆开：单行放四个控件在窄窗口下会溢出被裁
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            height: 32px;
+                                            FieldLabel { text: "输出格式"; width: 60px; vertical-alignment: center; }
+                                            ComboBox { width: 110px; model: PluginsG.bed-formats; current-index <=> PluginsG.bed-fmt-idx; }
+                                            FieldLabel { text: "回调函数"; width: 60px; vertical-alignment: center; }
+                                            LineEdit { text <=> PluginsG.bed-callback; placeholder-text: "callback"; }
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            height: 32px;
+                                            FieldLabel { text: "请求方式"; width: 60px; vertical-alignment: center; }
+                                            ComboBox { width: 90px; model: PluginsG.bed-methods; current-index <=> PluginsG.bed-method-idx; }
+                                            FieldLabel { text: "频率/秒"; width: 50px; vertical-alignment: center; }
+                                            LineEdit { width: 60px; text <=> PluginsG.bed-rate; placeholder-text: "4"; }
+                                            Rectangle {}
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            height: 32px;
+                                            FieldLabel { text: "请求地址"; width: 60px; vertical-alignment: center; }
+                                            LineEdit { text <=> PluginsG.bed-short-url; placeholder-text: "http://api.ft12.com/api.php"; }
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            height: 32px;
+                                            FieldLabel { text: "api_key"; width: 60px; vertical-alignment: center; }
+                                            LineEdit { text <=> PluginsG.bed-key; placeholder-text: "短链服务返回的 key"; }
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            Rectangle {}
+                                            PillBtn { label: "保存配置"; compact: true; clicked => { root.bed-save(); } }
+                                            PillBtn { label: "生成短链"; compact: true; clicked => { root.bed-make-short(); } }
+                                            PillBtn { label: "复制短链"; compact: true; clicked => { root.bed-copy(PluginsG.bed-short); } }
+                                        }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    PillBtn {
+                                        label: PluginsG.bed-busy ? "生成中…" : "生成直链";
+                                        primary: true;
+                                        disabled: PluginsG.bed-busy;
+                                        clicked => { root.bed-run(); }
+                                    }
+                                    Rectangle {}
+                                    PillBtn { label: "复制直链"; compact: true; clicked => { root.bed-copy(PluginsG.bed-link); } }
+                                }
+                                if PluginsG.bed-link != "" : VerticalLayout {
+                                    spacing: 4px;
+                                    Text { text: "直链"; font-size: 11px; color: ThemeG.text-dim; }
+                                    LineEdit { text: PluginsG.bed-link; read-only: true; }
+                                }
+                                if PluginsG.bed-short != "" : VerticalLayout {
+                                    spacing: 4px;
+                                    Text { text: "短链"; font-size: 11px; color: ThemeG.text-dim; }
+                                    LineEdit { text: PluginsG.bed-short; read-only: true; }
                                 }
                             }
                             // 命名与去重
@@ -4970,6 +5107,12 @@ export component MainWindow inherits Window {
     callback ih-revoke-token(int);
     callback ih-images-refresh();
     callback ih-image-del(int);
+    // 图床面板
+    callback bed-save();
+    callback bed-pick();
+    callback bed-run();
+    callback bed-refresh-remotes();
+    callback bed-make-short();
     callback ih-copy-url(int);
     callback copy-text(string);
     callback settings-save();
@@ -5293,6 +5436,13 @@ export component MainWindow inherits Window {
                     revoke-token(i) => { root.ih-revoke-token(i); }
                     copy-token(t) => { root.copy-text(t); }
                     images-refresh => { root.ih-images-refresh(); }
+                    // 图床工具
+                    bed-save => { root.bed-save(); }
+                    bed-pick => { root.bed-pick(); }
+                    bed-run => { root.bed-run(); }
+                    bed-refresh-remotes => { root.bed-refresh-remotes(); }
+                    bed-make-short => { root.bed-make-short(); }
+                    bed-copy(s) => { root.copy-text(s); }
                     image-del(i) => { root.ih-image-del(i); }
                     copy-url(i) => { root.ih-copy-url(i); }
                     plugin-toggle(i) => { root.plugin-toggle(i); }

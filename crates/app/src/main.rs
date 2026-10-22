@@ -5,6 +5,7 @@
 //! 架构：主线程跑 Slint UI；后台 std 线程内 tokio runtime 负责
 //! rclone 生命周期 / 内嵌 HTTP / 统计轮询 / UI 命令处理；托盘独立线程。
 
+mod bed;
 mod caps;
 mod config;
 mod conf_io;
@@ -180,6 +181,14 @@ enum Cmd {
     IhRevokeToken { id: String },
     IhImagesRefresh,
     IhImageDel { path: String },
+    // ---- 图床面板（上传 → 直链 → 短链）----
+    BedSave,
+    BedRun,
+    BedPick,
+    BedRefreshRemotes,
+    BedMakeShort {
+        direct: String,
+    },
     CopyText { text: String },
     SettingsSave,
     SettingsTest,
@@ -7201,6 +7210,72 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             }
             false
         }
+        // ---------------- 图床面板：上传 → 直链 → 短链 ----------------
+        Cmd::BedSave => {
+            let cfg = read_bed_cfg(ui).await;
+            bed_save_stored(ctx, &cfg);
+            toast(ui, 1, "图床面板配置已保存");
+            false
+        }
+        Cmd::BedPick => {
+            let start = bed_load_stored(ctx).upload_path;
+            let mut d = rfd::FileDialog::new()
+                .set_title("选择要上传的图片")
+                .add_filter("图片", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"])
+                .add_filter("所有文件", &["*"]);
+            if let Some(dir) = Path::new(&start).parent() {
+                if dir.is_dir() {
+                    d = d.set_directory(dir);
+                }
+            }
+            if let Some(p) = d.pick_file() {
+                let s = p.display().to_string();
+                let mut cfg = bed_load_stored(ctx);
+                cfg.upload_path = s.clone();
+                bed_save_stored(ctx, &cfg);
+                let _ = ui.upgrade_in_event_loop(move |ui| {
+                    ui.global::<PluginsG>().set_bed_upload_path(s.as_str().into())
+                });
+            }
+            false
+        }
+        Cmd::BedRefreshRemotes => {
+            // Slint 侧的 model 是 [string]（SharedString），这里顺手转换
+            let remotes: Vec<slint::SharedString> = ctx
+                .rc
+                .client()
+                .await
+                .list_remotes()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(slint::SharedString::from)
+                .collect();
+            let empty = remotes.is_empty();
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                let g = ui.global::<PluginsG>();
+                let cur = g.get_bed_remote_idx();
+                g.set_bed_remotes(ModelRc::from(Rc::new(VecModel::from(remotes))));
+                // 之前没有选中项时补一个 0，避免下拉框显示空白
+                if cur < 0 && !empty {
+                    g.set_bed_remote_idx(0);
+                }
+            });
+            false
+        }
+        Cmd::BedRun => {
+            bed_run(ctx, ui).await;
+            false
+        }
+        Cmd::BedMakeShort { direct } => {
+            let cfg = read_bed_cfg(ui).await;
+            if cfg.short_url.trim().is_empty() {
+                toast(ui, 2, "请先填写短链请求地址（模板一）");
+            } else {
+                bed_make_short(ctx, ui, &cfg, &direct).await;
+            }
+            false
+        }
         // ---------------- 插件通用面板 / 卸载 ----------------
         Cmd::PluginPanelOpen { idx } => {
             let row = read_ui(ui, move |ui| {
@@ -7961,6 +8036,247 @@ async fn load_ih_config(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             g.set_tokens(ModelRc::from(Rc::new(VecModel::from(toks))));
         },
     );
+    // 图床面板与插件配置同屏：一起加载，避免展开面板时字段先空一帧
+    load_bed(ctx, ui).await;
+}
+
+// ---------------------------------------------------------------- 图床面板
+
+/// 面板输入 → 配置结构体。
+///
+/// 远程取下拉框当前项（`bed-remotes`），不直接读文本：下拉框是唯一来源，
+/// 用户手改路径不会让 remote 变成未整理过的字符串。
+async fn read_bed_cfg(ui: &Weak<MainWindow>) -> bed::BedCfg {
+    read_ui(ui, |ui| {
+        let g = ui.global::<PluginsG>();
+        let idx = g.get_bed_remote_idx();
+        let remote = if idx >= 0 {
+            g.get_bed_remotes()
+                .row_data(idx as usize)
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let rate = g
+            .get_bed_rate()
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|r| *r > 0)
+            .unwrap_or(4);
+        bed::BedCfg {
+            remote,
+            path: g.get_bed_path().to_string(),
+            upload_path: g.get_bed_upload_path().to_string(),
+            short_tpl: g.get_bed_tpl_idx().max(0) as usize,
+            short_fmt: g.get_bed_fmt_idx().max(0) as usize,
+            short_callback: g.get_bed_callback().to_string(),
+            short_url: g.get_bed_short_url().to_string(),
+            short_method: g.get_bed_method_idx().max(0) as usize,
+            short_rate: rate,
+            short_key: g.get_bed_key().to_string(),
+            last_link: g.get_bed_link().to_string(),
+            last_short: g.get_bed_short().to_string(),
+        }
+    })
+    .await
+    .unwrap_or_default()
+}
+
+fn bed_load_stored(ctx: &Arc<Ctx>) -> bed::BedCfg {
+    let raw = ctx.store.get_all(bed::NS);
+    raw.get(bed::KEY)
+        .and_then(|v| serde_json::from_value::<bed::BedCfg>(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+fn bed_save_stored(ctx: &Arc<Ctx>, cfg: &bed::BedCfg) {
+    match serde_json::to_value(cfg) {
+        Ok(v) => {
+            if let Err(e) = ctx.store.set(bed::NS, bed::KEY, v) {
+                eprintln!("保存图床面板配置失败: {e:#}");
+            }
+        }
+        Err(e) => eprintln!("图床面板配置序列化失败: {e}"),
+    }
+}
+
+/// 把已保存的配置铺回面板（打开插件面板时调用）。
+async fn load_bed(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    let cfg = bed_load_stored(ctx);
+    let mut remotes = ctx.rc.client().await.list_remotes().await.unwrap_or_default();
+    // RC 不在线时列表会空：把已保存的远程补进去，否则用户看到的是一条空下拉框
+    if !cfg.remote.is_empty() && !remotes.iter().any(|r| r == &cfg.remote) {
+        remotes.insert(0, cfg.remote.clone());
+    }
+    let idx = remotes
+        .iter()
+        .position(|r| r == &cfg.remote)
+        .map(|i| i as i32)
+        .unwrap_or(if remotes.is_empty() { -1 } else { 0 });
+    let remotes: Vec<slint::SharedString> = remotes.into_iter().map(slint::SharedString::from).collect();
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let g = ui.global::<PluginsG>();
+        g.set_bed_remotes(ModelRc::from(Rc::new(VecModel::from(remotes))));
+        g.set_bed_remote_idx(idx);
+        g.set_bed_path(cfg.path.as_str().into());
+        g.set_bed_upload_path(cfg.upload_path.as_str().into());
+        g.set_bed_tpl_idx(cfg.short_tpl.clamp(0, bed::TEMPLATES.len() - 1) as i32);
+        g.set_bed_fmt_idx(cfg.short_fmt.clamp(0, bed::FORMATS.len() - 1) as i32);
+        g.set_bed_callback(cfg.short_callback.as_str().into());
+        g.set_bed_short_url(cfg.short_url.as_str().into());
+        g.set_bed_method_idx(cfg.short_method.clamp(0, bed::METHODS.len() - 1) as i32);
+        g.set_bed_rate(cfg.short_rate.to_string().as_str().into());
+        g.set_bed_key(cfg.short_key.as_str().into());
+        g.set_bed_link(cfg.last_link.as_str().into());
+        g.set_bed_short(cfg.last_short.as_str().into());
+    });
+}
+
+/// 本机代理直链（兜底）：`http://127.0.0.1:<port>/i/<root>/<path>`。
+///
+/// 需要 imagehost 插件里配过同名存储根；没配就没有这条退路（返回空串）。
+fn bed_proxy_url(ctx: &Arc<Ctx>, remote: &str, stored: &str) -> String {
+    let cfg_raw = ctx.store.get_all("imagehost");
+    let cfg = cfg_raw.get("config").cloned().unwrap_or(json!({}));
+    let roots = cfg
+        .get("roots")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let rid = roots
+        .iter()
+        .find(|r| {
+            r.get("remote")
+                .and_then(|x| x.as_str())
+                .map(|x| x.trim_end_matches(':'))
+                == Some(remote.trim())
+        })
+        .and_then(|r| r.get("id").and_then(|x| x.as_str()).map(|s| s.to_string()));
+    match rid {
+        Some(rid) => {
+            let port = ctx.cfg.lock().unwrap().http.port;
+            format!("http://127.0.0.1:{port}/i/{rid}/{stored}")
+        }
+        None => String::new(),
+    }
+}
+
+/// 一次「上传 → 直链 →（可选）短链」。任何一步失败都把原因 toast 出来，不静默。
+async fn bed_run(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    let mut cfg = read_bed_cfg(ui).await;
+    cfg.remote = cfg.remote.trim().trim_end_matches(':').to_string();
+    if cfg.remote.is_empty() {
+        toast(ui, 2, "请先选择存储的远程");
+        return;
+    }
+    let local = cfg.upload_path.trim().to_string();
+    if local.is_empty() {
+        toast(ui, 2, "请先填写上传图片路径（或点「选择文件…」）");
+        return;
+    }
+    let src = PathBuf::from(&local);
+    if !src.is_file() {
+        toast(ui, 2, format!("上传图片路径不是文件：{local}"));
+        return;
+    }
+    let name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if name.is_empty() {
+        toast(ui, 2, "无法从上传图片路径里取出文件名");
+        return;
+    }
+
+    let _ = ui.upgrade_in_event_loop(|ui| ui.global::<PluginsG>().set_bed_busy(true));
+    let client = ctx.rc.client().await;
+    let dir = cfg.path.trim().trim_matches('/').to_string();
+    let fs = format!("{}:", cfg.remote);
+    let dst_fs = if dir.is_empty() {
+        fs.clone()
+    } else {
+        format!("{fs}{dir}")
+    };
+
+    // 同名一律改名（与文件页上传一致）：静默覆盖不是安全默认
+    let existing: Vec<String> = client
+        .list(&fs, &dir, None)
+        .await
+        .map(|v| v.into_iter().map(|e| e.name).collect())
+        .unwrap_or_default();
+    let dest_name = unique_file_name(&name, &existing);
+    let src_fs = local_fs(src.parent().unwrap_or(Path::new(".")));
+    let uploaded = client.copyfile(&src_fs, &name, &dst_fs, &dest_name).await;
+    if let Err(e) = uploaded {
+        let _ = ui.upgrade_in_event_loop(|ui| ui.global::<PluginsG>().set_bed_busy(false));
+        toast(ui, 2, format!("上传失败: {e}"));
+        return;
+    }
+
+    let stored = bed::join_stored(&dir, &dest_name);
+    // 直链：按远程类型自动识别（rclone link → AList API → 本机代理）
+    let cli = bed::RcloneCli::discover(&client).await;
+    let info = bed::remote_info(&client, &cfg.remote)
+        .await
+        .unwrap_or(bed::RemoteInfo {
+            kind: String::new(),
+            url: String::new(),
+            user: String::new(),
+            pass: String::new(),
+        });
+    let proxy = bed_proxy_url(ctx, &cfg.remote, &stored);
+    let mount = bed::mount_path(&cfg.remote, &stored);
+    let linked = bed::resolve_link(cli.as_ref(), &info, &mount, &stored, &proxy).await;
+
+    match linked {
+        Ok((url, source)) => {
+            cfg.last_link = url.clone();
+            bed_save_stored(ctx, &cfg);
+            let show = url.clone();
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                ui.global::<PluginsG>().set_bed_link(show.as_str().into())
+            });
+            toast(
+                ui,
+                1,
+                format!(
+                    "已上传 {stored}，直链来源：{}（{}）",
+                    source.label(),
+                    source.note()
+                ),
+            );
+            // 选了「模板一」才换短链；换失败就只留直链（用户要求：获取失败就用直链）
+            if cfg.short_tpl == 1 {
+                bed_make_short(ctx, ui, &cfg, &url).await;
+            }
+        }
+        Err(e) => toast(ui, 2, format!("已上传 {stored}，但拿直链失败：{e:#}")),
+    }
+    let _ = ui.upgrade_in_event_loop(|ui| ui.global::<PluginsG>().set_bed_busy(false));
+}
+
+/// 生成短链：先按「请求频率」排队，再发一次请求。
+async fn bed_make_short(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cfg: &bed::BedCfg, direct: &str) {
+    let wait = bed::take_slot(cfg.short_rate);
+    if wait > std::time::Duration::ZERO {
+        tokio::time::sleep(wait).await;
+    }
+    match bed::request_short(cfg, direct).await {
+        Ok(short) => {
+            let mut c = cfg.clone();
+            c.last_short = short.clone();
+            c.last_link = direct.to_string();
+            bed_save_stored(ctx, &c);
+            let show = short.clone();
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                ui.global::<PluginsG>().set_bed_short(show.as_str().into())
+            });
+            toast(ui, 1, format!("短链已生成（{} / {}）：{short}", cfg.fmt_name(), cfg.method_name()));
+        }
+        Err(e) => toast(ui, 2, format!("短链生成失败：{e:#}")),
+    }
 }
 
 async fn ih_save_config(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
@@ -9099,6 +9415,45 @@ fn wire_callbacks(
                 clipboard_copy(&url);
                 let _ = tx.send(Cmd::CopyText { text: url });
             }
+        }
+    });
+    // ---- 图床面板（上传 → 直链 → 短链）----
+    ui.on_bed_save({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::BedSave);
+        }
+    });
+    ui.on_bed_pick({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::BedPick);
+        }
+    });
+    ui.on_bed_run({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::BedRun);
+        }
+    });
+    ui.on_bed_refresh_remotes({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::BedRefreshRemotes);
+        }
+    });
+    ui.on_bed_make_short({
+        // 已有直链、只补一条短链：直接把 UI 上的直链交给队列
+        let tx = tx.clone();
+        let ui2 = ui.as_weak();
+        move || {
+            let Some(ui2) = ui2.upgrade() else { return };
+            let g = ui2.global::<PluginsG>();
+            let direct = g.get_bed_link().to_string();
+            if direct.trim().is_empty() {
+                return;
+            }
+            let _ = tx.send(Cmd::BedMakeShort { direct });
         }
     });
     ui.on_copy_text(move |text| {
