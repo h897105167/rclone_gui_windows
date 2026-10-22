@@ -76,3 +76,42 @@
 
 > 排除的误报：代理配置的「删除确认」不是弹层，而是页面内联的一块，滚一下就能看到按钮 ——
 > 不算缺陷，但**位置偏低**，仍建议后续改成锚定式弹窗。
+
+## 五、截不到图时的排查顺序（会话 20 实测）
+
+症状：进程活着、`IsWindowVisible = true`、`SendMessageTimeout(WM_NULL)` 有响应、CPU/句柄都正常，
+但 `CaptureWindow` 抓到的永远是桌面或别的东西，`CapturePrint`（PrintWindow）全黑。
+
+按这个顺序排，基本一次能定位：
+
+1. **窗口是不是从来没被 Slint 画过**。`%APPDATA%\RCGUI\config.json` 里 `silent_start: true` 时，
+   `crates/app/src/main.rs` 的启动分支直接跳过 `ui.show()`，Slint 永远不出第一帧 ——
+   此时 `ShowWindow(SW_SHOW/SW_RESTORE)`、`SetWindowPos(SWP_SHOWWINDOW)`、`SetForegroundWindow`
+   全部"成功"但没有像素。判据：`DwmGetWindowAttribute(DWMWA_CLOAKED)` 也是 0、窗口能最小化/还原，
+   就是画不出内容。
+2. **本机 DSH 桌面窗口盖住了主屏**。`class = 'Tauri Window'` 的那扇窗是 always-on-top 且铺满主屏，
+   在主屏上抓任何窗口都只会得到它。把被测窗口挪到副屏（本机虚拟桌面原点是负的：`-1440,-402`）。
+3. **点不到 / 点了没反应**，先分清是"输入没送到"还是"命中了空白"：
+   - 输入是否送到：点标题栏的最小化按钮，看窗口是否真的最小化；
+   - 是否命中：拿控件几何**算**坐标，别凭截图目测 —— 例如左侧导航栏
+     `main.slint:5183` 是 `width: 64px; padding-top: 8px; spacing: 2px; height: 52px/项`，
+     第 7 项（插件）在 125% 缩放下 client y ≈ 494；y = 452 会落在第 6 项（传输）里。
+4. **想看面板就得换个 profile 启动**（不动用户配置与运行态）：
+
+   ```powershell
+   $roaming = '<tmp>\bedprof\Roaming'
+   New-Item -ItemType Directory -Force "$roaming\RCGUI" | Out-Null
+   Copy-Item "$env:APPDATA\RCGUI\config.json" "$roaming\RCGUI\config.json"   # 需要真配置时
+   # 把 silent_start / connect_on_start 改成 false
+   $env:APPDATA = $roaming
+   $env:RCGUI_SINGLETON = 'bedtest'        # crates/app/src/main.rs 读这个名字做单实例互斥
+   Start-Process <release>\rclone-gui.exe -WorkingDirectory <release>
+   ```
+
+   `config.rs:233` 用 `APPDATA` 定位配置，`main.rs:2767` 用 `RCGUI_SINGLETON` 做互斥名 ——
+   两件事凑齐就能与用户实例并存，且窗口会正常 `ui.show()`。
+   注意 `connect_on_start: false` 时面板里「存储的远程」下拉是空的（RC 没连），
+   要验远程列表就让它连真 rclone，别在隔离 profile 里连。
+
+5. 抓图仍要有"这张图是不是真的新"的判据：比较两次截图的 `Get-FileHash`。相同就说明界面没重绘，
+   别把旧帧当成"点击无效"的证据 —— 反过来也别把旧帧当成"点击生效"的证据。
