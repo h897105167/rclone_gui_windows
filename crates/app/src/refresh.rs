@@ -85,12 +85,17 @@ async fn fetch(ctx: &Arc<Ctx>) -> Fetched {
             names
                 .into_iter()
                 .map(|n| {
-                    let rtype = dump
-                        .get(&n)
+                    let entry = dump.get(&n);
+                    let mut rtype = entry
                         .and_then(|e| e.get("type"))
                         .and_then(|x| x.as_str())
                         .unwrap_or("?")
                         .to_string();
+                    // K-Vault 远程在 rclone 里就是 webdav：界面上要显示成 k-vault，
+                    // 否则用户看到「类型 webdav」会以为自己的专用远程没保存对。
+                    if rtype == crate::kvault::BACKEND && entry.map(crate::kvault::KvCfg::is_marked_entry).unwrap_or(false) {
+                        rtype = crate::kvault::TYPE.to_string();
+                    }
                     RemoteState {
                         name: n,
                         rtype,

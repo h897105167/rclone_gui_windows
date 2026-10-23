@@ -11,6 +11,7 @@ mod config;
 mod conf_io;
 mod http;
 mod kv;
+mod kvault;
 mod persist;
 mod plugins;
 mod profiles;
@@ -122,6 +123,8 @@ enum Cmd {
     RemoteSave,
     RemoteCancel,
     RemoteTypeChanged,
+    /// 探测 K-Vault 站点与令牌（编辑器里的「测试连接」）
+    KvTest,
     // ---------------- 代理（按 remote 分配） ----------------
     /// 打开/刷新代理配置列表（供远程页的「代理」列与配置卡片使用）
     ProxyListRefresh,
@@ -2234,12 +2237,404 @@ fn load_providers_cache() -> Option<Value> {
 
 /// 更新编辑器字段列表和描述
 fn update_editor_fields(ui: &Weak<MainWindow>, providers: &Value, type_name: &str) {
+    // `k-vault` 不是 rclone 的 provider：没有 Option 元数据可读，走专用表单。
+    // 这里只切开关与说明，表单值由调用方（新建 / 改类型 / 编辑现有）负责填。
+    if type_name == kvault::TYPE {
+        let _ = ui.upgrade_in_event_loop(|ui| {
+            let g = ui.global::<RemotesG>();
+            g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(Vec::<FieldRow>::new()))));
+            g.set_provider_desc(KV_DESC.into());
+            g.set_kv_editor(true);
+        });
+        return;
+    }
     let (desc, fields) = build_fields_from_provider(providers, type_name);
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let g = ui.global::<RemotesG>();
         g.set_provider_desc(desc.into());
         g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(fields))));
+        g.set_kv_editor(false);
     });
+}
+
+// ---------------- K-Vault（`k-vault` 类型） ----------------
+//
+// 这一类型在 rclone 侧其实是一个 `webdav` 远程（`url=<站点>/dav`）：浏览与
+// 下载复用 rclone 现成的只读通道，写入走站点 HTTP API。识别靠远程参数里的
+// `kvault=1` 标记，而不是 rclone 的 type —— 对 rclone 来说它就是 webdav。
+//
+// 为什么上传不经 rclone：站点的 DAV 端点只放行 OPTIONS/PROPFIND/GET/HEAD，
+// 写方法一律 403，所以这里自己发 `POST /api/v1/upload`。
+
+/// 选中 `k-vault` 类型时显示在类型下拉框下方的说明。
+const KV_DESC: &str = "K-Vault 站点：浏览/下载走只读 WebDAV，上传走站点 API。\
+令牌在站点的「API 令牌」页创建（需要 upload 权限）；只填用户名/密码时只能浏览。";
+
+/// 读一个远程的参数，判断它是不是 K-Vault 远程；是则返回配置（含明文令牌）。
+///
+/// 用 `config/get` 而不是 `config/dump`：只读这一个远程，不去拉全量凭据。
+/// 不缓存：用户可能刚在原始编辑器里改过参数，缓存会让上传用上过期配置。
+async fn kv_cfg_for(ctx: &Arc<Ctx>, remote: &str) -> Option<kvault::KvCfg> {
+    let remote = remote.trim();
+    if remote.is_empty() {
+        return None;
+    }
+    let client = ctx.rc.client().await;
+    let params = client.config_get(remote).await.ok()?;
+    if !kvault::KvCfg::is_marked(&params) {
+        return None;
+    }
+    let mut cfg = kvault::KvCfg::from_params(&params);
+    cfg.token = kv_token_get(ctx, remote);
+    Some(cfg)
+}
+
+/// 明文令牌（rclone 里那份是 obscured 的，API 用不了）。
+fn kv_token_get(ctx: &Arc<Ctx>, remote: &str) -> String {
+    ctx.store
+        .get_all(kvault::STORE_NS)
+        .get(remote)
+        .and_then(|v| v.get("token"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 写/清明文令牌。空令牌 = 删掉记录，不给站点留一份死凭据。
+fn kv_token_put(ctx: &Arc<Ctx>, remote: &str, token: &str) {
+    let token = token.trim();
+    if token.is_empty() {
+        let _ = ctx.store.delete(kvault::STORE_NS, remote);
+    } else {
+        let _ = ctx
+            .store
+            .set(kvault::STORE_NS, remote, json!({ "token": token }));
+    }
+}
+
+/// 从「key=value 每行一条」的参数文本里取一个值（改类型时用来认领已有参数）。
+fn kv_param_of(text: &str, key: &str) -> Option<String> {
+    text.lines().find_map(|l| {
+        let (k, v) = l.split_once('=')?;
+        if k.trim() == key {
+            Some(v.trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// 编辑器里 K-Vault 表单的当前值（都在 UI 线程读出来）。
+#[derive(Clone, Debug, Default)]
+struct KvForm {
+    /// 正在编辑的远程名（新建时为空）
+    name: String,
+    /// 当前类型选的是 k-vault：表单可见，保存走 K-Vault 分支
+    editor: bool,
+    base: String,
+    token: String,
+    token_set: bool,
+    user: String,
+    pass: String,
+    pass_set: bool,
+    folder: String,
+    storage: String,
+    dedup: bool,
+}
+
+impl KvForm {
+    /// 表单值 → 待写入的配置（不含「留空=不修改」的取值，那部分由保存路径补）。
+    fn to_cfg(&self) -> kvault::KvCfg {
+        kvault::KvCfg {
+            base: self.base.clone(),
+            token: self.token.clone(),
+            user: self.user.clone(),
+            pass: self.pass.clone(),
+            folder: self.folder.clone(),
+            storage: self.storage.clone(),
+            dedup: self.dedup,
+        }
+    }
+}
+
+async fn read_kv_form(ui: &Weak<MainWindow>) -> KvForm {
+    read_ui(ui, |u| {
+        let g = u.global::<RemotesG>();
+        let storages = g.get_kv_storages();
+        let storage = storages
+            .row_data(g.get_kv_storage_idx().max(0) as usize)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| kvault::DEFAULT_STORAGE.to_string());
+        KvForm {
+            name: g.get_edit_name().trim().to_string(),
+            editor: g.get_kv_editor(),
+            base: g.get_kv_base().trim().to_string(),
+            token: g.get_kv_token().trim().to_string(),
+            token_set: g.get_kv_token_set(),
+            user: g.get_kv_user().trim().to_string(),
+            pass: g.get_kv_pass().to_string(),
+            pass_set: g.get_kv_pass_set(),
+            folder: g.get_kv_folder().trim().trim_matches('/').to_string(),
+            storage,
+            dedup: g.get_kv_dedup(),
+        }
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// 把已有远程的参数填进表单；令牌/口令不回显，只标记「已设置」。
+fn apply_kv_form(ui: &MainWindow, cfg: &kvault::KvCfg, token_set: bool, pass_set: bool) {
+    let g = ui.global::<RemotesG>();
+    // 存储下拉框以 Rust 侧常量为准（.slint 里的默认值只是首帧占位）
+    let storages: Vec<slint::SharedString> =
+        kvault::STORAGES.iter().map(|s| (*s).into()).collect();
+    g.set_kv_storages(ModelRc::from(Rc::new(VecModel::from(storages))));
+    g.set_kv_base(cfg.base.clone().into());
+    g.set_kv_token("".into());
+    g.set_kv_token_set(token_set);
+    g.set_kv_user(cfg.user.clone().into());
+    g.set_kv_pass("".into());
+    g.set_kv_pass_set(pass_set);
+    g.set_kv_folder(cfg.folder.clone().into());
+    let storages = g.get_kv_storages();
+    let idx = (0..storages.row_count())
+        .find(|i| {
+            storages
+                .row_data(*i)
+                .map(|s| s.as_str() == cfg.storage)
+                .unwrap_or(false)
+        })
+        .unwrap_or(0);
+    g.set_kv_storage_idx(idx as i32);
+    g.set_kv_dedup(cfg.dedup);
+    g.set_kv_status("".into());
+    g.set_kv_status_level(0);
+    g.set_kv_testing(false);
+    g.set_kv_editor(true);
+}
+
+/// 新建远程 / 从别的类型切过来时的表单初值。
+fn reset_kv_form(ui: &MainWindow, base: &str) {
+    let g = ui.global::<RemotesG>();
+    let storages: Vec<slint::SharedString> =
+        kvault::STORAGES.iter().map(|s| (*s).into()).collect();
+    g.set_kv_storages(ModelRc::from(Rc::new(VecModel::from(storages))));
+    g.set_kv_base(base.into());
+    g.set_kv_token("".into());
+    g.set_kv_token_set(false);
+    g.set_kv_user("".into());
+    g.set_kv_pass("".into());
+    g.set_kv_pass_set(false);
+    g.set_kv_folder("".into());
+    let storages = g.get_kv_storages();
+    let idx = (0..storages.row_count())
+        .find(|i| {
+            storages
+                .row_data(*i)
+                .map(|s| s.as_str() == kvault::DEFAULT_STORAGE)
+                .unwrap_or(false)
+        })
+        .unwrap_or(0);
+    g.set_kv_storage_idx(idx as i32);
+    g.set_kv_dedup(true);
+    g.set_kv_status("".into());
+    g.set_kv_status_level(0);
+    g.set_kv_testing(false);
+    g.set_kv_editor(true);
+}
+
+/// 本次上传落到站点哪个目录。
+///
+/// 文件页当前路径就是用户看到的目录：非空时按它传（用户明确选了一个子目录），
+/// 否则用远程保存的上传目录（通常等于令牌的目录前缀）。
+fn kv_upload_folder(cfg: &kvault::KvCfg, gui_path: &str) -> String {
+    let p = gui_path.trim().trim_matches('/');
+    if p.is_empty() {
+        cfg.folder.clone()
+    } else {
+        p.to_string()
+    }
+}
+
+/// 一次 K-Vault 上传的汇总（给 toast 用）。
+#[derive(Default)]
+struct KvUpload {
+    total: usize,
+    ok: usize,
+    failed: Vec<String>,
+    /// 最后一个成功的直链；只传了一个文件时复制到剪贴板
+    link: String,
+    /// 与 `link` 同一次上传的文件名（提示语里指名道姓，免得用户猜是哪个）
+    name: String,
+    /// 是否只有一个文件（决定要不要把直链丢进剪贴板）
+    single: bool,
+}
+
+/// 递归列出目录下的文件：`(绝对路径, 相对目录的路径)`。
+///
+/// 跳过符号链接（避免绕圈），并对深度/数量设上限：这里只是给上传排个队，
+/// 真正的错误留给逐文件上传去报。
+fn kv_walk(dir: &Path) -> Vec<(PathBuf, String)> {
+    fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(PathBuf, String)>) {
+        if depth > 32 || out.len() > 20000 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            let path = e.path();
+            if ft.is_dir() {
+                walk(root, &path, depth + 1, out);
+            } else if ft.is_file() {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.push((path.clone(), rel.to_string_lossy().to_string()));
+                }
+            }
+        }
+    }
+    let mut v = Vec::new();
+    walk(dir, dir, 0, &mut v);
+    v
+}
+
+/// 把本机路径（文件或目录）上传到站点目录 `folder`。
+///
+/// **不做同名改名**：站点里文件名不是身份（记录靠 `file.id`），同名不会被覆盖，
+/// 而 `deduplicate` 正是按内容去重 —— 客户端抢先改名只会让去重失效。
+async fn kv_upload_paths(cfg: &kvault::KvCfg, folder: &str, paths: &[PathBuf]) -> KvUpload {
+    // 先排好队：目录展开成文件，这样 total 是「文件数」而不是「拖进来的项数」。
+    let mut jobs: Vec<(PathBuf, String, String)> = Vec::new();
+    let mut out = KvUpload::default();
+    for p in paths {
+        let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if p.is_dir() {
+            let files = kv_walk(p);
+            if files.is_empty() {
+                out.failed.push(format!("{name}: 目录里没有文件"));
+                continue;
+            }
+            let base_dir = join_path(folder, &name);
+            for (abs, rel) in files {
+                let rel = rel.replace('\\', "/");
+                let (sub, fname) = match rel.rsplit_once('/') {
+                    Some((d, n)) => (d.to_string(), n.to_string()),
+                    None => (String::new(), rel.clone()),
+                };
+                let dst = if sub.is_empty() {
+                    base_dir.clone()
+                } else {
+                    join_path(&base_dir, &sub)
+                };
+                jobs.push((abs, dst, fname));
+            }
+        } else {
+            jobs.push((p.clone(), folder.to_string(), name));
+        }
+    }
+    out.total = jobs.len();
+    out.single = jobs.len() == 1;
+    for (abs, dst, name) in jobs {
+        match kvault::upload(cfg, &abs, &name, &dst).await {
+            Ok(u) => {
+                out.ok += 1;
+                if !u.link.is_empty() {
+                    out.name = u.name;
+                    out.link = u.link;
+                }
+            }
+            Err(e) => out.failed.push(format!("{name}: {e}")),
+        }
+    }
+    out
+}
+
+/// 上传结果 → 一句 toast（成功 1 / 失败 2）。
+fn kv_upload_report(up: &KvUpload, where_: &str) -> (i32, String) {
+    let place = if where_.is_empty() {
+        "站点根目录"
+    } else {
+        where_
+    };
+    if up.failed.is_empty() {
+        return (
+            1,
+            format!(
+                "已上传 {} 个文件到 {}（站点 DAV 目录最长 5 分钟才刷新，刷新后可见）",
+                up.ok, place
+            ),
+        );
+    }
+    // 失败项只列前 3 条：toast 是一行字，全塞进去就看不清了。
+    let shown: Vec<String> = up.failed.iter().take(3).cloned().collect();
+    let mut msg = format!(
+        "上传完成 {}/{}，失败 {}：{}",
+        up.ok,
+        up.total,
+        up.failed.len(),
+        shown.join("；")
+    );
+    if up.failed.len() > shown.len() {
+        msg.push_str(&format!("（另有 {} 条未列出）", up.failed.len() - shown.len()));
+    }
+    (2, msg)
+}
+
+/// 写操作（新建/改名/移动/删除）在 K-Vault 远程上被站点拒绝，返回给用户看的原因。
+async fn kv_write_blocked(ctx: &Arc<Ctx>, remote: &str) -> Option<String> {
+    kv_cfg_for(ctx, remote).await.map(|_| {
+        "K-Vault 远程是只读的：站点只放行浏览/下载（WebDAV 写方法一律 403）。\
+传文件请用「上传」（走站点 API）；删除/改名请到站点网页端操作。"
+            .to_string()
+    })
+}
+
+/// 上传入口的 K-Vault 分支：三个「上传到本机→远程」的入口共用。
+///
+/// 先判令牌（没有令牌时 rclone 那条路根本走不通），再逐个文件发站点 API，
+/// 最后刷新列表 + 报一句结果。单个文件成功时把签名直链放进剪贴板 ——
+/// 「传完就能发出去」是这个站点最主要的用法。
+async fn kv_upload_into(
+    ctx: Arc<Ctx>,
+    ui: Weak<MainWindow>,
+    cfg: kvault::KvCfg,
+    paths: Vec<PathBuf>,
+    gui_path: &str,
+) -> bool {
+    if let Err(why) = cfg.upload_ready() {
+        toast(&ui, 2, why);
+        return false;
+    }
+    let folder = kv_upload_folder(&cfg, gui_path);
+    let _ = ui.upgrade_in_event_loop(|ui| {
+        ui.global::<FilesG>().set_busy(true);
+        ui.global::<LocalG>().set_busy(true);
+    });
+    let up = kv_upload_paths(&cfg, &folder, &paths).await;
+    let _ = ui.upgrade_in_event_loop(|ui| {
+        ui.global::<FilesG>().set_busy(false);
+        ui.global::<LocalG>().set_busy(false);
+    });
+    if up.ok > 0 {
+        let _ = Box::pin(handle_cmd(&ctx, &ui, Cmd::FilesRefresh { seq: -1 })).await;
+    }
+    let copied = up.single && !up.link.is_empty();
+    if copied {
+        clipboard_copy(&up.link);
+    }
+    let (level, mut msg) = kv_upload_report(&up, &folder);
+    if copied {
+        msg.push_str(&format!("；{} 的直链已复制到剪贴板", up.name));
+    }
+    toast(&ui, level, msg);
+    false
 }
 
 fn b64(data: &[u8]) -> String {
@@ -4570,6 +4965,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if remote.is_empty() || name.is_empty() {
                 return false;
             }
+            if let Some(msg) = kv_write_blocked(&ctx, &remote).await {
+                toast(ui, 2, msg);
+                return false;
+            }
             let src = join_path(&path, &name);
             if dest == path {
                 toast(ui, 2, "目标就是当前目录，无需移动");
@@ -4670,6 +5069,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         }
         Cmd::FilesMkdir => {
             let (remote, path) = ui_files_pos(ui).await;
+            if let Some(msg) = kv_write_blocked(&ctx, &remote).await {
+                toast(ui, 2, msg);
+                return false;
+            }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
             // 先列出当前目录，挑一个没被占用的名字。
@@ -4706,6 +5109,12 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         }
         Cmd::FilesDel { name, is_dir } => {
             let (remote, path) = ui_files_pos(ui).await;
+            // 站点 DAV 只读，删除请到站点网页端；这里给一句明确的原因，
+            // 而不是让 rclone 回一个 403 Method Not Allowed。
+            if let Some(msg) = kv_write_blocked(&ctx, &remote).await {
+                toast(ui, 2, msg);
+                return false;
+            }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
             let full = join_path(&path, &name);
@@ -4734,6 +5143,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 return false;
             }
             let (remote, path) = ui_files_pos(ui).await;
+            if let Some(msg) = kv_write_blocked(&ctx, &remote).await {
+                toast(ui, 2, msg);
+                return false;
+            }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
             if is_dir {
@@ -4955,6 +5368,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // 「上传到…」指定了目标目录：用它的路径，但仍留在当前列表里（不跳转）
             if let Some(d) = dest {
                 path = d;
+            }
+            // K-Vault 远程的写入不走 rclone（DAV 只读，写方法一律 403），改发站点 API。
+            if let Some(cfg) = kv_cfg_for(&ctx, &remote).await {
+                return Box::pin(kv_upload_into(ctx.clone(), ui.clone(), cfg, paths, &path)).await;
             }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
@@ -5184,6 +5601,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if remote.is_empty() {
                 return false;
             }
+            if let Some(msg) = kv_write_blocked(&ctx, &remote).await {
+                toast(ui, 2, msg);
+                return false;
+            }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
             let total = items.len();
@@ -5329,6 +5750,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 return false;
             }
             let src = Path::new(&cur).join(&name);
+            // K-Vault 远程：写入走站点 API，不经 rclone 的 DAV 通道（只读）。
+            if let Some(cfg) = kv_cfg_for(&ctx, &remote).await {
+                return Box::pin(kv_upload_into(ctx.clone(), ui.clone(), cfg, vec![src], &path)).await;
+            }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
             let entries = client.list(&fs, &path, None).await.unwrap_or_default();
@@ -5556,6 +5981,22 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             .unwrap_or_default();
             if cur.trim().is_empty() || items.is_empty() {
                 return false;
+            }
+            // K-Vault 远程：写入走站点 API，不经 rclone 的只读 DAV 通道。
+            if let Some(cfg) = kv_cfg_for(&ctx, &remote).await {
+                let paths: Vec<PathBuf> =
+                    items.iter().map(|(n, _)| Path::new(&cur).join(n)).collect();
+                let ret = Box::pin(kv_upload_into(ctx.clone(), ui.clone(), cfg, paths, &dest)).await;
+                // 传完退出多选并清空勾选（与下面 rclone 分支的处理一致）
+                let _ = ui.upgrade_in_event_loop(|ui| {
+                    let g = ui.global::<LocalG>();
+                    let n = g.get_entries().row_count();
+                    g.set_multi(false);
+                    g.set_checked(ModelRc::from(Rc::new(VecModel::from(vec![false; n]))));
+                    g.set_checked_count(0);
+                    g.set_anchor(-1);
+                });
+                return ret;
             }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
@@ -6027,6 +6468,12 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 if from_fallback {
                     names = FALLBACK_REMOTE_TYPES.iter().map(|s| s.to_string()).collect();
                 }
+                // `k-vault` 不是 rclone 的后端类型（GUI 里映射成 webdav 远程），
+                // rclone 的 provider 列表里永远没有它，得自己补进去才选得到。
+                if !names.iter().any(|n| n == kvault::TYPE) {
+                    names.push(kvault::TYPE.to_string());
+                    names.sort();
+                }
                 let first_type = names.first().cloned().unwrap_or_default();
                 let _ = ui2.upgrade_in_event_loop(move |ui| {
                     let g = ui.global::<RemotesG>();
@@ -6072,6 +6519,124 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             .unwrap_or_default();
             let providers = get_providers(&ctx).await;
             update_editor_fields(ui, &providers, &type_name);
+            if type_name == kvault::TYPE {
+                // 切到 k-vault：表单给初值。改的是已有远程（比如用户自己建的
+                // webdav 远程）时，把他填过的站点地址/用户名带过来，别让他重打。
+                let adopt = read_ui(ui, |ui| {
+                    let g = ui.global::<RemotesG>();
+                    (g.get_edit_is_new(), g.get_edit_params().to_string())
+                })
+                .await
+                .unwrap_or((true, String::new()));
+                let base = kv_param_of(&adopt.1, "url")
+                    .map(|u| kvault::base_from_url(&u))
+                    .filter(|b| !b.is_empty());
+                let user = kv_param_of(&adopt.1, "user").unwrap_or_default();
+                let token_set = !adopt.0 && kv_param_of(&adopt.1, "bearer_token").is_some_and(|t| !t.is_empty());
+                let pass_set = !adopt.0 && kv_param_of(&adopt.1, "pass").is_some_and(|p| !p.is_empty());
+                let _ = ui.upgrade_in_event_loop(move |ui| {
+                    reset_kv_form(&ui, base.as_deref().unwrap_or(kvault::DEFAULT_BASE));
+                    let g = ui.global::<RemotesG>();
+                    if !user.is_empty() {
+                        g.set_kv_user(user.into());
+                    }
+                    g.set_kv_token_set(token_set);
+                    g.set_kv_pass_set(pass_set);
+                });
+            }
+            false
+        }
+        Cmd::KvTest => {
+            let form = read_kv_form(ui).await;
+            let _ = ui.upgrade_in_event_loop(|ui| {
+                let g = ui.global::<RemotesG>();
+                g.set_kv_testing(true);
+                g.set_kv_status("正在连接站点…".into());
+                g.set_kv_status_level(0);
+            });
+            // 令牌框留空时用已存的那份：点「测试连接」多半就是想验证现有配置。
+            let mut token = form.token.clone();
+            if token.is_empty() && !form.name.is_empty() {
+                token = kv_token_get(&ctx, &form.name);
+            }
+            let base = if form.base.trim().is_empty() {
+                kvault::DEFAULT_BASE.to_string()
+            } else {
+                form.base.clone()
+            };
+            let res = kvault::probe(&base, &token).await;
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                let g = ui.global::<RemotesG>();
+                g.set_kv_testing(false);
+                match res {
+                    Err(e) => {
+                        g.set_kv_status(format!("连接失败：{e}").into());
+                        g.set_kv_status_level(3);
+                    }
+                    Ok(p) => {
+                        let mut notes: Vec<String> = Vec::new();
+                        let mut level = 1;
+                        if p.id.is_empty() {
+                            notes.push(
+                                "站点可访问；未填令牌，只验证到站点本身（浏览可用，上传需要令牌）"
+                                    .to_string(),
+                            );
+                            level = 2;
+                        } else {
+                            notes.push(format!(
+                                "令牌 {}",
+                                if p.name.is_empty() {
+                                    p.id.clone()
+                                } else {
+                                    format!("{}（{}）", p.id, p.name)
+                                }
+                            ));
+                            if !p.scopes.is_empty() {
+                                notes.push(format!("作用域 {}", p.scopes.join(",")));
+                            }
+                            if !p.storages.is_empty() {
+                                notes.push(format!("可用存储 {}", p.storages.join(",")));
+                            }
+                            if p.max_file > 0 {
+                                notes.push(format!("单文件上限 {}", fmt_size_bytes(p.max_file as i64)));
+                            }
+                            if !p.folder_prefix.is_empty() {
+                                notes.push(format!("目录前缀 /{}", p.folder_prefix));
+                            }
+                            if !p.scopes.iter().any(|s| s.as_str() == "upload") {
+                                notes.push("令牌没有 upload 作用域，上传会被站点拒绝".to_string());
+                                level = 2;
+                            }
+                            // 存储选错会被 POLICY_STORAGE_DENIED 拒；只剩一个可选时
+                            // 直接替用户选上，省一次来回。
+                            let picked_ok = p.storages.is_empty()
+                                || p.storages.iter().any(|s| s == &form.storage);
+                            if !picked_ok {
+                                notes.push(format!("当前存储 {} 不在允许列表里", form.storage));
+                                level = 2;
+                                if p.storages.len() == 1 {
+                                    let only = p.storages[0].clone();
+                                    let storages = g.get_kv_storages();
+                                    if let Some(i) = (0..storages.row_count()).find(|i| {
+                                        storages
+                                            .row_data(*i)
+                                            .map(|s| s.as_str() == only)
+                                            .unwrap_or(false)
+                                    }) {
+                                        g.set_kv_storage_idx(i as i32);
+                                    }
+                                }
+                            }
+                        }
+                        // 目录前缀空着就按策略补：填错的目录会被 POLICY_FOLDER_DENIED 拒掉。
+                        if g.get_kv_folder().trim().is_empty() && !p.folder_prefix.is_empty() {
+                            g.set_kv_folder(p.folder_prefix.clone().into());
+                        }
+                        g.set_kv_status(notes.join(" · ").into());
+                        g.set_kv_status_level(level);
+                    }
+                }
+            });
             false
         }
         Cmd::RemoteEditLoad { name } => {
@@ -6094,6 +6659,21 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 })
                 .unwrap_or_default();
             let existing_params = entry.as_object().cloned().unwrap_or_default();
+            // 带 `kvault=1` 标记的远程按 K-Vault 展示：类型显示成 k-vault，
+            // 表单换成专用的那块，而不是 rclone 的 webdav 参数表。
+            let kv_cfg = if kvault::KvCfg::is_marked(&existing_params) {
+                Some(kvault::KvCfg::from_params(&existing_params))
+            } else {
+                None
+            };
+            let (ty, kv_token_set, kv_pass_set) = match kv_cfg {
+                Some(ref c) => (
+                    kvault::TYPE.to_string(),
+                    !kv_token_get(&ctx, &name).is_empty() || kvault::KvCfg::has_secret(&existing_params, kvault::TOKEN_KEY),
+                    kvault::KvCfg::has_secret(&existing_params, kvault::PASS_KEY) || !c.user.is_empty(),
+                ),
+                None => (ty, false, false),
+            };
             let providers = get_providers(&ctx).await;
             let (desc, mut fields) = build_fields_from_provider(&providers, &ty);
             fill_fields_with_existing(&mut fields, &existing_params);
@@ -6112,8 +6692,18 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 g.set_edit_is_new(false);
                 g.set_edit_name(name.into());
                 g.set_edit_params(params_text.into());
-                g.set_provider_desc(desc.into());
-                g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(fields))));
+                match kv_cfg {
+                    Some(cfg) => {
+                        g.set_provider_desc(KV_DESC.into());
+                        g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(Vec::<FieldRow>::new()))));
+                        apply_kv_form(&ui, &cfg, kv_token_set, kv_pass_set);
+                    }
+                    None => {
+                        g.set_provider_desc(desc.into());
+                        g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(fields))));
+                        g.set_kv_editor(false);
+                    }
+                }
                 g.set_show_advanced(false);
                 g.set_show_raw(false);
                 g.set_show_editor(true);
@@ -6138,6 +6728,50 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if name.trim().is_empty() || name.contains(':') || name.contains(' ') {
                 toast(ui, 2, "名称不能为空，且不能包含空格或冒号");
                 return false;
+            }
+            // K-Vault 走专用表单：下拉框里是 k-vault，落盘的是 webdav + `kvault=1` 标记。
+            let kv_form = read_kv_form(ui).await;
+            if kv_form.editor && type_str == kvault::TYPE {
+                let cfg = kv_form.to_cfg();
+                if cfg.base.trim().is_empty() {
+                    toast(ui, 2, "站点地址不能为空");
+                    return false;
+                }
+                if cfg.token.is_empty() && cfg.user.is_empty() && !kv_form.token_set && !kv_form.pass_set {
+                    toast(
+                        ui,
+                        2,
+                        "至少填 API 令牌（推荐）或用户名/密码：没有凭据的 K-Vault 远程只能看到 401",
+                    );
+                    return false;
+                }
+                let mut params = cfg.params(!cfg.token.is_empty());
+                let client = ctx.rc.client().await;
+                let res = if is_new {
+                    client.config_create(&name, kvault::BACKEND, serde_json::Value::Object(params)).await
+                } else {
+                    // 更新时显式带 type：用户可能是把一个已有的远程改成 k-vault
+                    params.insert("type".to_string(), serde_json::Value::String(kvault::BACKEND.to_string()));
+                    client.config_update(&name, serde_json::Value::Object(params)).await
+                };
+                return match res {
+                    Ok(()) => {
+                        // 明文令牌另存一份：rclone 里的是 obscured 的，API 调用用不了。
+                        if !cfg.token.is_empty() {
+                            kv_token_put(&ctx, &name, &cfg.token);
+                        }
+                        let _ = ui.upgrade_in_event_loop(|ui| {
+                            ui.global::<RemotesG>().set_show_editor(false);
+                        });
+                        let _ = Box::pin(handle_cmd(&ctx.clone(), ui, Cmd::RemotesRefresh)).await;
+                        toast(ui, 1, format!("K-Vault 远程 {} 已保存", name));
+                        false
+                    }
+                    Err(e) => {
+                        toast(ui, 2, format!("保存失败: {e}"));
+                        false
+                    }
+                };
             }
             // 优先使用模板字段，原始模式或字段为空时用 key=value
             let params = if !show_raw {
@@ -6277,6 +6911,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // 3) 再删除远程
             match client.config_delete(&name).await {
                 Ok(()) => {
+                    // K-Vault 的明文令牌存在侧表里：远程没了，那份令牌也不该留着。
+                    let _ = ctx.store.delete(kvault::STORE_NS, &name);
                     // 4) 最后清理档案里的记忆（否则重放会一直失败并刷错误提示）
                     {
                         let mut cfg = ctx.cfg.lock().unwrap();
@@ -9212,6 +9848,13 @@ fn wire_callbacks(
         let tx = tx.clone();
         move || {
             let _ = tx.send(Cmd::RemoteTypeChanged);
+        }
+    });
+    // K-Vault 表单里的「测试连接」（回调挂在 RemotesG 上，因为表单在 global 里）
+    ui.global::<RemotesG>().on_kv_test({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::KvTest);
         }
     });
     // ---------------- 代理 ----------------
