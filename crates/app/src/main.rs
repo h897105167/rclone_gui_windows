@@ -2476,6 +2476,8 @@ struct KvUpload {
     name: String,
     /// 是否只有一个文件（决定要不要把直链丢进剪贴板）
     single: bool,
+    /// 站点判定「同一份内容已存在」直接复用的个数（开了去重才会出现）
+    dedup: usize,
 }
 
 /// 递归列出目录下的文件：`(绝对路径, 相对目录的路径)`。
@@ -2552,6 +2554,9 @@ async fn kv_upload_paths(cfg: &kvault::KvCfg, folder: &str, paths: &[PathBuf]) -
         match kvault::upload(cfg, &abs, &name, &dst).await {
             Ok(u) => {
                 out.ok += 1;
+                if u.dedup {
+                    out.dedup += 1;
+                }
                 if !u.link.is_empty() {
                     out.name = u.name;
                     out.link = u.link;
@@ -2571,13 +2576,14 @@ fn kv_upload_report(up: &KvUpload, where_: &str) -> (i32, String) {
         where_
     };
     if up.failed.is_empty() {
-        return (
-            1,
-            format!(
-                "已上传 {} 个文件到 {}（站点 DAV 目录最长 5 分钟才刷新，刷新后可见）",
-                up.ok, place
-            ),
-        );
+        let mut msg = format!("已上传 {} 个文件到 {}", up.ok, place);
+        if up.dedup > 0 {
+            msg.push_str(&format!(
+                "；其中 {} 个站点已有同一份内容，直接复用了直链",
+                up.dedup
+            ));
+        }
+        return (1, msg);
     }
     // 失败项只列前 3 条：toast 是一行字，全塞进去就看不清了。
     let shown: Vec<String> = up.failed.iter().take(3).cloned().collect();
@@ -2594,13 +2600,150 @@ fn kv_upload_report(up: &KvUpload, where_: &str) -> (i32, String) {
     (2, msg)
 }
 
-/// 写操作（新建/改名/移动/删除）在 K-Vault 远程上被站点拒绝，返回给用户看的原因。
+/// 改名/移动/新建目录在 K-Vault 远程上没得做：站点的 WebDAV 端点只读，HTTP API
+/// 也只开放上传、列表、删除和文本粘贴，没有移动或建目录的端点。这里给一句明确的
+/// 原因，而不是让 rclone 回一个干巴巴的 403。
 async fn kv_write_blocked(ctx: &Arc<Ctx>, remote: &str) -> Option<String> {
     kv_cfg_for(ctx, remote).await.map(|_| {
-        "K-Vault 远程是只读的：站点只放行浏览/下载（WebDAV 写方法一律 403）。\
-传文件请用「上传」（走站点 API）；删除/改名请到站点网页端操作。"
+        "K-Vault 远程不支持改名/移动/新建目录：站点只读（WebDAV 写方法一律 403），\
+API 也只开放上传、列表、删除。要在站点上调整目录，请到站点网页端操作。"
             .to_string()
     })
+}
+
+/// K-Vault 远程的列目录：直接读站点索引（`GET /api/v1/files`）。
+///
+/// 为什么不用 rclone 的 DAV：站点的目录树有一层 5 分钟 KV 缓存（`dav:tree:v2`，
+/// 上传和删除都不会主动失效），刚上传的文件那边要等好几分钟才出现；而站点索引
+/// 是直接读 KV 的，立刻可见。顺带也绕开了 Cloudflare 上偶发的 HTTP/2 建连抖动。
+///
+/// 返回 `None` 表示「这条远程不归我管」（不是 k-vault，或者没填令牌只能走 DAV）。
+async fn kv_list_rows(
+    ctx: &Arc<Ctx>,
+    remote: &str,
+    path: &str,
+    sort_key: &str,
+    desc: bool,
+) -> Option<Result<Vec<FileRow>, String>> {
+    let cfg = kv_cfg_for(ctx, remote).await?;
+    if cfg.token.trim().is_empty() {
+        return None;
+    }
+    match kvault::list_files(&cfg.base, &cfg.token).await {
+        Ok(files) => Some(Ok(kvault::list_folder(&files, path, sort_key, desc)
+            .into_iter()
+            .map(|i| FileRow {
+                name: i.name.into(),
+                is_dir: i.is_dir,
+                size: fmt_bytes(i.size as f64).into(),
+                mtime: fmt_mtime(&i.uploaded).into(),
+            })
+            .collect())),
+        Err(e) => Some(Err(e)),
+    }
+}
+
+/// 删除成功后本地摘行（必须在 UI 线程内调用）。
+///
+/// 不刷新列表的原因：站点目录树有一层 5 分钟 KV 缓存（`dav:tree:v2`，上传和
+/// 删除都不会主动失效），删完立刻刷新会把条目又读回来，看起来像「删了没效果」。
+/// 先本地摘掉，缓存过期后自然一致。
+fn prune_file_rows(ui: &MainWindow, names: &[String]) {
+    let g = ui.global::<FilesG>();
+    let model = g.get_entries();
+    let kept: Vec<FileRow> = (0..model.row_count())
+        .filter_map(|i| model.row_data(i))
+        .filter(|r| !names.iter().any(|n| n == r.name.as_str()))
+        .collect();
+    set_file_entries(ui, kept);
+}
+
+/// K-Vault 远程的删除：走站点 API（`DELETE /api/v1/file/<id>`，要 delete 权限），
+/// 按站点索引把「目录 + 名字」翻成文件 id 再删。
+///
+/// 不用 DAV 路径直接删的原因：站点的 DAV 显示名可能被改过（同目录重名会补
+/// `~<主键末 6 位>`），而且目录树有 5 分钟缓存；站点索引
+/// （`GET /api/v1/files`）里的 `folderPath` / 文件名才是原始值。
+async fn kv_delete_into(
+    ui: Weak<MainWindow>,
+    cfg: kvault::KvCfg,
+    dir: String,
+    items: Vec<(String, bool)>,
+) -> bool {
+    if cfg.token.trim().is_empty() {
+        toast(
+            &ui,
+            2,
+            "删除站点文件需要 API 令牌（WebDAV 通道只读）。请编辑该远程填入令牌。",
+        );
+        return false;
+    }
+    let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_busy(true));
+    let listed = kvault::list_files(&cfg.base, &cfg.token).await;
+    let files = match listed {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_busy(false));
+            toast(&ui, 2, format!("读取站点索引失败: {e}"));
+            return false;
+        }
+    };
+    let mut gone: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    for (name, is_dir) in &items {
+        let ids = kvault::pick_targets(&files, &dir, name, *is_dir);
+        if ids.is_empty() {
+            missing.push(name.clone());
+            continue;
+        }
+        // 站点允许同一目录里同名文件共存（靠主键区分）。删哪一条都不是用户在
+        // GUI 里看到的「那一条」，所以宁可不删，把话说明白。
+        if !*is_dir && ids.len() > 1 {
+            failed.push(format!(
+                "{name}: 站点有 {} 个同名文件，请到站点网页端处理",
+                ids.len()
+            ));
+            continue;
+        }
+        let mut err: Option<String> = None;
+        for id in &ids {
+            if let Err(e) = kvault::delete_file(&cfg.base, &cfg.token, id).await {
+                err = Some(e);
+                break;
+            }
+        }
+        match err {
+            Some(e) => failed.push(format!("{name}: {e}")),
+            None => gone.push(name.clone()),
+        }
+    }
+    let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_busy(false));
+    if !gone.is_empty() {
+        let names = gone.clone();
+        let _ = ui.upgrade_in_event_loop(move |ui| prune_file_rows(&ui, &names));
+    }
+    let mut msg = format!("已删除 {} 项", gone.len());
+    if !gone.is_empty() {
+        msg.push_str("（站点目录树有 5 分钟缓存，其它视图可能还会显示一会儿）");
+    }
+    if !missing.is_empty() {
+        msg.push_str(&format!(
+            "；{} 项在站点索引里找不到（可能已被删或改过名）",
+            missing.len()
+        ));
+    }
+    if !failed.is_empty() {
+        let shown: Vec<String> = failed.iter().take(2).cloned().collect();
+        msg.push_str(&format!("；失败 {}：{}", failed.len(), shown.join("；")));
+    }
+    let level = if failed.is_empty() && missing.is_empty() {
+        1
+    } else {
+        2
+    };
+    toast(&ui, level, msg);
+    false
 }
 
 /// 这类错误重试一次就好：HTTP/2 建连抖动、连接被重置、TLS 握手中断。
@@ -4803,6 +4946,40 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // 取一次「该远程是否绑了代理」：网络类错误没有代理证据时，
             // 只给弱提示（见 proxy::annotate_error），不能断言是谁的问题。
             let proxy_ep = remote_proxy_endpoint(ctx, &remote);
+            // k-vault 远程：列站点索引，比 DAV 新鲜，也不走那条抖动的 HTTP/2 链路
+            let sort = read_ui(ui, |u| {
+                (
+                    u.global::<FilesG>().get_sort_key().to_string(),
+                    u.global::<FilesG>().get_sort_desc(),
+                )
+            })
+            .await
+            .unwrap_or_else(|| ("name".to_string(), false));
+            if let Some(res) = kv_list_rows(&ctx, &remote, &path, &sort.0, sort.1).await {
+                // 请求期间用户可能已换目录（seq 变化），丢弃过期结果
+                let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq())
+                    .await
+                    .unwrap_or(-2);
+                if seq >= 0 && cur_seq != seq {
+                    let _ =
+                        ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
+                    return false;
+                }
+                let _ = ui.upgrade_in_event_loop(move |ui| {
+                    let g = ui.global::<FilesG>();
+                    match res {
+                        Ok(rows) => set_file_entries(&ui, rows),
+                        Err(e) => {
+                            set_file_entries(&ui, Vec::<FileRow>::new());
+                            toast_ui(&ui, 2, format!("列目录失败: {e}"));
+                        }
+                    }
+                    apply_crumbs(&ui, file_crumbs(&remote, &path));
+                    g.set_sel(-1);
+                    g.set_loading(false);
+                });
+                return false;
+            }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
             let mut res = tokio::time::timeout(
@@ -5151,11 +5328,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         }
         Cmd::FilesDel { name, is_dir } => {
             let (remote, path) = ui_files_pos(ui).await;
-            // 站点 DAV 只读，删除请到站点网页端；这里给一句明确的原因，
-            // 而不是让 rclone 回一个 403 Method Not Allowed。
-            if let Some(msg) = kv_write_blocked(&ctx, &remote).await {
-                toast(ui, 2, msg);
-                return false;
+            // K-Vault 远程：DAV 通道只读，但站点 API 有正经的删除端点，
+            // 按站点索引翻成文件 id 再删。
+            if let Some(cfg) = kv_cfg_for(&ctx, &remote).await {
+                let items = vec![(name, is_dir)];
+                return kv_delete_into(ui.clone(), cfg, path, items).await;
             }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
@@ -5643,9 +5820,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if remote.is_empty() {
                 return false;
             }
-            if let Some(msg) = kv_write_blocked(&ctx, &remote).await {
-                toast(ui, 2, msg);
-                return false;
+            // K-Vault 远程：走站点 API 删除（DAV 通道只读），逐项翻 id。
+            if let Some(cfg) = kv_cfg_for(&ctx, &remote).await {
+                return kv_delete_into(ui.clone(), cfg, path, items).await;
             }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");

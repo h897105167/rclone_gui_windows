@@ -101,6 +101,26 @@ pub struct Uploaded {
     /// 签名直链（`links.download`）；站点在 MINIMIZE_KV_WRITES 下给的是
     /// `tgs_` 能力 URL，可直接分享，换 Telegram bot token 会失效。
     pub link: String,
+    /// 站点判定「内容已存在」，直接复用了老文件的直链（只有开了 deduplicate
+    /// 且文件 ≤ 25 MB 时才会命中，见站点 `functions/api/v1/upload.js`）。
+    pub dedup: bool,
+}
+
+/// 站点索引里的一条文件记录（`GET /api/v1/files` 的一项）。
+///
+/// 和 WebDAV 的 PROPFIND 相比，这份索引**不经过 5 分钟的目录树缓存**，
+/// 所以刚上传的文件在这里立刻能看到；删除要用的 `id` 也只有这里有。
+#[derive(Clone, Debug, Default)]
+pub struct RemoteFile {
+    /// KV 主键（`tg:…` / `r2:…` / `s3:…`），`DELETE /api/v1/file/<id>` 用它。
+    pub id: String,
+    /// 站点记下的原始文件名。
+    pub name: String,
+    /// 所在目录（`folderPath`，无首尾斜杠；根目录为空串）。
+    pub folder: String,
+    pub size: u64,
+    /// 上传时间（`uploadedAt`，RFC3339）。
+    pub uploaded: String,
 }
 
 impl KvCfg {
@@ -321,6 +341,11 @@ fn parse_me(v: &Value) -> Probe {
 /// 为什么整文件读进内存：站点按 multipart 收单个 `file` 段，reqwest 的
 /// `Part::file` 需要 `stream` feature，而这里的上限就是 100 MB（站点侧），
 /// 读一次内存换来不引入新 feature，是可接受的取舍。
+///
+/// 带 `Idempotency-Key`：站点对同一把钥匙在 24 小时内只存一份，网络抖动重试
+/// 不会变成两个文件（站点实现见 `functions/api/v1/upload.js`）。钥匙把「目标
+/// 目录 + 后端 + 文件名 + 大小 + 秒级 mtime」都算进去，所以「同一份文件传到
+/// 另一个目录」不会误命中上一次的响应。
 pub async fn upload(cfg: &KvCfg, path: &Path, name: &str, folder: &str) -> Result<Uploaded, String> {
     cfg.upload_ready()?;
     let meta = std::fs::metadata(path).map_err(|e| format!("读取文件失败: {e}"))?;
@@ -331,18 +356,68 @@ pub async fn upload(cfg: &KvCfg, path: &Path, name: &str, folder: &str) -> Resul
             MAX_UPLOAD as f64 / 1048576.0
         ));
     }
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| format!("读取文件失败: {e}"))?;
+    let folder = folder.trim().trim_matches('/').to_string();
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let idem = idem_key(&cfg.base, &cfg.storage, &folder, name, meta.len(), mtime);
+
+    // 只重试一次：站点偶发 HTTP/2 建连失败（Cloudflare 侧），第二次几乎必成。
+    // 真正的业务错误（403/413）不重试，重试只会把同一句错误再说一遍。
+    let mut last = String::new();
+    for attempt in 0..2 {
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|e| format!("读取文件失败: {e}"))?;
+        match post_upload(cfg, bytes, name, &folder, &idem).await {
+            Ok(u) => return Ok(u),
+            Err((retry, msg)) => {
+                last = msg;
+                if !retry || attempt == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(700)).await;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// 幂等键：同一份文件 + 同一个目标位置 → 同一把钥匙。
+fn idem_key(base: &str, storage: &str, folder: &str, name: &str, size: u64, mtime: u64) -> String {
+    let seed = format!("{base}|{storage}|{folder}|{name}|{size}|{mtime}");
+    format!("rcgui-{:016x}", fnv1a(&seed))
+}
+
+/// FNV-1a 64 位：只为得到稳定短键，不做安全用途。
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// 发一次上传请求。`Err((是否值得重试, 给用户看的中文))`。
+async fn post_upload(
+    cfg: &KvCfg,
+    bytes: Vec<u8>,
+    name: &str,
+    folder: &str,
+    idem: &str,
+) -> Result<Uploaded, (bool, String)> {
     let part = reqwest::multipart::Part::bytes(bytes)
         .file_name(name.to_string())
         .mime_str(mime_for(name))
-        .map_err(|e| format!("构造上传请求失败: {e}"))?;
+        .map_err(|e| (false, format!("构造上传请求失败: {e}")))?;
     let mut form = reqwest::multipart::Form::new().part("file", part);
     // storage 必须显式给：该部署的令牌策略是 fail-closed 的，缺了直接
     // `403 POLICY_STORAGE_DENIED`，不会替你挑默认后端。
     form = form.text("storage", cfg.storage.clone());
-    let folder = folder.trim().trim_matches('/');
     if !folder.is_empty() {
         form = form.text("folderPath", folder.to_string());
     }
@@ -351,23 +426,39 @@ pub async fn upload(cfg: &KvCfg, path: &Path, name: &str, folder: &str) -> Resul
     }
 
     // 上传超时给足：15 MB 的图在慢上行链路上也可能要几十秒。
-    let http = http_client(Duration::from_secs(300))?;
-    let resp = http
+    let http = match http_client(Duration::from_secs(300)) {
+        Ok(c) => c,
+        Err(e) => return Err((false, e)),
+    };
+    let resp = match http
         .post(format!("{}/api/v1/upload", normalize_base(&cfg.base)))
         .bearer_auth(cfg.token.trim())
+        .header("Idempotency-Key", idem)
         .multipart(form)
         .send()
         .await
-        .map_err(|e| format!("上传请求失败: {e}"))?;
+    {
+        Ok(r) => r,
+        // 连接层面的失败才值得重试；`is_body`/`is_decode` 这类是确定性的。
+        Err(e) => {
+            let retry = e.is_timeout() || e.is_connect() || e.is_request();
+            return Err((retry, format!("上传请求失败: {e}")));
+        }
+    };
     let status = resp.status().as_u16();
     let body = resp.text().await.unwrap_or_default();
     if status >= 400 {
-        return Err(api_error(status, &body));
+        // 429 是令牌限流，5xx 是站点/Cloudflare 抖动，都算「过一会儿再来」。
+        let retry = status == 429 || status >= 500;
+        return Err((retry, api_error(status, &body)));
     }
-    let v: Value =
-        serde_json::from_str(&body).map_err(|e| format!("上传响应不是 JSON: {e}"))?;
-    let file = v.get("file").cloned().unwrap_or(json!({}));
-    let link = v
+    let v: Value = serde_json::from_str(&body)
+        .map_err(|e| (false, format!("上传响应不是 JSON: {e}")))?;
+    // 站点的成功信封是 `{success, file, links, deduplicated?}`；老文档写过
+    // 平铺形式，`data` 里也照看一眼。
+    let root = v.get("data").filter(|d| d.is_object()).unwrap_or(&v);
+    let file = root.get("file").cloned().unwrap_or(json!({}));
+    let link = root
         .get("links")
         .and_then(|l| l.get("download"))
         .and_then(|x| x.as_str())
@@ -379,7 +470,307 @@ pub async fn upload(cfg: &KvCfg, path: &Path, name: &str, folder: &str) -> Resul
             .unwrap_or(name)
             .to_string(),
         link: absolutize(&cfg.base, link),
+        dedup: truthy(root.get("deduplicated").unwrap_or(&Value::Null)),
     })
+}
+
+// ---------------- 站点索引（列表 / 删除） ----------------
+
+/// 列表每页条数。站点没写上限，管理页用的是 50；这里取大一点少跑几轮。
+const LIST_PAGE: usize = 200;
+/// 翻页上限：防止索引异常时无限翻（200 × 25 = 5000 条）。
+const LIST_MAX_PAGES: usize = 25;
+
+/// 读站点索引 `GET /api/v1/files`（自动翻页）。
+///
+/// 为什么要读这份索引而不是全信 WebDAV：站点的 DAV 目录树有一层 5 分钟的
+/// KV 缓存（`dav:tree:v2`，上传/删除都不会主动失效），而这份索引直读 KV，
+/// 刚传完的文件立刻可见，删除要用的文件 id 也只有这里有。
+pub async fn list_files(base: &str, token: &str) -> Result<Vec<RemoteFile>, String> {
+    let base = normalize_base(base);
+    if base.is_empty() {
+        return Err("站点地址不能为空".into());
+    }
+    if token.trim().is_empty() {
+        return Err("读取站点文件列表需要 API 令牌（令牌要有 read 权限）".into());
+    }
+    let http = http_client(Duration::from_secs(30))?;
+    let mut out: Vec<RemoteFile> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..LIST_MAX_PAGES {
+        let mut req = http
+            .get(format!("{base}/api/v1/files"))
+            .query(&[("limit", LIST_PAGE.to_string())])
+            .bearer_auth(token.trim());
+        if let Some(c) = &cursor {
+            req = req.query(&[("cursor", c.clone())]);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("读取站点文件列表失败: {e}"))?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        if status >= 400 {
+            return Err(format!(
+                "读取站点文件列表失败 · {}",
+                api_error(status, &body)
+            ));
+        }
+        let v: Value = serde_json::from_str(&body)
+            .map_err(|e| format!("文件列表不是 JSON（HTTP {status}）: {e}"))?;
+        let (page, next) = parse_files(&v);
+        out.extend(page);
+        match next {
+            Some(c) if !c.is_empty() => cursor = Some(c),
+            _ => return Ok(out),
+        }
+    }
+    Ok(out)
+}
+
+/// 解析一页 `GET /api/v1/files`，返回（本页记录，下一页 cursor）。
+fn parse_files(v: &Value) -> (Vec<RemoteFile>, Option<String>) {
+    let root = v.get("data").filter(|d| d.is_object()).unwrap_or(v);
+    let files = root
+        .get("files")
+        .or_else(|| v.get("files"))
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let list = files
+        .iter()
+        .map(|f| RemoteFile {
+            id: f.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            name: f
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            folder: f
+                .get("folderPath")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .trim_matches('/')
+                .to_string(),
+            size: f.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
+            uploaded: f
+                .get("uploadedAt")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+        .filter(|f| !f.id.is_empty())
+        .collect();
+    let pagination = root.get("pagination").or_else(|| v.get("pagination"));
+    let complete = pagination
+        .and_then(|p| p.get("listComplete"))
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let next = if complete {
+        None
+    } else {
+        pagination
+            .and_then(|p| p.get("cursor"))
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+    };
+    (list, next)
+}
+
+/// 删一个文件：`DELETE /api/v1/file/<id>`（要 `delete` 权限）。
+pub async fn delete_file(base: &str, token: &str, id: &str) -> Result<(), String> {
+    let base = normalize_base(base);
+    if base.is_empty() {
+        return Err("站点地址不能为空".into());
+    }
+    if token.trim().is_empty() {
+        return Err("删除站点文件需要 API 令牌（令牌要有 delete 权限）".into());
+    }
+    let http = http_client(Duration::from_secs(60))?;
+    let resp = http
+        .delete(format!("{base}/api/v1/file/{}", encode_id(id)))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .map_err(|e| format!("删除请求失败: {e}"))?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    if status >= 400 {
+        return Err(api_error(status, &body));
+    }
+    Ok(())
+}
+
+/// 文件 id（KV 主键，形如 `tg:AgACAg…` / `r2:dir/a.png`）编成 URL 路径段。
+///
+/// 保留 `/` 和 `:`：两者在路径段里都是合法字符，站点也是按解码后的整串去
+/// 查主键的（`decodeURIComponent(params.id)`），编得越少越不容易踩到歧义。
+fn encode_id(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for b in id.as_bytes() {
+        let ch = *b as char;
+        let keep = ch.is_ascii_alphanumeric()
+            || matches!(ch, '-' | '_' | '.' | '~' | ':' | '/');
+        if keep {
+            out.push(ch);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// 站点给重名文件补的 DAV 显示后缀本体（`a~ab12cd.txt` → `ab12cd`）。
+///
+/// 后缀就是文件主键的末 6 位，所以它同时也是「在 GUI 里点的到底是哪一条」的
+/// 唯一线索——同目录同名文件靠它区分。
+fn collision_tail(name: &str) -> Option<&str> {
+    let base = match name.rfind('.') {
+        Some(i) if i > 0 => &name[..i],
+        _ => name,
+    };
+    let tilde = base.rfind('~')?;
+    let tail = &base[tilde + 1..];
+    (tail.len() == 6 && tail.chars().all(|c| c.is_ascii_alphanumeric())).then_some(tail)
+}
+
+/// 去掉站点给重名文件加的 DAV 显示后缀（`a~ab12cd.txt` → `a.txt`）。
+///
+/// 站点的只读 DAV 在同一个目录里遇到同名文件时，会给后来者补一个
+/// `~<主键末 6 位>`，只在 PROPFIND 的显示名里出现；索引里的文件名是原始的。
+/// 拿 DAV 的显示名去索引里找文件，得先把这个后缀摘掉。
+pub fn strip_collision_suffix(name: &str) -> String {
+    let Some(tail) = collision_tail(name) else {
+        return name.to_string();
+    };
+    let marker = format!("~{tail}");
+    match name.find(&marker) {
+        Some(i) => format!("{}{}", &name[..i], &name[i + marker.len()..]),
+        None => name.to_string(),
+    }
+}
+
+/// 在站点索引里找出「目录 `folder` 下的 `name`」对应的文件 id。
+///
+/// 目录（`is_dir=true`）返回其下所有文件的 id；文件返回匹配项的 id
+/// （可能不止一条：站点允许同目录同名，调用方自己决定怎么处理）。
+///
+/// 带 DAV 后缀的显示名（`a~ff0011.png`）优先按「主键末 6 位」定位：这正是
+/// 后缀的来源，能唯一定位时就不会误伤同名的另一个文件。
+pub fn pick_targets(files: &[RemoteFile], folder: &str, name: &str, is_dir: bool) -> Vec<String> {
+    let dir = folder.trim().trim_matches('/');
+    if is_dir {
+        let self_dir = if dir.is_empty() {
+            name.to_string()
+        } else {
+            format!("{dir}/{name}")
+        };
+        let under = format!("{self_dir}/");
+        return files
+            .iter()
+            .filter(|f| f.folder == self_dir || f.folder.starts_with(&under))
+            .map(|f| f.id.clone())
+            .collect();
+    }
+    let want = strip_collision_suffix(name);
+    let candidates: Vec<&RemoteFile> = files
+        .iter()
+        .filter(|f| f.folder == dir)
+        .filter(|f| f.name == name || f.name == want)
+        .collect();
+    if let Some(tail) = collision_tail(name) {
+        let exact: Vec<String> = candidates
+            .iter()
+            .filter(|f| f.id.ends_with(tail))
+            .map(|f| f.id.clone())
+            .collect();
+        if exact.len() == 1 {
+            return exact;
+        }
+    }
+    candidates.iter().map(|f| f.id.clone()).collect()
+}
+
+/// 文件列表里的一行（站点索引按目录切出来的结果）。
+#[derive(Clone, Debug, Default)]
+pub struct KvItem {
+    pub name: String,
+    /// 由索引里的 `folderPath` 前缀推出来的子目录（站点没有真正的目录对象，
+    /// 也不会为「空目录」留记录）。
+    pub is_dir: bool,
+    pub size: u64,
+    /// `uploadedAt`（RFC3339）。字典序即时间序，和 rclone 的 `mod_time` 一致。
+    pub uploaded: String,
+}
+
+/// 把站点索引切成「`folder` 这一层」的条目，并按 GUI 的排序规则排好。
+///
+/// 排序规则和 `main.rs::file_rows` 保持一致：目录永远在前，同类按
+/// `sort_key`（`name` / `size` / `mtime`）排，`desc` 反向。目录的大小按 0 算
+/// （站点没有目录大小），时间取该目录下最新的一条，这样按时间倒序时，
+/// 最近传过东西的目录会冒到前面。
+pub fn list_folder(files: &[RemoteFile], folder: &str, sort_key: &str, desc: bool) -> Vec<KvItem> {
+    let dir = folder.trim().trim_matches('/');
+    let mut dirs: Vec<KvItem> = Vec::new();
+    let mut items: Vec<KvItem> = Vec::new();
+    for f in files {
+        if f.folder == dir {
+            items.push(KvItem {
+                name: f.name.clone(),
+                is_dir: false,
+                size: f.size,
+                uploaded: f.uploaded.clone(),
+            });
+            continue;
+        }
+        // 只认「当前目录下面一层」：更深的路径只贡献它的第一个路径段
+        let rest = if dir.is_empty() {
+            f.folder.as_str()
+        } else if let Some(r) = f.folder.strip_prefix(&format!("{dir}/")) {
+            r
+        } else {
+            continue;
+        };
+        let seg = rest.split('/').next().unwrap_or(rest);
+        if seg.is_empty() {
+            continue;
+        }
+        match dirs.iter_mut().find(|d| d.name == seg) {
+            Some(d) => {
+                if f.uploaded > d.uploaded {
+                    d.uploaded = f.uploaded.clone();
+                }
+            }
+            None => dirs.push(KvItem {
+                name: seg.to_string(),
+                is_dir: true,
+                size: 0,
+                uploaded: f.uploaded.clone(),
+            }),
+        }
+    }
+    let by = |a: &KvItem, b: &KvItem| -> std::cmp::Ordering {
+        let ord = if sort_key == "size" {
+            a.size.cmp(&b.size).then_with(|| a.name.cmp(&b.name))
+        } else if sort_key == "mtime" {
+            a.uploaded
+                .cmp(&b.uploaded)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        } else {
+            a.name.to_lowercase().cmp(&b.name.to_lowercase())
+        };
+        if desc {
+            ord.reverse()
+        } else {
+            ord
+        }
+    };
+    dirs.sort_by(by);
+    items.sort_by(by);
+    dirs.extend(items);
+    dirs
 }
 
 /// 把 `{"success":false,"error":{"code","message"}}` 摊平成一行中文，
@@ -482,6 +873,17 @@ mod tests {
             m.insert((*k).to_string(), json!(v));
         }
         m
+    }
+
+    /// 造一条站点索引记录（测试用）。
+    fn rf(id: &str, name: &str, folder: &str, size: u64, uploaded: &str) -> RemoteFile {
+        RemoteFile {
+            id: id.to_string(),
+            name: name.to_string(),
+            folder: folder.to_string(),
+            size,
+            uploaded: uploaded.to_string(),
+        }
     }
 
     #[test]
@@ -632,5 +1034,123 @@ mod tests {
         assert_eq!(p.id, "abc");
         assert!(p.folder_prefix.is_empty());
         assert_eq!(p.max_file, 1024);
+    }
+
+    #[test]
+    fn files_page_is_parsed_with_cursor() {
+        let v: Value = serde_json::from_str(
+            r#"{"success":true,"files":[
+                {"id":"tg:AgAC","name":"a.png","size":10,"folderPath":"image_bed"},
+                {"id":"r2:dir/b.txt","name":"b.txt","size":20,"folderPath":"/dir/"}],
+                "pagination":{"cursor":"next-1","listComplete":false,"pageCount":2,"total":3}}"#,
+        )
+        .unwrap();
+        let (files, next) = parse_files(&v);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].folder, "image_bed");
+        // folderPath 前后的斜杠要被吃掉，否则匹配不上 GUI 路径
+        assert_eq!(files[1].folder, "dir");
+        assert_eq!(next.as_deref(), Some("next-1"));
+
+        let done: Value = serde_json::from_str(
+            r#"{"files":[],"pagination":{"cursor":null,"listComplete":true}}"#,
+        )
+        .unwrap();
+        assert!(parse_files(&done).1.is_none());
+    }
+
+    #[test]
+    fn collision_suffix_is_stripped() {
+        assert_eq!(strip_collision_suffix("a~ab12cd.txt"), "a.txt");
+        assert_eq!(strip_collision_suffix("照片~0011aa.png"), "照片.png");
+        // 正常的波浪号/短尾不能被误摘
+        assert_eq!(strip_collision_suffix("a~b.txt"), "a~b.txt");
+        assert_eq!(strip_collision_suffix("a~toolong.txt"), "a~toolong.txt");
+        assert_eq!(strip_collision_suffix("plain"), "plain");
+    }
+
+    #[test]
+    fn targets_match_folder_and_name() {
+        let files = vec![
+            rf("tg:AAAAAA", "a.png", "image_bed", 1, "2026-10-23T10:00:00Z"),
+            rf("tg:00ff0011", "a.png", "image_bed", 1, "2026-10-23T10:00:00Z"),
+            rf("tg:3", "b.png", "image_bed/sub", 1, "2026-10-23T10:00:00Z"),
+            rf("tg:4", "a.png", "other", 1, "2026-10-23T10:00:00Z"),
+        ];
+        // 同目录两个同名文件：索引里都叫 a.png，点哪个都说不清，两个都返回，
+        // 交给调用方拒绝并让用户去站点处理。
+        assert_eq!(
+            pick_targets(&files, "image_bed", "a.png", false),
+            vec!["tg:AAAAAA", "tg:00ff0011"]
+        );
+        // DAV 显示名带后缀时，后缀（主键末 6 位）能唯一定位到那一条
+        assert_eq!(
+            pick_targets(&files, "image_bed", "a~ff0011.png", false),
+            vec!["tg:00ff0011"]
+        );
+        // 唯一的名字照旧
+        assert_eq!(pick_targets(&files, "other", "a.png", false), vec!["tg:4"]);
+        // 目录：把自己和整棵子树都算进去，别目录里的不算
+        assert_eq!(
+            pick_targets(&files, "", "image_bed", true),
+            vec!["tg:AAAAAA", "tg:00ff0011", "tg:3"]
+        );
+        assert_eq!(pick_targets(&files, "image_bed", "sub", true), vec!["tg:3"]);
+        assert!(pick_targets(&files, "image_bed", "nope.png", false).is_empty());
+    }
+
+    #[test]
+    fn folder_listing_splits_dirs_and_files() {
+        let files = vec![
+            rf("tg:1", "a.png", "image_bed", 10, "2026-10-23T10:00:00Z"),
+            rf("tg:2", "b.png", "image_bed/sub", 20, "2026-10-23T11:00:00Z"),
+            rf(
+                "tg:3",
+                "deep.png",
+                "image_bed/sub/deeper",
+                30,
+                "2026-10-23T12:00:00Z",
+            ),
+            rf("tg:4", "c.png", "other", 40, "2026-10-23T09:00:00Z"),
+        ];
+        // 根目录只看到两个目录名：更深层的路径只贡献第一段
+        let root = list_folder(&files, "", "name", false);
+        let names: Vec<&str> = root.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["image_bed", "other"]);
+        assert!(root.iter().all(|i| i.is_dir));
+        // 子目录这一层：目录在前，文件在后
+        let layer = list_folder(&files, "image_bed", "name", false);
+        let names: Vec<&str> = layer.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["sub", "a.png"]);
+        assert!(layer[0].is_dir);
+        assert!(!layer[1].is_dir);
+        // 目录的时间取子树里最新的一条，按时间倒序时最近有更新的目录会冒上来
+        assert_eq!(layer[0].uploaded, "2026-10-23T12:00:00Z");
+        let by_time = list_folder(&files, "image_bed", "mtime", true);
+        assert_eq!(by_time[0].name, "sub");
+        // 大小排序：目录算 0
+        let by_size = list_folder(&files, "image_bed", "size", false);
+        assert!(by_size[0].is_dir);
+        // 不存在的目录返回空，不 panic
+        assert!(list_folder(&files, "nope", "name", false).is_empty());
+    }
+
+    #[test]
+    fn idem_key_is_stable_and_destination_aware() {
+        let a = idem_key("https://h", "telegram", "img", "a.png", 10, 100);
+        let b = idem_key("https://h", "telegram", "img", "a.png", 10, 100);
+        // 同一份文件传到另一个目录不能被当成同一次上传（否则会拿回旧目录的直链）
+        let c = idem_key("https://h", "telegram", "other", "a.png", 10, 100);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.starts_with("rcgui-"));
+        assert_eq!(a.len(), "rcgui-".len() + 16);
+    }
+
+    #[test]
+    fn id_is_url_encoded_but_keeps_structure() {
+        assert_eq!(encode_id("tg:AgACAg"), "tg:AgACAg");
+        assert_eq!(encode_id("r2:dir/a b.png"), "r2:dir/a%20b.png");
+        assert_eq!(encode_id("tg:a#b"), "tg:a%23b");
     }
 }
