@@ -465,7 +465,7 @@ export global RemotesG {
     /// 当前是 K-Vault 远程：通用字段表 / 高级 / 原始编辑器全部让位给下面的表单
     in-out property <bool> kv-editor: false;
     /// 站点地址，形如 https://kvault.example.org（不带 /dav 后缀）
-    in-out property <string> kv-base: "https://kvault.example.com";
+    in-out property <string> kv-base: "";
     /// API 令牌（Bearer）；密码类字段，不回显
     in-out property <string> kv-token: "";
     /// 已保存过令牌（编辑现有远程时置位）：留空表示不修改
@@ -2553,7 +2553,7 @@ component RemotesView inherits Rectangle {
                             spacing: 3px;
                             horizontal-stretch: 1;
                             FieldLabel { text: "上传目录（相对站点根；留空 = 令牌策略里的目录前缀）"; }
-                            LineEdit { text <=> RemotesG.kv-folder; placeholder-text: "image_bed"; }
+                            LineEdit { text <=> RemotesG.kv-folder; }
                         }
                         VerticalLayout {
                             spacing: 3px;

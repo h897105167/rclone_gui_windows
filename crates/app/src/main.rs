@@ -2448,12 +2448,19 @@ fn reset_kv_form(ui: &MainWindow, base: &str) {
 ///
 /// 文件页当前路径就是用户看到的目录：非空时按它传（用户明确选了一个子目录），
 /// 否则用远程保存的上传目录（通常等于令牌的目录前缀）。
+///
+/// 站点按令牌策略要求目录落在前缀下，传到前缀之外一律 `POLICY_FOLDER_DENIED`；
+/// 所以当前路径不在上传目录里时退回上传目录，而不是让 rclone/站点回一个看不懂的错。
 fn kv_upload_folder(cfg: &kvault::KvCfg, gui_path: &str) -> String {
     let p = gui_path.trim().trim_matches('/');
-    if p.is_empty() {
-        cfg.folder.clone()
-    } else {
+    let root = cfg.folder.trim().trim_matches('/');
+    if p.is_empty() || root.is_empty() {
+        return if p.is_empty() { root.to_string() } else { p.to_string() };
+    }
+    if p == root || p.starts_with(&format!("{root}/")) {
         p.to_string()
+    } else {
+        root.to_string()
     }
 }
 
@@ -2594,6 +2601,27 @@ async fn kv_write_blocked(ctx: &Arc<Ctx>, remote: &str) -> Option<String> {
 传文件请用「上传」（走站点 API）；删除/改名请到站点网页端操作。"
             .to_string()
     })
+}
+
+/// 这类错误重试一次就好：HTTP/2 建连抖动、连接被重置、TLS 握手中断。
+///
+/// 站点挂在 Cloudflare 后面，实测偶发 `Propfind …: http2: client conn could not be
+/// established`，紧接着再请求就正常；把它当致命错误报给用户太吵。
+fn looks_like_transient_net(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    [
+        "http2",
+        "could not be established",
+        "connection reset",
+        "eof",
+        "broken pipe",
+        "tls handshake",
+        "timeout awaiting",
+        "请求超时",
+        "i/o timeout",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
 }
 
 /// 上传入口的 K-Vault 分支：三个「上传到本机→远程」的入口共用。
@@ -4777,13 +4805,27 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let proxy_ep = remote_proxy_endpoint(ctx, &remote);
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
-            let res = tokio::time::timeout(
+            let mut res = tokio::time::timeout(
                 std::time::Duration::from_secs(15),
                 client.list(&fs, &path, None),
             )
             .await
             .map_err(|_| anyhow!("请求超时"))
             .and_then(|r| r.map_err(anyhow::Error::from));
+            // 站点在 Cloudflare 后面，HTTP/2 建连偶发抖动（"http2: client conn could not
+            // be established"）；这种错误自己会好，重试一次远好过让用户盯着红色报错。
+            if let Err(e) = &res {
+                if looks_like_transient_net(&e.to_string()) {
+                    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                    res = tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        client.list(&fs, &path, None),
+                    )
+                    .await
+                    .map_err(|_| anyhow!("重试仍超时"))
+                    .and_then(|r| r.map_err(anyhow::Error::from));
+                }
+            }
             // 请求期间用户可能已发起更新操作（seq 变化），丢弃过期结果
             let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq()).await.unwrap_or(-2);
             if seq >= 0 && cur_seq != seq {
@@ -6535,7 +6577,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let token_set = !adopt.0 && kv_param_of(&adopt.1, "bearer_token").is_some_and(|t| !t.is_empty());
                 let pass_set = !adopt.0 && kv_param_of(&adopt.1, "pass").is_some_and(|p| !p.is_empty());
                 let _ = ui.upgrade_in_event_loop(move |ui| {
-                    reset_kv_form(&ui, base.as_deref().unwrap_or(kvault::DEFAULT_BASE));
+                    // 站点地址不预填：用户自己粘自己的站点，别给一个看起来像默认值的示例。
+                    reset_kv_form(&ui, base.as_deref().unwrap_or(""));
                     let g = ui.global::<RemotesG>();
                     if !user.is_empty() {
                         g.set_kv_user(user.into());
@@ -6548,6 +6591,15 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         }
         Cmd::KvTest => {
             let form = read_kv_form(ui).await;
+            if form.base.trim().is_empty() {
+                let _ = ui.upgrade_in_event_loop(|ui| {
+                    let g = ui.global::<RemotesG>();
+                    g.set_kv_testing(false);
+                    g.set_kv_status("请先填站点地址（根地址，不要带 /dav）".into());
+                    g.set_kv_status_level(3);
+                });
+                return false;
+            }
             let _ = ui.upgrade_in_event_loop(|ui| {
                 let g = ui.global::<RemotesG>();
                 g.set_kv_testing(true);
@@ -6559,11 +6611,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if token.is_empty() && !form.name.is_empty() {
                 token = kv_token_get(&ctx, &form.name);
             }
-            let base = if form.base.trim().is_empty() {
-                kvault::DEFAULT_BASE.to_string()
-            } else {
-                form.base.clone()
-            };
+            let base = form.base.clone();
             let res = kvault::probe(&base, &token).await;
             let _ = ui.upgrade_in_event_loop(move |ui| {
                 let g = ui.global::<RemotesG>();

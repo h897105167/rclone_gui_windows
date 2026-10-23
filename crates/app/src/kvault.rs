@@ -36,8 +36,6 @@ pub const TYPE: &str = "k-vault";
 pub const BACKEND: &str = "webdav";
 /// 远程参数里的标记键：有它才是本 GUI 创建的 K-Vault 远程。
 pub const MARKER: &str = "kvault";
-/// 站点根地址默认值（用户可在表单里改）。
-pub const DEFAULT_BASE: &str = "https://kvault.example.com";
 /// `storage` 的合法取值（与站点文档一致）。
 pub const STORAGES: [&str; 7] = [
     "telegram",
@@ -267,9 +265,27 @@ pub async fn probe(base: &str, token: &str) -> Result<Probe, String> {
     }
     let v: Value = serde_json::from_str(&body)
         .map_err(|e| format!("令牌信息不是 JSON（HTTP {status}）: {e}"))?;
-    // `/me` 的字段可能平铺，也可能包在 `token` 里，两种都兼容。
-    let node = v.get("token").cloned().unwrap_or_else(|| v.clone());
-    let policies = node.get("policies").cloned().unwrap_or(json!({}));
+    Ok(parse_me(&v))
+}
+
+/// 解析 `GET /api/v1/me`。
+///
+/// 站点实际返回的是 `{"success":true,"data":{"token":{…}}}`（2026-10-23 实测），
+/// 交接文档里另外写过平铺形式；三种位置都试一遍，免得取值路径不对又被当成「没填令牌」。
+fn parse_me(v: &Value) -> Probe {
+    let data = v.get("data").filter(|d| d.is_object());
+    let node = data
+        .and_then(|d| d.get("token"))
+        .or_else(|| v.get("token"))
+        .or(data)
+        .cloned()
+        .unwrap_or_else(|| v.clone());
+    let policies = node
+        .get("policies")
+        .or_else(|| data.and_then(|d| d.get("policies")))
+        .or_else(|| v.get("policies"))
+        .cloned()
+        .unwrap_or(json!({}));
     let strings = |v: Option<&Value>| -> Vec<String> {
         v.and_then(|x| x.as_array())
             .map(|a| {
@@ -279,7 +295,7 @@ pub async fn probe(base: &str, token: &str) -> Result<Probe, String> {
             })
             .unwrap_or_default()
     };
-    Ok(Probe {
+    Probe {
         id: node.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         name: node
             .get("name")
@@ -297,7 +313,7 @@ pub async fn probe(base: &str, token: &str) -> Result<Probe, String> {
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string(),
-    })
+    }
 }
 
 /// 上传一个文件到 `folder`，`name` 作为最终文件名（同名处理由调用方完成）。
@@ -582,5 +598,39 @@ mod tests {
         assert_eq!(mime_for("a.PNG"), "image/png");
         assert_eq!(mime_for("a.webm"), "application/octet-stream");
         assert_eq!(mime_for("noext"), "application/octet-stream");
+    }
+
+    /// 站点真实返回（交接文档 2026-10-23 实测）：`data.token` 包一层。
+    /// 曾经只认平铺字段，导致填好令牌还提示「未填令牌」。
+    #[test]
+    fn me_is_read_from_data_token() {
+        let v: Value = serde_json::from_str(
+            r#"{"success":true,"data":{"token":{"id":"EVhBVOYTA6bP","name":"图床",
+            "scopes":["upload","read"],"enabled":true,
+            "policies":{"allowedStorages":["telegram"],"maxFileSize":15728640,
+            "folderPrefix":"image_bed"}}}}"#,
+        )
+        .unwrap();
+        let p = parse_me(&v);
+        assert_eq!(p.id, "EVhBVOYTA6bP");
+        assert_eq!(p.name, "图床");
+        assert_eq!(p.scopes, vec!["upload", "read"]);
+        assert_eq!(p.storages, vec!["telegram"]);
+        assert_eq!(p.max_file, 15728640);
+        assert_eq!(p.folder_prefix, "image_bed");
+    }
+
+    /// 平铺形式仍然要能读，免得站点回退旧格式时又坏掉。
+    #[test]
+    fn me_is_read_from_flat_body() {
+        let v: Value = serde_json::from_str(
+            r#"{"token":{"id":"abc","scopes":["read"]},
+                "policies":{"allowedStorages":["r2"],"maxFileSize":1024,"folderPrefix":""}}"#,
+        )
+        .unwrap();
+        let p = parse_me(&v);
+        assert_eq!(p.id, "abc");
+        assert!(p.folder_prefix.is_empty());
+        assert_eq!(p.max_file, 1024);
     }
 }
