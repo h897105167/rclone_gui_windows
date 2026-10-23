@@ -8225,6 +8225,7 @@ async fn bed_run(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             url: String::new(),
             user: String::new(),
             pass: String::new(),
+            addr: String::new(),
         });
     let proxy = bed_proxy_url(ctx, &cfg.remote, &stored);
     let mount = bed::mount_path(&cfg.remote, &stored);

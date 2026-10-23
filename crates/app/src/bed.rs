@@ -342,6 +342,12 @@ impl RcloneCli {
         Some(Self { exe, conf })
     }
 
+    /// 用已知的 exe / conf 直接构造，供自检使用。
+    #[cfg(test)]
+    pub fn from_parts(exe: PathBuf, conf: String) -> Self {
+        Self { exe, conf }
+    }
+
     /// `rclone link <remote>:<path>`；返回链接或 rclone 自己的失败原因。
     pub async fn link(&self, mount: String) -> Result<String> {
         let exe = self.exe.clone();
@@ -361,10 +367,12 @@ impl RcloneCli {
             if !out.status.success() {
                 bail!("{}", first_line(&stderr));
             }
+            // teldrive 只输出相对路径（`/share/tds_xxx`），由调用方用远程地址补全；
+            // 所以这里接受任意非空行，不做 http 前缀过滤。
             stdout
                 .lines()
                 .map(str::trim)
-                .find(|l| l.starts_with("http"))
+                .find(|l| !l.is_empty())
                 .map(|s| s.to_string())
                 .ok_or_else(|| anyhow!("rclone link 没有输出链接: {}", brief(&stdout)))
         })
@@ -418,6 +426,10 @@ pub struct RemoteInfo {
     pub url: String,
     pub user: String,
     pub pass: String,
+    /// 站点根地址，用来把「相对形式的链接」补成完整链接：
+    /// teldrive 的 `rclone link` 只给 `/share/xxx`，需要拿 `api_host` 拼；
+    /// 其他后端没有 `api_host` 时退回 `url`。
+    pub addr: String,
 }
 
 impl RemoteInfo {
@@ -428,12 +440,43 @@ impl RemoteInfo {
                 .unwrap_or("")
                 .to_string()
         };
+        let addr = ["api_host", "rclone_address", "url"]
+            .iter()
+            .map(|k| s(k))
+            .find(|v| !v.trim().is_empty())
+            .unwrap_or_default();
         Self {
             kind: s("type"),
             url: s("url"),
             user: s("user"),
             pass: s("pass"),
+            addr,
         }
+    }
+
+    /// 把 `rclone link` 的输出补成可点的完整链接。
+    ///
+    /// 已经是 `http(s)://` 的直接返回；相对路径（teldrive 的 `/share/xxx`）用
+    /// [`Self::addr`] 拼；连站点地址都没有时返回 `None`，由调用方给出可读的失败原因。
+    pub fn absolute_link(&self, raw: &str) -> Option<String> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let lower = raw.to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            return Some(raw.to_string());
+        }
+        let base = self.addr.trim().trim_end_matches('/');
+        if base.is_empty() {
+            return None;
+        }
+        let base = if base.to_ascii_lowercase().starts_with("http") {
+            base.to_string()
+        } else {
+            format!("https://{base}")
+        };
+        Some(format!("{}/{}", base, raw.trim_start_matches('/')))
     }
 
     /// webdav + 有 url：才有可能是 AList（探活会再确认一次，避免把普通 webdav 当 AList）。
@@ -476,8 +519,18 @@ impl Alist {
             bail!("{base}/api/public/settings 返回 HTTP {}", probe.status().as_u16());
         }
         let body: Value = probe.json().await.unwrap_or(Value::Null);
-        let title = body.get("site_title").and_then(|x| x.as_str()).unwrap_or("");
-        let version = body.get("version").and_then(|x| x.as_str()).unwrap_or("");
+        // AList 把设置放在 `data` 里（`{"code":200,"data":{"site_title":...}}`）；
+        // 兼容某些版本/反代直接平铺在顶层。
+        let data = body.get("data").cloned().unwrap_or(Value::Null);
+        let pick = |k: &str| {
+            data.get(k)
+                .or_else(|| body.get(k))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let title = pick("site_title");
+        let version = pick("version");
         if title.is_empty() && version.is_empty() {
             bail!("{base} 不是 AList 站点（public/settings 无 site_title/version）");
         }
@@ -491,31 +544,46 @@ impl Alist {
             .context("AList 登录请求失败")?;
         let status = resp.status();
         let body: Value = resp.json().await.unwrap_or(Value::Null);
+        let message = body
+            .get("message")
+            .and_then(|x| x.as_str())
+            .unwrap_or("未知错误")
+            .to_string();
         if !status.is_success() {
-            let msg = body
-                .get("message")
-                .and_then(|x| x.as_str())
-                .unwrap_or("未知错误");
-            bail!("AList 登录失败（HTTP {}）：{msg}", status.as_u16());
+            bail!("AList 登录失败（HTTP {}）：{message}", status.as_u16());
         }
-        let token = body
+        // AList 成功也带 `code`；非 200 时 token 一定拿不到，先把 message 报出来。
+        let code = body.get("code").and_then(|x| x.as_i64()).unwrap_or(200);
+        if code != 200 {
+            bail!("AList 登录返回 code={code}：{message}");
+        }
+        // token 在 `data.token`（v3 全系）；老版本/反代可能平铺在顶层。
+        let data = body.get("data").cloned().unwrap_or(Value::Null);
+        let token = data
             .get("token")
+            .or_else(|| body.get("token"))
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
         if token.is_empty() {
-            bail!("AList 登录成功但没有返回 token");
+            bail!("AList 登录成功但没有返回 token（响应：{}）", brief(&body.to_string()));
         }
         Ok(Self { http, base: base.to_string(), token })
     }
 
     /// `/api/fs/get` 返回的 `data.raw_url` 就是存储后端的直链（可能带签名、会过期）。
     async fn direct(&self, path: &str) -> Result<(String, String)> {
+        // AList 的 fs 接口只认以 `/` 开头的绝对路径；图床里存的 `img/a.png` 得补成 `/img/a.png`。
+        let abs = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
         let resp = self
             .http
             .post(format!("{}/api/fs/get", self.base))
             .header("Authorization", &self.token)
-            .json(&json!({ "path": path, "password": "" }))
+            .json(&json!({ "path": abs, "password": "" }))
             .send()
             .await
             .context("AList fs/get 请求失败")?;
@@ -526,7 +594,7 @@ impl Alist {
                 .get("message")
                 .and_then(|x| x.as_str())
                 .unwrap_or("未知错误");
-            bail!("AList fs/get 失败（HTTP {}）：{msg}", status.as_u16());
+            bail!("AList fs/get {abs} 失败（HTTP {}）：{msg}", status.as_u16());
         }
         let code = body.get("code").and_then(|x| x.as_i64()).unwrap_or(0);
         if code != 200 {
@@ -534,7 +602,7 @@ impl Alist {
                 .get("message")
                 .and_then(|x| x.as_str())
                 .unwrap_or("未知错误");
-            bail!("AList fs/get 返回 code={code}：{msg}");
+            bail!("AList fs/get {abs} 返回 code={code}：{msg}");
         }
         let data = body.get("data").cloned().unwrap_or(Value::Null);
         let raw = data
@@ -544,7 +612,7 @@ impl Alist {
             .trim()
             .to_string();
         if raw.is_empty() {
-            bail!("AList 没有给出直链（该驱动可能不支持 raw_url）");
+            bail!("AList 没有给出 {abs} 的直链（该驱动可能不支持 raw_url）");
         }
         // provider 名字只用于在提示里说明「直链来自哪个存储」。
         let provider = data
@@ -561,6 +629,8 @@ impl Alist {
 pub enum Source {
     /// rclone link（后端给的公开/临时链接）
     Cli,
+    /// rclone link 返回的是相对地址，补全后是一个「分享页」而不是文件本身（teldrive 就是这样）
+    Share,
     /// AList 管理 API 的 raw_url
     Alist,
     /// 本机 HTTP 代理
@@ -571,6 +641,7 @@ impl Source {
     pub fn label(&self) -> &'static str {
         match self {
             Source::Cli => "rclone link",
+            Source::Share => "rclone link（分享页）",
             Source::Alist => "AList raw_url",
             Source::Proxy => "本机代理",
         }
@@ -579,6 +650,7 @@ impl Source {
     pub fn note(&self) -> &'static str {
         match self {
             Source::Cli => "后端公开链接（是否长期有效取决于后端）",
+            Source::Share => "这是后端分享页（网页预览），不是图片文件直链",
             Source::Alist => "存储后端直链，可能带签名、会过期",
             Source::Proxy => "只有本机能打开（127.0.0.1）",
         }
@@ -599,7 +671,22 @@ pub async fn resolve_link(
 
     if let Some(cli) = cli {
         match cli.link(mount.to_string()).await {
-            Ok(u) => return Ok((u, Source::Cli)),
+            Ok(raw) => match info.absolute_link(&raw) {
+                Some(u) => {
+                    // 相对地址 = 该后端只给「分享路径」（teldrive 的 /share/xxx），补全后是网页。
+                    let relative = raw.trim().starts_with('/');
+                    let src = if relative && info.kind.eq_ignore_ascii_case("teldrive") {
+                        Source::Share
+                    } else {
+                        Source::Cli
+                    };
+                    return Ok((u, src));
+                }
+                None => attempts.push(format!(
+                    "rclone link 只给出相对链接 {raw}，而远程 {} 没有配置站点地址（api_host / url），无法补全",
+                    if info.kind.is_empty() { "未知" } else { &info.kind }
+                )),
+            },
             Err(e) => attempts.push(format!("rclone link：{e:#}")),
         }
     } else {
@@ -617,7 +704,8 @@ pub async fn resolve_link(
                 }
             }
         }
-        let mut last = String::new();
+        // 两个候选地址都试；每个候选的失败原因都留下来，避免最后一条把前一条盖掉。
+        let mut why: Vec<String> = Vec::new();
         let mut got = None;
         for base in &candidates {
             match Alist::open(base, &info.user, &pass).await {
@@ -626,18 +714,18 @@ pub async fn resolve_link(
                         got = Some((url, provider));
                         break;
                     }
-                    Err(e) => last = format!("{e:#}"),
+                    Err(e) => why.push(format!("{base}：{e:#}")),
                 },
-                Err(e) => last = format!("{e:#}"),
+                Err(e) => why.push(format!("{base}：{e:#}")),
             }
         }
         match got {
             Some((url, _provider)) => return Ok((url, Source::Alist)),
-            None => attempts.push(format!("AList：{last}")),
+            None => attempts.push(format!("AList：{}", why.join("；"))),
         }
     } else {
         attempts.push(format!(
-            "AList：远程类型是 {}，不是 webdav，跳过",
+            "AList 直链：远程类型是 {}，只有 webdav 类型的 AList 远程能走管理 API",
             if info.kind.is_empty() { "未知" } else { &info.kind }
         ));
     }
@@ -831,6 +919,40 @@ mod tests {
     }
 
     #[test]
+    fn joins_relative_links() {
+        // teldrive：rclone link 只给 `/share/xxx`，要用 api_host 补全
+        let m = json!({"type": "teldrive", "api_host": "https://t.example/"});
+        let info = RemoteInfo::from_map(m.as_object().unwrap());
+        assert_eq!(
+            info.absolute_link("/share/tds_x").as_deref(),
+            Some("https://t.example/share/tds_x")
+        );
+        // 已经完整的链接原样返回
+        assert_eq!(
+            info.absolute_link("https://cdn.example/a.png?sign=1").as_deref(),
+            Some("https://cdn.example/a.png?sign=1")
+        );
+        // api_host 没写协议时补 https://
+        let m2 = json!({"type": "teldrive", "api_host": "t.example"});
+        let info2 = RemoteInfo::from_map(m2.as_object().unwrap());
+        assert_eq!(
+            info2.absolute_link("share/x").as_deref(),
+            Some("https://t.example/share/x")
+        );
+        // 没有站点地址 + 相对链接：交给调用方报错，而不是拼出坏链
+        let m3 = json!({"type": "webdav"});
+        let info3 = RemoteInfo::from_map(m3.as_object().unwrap());
+        assert_eq!(info3.absolute_link("/share/x"), None);
+        // webdav 远程退回 url 作为站点地址
+        let m4 = json!({"type": "webdav", "url": "https://alist.example/dav"});
+        let info4 = RemoteInfo::from_map(m4.as_object().unwrap());
+        assert_eq!(
+            info4.absolute_link("/share/x").as_deref(),
+            Some("https://alist.example/dav/share/x")
+        );
+    }
+
+    #[test]
     fn params_map_unwraps_result() {
         let v = json!({"result": {"type": "webdav", "url": "https://h"}});
         let m = params_map(&v);
@@ -840,6 +962,96 @@ mod tests {
     #[test]
     fn source_labels_exist() {
         assert_eq!(Source::Alist.label(), "AList raw_url");
+        assert_eq!(Source::Share.label(), "rclone link（分享页）");
         assert!(Source::Proxy.note().contains("127.0.0.1"));
+    }
+
+    // ------------------------------------------------------------ 真机自检（默认忽略）
+    //
+    // 这两条会真连本机 rclone.conf 里的远程，只在手动排查时跑：
+    //   cargo test -p rclone-gui bed_live_ -- --ignored --nocapture
+    //
+    // `bed_live_alist_open` 守的是「AList 探活把 site_title/version 当顶层字段」那个 bug；
+    // `bed_live_teldrive_link` 守的是「teldrive 的 rclone link 只给相对地址」那个 bug。
+
+    fn live_cli() -> Option<RcloneCli> {
+        let exe = discover_exe(None).ok()?;
+        let out = std::process::Command::new(&exe)
+            .arg("config")
+            .arg("file")
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let conf = text.lines().map(str::trim).filter(|l| !l.is_empty()).last()?.to_string();
+        Some(RcloneCli::from_parts(exe, conf))
+    }
+
+    fn live_dump(cli: &RcloneCli) -> Value {
+        let out = std::process::Command::new(&cli.exe)
+            .args(["config", "dump"])
+            .output()
+            .expect("rclone config dump 失败");
+        serde_json::from_slice(&out.stdout).expect("config dump 不是 JSON")
+    }
+
+    #[test]
+    #[ignore = "需要本机已配置 alist 远程（真网络）"]
+    fn bed_live_alist_open() {
+        let cli = live_cli().expect("找不到 rclone.exe / rclone.conf");
+        let dump = live_dump(&cli);
+        let raw = dump.get("alist").expect("本机没有名为 alist 的远程");
+        let info = RemoteInfo::from_map(raw.as_object().unwrap());
+        assert!(info.looks_alist(), "alist 远程应是 webdav 且有 url");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bases = alist_base_candidates(&info.url);
+        let pass = rt.block_on(cli.reveal(&info.pass)).expect("rclone reveal 失败");
+        let mut errs = Vec::new();
+        let mut ok = None;
+        for base in &bases {
+            match rt.block_on(Alist::open(base, &info.user, &pass)) {
+                Ok(a) => {
+                    ok = Some(base.clone());
+                    // 顺手确认真能拿到直链：根目录一定是目录，raw_url 为空是正常的，
+                    // 这里只要求接口 code=200（失败会返回 Err）。
+                    let _ = rt.block_on(a.direct("/"));
+                    break;
+                }
+                Err(e) => errs.push(format!("{base}：{e:#}")),
+            }
+        }
+        assert!(ok.is_some(), "AList 探活/登录全部失败：\n{}", errs.join("\n"));
+        println!("bed_live_alist_open ok via {}", ok.unwrap());
+    }
+
+    #[test]
+    #[ignore = "需要本机已配置 teldrive 远程（真网络）"]
+    fn bed_live_teldrive_link() {
+        let cli = live_cli().expect("找不到 rclone.exe / rclone.conf");
+        let dump = live_dump(&cli);
+        let raw = dump.get("teldrive").expect("本机没有名为 teldrive 的远程");
+        let info = RemoteInfo::from_map(raw.as_object().unwrap());
+        assert!(!info.addr.is_empty(), "teldrive 远程应有 api_host");
+
+        // 找一个真实文件做样本
+        let out = std::process::Command::new(&cli.exe)
+            .args(["lsf", "teldrive:", "--max-depth", "2"])
+            .output()
+            .expect("rclone lsf 失败");
+        let listing = String::from_utf8_lossy(&out.stdout).to_string();
+        let file = listing
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.ends_with('/'))
+            .expect("teldrive 里没有可用文件")
+            .to_string();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mount = mount_path("teldrive", &file);
+        let got = rt.block_on(resolve_link(Some(&cli), &info, &mount, &file, ""));
+        let (url, src) = got.expect("teldrive 取直链失败");
+        println!("bed_live_teldrive_link ok: {url} via {}", src.label());
+        assert!(url.starts_with("http"), "链接应以 http 开头：{url}");
+        assert_eq!(src, Source::Share, "teldrive 走的是分享页");
     }
 }
