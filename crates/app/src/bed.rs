@@ -633,6 +633,8 @@ pub enum Source {
     Share,
     /// AList 管理 API 的 raw_url
     Alist,
+    /// K-Vault 站点 API 返回的签名直链（`links.download`）
+    Kvault,
     /// 本机 HTTP 代理
     Proxy,
 }
@@ -643,6 +645,7 @@ impl Source {
             Source::Cli => "rclone link",
             Source::Share => "rclone link（分享页）",
             Source::Alist => "AList raw_url",
+            Source::Kvault => "K-Vault 站点直链",
             Source::Proxy => "本机代理",
         }
     }
@@ -652,6 +655,7 @@ impl Source {
             Source::Cli => "后端公开链接（是否长期有效取决于后端）",
             Source::Share => "这是后端分享页（网页预览），不是图片文件直链",
             Source::Alist => "存储后端直链，可能带签名、会过期",
+            Source::Kvault => "站点签名的下载直链；站点换 Telegram bot token 后会全部失效",
             Source::Proxy => "只有本机能打开（127.0.0.1）",
         }
     }

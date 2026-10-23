@@ -261,10 +261,100 @@ impl HostCaps {
     }
 }
 
+/// 把「源/目标是 K-Vault 远程」的写操作接到站点 API 上；`None` = 与 k-vault 无关。
+///
+/// 站点只开放「上传 / 列表 / 删除」：删除映射到 `DELETE /api/v1/file/<id>`，
+/// 而改名、移动、建目录没有对应接口——那边给一句明确的原因，比把 rclone 的
+/// 403 原样抛给用户更有用。读方法（list/stat/cat…）不动，DAV 读是允许的。
+async fn kv_write_op(
+    client: &rclone_client::RcClient,
+    store: &KvStore,
+    method: &str,
+    params: &Value,
+) -> Result<Option<Value>> {
+    let deletes = matches!(
+        method,
+        "operations/deletefile" | "operations/purge"
+    );
+    let refuses = matches!(
+        method,
+        "operations/movefile"
+            | "operations/move"
+            | "operations/copyfile"
+            | "operations/copy"
+            | "operations/mkdir"
+            | "operations/rmdir"
+    );
+    if !deletes && !refuses {
+        return Ok(None);
+    }
+    let fs = params.get("fs").and_then(|v| v.as_str()).unwrap_or("");
+    let Some((remote, sub)) = fs.split_once(':') else {
+        return Ok(None);
+    };
+    let Some(cfg) = crate::kv_cfg_lookup(client, store, remote).await else {
+        return Ok(None);
+    };
+    if refuses {
+        let what = match method {
+            "operations/mkdir" => "新建目录",
+            "operations/rmdir" => "删除目录",
+            _ => "改名/移动/复制",
+        };
+        return Err(anyhow!(
+            "K-Vault 远程不支持{what}：站点的 DAV 只读，API 也只开放上传、列表、删除。\
+             要在站点上调整目录，请到站点网页端操作。"
+        ));
+    }
+    let path = params
+        .get("remote")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim_matches('/');
+    let is_dir = method == "operations/purge";
+    let (parent, name) = match path.rsplit_once('/') {
+        Some((d, n)) => (d, n),
+        None => ("", path),
+    };
+    let folder = kv_join(&[sub, parent]);
+    let files = crate::kvault::list_files(&cfg.base, &cfg.token)
+        .await
+        .map_err(|e| anyhow!("站点索引读取失败: {e}"))?;
+    let ids = crate::kvault::pick_targets(&files, &folder, name, is_dir);
+    if ids.is_empty() {
+        return Err(anyhow!(
+            "站点索引里没有 {}/{}（可能已经被删掉了）",
+            folder.trim_matches('/'),
+            name
+        ));
+    }
+    for id in &ids {
+        crate::kvault::delete_file(&cfg.base, &cfg.token, id)
+            .await
+            .map_err(|e| anyhow!("站点删除失败: {e}"))?;
+    }
+    Ok(Some(json!({ "deleted": ids.len() })))
+}
+
+/// 拼远程内的路径：跳过空段，段之间用 `/`。
+fn kv_join(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .map(|p| p.trim().trim_matches('/'))
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 #[async_trait::async_trait]
 impl CapProvider for HostCaps {
     async fn rclone_call(&self, method: String, params: Value) -> Result<Value> {
         let client = self.rc.client().await;
+        // K-Vault 远程上 rclone 的写方法一定是 403（站点 DAV 只放行读）。
+        // 这是传输层的事实，不是插件策略：删除接到站点 API，改名/移动说明原因。
+        if let Some(v) = kv_write_op(&client, &self.store, &method, &params).await? {
+            return Ok(v);
+        }
         client.call(&method, &params).await.map_err(Into::into)
     }
 
@@ -272,7 +362,7 @@ impl CapProvider for HostCaps {
         &self,
         fs: String,
         remote_path: String,
-        _filename: String,
+        filename: String,
         data_b64: String,
     ) -> Result<Value> {
         let data = base64::engine::general_purpose::STANDARD
@@ -284,6 +374,37 @@ impl CapProvider for HostCaps {
         let tmp = tmp_dir.join(&name);
         std::fs::write(&tmp, &data)?;
         let client = self.rc.client().await;
+
+        // K-Vault 远程：站点 DAV 写方法一律 403，上传只能走 `POST /api/v1/upload`。
+        // 插件的上传全都汇到这一个函数，所以在这里分流就够了。
+        // 目录沿用插件算好的路径（相对存储根），是否在前缀之内由站点的令牌策略判；
+        // 越界时站点回 POLICY_FOLDER_DENIED，比这里悄悄搬到别的目录更可信。
+        if let Some((remote, sub)) = fs.split_once(':') {
+            if let Some(cfg) = crate::kv_cfg_lookup(&client, &self.store, remote).await {
+                let dir = remote_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                let folder = kv_join(&[sub, dir]);
+                // 插件给的 final_name 才带扩展名（临时文件是 up-<pid>-<ts>），
+                // 站点按扩展名判类型，所以名字必须用 final_name。
+                let shown = if filename.trim().is_empty() {
+                    remote_path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(name.as_str())
+                        .to_string()
+                } else {
+                    filename.clone()
+                };
+                let r = crate::kvault::upload(&cfg, &tmp, &shown, &folder).await;
+                let _ = std::fs::remove_file(&tmp);
+                let up = r.map_err(|e| anyhow!("站点上传失败: {e}"))?;
+                return Ok(json!({
+                    "link": up.link,
+                    "name": up.name,
+                    "deduped": up.dedup,
+                }));
+            }
+        }
+
         let r = client
             .copyfile(&rclone_client::local_fs(&tmp_dir), &name, &fs, &remote_path)
             .await
@@ -1321,5 +1442,15 @@ mod search_tests {
             .await
             .unwrap();
         });
+    }
+
+    /// 插件的 `fs` 是「远程名:存储根内的子路径」，站点目录要拼成
+    /// 「子路径 / remote_path 里的目录」，空段一律丢掉。
+    #[test]
+    fn kv_join_builds_site_folder() {
+        assert_eq!(super::kv_join(&["image_bed", ""]), "image_bed");
+        assert_eq!(super::kv_join(&["", "2026/10"]), "2026/10");
+        assert_eq!(super::kv_join(&["image_bed", "/2026/10/"]), "image_bed/2026/10");
+        assert_eq!(super::kv_join(&["", ""]), "");
     }
 }

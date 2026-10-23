@@ -2274,24 +2274,39 @@ const KV_DESC: &str = "K-Vault 站点：浏览/下载走只读 WebDAV，上传�
 ///
 /// 用 `config/get` 而不是 `config/dump`：只读这一个远程，不去拉全量凭据。
 /// 不缓存：用户可能刚在原始编辑器里改过参数，缓存会让上传用上过期配置。
-async fn kv_cfg_for(ctx: &Arc<Ctx>, remote: &str) -> Option<kvault::KvCfg> {
+///
+/// 拆成两步是因为插件宿主（`caps.rs`）手里只有 `RcClient` + `KvStore`，没有 `Ctx`：
+/// 它执行插件的 `rclone.upload_file` 时也要判断目标是不是 K-Vault 远程。
+pub async fn kv_cfg_lookup(
+    client: &rclone_client::RcClient,
+    store: &crate::kv::KvStore,
+    remote: &str,
+) -> Option<kvault::KvCfg> {
     let remote = remote.trim();
     if remote.is_empty() {
         return None;
     }
-    let client = ctx.rc.client().await;
     let params = client.config_get(remote).await.ok()?;
     if !kvault::KvCfg::is_marked(&params) {
         return None;
     }
     let mut cfg = kvault::KvCfg::from_params(&params);
-    cfg.token = kv_token_get(ctx, remote);
+    cfg.token = kv_token_in(store, remote);
     Some(cfg)
+}
+
+async fn kv_cfg_for(ctx: &Arc<Ctx>, remote: &str) -> Option<kvault::KvCfg> {
+    let client = ctx.rc.client().await;
+    kv_cfg_lookup(&client, &ctx.store, remote).await
 }
 
 /// 明文令牌（rclone 里那份是 obscured 的，API 用不了）。
 fn kv_token_get(ctx: &Arc<Ctx>, remote: &str) -> String {
-    ctx.store
+    kv_token_in(&ctx.store, remote)
+}
+
+fn kv_token_in(store: &crate::kv::KvStore, remote: &str) -> String {
+    store
         .get_all(kvault::STORE_NS)
         .get(remote)
         .and_then(|v| v.get("token"))
@@ -7925,7 +7940,34 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         Cmd::IhAddRoot => {
             let client = ctx.rc.client().await;
             let remotes = client.list_remotes().await.unwrap_or_default();
-            let first = remotes.first().cloned().unwrap_or_else(|| "remote".into());
+            // 有 K-Vault 远程就优先给它建根：站点的图片目录是令牌策略里的那个前缀，
+            // 根直接写成 `k-vault:image_bed`，插件的列表/上传都不用再猜目录。
+            let mut kv_root: Option<String> = None;
+            for r in &remotes {
+                let bare = r.trim_end_matches(':');
+                if let Some(cfg) = kv_cfg_lookup(&client, &ctx.store, bare).await {
+                    let folder = cfg.folder.trim().trim_matches('/');
+                    kv_root = Some(if folder.is_empty() {
+                        format!("{bare}:")
+                    } else {
+                        format!("{bare}:{folder}")
+                    });
+                    break;
+                }
+            }
+            let target = kv_root.clone().unwrap_or_else(|| {
+                format!(
+                    "{}:",
+                    remotes.first().cloned().unwrap_or_else(|| "remote".into())
+                )
+            });
+            if let Some(r) = kv_root {
+                toast(
+                    ui,
+                    1,
+                    format!("已添加根 {r}：K-Vault 远程的 DAV 只读，上传/删除都走站点 API"),
+                );
+            }
             let _ = ui.upgrade_in_event_loop(
                 move |ui| {
                     let g = ui.global::<PluginsG>();
@@ -7933,7 +7975,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     let mut rows: Vec<RootRow> = (0..n).filter_map(|i| g.get_roots().row_data(i)).collect();
                     rows.push(RootRow {
                         id: format!("root{}", n + 1).into(),
-                        remote: format!("{first}:").into(),
+                        remote: target.as_str().into(),
                         is_default: n == 0,
                         public_template: "".into(),
                     });
@@ -9060,6 +9102,44 @@ async fn bed_run(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     } else {
         format!("{fs}{dir}")
     };
+
+    // K-Vault 远程：站点的 DAV 端点只放行读方法，COPY/PUT 一律 403，
+    // 所以上传走 `POST /api/v1/upload`，直链直接用站点返回的签名链接。
+    // 这条路自己收尾（不落到下面的 copyfile/直链推导）。
+    if let Some(kcfg) = kv_cfg_for(ctx, &cfg.remote).await {
+        let folder = kv_upload_folder(&kcfg, &dir);
+        match kvault::upload(&kcfg, &src, &name, &folder).await {
+            Ok(up) => {
+                let stored = bed::join_stored(&folder, &up.name);
+                cfg.last_link = up.link.clone();
+                bed_save_stored(ctx, &cfg);
+                let show = up.link.clone();
+                let _ = ui.upgrade_in_event_loop(move |ui| {
+                    ui.global::<PluginsG>().set_bed_link(show.as_str().into())
+                });
+                let extra = if up.dedup {
+                    "；站点已有同一份内容，直接复用了直链"
+                } else {
+                    ""
+                };
+                toast(
+                    ui,
+                    1,
+                    format!(
+                        "已上传 {stored}，直链来源：{}（{}）{extra}",
+                        bed::Source::Kvault.label(),
+                        bed::Source::Kvault.note()
+                    ),
+                );
+                if cfg.short_tpl == 1 {
+                    bed_make_short(ctx, ui, &cfg, &up.link).await;
+                }
+            }
+            Err(e) => toast(ui, 2, format!("上传失败: {e}")),
+        }
+        let _ = ui.upgrade_in_event_loop(|ui| ui.global::<PluginsG>().set_bed_busy(false));
+        return;
+    }
 
     // 同名一律改名（与文件页上传一致）：静默覆盖不是安全默认
     let existing: Vec<String> = client

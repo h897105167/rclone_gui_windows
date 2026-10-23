@@ -4300,7 +4300,8 @@ component PluginsView inherits Rectangle {
                             //
                             // 与下面几块的分工：存储根/命名/令牌是 imagehost 插件的配置；
                             // 这一块是「拿一张图换一条能贴出去的链接」的操作台，
-                            // 配置存在 Rust 侧 kv（imagehost/bed），上传走 rclone copyfile。
+                            // 配置存在 Rust 侧 kv（imagehost/bed），普通远程上传走 rclone copyfile；
+                            // 选中的是 K-Vault 远程时改走站点 API（站点 DAV 只读），直链就是站点签名链接。
                             VerticalLayout {
                                 spacing: 8px;
                                 Text { text: "图床工具（上传 → 直链 → 短链）"; font-size: 12px; font-weight: 600; color: ThemeG.text-dim; }
