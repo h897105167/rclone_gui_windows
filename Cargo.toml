@@ -19,7 +19,8 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-reqwest = { version = "0.12", features = ["json"] }
+# multipart: K-Vault 上传走 multipart/form-data（POST /api/v1/upload）
+reqwest = { version = "0.12", features = ["json", "multipart"] }
 base64 = "0.22"
 sha1 = "0.10"
 sha2 = "0.10"

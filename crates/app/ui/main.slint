@@ -461,6 +461,31 @@ export global RemotesG {
     in-out property <string> provider-desc: "";
     in-out property <bool> show-advanced: false;
     in-out property <bool> show-raw: false;  // 显示原始 key=value 编辑器
+    // ---------------- K-Vault（专用表单，选中 k-vault 类型时替换通用字段表） ----------------
+    /// 当前是 K-Vault 远程：通用字段表 / 高级 / 原始编辑器全部让位给下面的表单
+    in-out property <bool> kv-editor: false;
+    /// 站点地址，形如 https://kvault.example.org（不带 /dav 后缀）
+    in-out property <string> kv-base: "https://kvault.example.com";
+    /// API 令牌（Bearer）；密码类字段，不回显
+    in-out property <string> kv-token: "";
+    /// 已保存过令牌（编辑现有远程时置位）：留空表示不修改
+    in-out property <bool> kv-token-set: false;
+    /// 未填令牌时用站点的 HTTP Basic 用户名/密码浏览（只读）
+    in-out property <string> kv-user: "";
+    in-out property <string> kv-pass: "";
+    in-out property <bool> kv-pass-set: false;
+    /// 上传目录（相对站点根，通常等于令牌的目录前缀）
+    in-out property <string> kv-folder: "";
+    /// 上传存储：只列出站点支持的存储名，默认 telegram
+    in-out property <[string]> kv-storages: ["telegram", "r2", "s3", "discord", "huggingface", "webdav", "github"];
+    in-out property <int> kv-storage-idx: 0;
+    /// 同名文件直接复用已有记录（服务端去重），而不是复制一份
+    in-out property <bool> kv-dedup: true;
+    /// 测试结果：一行说明，level 0 进行中 / 1 成功 / 2 失败
+    in-out property <string> kv-status: "";
+    in-out property <int> kv-status-level: 0;
+    in-out property <bool> kv-testing: false;
+    callback kv-test();
     // ---------------- 代理配置 ----------------
     /// 第 0 项固定是「不代理」，之后是已保存的配置
     in-out property <[string]> proxy-options: ["不代理"];
@@ -2497,8 +2522,91 @@ component RemotesView inherits Rectangle {
                     color: ThemeG.text-dim;
                     wrap: word-wrap;
                 }
+                // K-Vault 专用表单：类型选 k-vault 时替代通用参数表。
+                //
+                // 它其实是一个 rclone webdav 远程（浏览/下载靠 rclone 只读 DAV），
+                // 写入走站点 HTTP API，所以这里收的是「上传要用的东西」：
+                // 站点地址、API 令牌、上传目录、存储位置。令牌/密码留空 = 不修改：
+                // rclone 里那份是混淆串，读不回明文，另行存了一份（见 kvault.rs）。
+                if RemotesG.kv-editor : VerticalLayout {
+                    spacing: 10px;
+                    VerticalLayout {
+                        spacing: 3px;
+                        FieldLabel { text: "站点地址（根地址，不要带 /dav）"; }
+                        LineEdit {
+                            text <=> RemotesG.kv-base;
+                            placeholder-text: "https://kvault.example.com";
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 3px;
+                        FieldLabel { text: "API 令牌（上传必填；留空 = 不修改已保存的令牌）"; }
+                        LineEdit {
+                            text <=> RemotesG.kv-token;
+                            input-type: InputType.password;
+                            placeholder-text: RemotesG.kv-token-set ? "已设置（留空不修改）" : "kvault_xxxxxxxxxx_…";
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        VerticalLayout {
+                            spacing: 3px;
+                            horizontal-stretch: 1;
+                            FieldLabel { text: "上传目录（相对站点根；留空 = 令牌策略里的目录前缀）"; }
+                            LineEdit { text <=> RemotesG.kv-folder; placeholder-text: "image_bed"; }
+                        }
+                        VerticalLayout {
+                            spacing: 3px;
+                            width: 170px;
+                            FieldLabel { text: "存储位置"; }
+                            ComboBox {
+                                model: RemotesG.kv-storages;
+                                current-index <=> RemotesG.kv-storage-idx;
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        VerticalLayout {
+                            spacing: 3px;
+                            horizontal-stretch: 1;
+                            FieldLabel { text: "用户名（可选，只影响浏览/下载）"; }
+                            LineEdit { text <=> RemotesG.kv-user; }
+                        }
+                        VerticalLayout {
+                            spacing: 3px;
+                            horizontal-stretch: 1;
+                            FieldLabel { text: "密码（可选；留空 = 不修改）"; }
+                            LineEdit { text <=> RemotesG.kv-pass; input-type: InputType.password; }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        height: 30px;
+                        CheckBox {
+                            text: "内容去重（同一份文件只存一次，返回已有直链）";
+                            checked <=> RemotesG.kv-dedup;
+                        }
+                        Rectangle {}
+                        PillBtn {
+                            label: RemotesG.kv-testing ? "测试中…" : "测试连接";
+                            disabled: RemotesG.kv-testing;
+                            clicked => { RemotesG.kv-test(); }
+                        }
+                    }
+                    // 测试结果：0 中性 / 1 正常 / 2 警告（策略、作用域对不上）/ 3 失败
+                    if RemotesG.kv-status != "" : Text {
+                        text: RemotesG.kv-status;
+                        font-size: 12px;
+                        color: RemotesG.kv-status-level >= 3 ? ThemeG.err
+                             : RemotesG.kv-status-level == 2 ? ThemeG.warn
+                             : RemotesG.kv-status-level == 1 ? ThemeG.ok
+                             : ThemeG.text-dim;
+                        wrap: word-wrap;
+                    }
+                }
                 // 参数字段（模板驱动）
-                if RemotesG.edit-fields.length > 0 && !RemotesG.show-raw : Rectangle {
+                if RemotesG.edit-fields.length > 0 && !RemotesG.show-raw && !RemotesG.kv-editor : Rectangle {
                     border-radius: ThemeG.radius-s;
                     border-width: 1px;
                     border-color: ThemeG.border;
@@ -2582,7 +2690,11 @@ component RemotesView inherits Rectangle {
                     }
                 }
                 // 高级选项 + 原始编辑器切换
-                HorizontalLayout {
+                //
+                // K-Vault 表单下两者都藏起来：「高级选项」只对模板字段有意义，
+                // 而原始编辑器写的是 rclone 参数，保存路径会把它忽略掉 ——
+                // 留着只会让人以为改了原始参数就能生效。
+                if !RemotesG.kv-editor : HorizontalLayout {
                     spacing: 12px;
                     height: 28px;
                     if RemotesG.edit-fields.length > 0 : TouchArea {
@@ -2608,7 +2720,7 @@ component RemotesView inherits Rectangle {
                     }
                 }
                 // 原始 key=value 编辑器（保留给高级用户）
-                if RemotesG.show-raw || RemotesG.edit-fields.length == 0 : VerticalLayout {
+                if (RemotesG.show-raw || RemotesG.edit-fields.length == 0) && !RemotesG.kv-editor : VerticalLayout {
                     spacing: 3px;
                     FieldLabel { text: "参数（每行一个 key=value，保存时将覆盖已有同名参数）"; }
                     Rectangle {
