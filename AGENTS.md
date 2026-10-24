@@ -87,7 +87,7 @@ At the end of each phase, report what changed, affected files, remaining assumpt
 ## 8. Build and Command Constraints
 
 - Read the current `README.md`, relevant crate `Cargo.toml` files, `build.rs`, and PowerShell build scripts before choosing build commands. The README currently describes an embedded-rclone workflow that may remain necessary until migration is complete.
-- Before changing the build flow, verify the WASM plugin's `include_bytes!` and `IMAGEHOST_WASM` generation order. Removing rclone embedding must not accidentally remove the plugin build step.
+- Plugins are **not** in this repository and are **not** compiled into the executable. Before building, `scripts/fetch_plugins.ps1` downloads each plugin's release zip listed in `plugins/manifest.json` and verifies its sha256; `crates/app/build.rs` only copies `crates/app/assets/plugins/` next to the binary. There is no `include_bytes!`/`IMAGEHOST_WASM` step any more, so the old "build the WASM plugins first" ordering rule is obsolete — but never drop the fetch step or ship without plugin assets. Plugin framework and integration rules: `docs/PLUGIN.md`.
 - Do not run the test suite unless the user explicitly asks for testing or verification. Explain the purpose before running other build/formatting commands. Do not install tools, modify system services, register startup tasks, or access the network unless necessary.
 - Never expose RC passwords, OAuth tokens, or full sensitive configuration in code, command output, screenshots, or documentation.
 
