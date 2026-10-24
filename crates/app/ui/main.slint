@@ -419,6 +419,8 @@ export global PluginsG {
     // 用过的路径（最新在前，最多 10 条），由 Rust 侧落盘
     in-out property <[string]> bed-history: [];
     in-out property <int> bed-history-idx: -1;
+    // 路径历史下拉是否展开（箭头内嵌在路径框右端，点它展开/收起）
+    in-out property <bool> bed-hist-open: false;
     // 目录浏览弹窗
     in-out property <bool> bed-browsing: false;
     in-out property <string> bed-brow-path: "";
@@ -3696,7 +3698,6 @@ component PluginsView inherits Rectangle {
     callback bed-pick;
     callback bed-run;
     callback bed-refresh-remotes;
-    callback bed-make-short;
     callback bed-copy(string);
     // 路径浏览：打开弹窗 / 进入子目录 / 上一级 / 选中 / 关闭
     callback bed-browse;
@@ -4299,20 +4300,133 @@ component PluginsView inherits Rectangle {
                                     }
                                     PillBtn { label: "刷新远程"; compact: true; clicked => { root.bed-refresh-remotes(); } }
                                 }
+                                // 路径：下拉箭头长在输入框内部的右端（点箭头展开下面的历史），
+                                // 而不是像通用面板那样在旁边再摆一块 ▾。
+                                //
+                                // 这里没用 LineEdit：它不允许放子元素，聚焦时框内右端还会冒出
+                                // 自带的清除 ✕ —— 叠一个箭头上去必然打架。所以用 TextInput
+                                // 拼一个外形一致（配色取 Palette，与旁边 LineEdit 同源）的框。
+                                // 历史列表内联展开而不是 PopupWindow：面板在 ScrollView 里，浮层会跟着滚走。
                                 HorizontalLayout {
                                     spacing: 8px;
-                                    height: 32px;
-                                    FieldLabel { text: "路径"; width: 80px; vertical-alignment: center; }
-                                    LineEdit { text <=> PluginsG.bed-path; enabled: PluginsG.bed-remote-idx >= 0; placeholder-text: "如 img，留空 = 远程根"; }
-                                    PillBtn { label: "浏览"; compact: true; clicked => { root.bed-browse(); } }
-                                    // 历史记录下拉：选一条就等于填进路径（最多 10 条，最新的在最前）
-                                    ComboBox {
-                                        width: 170px;
-                                        model: PluginsG.bed-history;
-                                        selected(v) => {
-                                            PluginsG.bed-path = v;
-                                            root.bed-save();
+                                    FieldLabel { text: "路径"; width: 80px; height: 32px; vertical-alignment: center; }
+                                    // 输入框和历史列表放进同一列：列表展开时左右边正好和输入框对齐
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        spacing: 6px;
+                                        Rectangle {
+                                            height: 32px;
+                                            border-radius: 4px;
+                                            border-width: 1px;
+                                            // 聚焦时整圈换强调色（旁边的 LineEdit 是底部下划线，这里整圈更好认）
+                                            border-color: path-input.has-focus ? ThemeG.accent : Palette.border;
+                                            background: PluginsG.bed-remote-idx >= 0 ? Palette.control-background : ThemeG.panel;
+                                            // TextInput 没有 placeholder 属性，占位文案用一层 Text 垫在下面
+                                            if PluginsG.bed-path == "" && !path-input.has-focus : Text {
+                                                x: 10px;
+                                                width: parent.width - 38px;
+                                                height: parent.height;
+                                                text: "如 img，留空 = 远程根";
+                                                font-size: 13px;
+                                                color: ThemeG.placeholder;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                                wrap: no-wrap;
+                                            }
+                                            path-input := TextInput {
+                                                x: 10px;
+                                                y: 1px;
+                                                // 右端留出箭头的位置，文字不会压到箭头上
+                                                width: parent.width - 38px;
+                                                height: parent.height - 2px;
+                                                single-line: true;
+                                                wrap: no-wrap;
+                                                font-size: 13px;
+                                                vertical-alignment: center;
+                                                color: PluginsG.bed-remote-idx >= 0 ? ThemeG.text : ThemeG.text-dim;
+                                                enabled: PluginsG.bed-remote-idx >= 0;
+                                                text <=> PluginsG.bed-path;
+                                            }
+                                            // 框内下拉箭头：点一下展开/收起历史列表
+                                            Rectangle {
+                                                x: parent.width - 28px;
+                                                y: 1px;
+                                                width: 26px;
+                                                height: parent.height - 2px;
+                                                border-radius: 3px;
+                                                background: hist-ta.pressed ? ThemeG.pressed : (hist-ta.has-hover ? ThemeG.hover : (PluginsG.bed-hist-open ? ThemeG.hover : transparent));
+                                                Text {
+                                                    text: "\u{E70D}";
+                                                    font-family: "Segoe MDL2 Assets";
+                                                    font-size: 10px;
+                                                    // 展开时箭头跟着变成强调色，一眼看出列表是开着的
+                                                    color: PluginsG.bed-hist-open ? ThemeG.accent : (hist-ta.has-hover ? ThemeG.text : ThemeG.text-dim);
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+                                                hist-ta := TouchArea {
+                                                    mouse-cursor: pointer;
+                                                    enabled: PluginsG.bed-remote-idx >= 0;
+                                                    clicked => { PluginsG.bed-hist-open = !PluginsG.bed-hist-open; }
+                                                }
+                                            }
                                         }
+                                        // 历史记录：选一条就等于填进路径并保存（Rust 侧最多给 10 条，最新的在最前）
+                                        if PluginsG.bed-hist-open : Rectangle {
+                                            background: ThemeG.panel-2;
+                                            border-radius: ThemeG.radius-s;
+                                            border-width: 1px;
+                                            border-color: ThemeG.border;
+                                            VerticalLayout {
+                                                padding: 4px;
+                                                spacing: 0px;
+                                                if PluginsG.bed-history.length == 0 : Rectangle {
+                                                    height: 28px;
+                                                    HorizontalLayout {
+                                                        padding-left: 6px;
+                                                        padding-right: 6px;
+                                                        Text {
+                                                            text: "还没有用过的路径；点「保存设置」后会自动记下来";
+                                                            font-size: 12px;
+                                                            color: ThemeG.text-dim;
+                                                            vertical-alignment: center;
+                                                            overflow: elide;
+                                                        }
+                                                    }
+                                                }
+                                                for h in PluginsG.bed-history : Rectangle {
+                                                    height: 26px;
+                                                    border-radius: ThemeG.radius-s;
+                                                    background: hrow-ta.has-hover ? ThemeG.hover : transparent;
+                                                    HorizontalLayout {
+                                                        padding-left: 6px;
+                                                        padding-right: 6px;
+                                                        Text {
+                                                            text: h;
+                                                            font-size: 12px;
+                                                            // 当前路径标成强调色，一眼看出选了哪条
+                                                            color: h == PluginsG.bed-path ? ThemeG.accent : ThemeG.text;
+                                                            vertical-alignment: center;
+                                                            overflow: elide;
+                                                        }
+                                                    }
+                                                    hrow-ta := TouchArea {
+                                                        mouse-cursor: pointer;
+                                                        clicked => {
+                                                            PluginsG.bed-path = h;
+                                                            PluginsG.bed-hist-open = false;
+                                                            root.bed-save();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // 浏览按钮钉在输入框那一行的顶部，历史列表展开时不跟着下移
+                                    VerticalLayout {
+                                        alignment: start;
+                                        // 开浏览面板前先把历史列表收掉，免得两块叠在一起
+                                        PillBtn { label: "浏览"; compact: true; clicked => { PluginsG.bed-hist-open = false; root.bed-browse(); } }
                                     }
                                 }
                                 HorizontalLayout {
@@ -4425,8 +4539,6 @@ component PluginsView inherits Rectangle {
                                             spacing: 8px;
                                             Rectangle {}
                                             PillBtn { label: "保存配置"; compact: true; clicked => { root.bed-save(); } }
-                                            PillBtn { label: "生成短链"; compact: true; clicked => { root.bed-make-short(); } }
-                                            PillBtn { label: "复制短链"; compact: true; clicked => { root.bed-copy(PluginsG.bed-short); } }
                                         }
                                     }
                                 }
@@ -5130,7 +5242,6 @@ export component MainWindow inherits Window {
     callback bed-pick();
     callback bed-run();
     callback bed-refresh-remotes();
-    callback bed-make-short();
     callback bed-browse();
     callback bed-brow-into(int);
     callback bed-brow-up();
@@ -5464,7 +5575,6 @@ export component MainWindow inherits Window {
                     bed-pick => { root.bed-pick(); }
                     bed-run => { root.bed-run(); }
                     bed-refresh-remotes => { root.bed-refresh-remotes(); }
-                    bed-make-short => { root.bed-make-short(); }
                     bed-copy(s) => { root.copy-text(s); }
                     bed-browse => { root.bed-browse(); }
                     bed-brow-into(i) => { root.bed-brow-into(i); }
