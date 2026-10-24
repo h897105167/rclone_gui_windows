@@ -821,6 +821,35 @@ fn apply_body(ctx: &Arc<Ctx>, id: &str, body: &Value) -> Option<(i32, String)> {
         }
         let _ = ctx.store.set(id, "_state", Value::Object(old));
     }
+    // 2b) choices（下拉候选）也记下来：动作返回的候选要在面板重拉后继续显示，
+    //     否则「刷新远程」这类按钮点完就白点了。
+    if let Some(choices) = body.get("choices").and_then(|v| v.as_object()) {
+        let mut old = ctx
+            .store
+            .get_all(id)
+            .get("_state")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let mut merged = old
+            .get("choices")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        for (k, v) in choices {
+            // 空数组是「这个字段没有候选了」，不能留着旧候选
+            match v.as_array() {
+                Some(a) if a.is_empty() => {
+                    merged.remove(k);
+                }
+                _ => {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        old.insert("choices".into(), Value::Object(merged));
+        let _ = ctx.store.set(id, "_state", Value::Object(old));
+    }
     // 3) 提示
     body.get("toast").and_then(|t| {
         let msg = t.get("message").and_then(|m| m.as_str())?.to_string();
@@ -890,9 +919,38 @@ fn hint_text(body: &Value, key: &str, fallback: &str) -> String {
         .to_string()
 }
 
+/// 把上次动作留下的下拉候选合回去：面板重拉时插件回的是 `state`，里面通常
+/// 不带 `choices`，不补就会让「刷新远程 / 浏览路径」的结果一闪而过。
+fn merge_saved_choices(store: &KvStore, id: &str, mut body: Value) -> Value {
+    let saved = store
+        .get_all(id)
+        .get("_state")
+        .and_then(|v| v.get("choices"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    if saved.is_null() {
+        return body;
+    }
+    if !body.is_object() {
+        body = json!({});
+    }
+    let mut merged = saved.as_object().cloned().unwrap_or_default();
+    if let Some(own) = body.get("choices").and_then(|v| v.as_object()) {
+        for (k, v) in own {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("choices".into(), Value::Object(merged));
+    }
+    body
+}
+
 /// 某个字段的下拉候选（插件通过 `body.choices.<key>` 提供）。
 ///
-/// 目前只有 path 字段用它（历史路径）；返回空列表时前端不显示 ▾。
+/// `path` 与 `select` 两类字段都用它：`path` 只认这里的候选（历史路径 / 子目录），
+/// `select` 这里有值就覆盖 `config.json` 里写死的 `options`（如 rclone 远端列表），
+/// 没有则退回静态 `options`。返回空列表表示「这次没候选」，前端据此决定显不显示 ▾。
 fn choices_for(body: &Value, key: &str) -> Vec<String> {
     body.get("choices")
         .and_then(|c| c.get(key))
@@ -1028,21 +1086,32 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, id:
                     .map(value_as_str)
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| c.default.clone());
-                let sel = c
-                    .options
+                // 候选的来源：
+                // - path 字段：只认插件运行时给的 `choices.<key>`（历史路径 / 子目录），
+                //   静态 `options` 对 path 没有意义，混用会让下拉出现写死的垃圾项；
+                // - select 字段：插件给了 `choices.<key>` 就用它（如 rclone 远端列表），
+                //   否则退回 config.json 里写死的 `options`。
+                let field_kind = FieldKind::as_str(c.field_enum().unwrap_or(FieldKind::Text));
+                let runtime_choices = choices_for(body, &c.key);
+                let mut options = if field_kind == "path" {
+                    // path 字段只认插件运行时给的候选（子目录 / 历史路径），
+                    // 写死的 options 对路径没有意义
+                    runtime_choices
+                } else if runtime_choices.is_empty() {
+                    c.options.clone()
+                } else {
+                    runtime_choices
+                };
+                // 当前值不在候选里就补到第一位：插件还没给候选时（如远程列表要
+                // 点「刷新远程」才来），下拉框也必须显示真实值而不是空着。
+                if !value.is_empty() && !options.iter().any(|o| o == &value) {
+                    options.insert(0, value.clone());
+                }
+                let sel = options
                     .iter()
                     .position(|o| o == &value)
                     .map(|i| i as i32)
                     .unwrap_or(0);
-                // 路径字段的候选来自插件运行时（`choices.<key>`，如历史路径）。
-                // 静态 `options` 只对 select 有意义，这里不能混用：select 用
-                // `selected_index` 定位，path 只是给个下拉候选。
-                let field_kind = FieldKind::as_str(c.field_enum().unwrap_or(FieldKind::Text));
-                let options = if field_kind == "path" {
-                    choices_for(body, &c.key)
-                } else {
-                    c.options.clone()
-                };
                 out.push(PanelData {
                     kind: "field".into(),
                     key: c.key.clone(),
@@ -1108,6 +1177,7 @@ pub async fn build_panel(ctx: &Arc<Ctx>, id: &str) -> Result<Vec<PanelData>> {
     };
     // 与传给插件的同一份有效表单：界面显示的值必须等于插件实际拿到的值
     let form = effective_form(&cfg.plugin_setting, &ctx.store, id);
+    let body = merge_saved_choices(&ctx.store, id, body);
     Ok(compose(&cfg.plugin_setting, &body, &form, id))
 }
 
