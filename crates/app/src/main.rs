@@ -2912,6 +2912,40 @@ fn main() {
         op_hints: Arc::new(std::sync::Mutex::new(OpHints::default())),
     });
 
+    // 调试开关：`RCGUI_PANEL_DUMP=<插件 id>` 只打印该插件面板的行然后退出。
+    //
+    // 面板外观对不上时，先用它确认宿主到底往界面发了什么，免得在 UI 和插件
+    // 之间来回猜。
+    if let Ok(id) = std::env::var("RCGUI_PANEL_DUMP") {
+        if !id.is_empty() {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(BACKEND_THREAD_STACK)
+                .enable_all()
+                .build()
+                .expect("tokio runtime 启动失败");
+            match rt.block_on(plugins::build_panel(&ctx, &id)) {
+                Ok(rows) => {
+                    for r in &rows {
+                        let buttons: Vec<String> = r
+                            .buttons
+                            .iter()
+                            .map(|b| format!("{}/{}", b.label, b.action))
+                            .collect();
+                        println!("[{}] key={} label={:?} value={:?}", r.kind, r.key, r.label, r.value);
+                        println!("    text={:?}", r.text);
+                        println!("    field={} options={:?} sel={}", r.field_kind, r.options, r.selected_index);
+                        println!("    buttons={:?} enabled={} lamp={} ok={} warn={}",
+                            buttons, r.enabled, r.lamp, r.ok, r.warning);
+                    }
+                    println!("-- total {} rows", rows.len());
+                }
+                Err(e) => println!("PANEL ERROR: {e:#}"),
+            }
+            std::process::exit(0);
+        }
+    }
+
     {
         let ctx = ctx.clone();
         let ui_weak = ui.as_weak();
@@ -7857,25 +7891,42 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 ui.global::<PluginsG>()
                     .get_rows()
                     .row_data(idx as usize)
-                    .map(|r| (r.id.to_string(), r.has_panel, r.verified))
+                    .map(|r| {
+                        (
+                            r.id.to_string(),
+                            r.has_panel,
+                            r.verified,
+                            r.status.to_string(),
+                        )
+                    })
             })
             .await
             .flatten();
-            if let Some((id, has_panel, verified)) = row {
-                if !verified {
-                    toast(ui, 2, "插件未通过完整性校验，设置面板不可用");
-                    return false;
-                }
+            if let Some((id, has_panel, verified, status)) = row {
+                // 先无条件清空面板：校验失败的插件也要清，
+                // 否则它会继续显示"上一个插件"的面板（用户会以为面板串了）。
                 let panel_id = id.clone();
+                let fail = if verified {
+                    String::new()
+                } else if status.trim().is_empty() {
+                    "插件未通过完整性校验，设置面板不可用".to_string()
+                } else {
+                    format!("插件未通过完整性校验：{status}")
+                };
+                let fail_ui = fail.clone();
                 let _ = ui.upgrade_in_event_loop(move |ui| {
                     let g = ui.global::<PluginsG>();
                     g.set_panel_plugin(panel_id.as_str().into());
-                    g.set_panel_loading(has_panel);
-                    g.set_panel_error("".into());
+                    g.set_panel_loading(has_panel && fail_ui.is_empty());
+                    g.set_panel_error(fail_ui.as_str().into());
                     g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(Vec::<
                         crate::PanelRow,
                     >::new()))));
                 });
+                if !verified {
+                    toast(ui, 2, fail.as_str());
+                    return false;
+                }
                 if has_panel {
                     match plugins::build_panel(ctx, &id).await {
                         Ok(rows) => {

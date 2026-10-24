@@ -346,6 +346,53 @@ fn kv_join(parts: &[&str]) -> String {
         .join("/")
 }
 
+/// 只读解析 rclone.conf 里的 `[远程名]` 段：不启动进程、不碰 RC。
+///
+/// 只在 RC 拿不到列表时兜底（rclone 没在跑、或者认证对不上）。读不到就返回空，
+/// 由插件自己决定怎么提示——这里不猜、不造名字。
+fn remotes_from_conf() -> Vec<String> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("RCLONE_CONFIG") {
+        if !p.trim().is_empty() {
+            paths.push(PathBuf::from(p.trim()));
+        }
+    }
+    if let Ok(a) = std::env::var("APPDATA") {
+        paths.push(PathBuf::from(a).join("rclone").join("rclone.conf"));
+    }
+    if let Ok(u) = std::env::var("USERPROFILE") {
+        paths.push(
+            PathBuf::from(u)
+                .join(".config")
+                .join("rclone")
+                .join("rclone.conf"),
+        );
+    }
+    for p in paths {
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let mut out: Vec<String> = Vec::new();
+        for line in text.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix('[') else {
+                continue;
+            };
+            let Some(name) = rest.strip_suffix(']') else {
+                continue;
+            };
+            let name = name.trim();
+            if !name.is_empty() && !out.iter().any(|x| x == name) {
+                out.push(name.to_string());
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    Vec::new()
+}
+
 #[async_trait::async_trait]
 impl CapProvider for HostCaps {
     async fn rclone_call(&self, method: String, params: Value) -> Result<Value> {
@@ -971,6 +1018,33 @@ impl CapProvider for HostCaps {
                     Ok(json!({ "ok": ok }))
                 })
                 .await
+            }
+
+            // 远程名列表：RC 通了就问 RC，否则只读解析 rclone.conf。
+            // 面板里只想填一个下拉框，不该因为 RC 没起或认证不对就空白。
+            "rclone.remotes" => {
+                let mut source = "rc";
+                let mut names: Vec<String> = Vec::new();
+                let client = self.rc.client().await;
+                if let Ok(v) = client.call("config/listremotes", &json!({})).await {
+                    for it in v.as_array().cloned().unwrap_or_default() {
+                        // rclone 回的是 "名字:类型"，面板里只认裸名字
+                        let raw = it.as_str().unwrap_or("").trim().to_string();
+                        if let Some(n) = raw.split(':').next() {
+                            let n = n.trim();
+                            if !n.is_empty() {
+                                names.push(n.to_string());
+                            }
+                        }
+                    }
+                }
+                if names.is_empty() {
+                    source = "conf";
+                    names = remotes_from_conf();
+                }
+                names.sort();
+                names.dedup();
+                Ok(json!({ "remotes": names, "source": source }))
             }
 
             "rclone.cat" => {
