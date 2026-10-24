@@ -17,10 +17,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Rust toolchain (stable + wasm32-wasip1)
+      - name: Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-wasip1
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -34,11 +32,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # build.rs 会去 target/wasm32-wasip1/<profile>/imagehost.wasm 找插件字节，
-      # 缺了会直接报错（刻意加的构建期护栏），所以测试前先出 debug wasm。
-      - name: Build wasm plugins (debug)
+      # 插件不在本仓库：按 plugins/manifest.json 从各插件仓库的 Release 下载 zip，
+      # 校验 sha256 后解到 crates/app/assets/plugins/。这一步失败通常意味着
+      # 插件仓库的 Release 被删了，或 manifest 里的 tag/sha256 过期。
+      - name: Fetch plugin assets
         shell: pwsh
-        run: cargo build -p imagehost-plugin -p oneclick-plugin --target wasm32-wasip1
+        run: ./scripts/fetch_plugins.ps1
 
       - name: Unit tests
         shell: pwsh
@@ -46,10 +45,10 @@ jobs:
           cargo test --workspace --no-fail-fast 2>&1 | Tee-Object -FilePath test-log.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Release build (plugins + app)
+      - name: Release build (app)
         shell: pwsh
         run: |
-          ./scripts/build.ps1 -Release 2>&1 | Tee-Object -FilePath build-log.txt
+          ./scripts/build.ps1 -Release -SkipPlugins 2>&1 | Tee-Object -FilePath build-log.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload artifacts
@@ -59,6 +58,7 @@ jobs:
           name: rclone-gui-windows-release
           path: |
             target/release/rclone-gui.exe
+            target/release/assets/plugins/**
             test-log.txt
             build-log.txt
           if-no-files-found: warn

@@ -6,9 +6,9 @@ members = [
     "crates/rc",
     "crates/rclone",
     "crates/plugin",
-    "plugins/imagehost",
-    "plugins/oneclick",
 ]
+# 插件不在这里：每个插件是独立仓库，以 WASM 包的形式从 Release 拉取，
+# 见 plugins/manifest.json 与 docs/PLUGIN.md。本工作区只编译本体。
 
 [workspace.package]
 version = "0.1.0"

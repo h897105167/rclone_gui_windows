@@ -7,54 +7,25 @@ fn main() {
         slint_build::compile(&ui).expect("Slint UI 编译失败");
     }
 
-    // 2) 嵌入 imagehost wasm（存在时）：优先与当前 profile 相同，其次另一个
+    // 2) 插件**不再**编进 exe
     //
-    // 注意：**不要**删掉这一段。`crates/app/src/main.rs` 用
-    // `include_bytes!(env!("IMAGEHOST_WASM"))` 把内置插件编进程序，
-    // 构建顺序必须是「先 WASM 插件、再应用」（见 scripts/build.ps1）。
+    // 插件与本体彻底分离：每个插件都有自己的仓库与 Release，本体仓库只保存
+    // `plugins/manifest.json`（id / repo / tag / sha256 的锁文件）。
+    // 构建前用 `scripts/fetch_plugins.ps1` 按锁文件下载、校验、解包到
+    // `crates/app/assets/plugins/<dir>/`（config.json + 入口 wasm + check.sha256）。
     //
-    // 已移除的部分（阶段 7）：内嵌 rclone.exe。RCGUI 不拥有 rclone 生命周期，
-    // 不再需要把 82 MB 的 rclone 编进可执行文件。
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
-    let mut wasm_dir = None;
-    for base in ["..", "../.."] {
-        for prof in [profile.as_str(), if profile == "release" { "debug" } else { "release" }] {
-            let p = PathBuf::from(base)
-                .join("target")
-                .join("wasm32-wasip1")
-                .join(prof)
-                .join("imagehost.wasm");
-            if p.exists() {
-                wasm_dir = Some(p);
-                break;
-            }
-        }
-        if wasm_dir.is_some() {
-            break;
-        }
-    }
-    match wasm_dir {
-        Some(p) => {
-            let abs = std::fs::canonicalize(&p).unwrap_or(p);
-            println!("cargo:rustc-env=IMAGEHOST_WASM={}", abs.display());
-            println!("cargo:rerun-if-changed={}", abs.display());
-        }
-        None => {
-            // 空路径会让 main.rs 的 include_bytes! 编译失败，因此这里给一个明确的构建期错误，
-            // 而不是留下一个只在运行时才发现的「内置插件缺失」。
-            panic!(
-                "imagehost.wasm 未找到：请先 cargo build -p imagehost-plugin --target wasm32-wasip1"
-            );
-        }
-    }
+    // 因此这里不再有 `cargo:rustc-env=IMAGEHOST_WASM`，也不再要求
+    // 「先编 WASM 插件、再编 app」的顺序 —— 那个顺序是 `include_bytes!` 时代
+    // 的历史包袱（详见 docs/PLUGIN.md「为什么要改成 Release 分发」）。
+    println!("cargo:rerun-if-changed=../../plugins/manifest.json");
 
-    // 3) 把内置插件资产复制到 exe 同级目录
+    // 3) 把插件资产复制到 exe 同级目录
     //
     // `crates/app/src/plugins.rs::builtin_root()` 在运行期读 `<exe>/assets/plugins`，
     // 而 cargo 不会把非 Rust 资产复制到 target/<profile>/。这里在构建期补上，
     // 好处是 `cargo build -p rclone-gui` 一条命令就能得到一个可直接运行的目录。
     //
-    // 资产由 scripts/build.ps1 生成（编 wasm → 复制 config.json/main.wasm → 生成 check.sha256）。
+    // 资产由 `scripts/fetch_plugins.ps1` 从各插件仓库的 Release 下载并校验后生成。
     println!("cargo:rerun-if-changed=assets/plugins");
     let assets = PathBuf::from("assets/plugins");
     if assets.is_dir() {
@@ -62,11 +33,15 @@ fn main() {
             Some(dst) => {
                 let dst = dst.join("assets").join("plugins");
                 if let Err(e) = copy_dir(&assets, &dst) {
-                    println!("cargo:warning=复制内置插件资产失败: {e}");
+                    println!("cargo:warning=复制插件资产失败: {e}");
                 }
             }
-            None => println!("cargo:warning=无法定位 target profile 目录，内置插件资产未复制"),
+            None => println!("cargo:warning=无法定位 target profile 目录，插件资产未复制"),
         }
+    } else {
+        println!(
+            "cargo:warning=assets/plugins 不存在：请先运行 scripts/fetch_plugins.ps1 拉取插件资产"
+        );
     }
 }
 

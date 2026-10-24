@@ -4,3 +4,7 @@ crates/app/data
 *.log
 .env
 
+# 插件资产：由 scripts/fetch_plugins.ps1 按 plugins/manifest.json 从各插件仓库
+# 的 Release 下载生成（crates/app/assets/plugins/<id>/）。不进本仓库 ——
+# 插件源码与打包产物都在各自的独立仓库里。
+/crates/app/assets/plugins/

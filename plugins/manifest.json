@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "body_repo": "https://github.com/h897105167/rclone_gui_windows",
+  "note": "插件源码不在本仓库。每个插件是独立 GitHub 仓库，Release 里挂打包好的 zip；本文件只锁版本与哈希，脚本按它下载校验。改版本 = 改 tag + sha256。",
+  "plugins": [
+    {
+      "id": "imagehost",
+      "name": "图床",
+      "repo": "https://github.com/h897105167/rcgui-plugin-imagehost",
+      "tag": "v0.3.0",
+      "asset": "imagehost-0.3.0.zip",
+      "sha256": "f40214c281f51e61f7904b2342386f777892a61059b02ee8fe631de2b24bb80e",
+      "dir": "imagehost"
+    },
+    {
+      "id": "onerclone",
+      "name": "一键 rclone",
+      "repo": "https://github.com/h897105167/rcgui-plugin-oneclick",
+      "tag": "v0.3.1",
+      "asset": "onerclone-0.3.1.zip",
+      "sha256": "43f4e2e4867c5c5d4bb42e5a364769e26e3cf4c0e2ef2d5116006f0456be69ad",
+      "dir": "onerclone"
+    }
+  ]
+}

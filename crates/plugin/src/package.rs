@@ -93,8 +93,11 @@ impl PluginJson {
         if self.entry_file.trim().is_empty() {
             bail!("plugin.json 缺少 entry_file");
         }
-        if !self.platform.trim().is_empty() && self.platform.trim() != "windows" {
-            bail!("插件声明的平台不受支持：{}（仅支持 windows）", self.platform);
+        // 与 [`crate::config::PluginConfig::validate`] 一致：WASI 插件不挑平台，
+        // `any`（或不填）与 `windows` 都放行，其余拒绝。
+        let platform = self.platform.trim();
+        if !platform.is_empty() && platform != "windows" && platform != "any" {
+            bail!("插件声明的平台不受支持：{platform}（仅支持 windows / any）");
         }
         Ok(())
     }
