@@ -876,3 +876,4 @@ fn main() {
 | 1.2 | 补齐文档缺口：`config.json.http_entry` 与 §5.7 内嵌 HTTP 入口（请求快照 + 响应约定）、§7.7 为什么用 Release 分发；本体删掉最后一处 `id == "imagehost"` 特判与已废弃的 `PluginsG.loaded` |
 | 1.3 | `body.choices` 对 `select` 字段生效（运行时拉到的候选覆盖静态 `options`；`path` 仍只认 `choices`），候选与当前值一起持久化，面板重拉后不丢；`imagehost` v0.4.0 用它列出 rclone 远程与子目录 |
 | 1.4 | `select` 新增 `dynamic` 字段（候选项全由 `choices` 提供，`options` 可空）；新增 `rclone.remotes`（读本地 `rclone.conf`，绕开 RC 401）；面板加载失败时先清空行再显示错误，不再残留上一个插件的界面；`imagehost` v0.4.1 改用 `rclone.remotes`，v0.4.2 修掉首屏把已配置远程覆盖成候选列表第一个的毛病 |
+| 1.5 | 新增 `rclone.upload_file`（`fs` + `remote_path` + `filename` + `data_b64`，能当 `need` 用：站点型远程直接回 `{link,name,deduped}`，供插件上传后取直链，普通远程回 `{}`）；`rclone.cat`/`rclone.upload_file` 的 `fs` 都会补冒号，避免 `srcFs:"k-vault"` 被当成相对本地目录；RC 响应分类只把「方法缺失」判为不支持，其余 404 不再被当成 Unsupported 去回退；`status`/`group`/`hint` 控件同样必须写 `key`（否则插件卡片显示「校验失败」）；内置资产升到 `imagehost` v0.5.0、`rcgui-rc` 补测试 |

@@ -7,9 +7,9 @@
       "id": "imagehost",
       "name": "图床",
       "repo": "https://github.com/h897105167/rcgui-plugin-imagehost",
-      "tag": "v0.4.2",
-      "asset": "imagehost-0.4.2.zip",
-      "sha256": "0c0eb9e6cf23299a7f40a47c2a2eb150ceffb5c0c445be8518b0a97311b23213",
+      "tag": "v0.5.0",
+      "asset": "imagehost-0.5.0.zip",
+      "sha256": "e097764d2124b83984dd22d6a49ec0461de711f370f6f682528bf82aa82238b7",
       "dir": "imagehost"
     },
     {
