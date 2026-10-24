@@ -189,9 +189,6 @@ enum Cmd {
     BedRun,
     BedPick,
     BedRefreshRemotes,
-    BedMakeShort {
-        direct: String,
-    },
     /// 打开目录浏览弹窗（列当前远程 + 当前路径下的子目录）
     BedBrowOpen,
     /// 进入子目录（下标对应弹窗里的目录表）
@@ -8179,15 +8176,6 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             bed_run(ctx, ui).await;
             false
         }
-        Cmd::BedMakeShort { direct } => {
-            let cfg = read_bed_cfg(ui).await;
-            if cfg.short_url.trim().is_empty() {
-                toast(ui, 2, "请先填写短链请求地址（模板一）");
-            } else {
-                bed_make_short(ctx, ui, &cfg, &direct).await;
-            }
-            false
-        }
         Cmd::BedBrowOpen => {
             let (remote, path) = read_ui(ui, |ui| {
                 let g = ui.global::<PluginsG>();
@@ -10637,20 +10625,6 @@ fn wire_callbacks(
         let tx = tx.clone();
         move || {
             let _ = tx.send(Cmd::BedBrowClose);
-        }
-    });
-    ui.on_bed_make_short({
-        // 已有直链、只补一条短链：直接把 UI 上的直链交给队列
-        let tx = tx.clone();
-        let ui2 = ui.as_weak();
-        move || {
-            let Some(ui2) = ui2.upgrade() else { return };
-            let g = ui2.global::<PluginsG>();
-            let direct = g.get_bed_link().to_string();
-            if direct.trim().is_empty() {
-                return;
-            }
-            let _ = tx.send(Cmd::BedMakeShort { direct });
         }
     });
     ui.on_copy_text(move |text| {
