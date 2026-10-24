@@ -485,6 +485,7 @@ call_plugin(ctx, id, action_key, form) → 方法 "request"，params 至少含�
 // rclone.call { method, params }                          → rclone RC 返回值
 // rclone.upload_file { fs, remote_path, filename, data_b64 }
 // rclone.cat  { remote, path, max_bytes? }                → { data_b64, size }  （走临时文件，见下）
+//      remote 可以写 `k-vault` 也可以写 `k-vault:`，本体统一补冒号后再用
 // rclone.remotes { }                                      → ["k-vault","gdrive"]  本地配置里的远程名
 ```
 
@@ -499,12 +500,22 @@ call_plugin(ctx, id, action_key, form) → 方法 "request"，params 至少含�
 而是 `operations/copyfile` 到 `<data>/tmp/cat-<pid>/` 再读回本地，读完即删；
 所以它适合取几 MB 以内的对象（头像、配置文件），不适合大文件。
 
+⚠️ `remote` 必须是「远程名」，**不要**自己拼 `image_bed/x.png` 到 `remote` 里假装是 fs 串：
+本体收到 `k-vault` 会补成 `k-vault:`，收到 `k-vault:image_bed` 则原样当 fs 用。
+以前 `remote` 不带冒号会被直接当成本地相对目录传给 `operations/copyfile`，rclone 回
+`object not found`，而旧的错误分类又把这条 404 误判成「方法不支持」，最终报成
+`operations/copy: couldn't find method`，真因完全看不见（已在 `caps.rs` / `error.rs` 修掉）。
+
 `rclone.upload_file` 的返回值随远端类型变化：
 
 - 普通远端 → `{}`（走 rclone `operations/copyfile`）；
 - **k-vault 远端**（远端类型 `kvault`）→ `{ link, name, deduped }`，因为站点 DAV 写入
   一律 403，只能走 `POST /api/v1/upload`；分流按**远端类型**判断，与本插件无关，
   所以任何插件上传到 kvault 远端都拿到 `link`。`deduped: true` 表示站点判为重复并复用了旧文件。
+
+`rclone.upload_file` 既能当 `ops`（§5.6，返回值被丢弃），也能当 `need` 直接调用 ——
+**要拿直链就必须用 `need`**：`{"cap":"rclone.upload_file","key":"up","params":{…}}`，
+下一轮从 `provided.up` 读 `{link,name,deduped}`（普通远端是 `{}`）。两条路走的是同一份实现。
 
 ### 6.3 kv 存储位置
 

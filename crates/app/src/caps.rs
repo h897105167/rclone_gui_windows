@@ -1060,17 +1060,24 @@ impl CapProvider for HostCaps {
                 }
                 // 该 rclone 版本没有 operations/cat（实测 404），
                 // 因此走 copyfile 到唯一临时目录再读回来，和图片直链同一路径。
+                // fs 串必须带冒号：`k-vault` 会被当成相对本地目录，
+                // copyfile 直接回 `object not found`（实测 404）。
+                let fs = if remote.contains(':') {
+                    remote.clone()
+                } else {
+                    format!("{remote}:")
+                };
                 let dir = config::data_dir()
                     .join("tmp")
                     .join(format!("cat-{}", std::process::id()));
                 let client = self.rc.client().await;
-                let bytes = rcgui_rc::fetch_to_temp(&client, &remote, &path, &dir)
+                let bytes = rcgui_rc::fetch_to_temp(&client, &fs, &path, &dir)
                     .await
                     .map_err(|e| anyhow!("读取远程文件失败（{}）: {}", e.kind.label(), e))?;
                 let _ = std::fs::remove_dir_all(&dir);
                 if bytes.len() > max {
                     bail!(
-                        "远程文件超过 {} MB 上限: {remote}:{path}",
+                        "远程文件超过 {} MB 上限: {fs}{path}",
                         max / 1024 / 1024
                     );
                 }
@@ -1079,6 +1086,19 @@ impl CapProvider for HostCaps {
                     "size": bytes.len(),
                     "content_type": content_type_of(&path),
                 }))
+            }
+            // 同一个上传，但把结果**带回来**：`ops` 里的 `rclone.upload_file` 是
+            // 即发即忘的（`exec_ops` 丢掉返回值），需要直链的插件只能走 need。
+            // 行为与 op 完全一致（同一份 `upload_file` 实现），只是返回 `{link,name,deduped}`。
+            "rclone.upload_file" => {
+                let fs = Self::p_str(&params, "fs");
+                let remote_path = Self::p_str(&params, "remote_path");
+                if fs.trim().is_empty() || remote_path.trim().is_empty() {
+                    bail!("rclone.upload_file 需要 fs 与 remote_path");
+                }
+                let filename = Self::p_str(&params, "filename");
+                let data_b64 = Self::p_str(&params, "data_b64");
+                self.upload_file(fs, remote_path, filename, data_b64).await
             }
             other => bail!("宿主不认识的能力: {other}"),
         }

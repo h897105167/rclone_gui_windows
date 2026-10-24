@@ -142,14 +142,17 @@ pub(crate) fn classify_response(status: u16, message: &str) -> RcErrorKind {
         return RcErrorKind::Auth;
     }
     let lower = message.to_ascii_lowercase();
-    let looks_unknown = status == 404
-        || lower.contains("unknown")
-        || lower.contains("not found")
-        || lower.contains("doesn't exist")
-        || lower.contains("no such")
-        || lower.contains("unsupported")
-        // rclone 实测形态：400 + `couldn't find method "operations/cat"`
-        || lower.contains("find method");
+    // 只认「方法本身不存在」的签名：rclone 的文案是
+    // `couldn't find method "operations/cat"`（404）。
+    // 以前把任何 `not found` / `doesn't exist` / `no such` 都算进这里，
+    // 结果 `object not found`（源文件不存在）被误判成「不支持」，
+    // 调用方于是回退到旧方法名，最终报出与真因无关的错误（实测踩过）。
+    let looks_unknown = lower.contains("find method")
+        || lower.contains("unknown method")
+        || lower.contains("method not found")
+        // 只有「404 + 空正文」（rclone 对未注册的 rc 路径就是这样回的）才算方法缺失；
+        // 「404 + object not found」是资源缺失，必须留在 Api 里。
+        || (status == 404 && lower.trim().is_empty());
     if looks_unknown {
         return RcErrorKind::Unsupported;
     }
@@ -169,8 +172,19 @@ mod tests {
     #[test]
     fn missing_method_is_unsupported() {
         assert_eq!(classify_response(404, ""), RcErrorKind::Unsupported);
-        assert_eq!(classify_response(400, "couldn't find method"), RcErrorKind::Unsupported);
-        assert_eq!(classify_response(500, "no such remote"), RcErrorKind::Unsupported);
+        assert_eq!(
+            classify_response(400, "couldn't find method \"operations/copy\""),
+            RcErrorKind::Unsupported
+        );
+    }
+
+    /// rclone 的「源文件/目录不存在」也是 404，但那是资源缺失，不是方法缺失：
+    /// 不能触发旧方法名回退，否则最终报错会被回退那次的 404 覆盖（实测踩过）。
+    #[test]
+    fn resource_errors_are_api_not_unsupported() {
+        assert_eq!(classify_response(404, "object not found"), RcErrorKind::Api);
+        assert_eq!(classify_response(500, "no such remote"), RcErrorKind::Api);
+        assert_eq!(classify_response(404, "directory not found"), RcErrorKind::Api);
     }
 
     #[test]
