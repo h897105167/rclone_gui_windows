@@ -4221,6 +4221,13 @@ component PluginsView inherits Rectangle {
                                     }
                                 }
                             }
+                            // 底部占位：展开区的 padding-bottom 撑不住最后一行。
+                            // 只靠布局的 padding 时，外层算出的内容高度会比实际少约 16px，
+                            // 滚动到底「卸载插件」就被裁掉一半；显式放一个高度固定的占位块，
+                            // 让被算少的那一段落在占位上，而不是落在按钮上。
+                            Rectangle {
+                                height: 16px;
+                            }
 
                     }
                 }
