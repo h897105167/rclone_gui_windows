@@ -75,6 +75,19 @@ pub struct BedCfg {
     /// 上一次生成的短链
     #[serde(default)]
     pub last_short: String,
+    /// 去重：开启时目标路径已有同名文件就提示并取消上传；关闭时改成 `名字 (1).扩展名`
+    #[serde(default = "d_true")]
+    pub dedupe: bool,
+    /// 用过的远端路径，最新在前，最多 [`HISTORY_MAX`] 条（面板下拉框直接铺这个）
+    #[serde(default)]
+    pub path_history: Vec<String>,
+}
+
+/// 路径历史最多记多少条。
+pub const HISTORY_MAX: usize = 10;
+
+fn d_true() -> bool {
+    true
 }
 
 fn d_rate() -> u32 {
@@ -96,6 +109,8 @@ impl Default for BedCfg {
             short_key: String::new(),
             last_link: String::new(),
             last_short: String::new(),
+            dedupe: true,
+            path_history: Vec::new(),
         }
     }
 }
@@ -107,6 +122,21 @@ impl BedCfg {
 
     pub fn method_name(&self) -> &'static str {
         METHODS.get(self.short_method).copied().unwrap_or("GET")
+    }
+
+    /// 记一条用过的路径：去重、挪到最前、只留前 [`HISTORY_MAX`] 条。
+    ///
+    /// 空路径（= 远程根）也记：用户经常就在根目录传图，不记的话下拉框永远是空的。
+    /// 记住用过的远端路径（最新的在最前，最多 [`HISTORY_MAX`] 条）。
+    ///
+    /// 远程根（空路径）存成 `/`：下拉框里显示成空行会让人以为没记住，
+    /// 而 `/` 回填进「路径」后跟留空是同一个意思（两侧斜杠都会被去掉）。
+    pub fn remember_path(&mut self, path: &str) {
+        let trimmed = path.trim().trim_matches('/');
+        let p = if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() };
+        self.path_history.retain(|x| x != &p);
+        self.path_history.insert(0, p);
+        self.path_history.truncate(HISTORY_MAX);
     }
 }
 
@@ -787,6 +817,32 @@ mod tests {
         assert_eq!(mount_path("alist", "img/a.png"), "alist:img/a.png");
         assert_eq!(mount_path("alist:", "img/a.png"), "alist:img/a.png");
         assert_eq!(mount_path(" alist ", "a.png"), "alist:a.png");
+    }
+
+    #[test]
+    fn history_keeps_newest_first_without_duplicates() {
+        let mut cfg = BedCfg::default();
+        cfg.remember_path("img");
+        cfg.remember_path("/photo/");
+        // 重复用的路径回到最前，而不是再存一条
+        cfg.remember_path("img");
+        assert_eq!(cfg.path_history, vec!["img", "photo"]);
+        // 空路径也要留一条：远程根（留空）是常用的选择，显示成 `/`
+        cfg.remember_path("");
+        assert_eq!(cfg.path_history[0], "/");
+        for i in 0..20 {
+            cfg.remember_path(&format!("p{i}"));
+        }
+        assert_eq!(cfg.path_history.len(), HISTORY_MAX);
+        assert_eq!(cfg.path_history[0], "p19");
+    }
+
+    #[test]
+    fn dedupe_defaults_to_on_and_survives_old_config() {
+        // 老配置文件里没有这两个字段：反序列化后去重默认开、历史为空
+        let cfg: BedCfg = serde_json::from_str(r#"{"remote":"k-vault"}"#).unwrap();
+        assert!(cfg.dedupe);
+        assert!(cfg.path_history.is_empty());
     }
 
     #[test]
