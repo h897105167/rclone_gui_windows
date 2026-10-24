@@ -36,7 +36,7 @@ use crate::kv::KvStore;
 use crate::{caps, Ctx, PanelBtn, PanelRow, PluginRow};
 use anyhow::{anyhow, bail, Context, Result};
 use plugin_host::config::{ControlKind, FieldKind, PluginConfig, PluginSetting, CONFIG_JSON};
-use plugin_host::{bundle, Allowed};
+use plugin_host::{bundle, Allowed, CapProvider};
 use serde_json::{json, Map, Value};
 use slint::{ModelRc, SharedString, VecModel};
 use std::path::{Path, PathBuf};
@@ -133,6 +133,18 @@ pub fn ensure_builtin(ctx: &Arc<Ctx>) -> Vec<String> {
             eprintln!("释放内置插件 {} 失败: {e:#}", cfg.id);
             continue;
         }
+        // 迁移：旧版本体把 imagehost 释放成**单文件** `plugins/imagehost.wasm`，
+        // 而插件资产现在一律是目录包。同一个 id 同时存在文件与目录时扫描会列出两张
+        // 卡片（各自还有一份启用记录），所以在装包成功后删掉那个旧文件。
+        // 插件数据在 `plugins/<id>/kv.json`，不受影响。
+        let legacy = dest_root.join(format!(
+            "{}.wasm",
+            plugin_host::config::sanitize_dir_name(&cfg.id)
+        ));
+        if legacy.is_file() {
+            let _ = std::fs::remove_file(&legacy);
+            eprintln!("已迁移旧版单文件插件: {}", legacy.display());
+        }
         // 首次释放的内置插件默认启用：它们替代的是旧版里「恒开」的内置功能，
         // 默认关掉会让升级后的用户莫名其妙地失去原来的能力。
         // （用户手动停用过的不会被覆盖 —— 那条记录已经存在。）
@@ -151,30 +163,15 @@ pub fn ensure_builtin(ctx: &Arc<Ctx>) -> Vec<String> {
 
 /// 恢复被卸载的随程序插件：清墓碑 + 重新释放。
 ///
-/// 两种情况：
-/// - 内置三件套：从 exe 同级 `assets/plugins/<包>/` 复制回插件目录；
-/// - `imagehost`：它是**编进 exe 的**单文件 wasm，重新跑一次
-///   [`crate::embed_plugins`] 就会写回来（那条路径本身不看墓碑）。
+/// 从 exe 同级插件资产目录 `assets/plugins/<包>/` 复制回用户插件目录。
+/// 插件资产现在来自各插件自己的 Release（`scripts/fetch_plugins.ps1` 按
+/// `plugins/manifest.json` 下载并校验），本体不再内嵌任何插件，这里也就没有 id 特例。
 pub fn restore_builtin(ctx: &Arc<Ctx>, id: &str) -> Result<()> {
     {
         let mut cfg = ctx.cfg.lock().unwrap();
         cfg.plugin_removed.retain(|r| r != id);
         cfg.plugin_enabled.insert(id.to_string(), true);
         let _ = config::save(&cfg);
-    }
-    if id == "imagehost" {
-        let removed = ctx
-            .cfg
-            .lock()
-            .map(|c| c.plugin_removed.clone())
-            .unwrap_or_default();
-        crate::embed_plugins(&removed);
-        let p = plugins_dir().join("imagehost.wasm");
-        return if p.is_file() {
-            Ok(())
-        } else {
-            Err(anyhow!("无法恢复 imagehost：内嵌 wasm 写出失败"))
-        };
     }
     let root = builtin_root().ok_or_else(|| anyhow!("找不到内置插件目录（assets/plugins）"))?;
     let mut found = None;
@@ -204,8 +201,8 @@ pub fn restore_builtin(ctx: &Arc<Ctx>, id: &str) -> Result<()> {
 /// - 单文件插件是 `plugins/<id>.wasm`，而 `plugins/<id>/` 是**它的 kv 目录**，
 ///   按 id 反推会只删掉 kv、把 wasm 留下来（看起来「卸载了但插件还在」）。
 ///
-/// 随程序发布的插件（内置三件套 + 内嵌的 imagehost）额外写墓碑，避免下次启动被
-/// `ensure_builtin` / `embed_plugins` 又释放回来。
+/// 随程序发布的插件（`assets/plugins/` 里列出的每一个）额外写墓碑，避免下次启动被
+/// `ensure_builtin` 又释放回来。
 pub fn uninstall(ctx: &Arc<Ctx>, id: &str, path: &str) -> Result<PathBuf> {
     let removed = remove_plugin_files(Path::new(path), &plugins_dir(), id)?;
     {
@@ -241,10 +238,9 @@ fn remove_plugin_files(path: &Path, plugins_root: &Path, id: &str) -> Result<Pat
 
 /// 这个 id 是不是「随程序一起发」的（卸载后需要墓碑，否则会被自动释放回来）。
 ///
-/// 除内置三件套外，还有一个特例：`imagehost` 是 `include_bytes!` 编进 exe 的
-/// 单文件插件，由 [`crate::embed_plugins`] 在启动时写出，它不在 `assets/plugins` 里。
+/// 判定完全由插件资产目录（`assets/plugins/`）决定：那里有同 id 的包就是随程序发布的。
 pub fn ships_with_app(id: &str) -> bool {
-    id == "imagehost" || builtin_ids().iter().any(|b| b == id)
+    builtin_ids().iter().any(|b| b == id)
 }
 
 /// 已被卸载、仍可从安装包里恢复的内置插件：`(id, name, version)`。
@@ -276,13 +272,8 @@ pub fn removed_builtins(ctx: &Arc<Ctx>) -> Vec<(String, String, String)> {
             }
         }
     }
-    // imagehost 是编进 exe 的单文件插件，不在 assets/plugins 里，
-    // 名字/版本只能就地写死（它就是「图床」，版本跟 wasm 的 manifest 一致）。
-    if removed.iter().any(|r| r == "imagehost")
-        && !out.iter().any(|(id, _, _)| id == "imagehost")
-    {
-        out.push(("imagehost".into(), "图床".into(), String::new()));
-    }
+    // 已不需要任何 id 特例：所有随程序发布的插件都在 assets/plugins/ 里，
+    // 上面那次扫描就能列出它们的名字与版本。
     out.sort_by(|a, b| a.1.cmp(&b.1));
     out
 }
@@ -485,13 +476,12 @@ pub async fn scan_rows(ctx: &Arc<Ctx>) -> Vec<Row> {
                     continue;
                 }
                 seen.push(m.id.clone());
-                // 单文件 wasm 没有 config.json，**没有声明式面板**。
-                // imagehost 的设置面板是 Slint 里历史硬编码的一段（`if p.id == "imagehost"`），
-                // 与通用面板无关：这里若置 true，通用面板会去读不存在的 config.json 并报错。
+                // 单文件 wasm 没有 config.json，所以**没有声明式面板**：
+                // 这里若置 true，通用面板会去读不存在的 config.json 并报错。
                 let has_panel = false;
-                // imagehost 是 include_bytes! 编进 exe 的，也算「随程序发布」：
-                // 打上内置徽标，卸载后才有「恢复内置」入口。
-                let ships = m.id == "imagehost";
+                // 单文件插件不再随程序发布（插件资产一律是目录包），所以没有内置徽标；
+                // 是否「随程序发布」完全由 `assets/plugins/` 里有没有同名包决定。
+                let ships = false;
                 rows.push(Row {
                     enabled: enabled_map.get(&m.id).copied().unwrap_or(true),
                     kind: "wasm".into(),
@@ -621,7 +611,56 @@ pub fn loaded_config(id: &str) -> Option<(PathBuf, PluginConfig)> {
     Some((dir, cfg))
 }
 
-/// 调一次插件：`action` 由 config.json 的 action 控件 key 决定。
+/// 当前时间，按插件的需要拆成几个常用形状。
+///
+/// 插件是无状态的 WASI 程序，拿不到宿主时钟（只能 `clock_time_get`，还要自己算时区），
+/// 因此宿主每轮都把它填进 `params.now`：
+/// - `unix`：秒
+/// - `unix_ms`：毫秒
+/// - `local`：`YYYY-MM-DDTHH:MM:SS`（本地时区）
+/// - `date`：`YYYY-MM-DD`
+/// - `tz_offset_min`：本地时区相对 UTC 的分钟数
+pub fn now_json() -> Value {
+    use chrono::Local;
+    let now = Local::now();
+    json!({
+        "unix": now.timestamp(),
+        "unix_ms": now.timestamp_millis(),
+        "local": now.format("%Y-%m-%dT%H:%M:%S").to_string(),
+        "date": now.format("%Y-%m-%d").to_string(),
+        "time": now.format("%H:%M:%S").to_string(),
+        "tz_offset_min": now.offset().local_minus_utc() / 60,
+    })
+}
+
+/// 把一次 HTTP 请求转给插件的 HTTP 入口（`config.json` 里的 `http_entry: true`）。
+///
+/// 宿主不认识任何具体路由：`path` 原样交给插件，插件自己决定 200/404 与响应格式。
+/// 参数形状（插件视角）：
+/// ```json
+/// {"http":{"method":"POST","path":"/upload","query":"a=1","headers":{...},
+///          "body_b64":"...","remote_addr":"127.0.0.1:1234"}}
+/// ```
+/// `body_b64` 用 base64 而不是字符串：上传的可能是任意二进制（图片），
+/// JSON 字符串装不下非 UTF-8 字节。
+pub async fn dispatch_http(ctx: &Arc<Ctx>, id: &str, req: Value) -> Result<Value> {
+    let (dir, cfg) = loaded_config(id).ok_or_else(|| anyhow!("找不到插件 {id}"))?;
+    if !cfg.http_entry {
+        bail!("插件 {id} 没有声明 HTTP 入口");
+    }
+    let mut params = json!({
+        "action": "http",
+        "http": req,
+        "form": Value::Object(effective_form(&cfg.plugin_setting, &ctx.store, id)),
+        "now": now_json(),
+    });
+    if let Some(obj) = params.as_object_mut() {
+        obj.insert("live".into(), ctx.caps().live());
+    }
+    call_entry(ctx, id, &dir, &cfg, params).await
+}
+
+/// 调一次插件：`action` 由 config.json 的 action 控件决定。
 async fn call_plugin(
     ctx: &Arc<Ctx>,
     id: &str,
@@ -629,18 +668,12 @@ async fn call_plugin(
     extra: Value,
 ) -> Result<Value> {
     let (dir, cfg) = loaded_config(id).ok_or_else(|| anyhow!("找不到插件 {id}"))?;
-    if !cfg.entry_is_wasm() {
-        bail!("插件 {id} 的入口不是 WASM，无法提供设置面板");
-    }
-    let entry = dir.join(&cfg.entry);
-    if !entry.is_file() {
-        bail!("入口文件不存在: {}", entry.display());
-    }
     let mut params = json!({
         "action": action,
         // 必须是合并过声明式默认值的有效表单：插件看到的要和界面显示的一致，
         // 否则「界面上填好了、插件收到空值」（见 effective_form 的说明）。
         "form": Value::Object(effective_form(&cfg.plugin_setting, &ctx.store, id)),
+        "now": now_json(),
     });
     if let Some(obj) = params.as_object_mut() {
         if let Some(extra) = extra.as_object() {
@@ -649,13 +682,32 @@ async fn call_plugin(
             }
         }
     }
-    let allowed = Allowed::from_groups(&cfg.capabilities);
-    let out = ctx
-        .host
-        .invoke_with(&entry, "request", params, Some(ctx.caps()), id, &allowed)
-        .await?;
+    let out = call_entry(ctx, id, &dir, &cfg, params).await?;
     // result.body 是插件的业务返回；没有 body 时按空对象处理
     Ok(out.get("body").cloned().unwrap_or(Value::Null))
+}
+
+/// 真正执行一次插件调用，返回完整的 `result`（含 `status`/`headers`/`body` 等）。
+///
+/// 面板与 HTTP 入口共用这一层：差别只在 `params` 的形状。
+async fn call_entry(
+    ctx: &Arc<Ctx>,
+    id: &str,
+    dir: &Path,
+    cfg: &PluginConfig,
+    params: Value,
+) -> Result<Value> {
+    if !cfg.entry_is_wasm() {
+        bail!("插件 {id} 的入口不是 WASM，无法执行");
+    }
+    let entry = dir.join(&cfg.entry);
+    if !entry.is_file() {
+        bail!("入口文件不存在: {}", entry.display());
+    }
+    let allowed = Allowed::from_groups(&cfg.capabilities);
+    ctx.host
+        .invoke_with(&entry, "request", params, Some(ctx.caps()), id, &allowed)
+        .await
 }
 
 /// 处理插件返回的 `body`：写回表单/状态，返回需要提示的消息。
@@ -1236,14 +1288,6 @@ mod tests {
         assert_eq!(removed, dir);
         assert!(!dir.exists());
         std::fs::remove_dir_all(&root).ok();
-    }
-
-    /// `imagehost` 是 include_bytes! 编进 exe 的，不满足 `builtin_ids()`
-    /// （它不在 assets/plugins 里）。`ships_with_app` 必须把它算进来，
-    /// 否则卸载后不写墓碑，下次启动 `embed_plugins` 又把 wasm 写回来。
-    #[test]
-    fn imagehost_counts_as_ships_with_app() {
-        assert!(ships_with_app("imagehost"));
     }
 
     /// 声明式默认值必须真的进到传给插件的 form 里。

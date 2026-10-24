@@ -1,51 +1,45 @@
-//! 内嵌 HTTP 服务：
-//! - /api/plugin/{id}/*  → 转发到插件（multipart / raw body 双模式，兼容旧 Obsidian 插件）
-//! - GET /i/{rootId}/{*path} → 图床直链代理（磁盘缓存 + rclone cat 回源）
-//! - GET /api/health
+//! 内嵌 HTTP 服务（**与具体插件无关**）。
+//!
+//! 只有两条路由：
+//! - `/plugin/{id}/{*rest}`：把请求转给 `config.json` 里声明了 `http_entry: true`
+//!   的插件。路径、查询串、请求头、原始 body 原样交给插件，路由表、鉴权、
+//!   响应格式全部由插件自己决定（宿主只负责超时与错误兜底）。
+//! - `/api/health`：探活。
+//!
+//! `/api/plugin/{id}/{*rest}` 是早期版本用过的别名，保留一段时间，
+//! 新接入方请用 `/plugin/...`。
+//!
+//! 这里**不认识任何插件 id、任何业务路径**：图床的 `/upload`、`/i/...`、短链
+//! `/s/...` 都住在图床插件自己的路由表里（见 `rcgui-plugin-imagehost`）。
 
-use crate::caps::HostCaps;
-use crate::config;
-use anyhow::{anyhow, Result};
+use crate::plugins;
+use crate::Ctx;
+use anyhow::Result;
 use axum::extract::{FromRequest, Multipart, Path as AxPath, Query as AxQuery, Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{any, get};
 use axum::Router;
 use base64::Engine as _;
-use plugin_host::PluginHost;
-
 use serde_json::{json, Value};
-use sha1::{Digest, Sha1};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
+/// 单次请求体上限。上传图片够用，同时挡住误把 GB 级文件怼进来的情况。
 const BODY_LIMIT: usize = 100 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct HttpState {
-    pub host: Arc<PluginHost>,
-    pub caps: Arc<HostCaps>,
-    pub cfg: Arc<std::sync::Mutex<config::AppConfig>>,
-}
-
-impl HttpState {
-    /// 插件是否已启用（默认启用）
-    fn plugin_enabled(&self, id: &str) -> bool {
-        self.cfg
-            .lock()
-            .map(|c| c.plugin_enabled.get(id).copied().unwrap_or(true))
-            .unwrap_or(true)
-    }
+    pub ctx: Arc<Ctx>,
 }
 
 pub fn build_router(state: HttpState) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route("/plugin/{id}/{*rest}", any(plugin_dispatch))
+        .route("/plugin/{id}", any(plugin_root))
+        // 兼容旧路径
         .route("/api/plugin/{id}/{*rest}", any(plugin_dispatch))
-        // 旧版 Obsidian 插件约定的裸路径（raw-body + query），保持向后兼容
-        .route("/upload", any(legacy_upload))
-        .route("/i/{root_id}/{*path}", get(direct_link))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
 }
@@ -65,20 +59,17 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, axum::Json(json!({"ok": true})))
 }
 
-pub(crate) fn now_json() -> Value {
-    use chrono::{Datelike, Local, Timelike};
-    let now = Local::now();
-    json!({
-        "ymd": format!("{:04}{:02}{:02}", now.year(), now.month(), now.day()),
-        "hms": format!("{:02}{:02}{:02}", now.hour(), now.minute(), now.second()),
-        "ms": format!("{:03}", now.timestamp_subsec_millis()),
-        "date_iso": now.format("%Y-%m-%d").to_string(),
-        "iso": now.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),
-        "epoch_ms": now.timestamp_millis().to_string(),
-    })
+async fn plugin_root(
+    State(st): State<HttpState>,
+    method: Method,
+    AxPath(id): AxPath<String>,
+    AxQuery(q): AxQuery<HashMap<String, String>>,
+    headers: HeaderMap,
+    req: Request,
+) -> impl IntoResponse {
+    dispatch(st, id, "/".to_string(), method, q, headers, req).await
 }
 
-/// 插件请求统一入口：把 HTTP 请求转成协议 HttpReq，交给插件多轮协商
 async fn plugin_dispatch(
     State(st): State<HttpState>,
     method: Method,
@@ -87,27 +78,18 @@ async fn plugin_dispatch(
     headers: HeaderMap,
     req: Request,
 ) -> impl IntoResponse {
-    dispatch_to_plugin(st, id, format!("/{rest}"), method, q, headers, req).await
+    dispatch(st, id, format!("/{}", rest.trim_start_matches('/')), method, q, headers, req).await
 }
 
-/// 旧版 Obsidian 插件兼容入口：POST /upload → imagehost 的 /upload。
+/// 统一入口：把 HTTP 请求打包成插件协议里的 `http` 对象，交给插件。
 ///
-/// 早期 Node/Vue 时代的 Obsidian 插件约定直接向 `127.0.0.1:5273/upload`
-/// 以 raw-body + query 方式上传（响应 `{items:[...]}`）。当前实现只暴露
-/// `/api/plugin/imagehost/upload`，旧插件会收到 404 而静默失败。
-/// 这里保留该别名，使旧插件无需改动即可继续工作。
-async fn legacy_upload(
-    State(st): State<HttpState>,
-    method: Method,
-    AxQuery(q): AxQuery<HashMap<String, String>>,
-    headers: HeaderMap,
-    req: Request,
-) -> impl IntoResponse {
-    dispatch_to_plugin(st, "imagehost".to_string(), "/upload".to_string(), method, q, headers, req)
-        .await
-}
-
-async fn dispatch_to_plugin(
+/// 打包规则（写进 `docs/PLUGIN.md`，插件作者按这个读）：
+/// - `body_b64`：原始请求体，base64（二进制安全；JSON 字符串装不下非 UTF-8）
+/// - `multipart`：`multipart/form-data` 时额外给出
+///   `{"fields":{...},"files":[{"filename","dataB64"}]}`
+/// - `authorization`：原始 Authorization 头（插件自己校验）
+/// - `headers`：其余请求头（小写键）
+async fn dispatch(
     st: HttpState,
     id: String,
     plugin_path: String,
@@ -116,13 +98,13 @@ async fn dispatch_to_plugin(
     headers: HeaderMap,
     req: Request,
 ) -> axum::response::Response {
-    if !st.plugin_enabled(&id) {
-        return (
+    if !plugin_enabled(&st, &id) {
+        return fail(
             StatusCode::FORBIDDEN,
-            axum::Json(json!({"error": format!("插件 {id} 已停用")})),
-        )
-            .into_response();
+            format!("插件 {id} 已停用，请先在「插件」页启用"),
+        );
     }
+
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -131,8 +113,26 @@ async fn dispatch_to_plugin(
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("127.0.0.1");
+        .unwrap_or("127.0.0.1")
+        .to_string();
     let origin = format!("http://{host}");
+    let ctype = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // 其余请求头：给插件留出读自定义头的余地（如短链服务需要的 X-* 头）
+    let mut header_map = serde_json::Map::new();
+    for (k, v) in headers.iter() {
+        let name = k.as_str().to_lowercase();
+        if name == "authorization" || name == "host" || name == "content-length" {
+            continue;
+        }
+        if let Ok(text) = v.to_str() {
+            header_map.insert(name, Value::String(text.to_string()));
+        }
+    }
 
     let query: Value = q
         .iter()
@@ -140,13 +140,7 @@ async fn dispatch_to_plugin(
         .collect::<serde_json::Map<String, Value>>()
         .into();
 
-    let ctype = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    // multipart 或 raw body
+    // multipart 走 axum 的解析器，其余一律原始字节
     let (multipart_json, body_b64) = if ctype.starts_with("multipart/form-data") {
         let mut fields = serde_json::Map::new();
         let mut files: Vec<Value> = Vec::new();
@@ -173,11 +167,7 @@ async fn dispatch_to_plugin(
                 }
             },
             Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(json!({"error": format!("multipart 解析失败: {e}")})),
-                )
-                    .into_response();
+                return fail(StatusCode::BAD_REQUEST, format!("multipart 解析失败: {e}"));
             }
         }
         (Some(json!({"fields": fields, "files": files})), String::new())
@@ -185,209 +175,113 @@ async fn dispatch_to_plugin(
         let bytes = match axum::body::to_bytes(req.into_body(), BODY_LIMIT).await {
             Ok(b) => b,
             Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(json!({"error": format!("读取请求体失败: {e}")})),
-                )
-                    .into_response();
+                return fail(StatusCode::BAD_REQUEST, format!("读取请求体失败: {e}"));
             }
         };
-        (None, base64::engine::general_purpose::STANDARD.encode(&bytes))
+        (
+            None,
+            base64::engine::general_purpose::STANDARD.encode(&bytes),
+        )
     };
 
     let http_req = json!({
         "method": method.as_str(),
         "path": plugin_path,
         "query": query,
+        "headers": header_map,
         "authorization": authorization,
-        "bodyB64": body_b64,
+        "body_b64": body_b64,
         "multipart": multipart_json,
         "origin": origin,
-    });
-
-    let params = json!({
-        "http": http_req,
-        "now": now_json(),
+        "remote_addr": headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("127.0.0.1")
+            .to_string(),
         "req_id": uuid::Uuid::new_v4().simple().to_string(),
     });
 
-    let result = st
-        .host
-        .invoke(&plugin_wasm_path(&id), "request", params, Some(st.caps.clone()), &id)
-        .await;
-
-    match result {
-        Ok(v) => {
-            let status = v.get("status").and_then(|s| s.as_u64()).unwrap_or(200) as u16;
-            let body = v.get("body").cloned().unwrap_or(json!({}));
-            (
-                StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
-                axum::Json(body),
-            )
-                .into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+    match plugins::dispatch_http(&st.ctx, &id, http_req).await {
+        Ok(v) => render(v),
+        Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
 
-/// 插件 wasm 定位：data/plugins/{id}.wasm → exe旁 assets → 内置释放
-fn plugin_wasm_path(id: &str) -> PathBuf {
-    let data = config::data_dir().join("plugins").join(format!("{id}.wasm"));
-    if data.exists() {
-        return data;
-    }
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| {
-            p.parent()
-                .map(|d| d.join("assets/plugins").join(format!("{id}.wasm")))
-        })
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from("assets/plugins").join(format!("{id}.wasm")))
-}
-
-fn sha1_hex(data: &[u8]) -> String {
-    let mut h = Sha1::new();
-    h.update(data);
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// 直链代理：data/cache/{rootId}/{sha1}_{name}，miss 时 rclone cat 回源
-async fn direct_link(
-    State(st): State<HttpState>,
-    AxPath((root_id, path)): AxPath<(String, String)>,
-) -> impl IntoResponse {
-    match direct_link_inner(&st, &root_id, &path).await {
-        Ok((bytes, ctype)) => (
-            [
-                (header::CONTENT_TYPE, ctype.to_string()),
-                (header::CACHE_CONTROL, "public, max-age=3600".to_string()),
-            ],
-            bytes,
-        )
-            .into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, format!("直链获取失败: {e}")).into_response(),
-    }
-}
-
-type BodyOf = (Vec<u8>, &'static str);
-
-/// 图床 roots：kv 有 config 直接用；否则向插件取当前（含默认）配置
-async fn fetch_roots(st: &HttpState) -> Vec<Value> {
-    let cfg_raw = st.caps.store.get_all("imagehost");
-    if let Some(roots) = cfg_raw
-        .get("config")
-        .and_then(|c| c.get("roots"))
-        .and_then(|r| r.as_array())
-    {
-        return roots.clone();
-    }
-    let params = json!({
-        "http": {"method":"GET","path":"/config","query":{},"authorization":"","bodyB64":"","multipart":null,"origin":"local"},
-        "now": now_json(),
-        "req_id": uuid::Uuid::new_v4().simple().to_string(),
-    });
-    match st
-        .host
-        .invoke(
-            &plugin_wasm_path("imagehost"),
-            "request",
-            params,
-            Some(st.caps.clone()),
-            "imagehost",
-        )
-        .await
-    {
-        Ok(v) => v
-            .get("body")
-            .and_then(|b| b.get("roots"))
-            .and_then(|r| r.as_array())
-            .cloned()
-            .unwrap_or_default(),
-        Err(e) => {
-            let _ = std::fs::write(
-                config::data_dir().join("directlink.err"),
-                format!("{}\n", e),
-            );
-            Vec::new()
-        }
-    }
-}
-
-/// 规范化远程相对路径：统一分隔符并剔除 `.` / `..` 段。
+/// 插件返回的 `result` → HTTP 响应。
 ///
-/// 直链路径来自 URL，未规范化时 `..` 会被原样传给 `rclone cat`，
-/// 从而读到图床根目录之外的文件。这里与插件的 normalize_sub 保持同一规则。
-pub(crate) fn normalize_rel_path(p: &str) -> String {
-    p.replace('\\', "/")
-        .split('/')
-        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
-        .collect::<Vec<_>>()
-        .join("/")
+/// 约定（见 `docs/PLUGIN.md`）：
+/// - `status`：HTTP 状态码，缺省 200
+/// - `body`：JSON 响应体
+/// - `body_b64` + `content_type`：二进制响应（图片、下载流）
+/// - `headers`：附加响应头
+fn render(v: Value) -> axum::response::Response {
+    let status = v.get("status").and_then(|s| s.as_u64()).unwrap_or(200) as u16;
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+
+    let mut extra: Vec<(String, String)> = Vec::new();
+    if let Some(h) = v.get("headers").and_then(|h| h.as_object()) {
+        for (k, val) in h {
+            if let Some(s) = val.as_str() {
+                extra.push((k.clone(), s.to_string()));
+            }
+        }
+    }
+
+    if let Some(b64) = v.get("body_b64").and_then(|b| b.as_str()).filter(|s| !s.is_empty()) {
+        match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
+            Ok(bytes) => {
+                let ctype = v
+                    .get("content_type")
+                    .and_then(|c| c.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                let mut resp = (
+                    [
+                        (header::CONTENT_TYPE, ctype),
+                        (header::CACHE_CONTROL, "public, max-age=3600".to_string()),
+                    ],
+                    bytes,
+                )
+                    .into_response();
+                apply_headers(resp.headers_mut(), &extra);
+                *resp.status_mut() = status;
+                return resp;
+            }
+            Err(e) => {
+                return fail(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("插件返回的 body_b64 不是合法 base64: {e}"),
+                );
+            }
+        }
+    }
+
+    let body = v.get("body").cloned().unwrap_or(json!({}));
+    let mut resp = (status, axum::Json(body)).into_response();
+    apply_headers(resp.headers_mut(), &extra);
+    resp
 }
 
-async fn direct_link_inner(st: &HttpState, root_id: &str, path: &str) -> Result<BodyOf> {
-    let roots = fetch_roots(st).await;
-    let root = roots
-        .iter()
-        .find(|r| r.get("id").and_then(|x| x.as_str()) == Some(root_id))
-        .ok_or_else(|| anyhow!("root 不存在: {root_id}"))?;
-    let remote = root
-        .get("remote")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| anyhow!("root 缺少 remote"))?
-        .to_string();
-
-    // 防目录穿越：路径必须先规范化再回源
-    let path = normalize_rel_path(path);
-    if path.is_empty() {
-        return Err(anyhow!("路径为空"));
+fn apply_headers(headers: &mut HeaderMap, extra: &[(String, String)]) {
+    for (k, val) in extra {
+        if let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::try_from(k.as_str()),
+            axum::http::HeaderValue::try_from(val.as_str()),
+        ) {
+            headers.insert(name, value);
+        }
     }
-
-    let name = path.rsplit('/').next().unwrap_or("file").to_string();
-    let cache_dir = config::data_dir().join("cache").join(root_id);
-    let key = &sha1_hex(format!("{remote}:{path}").as_bytes())[..16];
-    let file = cache_dir.join(format!("{key}_{name}"));
-
-    if !file.exists() {
-        std::fs::create_dir_all(&cache_dir)?;
-        // 回源：只走 RC（operations/copyfile 到唯一临时文件 → 读字节 → 写缓存）。
-        // 不再启动 `rclone cat` 子进程；该 rclone 版本没有 operations/cat（实测 404）。
-        let dir = cache_dir.join(format!("tmp-{}", std::process::id()));
-        let client = st.caps.rc.client().await;
-        let bytes = rcgui_rc::fetch_to_temp(&client, &remote, &path, &dir)
-            .await
-            .map_err(|e| anyhow!("回源失败（{}）: {}", e.kind.label(), e))?;
-        // 原子落缓存：先写临时名再改名，避免读到半截文件
-        let tmp = file.with_extension(format!("dl-{}", std::process::id()));
-        tokio::fs::write(&tmp, &bytes).await?;
-        std::fs::rename(&tmp, &file)?;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    let bytes = tokio::fs::read(&file).await?;
-    Ok((bytes, content_type_of(&name)))
 }
 
-fn content_type_of(name: &str) -> &'static str {
-    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
-    match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        "avif" => "image/avif",
-        "bmp" => "image/bmp",
-        "ico" => "image/x-icon",
-        "mp4" => "video/mp4",
-        "css" => "text/css",
-        "js" => "application/javascript",
-        "json" => "application/json",
-        "txt" | "md" => "text/plain",
-        _ => "application/octet-stream",
-    }
+fn fail(status: StatusCode, message: String) -> axum::response::Response {
+    (status, axum::Json(json!({"error": message}))).into_response()
+}
+
+fn plugin_enabled(st: &HttpState, id: &str) -> bool {
+    st.ctx
+        .cfg
+        .lock()
+        .map(|c| c.plugin_enabled.get(id).copied().unwrap_or(true))
+        .unwrap_or(true)
 }

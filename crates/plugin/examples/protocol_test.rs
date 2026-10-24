@@ -1,6 +1,6 @@
 //! 插件协议端到端测试：编译好的 imagehost.wasm + 假能力提供者。
 //! 用法：cargo run -p plugin_host --example protocol_test
-//! 前置：cargo build -p imagehost-plugin --target wasm32-wasip1
+//! 前置：./scripts/fetch_plugins.ps1（把内置插件资产下到 crates/app/assets/plugins/）
 
 use anyhow::Result;
 use plugin_host::{CapProvider, PluginHost};
@@ -63,8 +63,7 @@ fn now() -> Value {
 
 fn wasm_path() -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");
-    PathBuf::from(manifest)
-        .join("../../target/wasm32-wasip1/debug/imagehost.wasm")
+    PathBuf::from(manifest).join("../../crates/app/assets/plugins/imagehost/main.wasm")
 }
 
 #[tokio::main]

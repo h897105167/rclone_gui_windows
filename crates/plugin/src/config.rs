@@ -53,18 +53,18 @@ pub const CAP_GROUPS: &[&str] = &[
 pub fn cap_of_op(op: &str) -> Option<&'static str> {
     Some(match op {
         "kv.get" | "kv.set" | "kv.delete" | "kv.get_all" => "kv",
-        "ui.toast" | "ui.confirm" => "ui",
+        "ui.toast" | "ui.confirm" | "ui.copy" => "ui",
 
-        "fs.meta" | "fs.sha256" | "fs.read_text" | "fs.write_text" | "fs.copy" | "fs.mkdir"
-        | "fs.remove" | "fs.list_dir" | "fs.find" | "fs.unzip" | "fs.pick_file" | "fs.pick_dir"
-        | "fs.open_dir" | "fs.pe_info" | "fs.signature" | "fs.search_exe" => "fs",
+        "fs.meta" | "fs.sha256" | "fs.read_text" | "fs.read_b64" | "fs.write_text" | "fs.copy"
+        | "fs.mkdir" | "fs.remove" | "fs.list_dir" | "fs.find" | "fs.unzip" | "fs.pick_file"
+        | "fs.pick_dir" | "fs.open_dir" | "fs.pe_info" | "fs.signature" | "fs.search_exe" => "fs",
         // 早期命名，保留兼容
         "fs.inspect_exe" | "fs.write_file" | "fs.remove_dir" => "fs",
 
-        "http.download" | "http.json" | "http.text" => "http",
+        "http.download" | "http.json" | "http.text" | "http.request" => "http",
         "proc.start" | "proc.stop" | "proc.status" | "proc.run" => "proc",
         "net.port_open" => "net",
-        "rclone.call" | "rclone.upload_file" => "rclone",
+        "rclone.call" | "rclone.upload_file" | "rclone.cat" => "rclone",
         "env.info" => "env",
         _ => return None,
     })
@@ -381,6 +381,11 @@ pub struct PluginConfig {
     /// 是否为随程序安装的内置插件（由宿主写入，用户可以卸载）
     #[serde(default)]
     pub builtin: bool,
+    /// 是否声明了 HTTP 入口：为 `true` 时宿主把 `/plugin/<id>/*` 转发给插件。
+    ///
+    /// 路由、鉴权、响应格式全部由插件自己决定；宿主只负责转发与超时。
+    #[serde(default)]
+    pub http_entry: bool,
 }
 
 impl PluginConfig {
@@ -411,8 +416,11 @@ impl PluginConfig {
         if self.entry.trim().is_empty() {
             bail!("config.json 缺少 entry（一般是 main.wasm）");
         }
-        if !self.platform.trim().is_empty() && self.platform.trim() != "windows" {
-            bail!("插件声明的平台不受支持：{}（仅支持 windows）", self.platform);
+        // `platform` 只用来挡「明显不是这台机器的插件」。宿主本身是 Windows 应用，
+        // 而插件跑在 WASI 沙箱里：`any`（或不填）与 `windows` 都能跑，其余拒绝。
+        let platform = self.platform.trim();
+        if !platform.is_empty() && platform != "windows" && platform != "any" {
+            bail!("插件声明的平台不受支持：{platform}（仅支持 windows / any）");
         }
         if self.tags.len() > 32 {
             bail!("config.json 的 tags 过多（{} > 32）", self.tags.len());

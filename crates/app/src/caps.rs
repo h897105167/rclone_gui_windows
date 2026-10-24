@@ -482,6 +482,30 @@ impl CapProvider for HostCaps {
                 })
                 .await
             }
+            "fs.read_b64" => {
+                let path = Self::p_str(&params, "path");
+                let max = if Self::p_u64(&params, "max_bytes") == 0 {
+                    64 * 1024 * 1024
+                } else {
+                    Self::p_u64(&params, "max_bytes")
+                } as usize;
+                spawn_blocking(move || {
+                    let md = std::fs::metadata(&path)
+                        .with_context(|| format!("读取 {path} 失败"))?;
+                    if !md.is_file() {
+                        bail!("不是文件: {path}");
+                    }
+                    if md.len() as usize > max {
+                        bail!("文件超过 {} MB 上限: {path}", max / 1024 / 1024);
+                    }
+                    let raw = std::fs::read(&path).with_context(|| format!("读取 {path} 失败"))?;
+                    Ok(json!({
+                        "data_b64": base64::engine::general_purpose::STANDARD.encode(&raw),
+                        "size": raw.len(),
+                    }))
+                })
+                .await
+            }
             "fs.write_text" => {
                 let path = Self::p_str(&params, "path");
                 let text = Self::p_str(&params, "text");
@@ -714,6 +738,72 @@ impl CapProvider for HostCaps {
                     .with_context(|| format!("读取 {url} 响应失败"))?;
                 Ok(json!({ "status": status, "body": body }))
             }
+            "http.request" => {
+                let url = Self::p_str(&params, "url");
+                let method = {
+                    let m = Self::p_str(&params, "method").to_uppercase();
+                    if m.is_empty() {
+                        "GET".to_string()
+                    } else {
+                        m
+                    }
+                };
+                let body = Self::p_str(&params, "body");
+                let timeout = Self::p_u64(&params, "timeout_ms");
+                let timeout = Duration::from_millis(if timeout == 0 { 30_000 } else { timeout });
+                let max = if Self::p_u64(&params, "max_bytes") == 0 {
+                    16 * 1024 * 1024
+                } else {
+                    Self::p_u64(&params, "max_bytes")
+                } as usize;
+                let client = reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(15))
+                    .timeout(timeout)
+                    .user_agent(format!("RCGUI/{}", env!("CARGO_PKG_VERSION")))
+                    .build()?;
+                let mut req = match method.as_str() {
+                    "GET" => client.get(&url),
+                    "POST" => client.post(&url),
+                    "PUT" => client.put(&url),
+                    "PATCH" => client.patch(&url),
+                    "DELETE" => client.delete(&url),
+                    "HEAD" => client.head(&url),
+                    other => bail!("http.request 不支持的方法: {other}"),
+                };
+                if let Some(h) = params.get("headers").and_then(|v| v.as_object()) {
+                    for (k, v) in h {
+                        let Some(v) = v.as_str() else { continue };
+                        req = req.header(k.as_str(), v);
+                    }
+                }
+                if !body.is_empty() {
+                    req = req.body(body);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .with_context(|| format!("请求 {url} 失败"))?;
+                let status = resp.status().as_u16();
+                let content_type = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .with_context(|| format!("读取 {url} 响应失败"))?;
+                if bytes.len() > max {
+                    bail!("响应超过 {} MB 上限: {url}", max / 1024 / 1024);
+                }
+                Ok(json!({
+                    "status": status,
+                    "content_type": content_type,
+                    "body": String::from_utf8_lossy(&bytes).to_string(),
+                    "size": bytes.len(),
+                }))
+            }
             "http.download" => {
                 let url = Self::p_str(&params, "url");
                 let dest = Self::p_str(&params, "dest");
@@ -857,6 +947,17 @@ impl CapProvider for HostCaps {
             })),
 
             // ---------------- 交互 ----------------
+            "ui.copy" => {
+                let text = Self::p_str(&params, "text");
+                spawn_blocking(move || {
+                    let mut cb = arboard::Clipboard::new()
+                        .map_err(|e| anyhow!("无法访问剪贴板: {e}"))?;
+                    cb.set_text(text)
+                        .map_err(|e| anyhow!("写入剪贴板失败: {e}"))?;
+                    Ok(json!({ "ok": true }))
+                })
+                .await
+            }
             "ui.confirm" => {
                 let title = Self::p_str(&params, "title");
                 let message = Self::p_str(&params, "message");
@@ -872,12 +973,70 @@ impl CapProvider for HostCaps {
                 .await
             }
 
+            "rclone.cat" => {
+                let remote = Self::p_str(&params, "remote");
+                let path = Self::p_str(&params, "path");
+                let max = if Self::p_u64(&params, "max_bytes") == 0 {
+                    32 * 1024 * 1024
+                } else {
+                    Self::p_u64(&params, "max_bytes")
+                } as usize;
+                if remote.trim().is_empty() || path.trim().is_empty() {
+                    bail!("rclone.cat 需要 remote 与 path");
+                }
+                // 该 rclone 版本没有 operations/cat（实测 404），
+                // 因此走 copyfile 到唯一临时目录再读回来，和图片直链同一路径。
+                let dir = config::data_dir()
+                    .join("tmp")
+                    .join(format!("cat-{}", std::process::id()));
+                let client = self.rc.client().await;
+                let bytes = rcgui_rc::fetch_to_temp(&client, &remote, &path, &dir)
+                    .await
+                    .map_err(|e| anyhow!("读取远程文件失败（{}）: {}", e.kind.label(), e))?;
+                let _ = std::fs::remove_dir_all(&dir);
+                if bytes.len() > max {
+                    bail!(
+                        "远程文件超过 {} MB 上限: {remote}:{path}",
+                        max / 1024 / 1024
+                    );
+                }
+                Ok(json!({
+                    "data_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    "size": bytes.len(),
+                    "content_type": content_type_of(&path),
+                }))
+            }
             other => bail!("宿主不认识的能力: {other}"),
         }
     }
 }
 
 // ---------------- 辅助 ----------------
+
+/// 按扩展名猜 Content-Type。
+///
+/// 插件自己不知道 HTTP 语义，回 `content_type` 时常用得到；
+/// 也用在内置 HTTP 入口转发二进制响应时。
+pub(crate) fn content_type_of(name: &str) -> &'static str {
+    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "mp4" => "video/mp4",
+        "css" => "text/css",
+        "js" => "application/javascript",
+        "json" => "application/json",
+        "txt" | "md" => "text/plain; charset=utf-8",
+        "html" => "text/html; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
 
 async fn spawn_blocking<T, F>(f: F) -> Result<T>
 where
