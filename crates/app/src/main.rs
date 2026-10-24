@@ -192,6 +192,16 @@ enum Cmd {
     BedMakeShort {
         direct: String,
     },
+    /// 打开目录浏览弹窗（列当前远程 + 当前路径下的子目录）
+    BedBrowOpen,
+    /// 进入子目录（下标对应弹窗里的目录表）
+    BedBrowInto { idx: usize },
+    /// 回到上一级
+    BedBrowUp,
+    /// 选中当前浏览的目录填进「路径」
+    BedBrowSelect,
+    /// 关掉浏览弹窗
+    BedBrowClose,
     CopyText { text: String },
     SettingsSave,
     SettingsTest,
@@ -2466,17 +2476,16 @@ fn reset_kv_form(ui: &MainWindow, base: &str) {
 ///
 /// 站点按令牌策略要求目录落在前缀下，传到前缀之外一律 `POLICY_FOLDER_DENIED`；
 /// 所以当前路径不在上传目录里时退回上传目录，而不是让 rclone/站点回一个看不懂的错。
+/// 站点目录：用户在界面里选的路径优先，留空才用配置里的上传目录。
+///
+/// 不把「不在策略前缀下」的路径偷偷换成上传目录——那会让文件跑到用户没有指定的地方。
+/// 站点自己会用 `POLICY_FOLDER_DENIED` 明确拒绝，错误信息里也写了允许的前缀。
 fn kv_upload_folder(cfg: &kvault::KvCfg, gui_path: &str) -> String {
     let p = gui_path.trim().trim_matches('/');
-    let root = cfg.folder.trim().trim_matches('/');
-    if p.is_empty() || root.is_empty() {
-        return if p.is_empty() { root.to_string() } else { p.to_string() };
+    if p.is_empty() {
+        return cfg.folder.trim().trim_matches('/').to_string();
     }
-    if p == root || p.starts_with(&format!("{root}/")) {
-        p.to_string()
-    } else {
-        root.to_string()
-    }
+    p.to_string()
 }
 
 /// 一次 K-Vault 上传的汇总（给 toast 用）。
@@ -8179,6 +8188,91 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             }
             false
         }
+        Cmd::BedBrowOpen => {
+            let (remote, path) = read_ui(ui, |ui| {
+                let g = ui.global::<PluginsG>();
+                (
+                    bed_remote_of(&g).trim_end_matches(':').to_string(),
+                    g.get_bed_path().to_string(),
+                )
+            })
+            .await
+            .unwrap_or_default();
+            if remote.is_empty() {
+                toast(ui, 2, "请先选择存储的远程");
+                return false;
+            }
+            let path = path.trim().trim_matches('/').to_string();
+            let dirs = bed_list_dirs(ctx, &remote, &path).await;
+            let _ = ui.upgrade_in_event_loop(move |ui| bed_show_browse(&ui, &path, dirs));
+            false
+        }
+        Cmd::BedBrowInto { idx } => {
+            let (remote, cur, name) = read_ui(ui, move |ui| {
+                let g = ui.global::<PluginsG>();
+                (
+                    bed_remote_of(&g).trim_end_matches(':').to_string(),
+                    g.get_bed_brow_path().to_string(),
+                    g.get_bed_brow_dirs()
+                        .row_data(idx)
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                )
+            })
+            .await
+            .unwrap_or_default();
+            if remote.is_empty() || name.is_empty() {
+                return false;
+            }
+            let next = format!("{cur}/{name}").trim_matches('/').to_string();
+            let dirs = bed_list_dirs(ctx, &remote, &next).await;
+            let _ = ui.upgrade_in_event_loop(move |ui| bed_show_browse(&ui, &next, dirs));
+            false
+        }
+        Cmd::BedBrowUp => {
+            let (remote, cur) = read_ui(ui, |ui| {
+                let g = ui.global::<PluginsG>();
+                (
+                    bed_remote_of(&g).trim_end_matches(':').to_string(),
+                    g.get_bed_brow_path().to_string(),
+                )
+            })
+            .await
+            .unwrap_or_default();
+            if remote.is_empty() {
+                return false;
+            }
+            let next = cur
+                .rsplit_once('/')
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_default();
+            let dirs = bed_list_dirs(ctx, &remote, &next).await;
+            let _ = ui.upgrade_in_event_loop(move |ui| bed_show_browse(&ui, &next, dirs));
+            false
+        }
+        Cmd::BedBrowSelect => {
+            let cur = read_ui(ui, |ui| ui.global::<PluginsG>().get_bed_brow_path().to_string())
+                .await
+                .unwrap_or_default();
+            let path = cur.trim().trim_matches('/').to_string();
+            // 选完就落盘：用户点「选择此目录」的意图就是「以后就传这里」，
+            // 不顺手保存的话，下次打开插件面板又要重新选一遍。
+            let mut cfg = read_bed_cfg(ui).await;
+            cfg.path = path.clone();
+            bed_save_stored(ctx, &cfg);
+            let shown = if path.is_empty() { "/".to_string() } else { path.clone() };
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                let g = ui.global::<PluginsG>();
+                g.set_bed_path(path.as_str().into());
+                g.set_bed_browsing(false);
+            });
+            toast(ui, 1, format!("已选择上传目录 {shown}（已保存）"));
+            false
+        }
+        Cmd::BedBrowClose => {
+            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<PluginsG>().set_bed_browsing(false));
+            false
+        }
         // ---------------- 插件通用面板 / 卸载 ----------------
         Cmd::PluginPanelOpen { idx } => {
             let row = read_ui(ui, move |ui| {
@@ -8981,6 +9075,13 @@ async fn read_bed_cfg(ui: &Weak<MainWindow>) -> bed::BedCfg {
             short_key: g.get_bed_key().to_string(),
             last_link: g.get_bed_link().to_string(),
             last_short: g.get_bed_short().to_string(),
+            dedupe: g.get_bed_dedupe(),
+            path_history: {
+                let m = g.get_bed_history();
+                (0..m.row_count())
+                    .filter_map(|i| m.row_data(i).map(|s| s.to_string()))
+                    .collect()
+            },
         }
     })
     .await
@@ -8995,7 +9096,11 @@ fn bed_load_stored(ctx: &Arc<Ctx>) -> bed::BedCfg {
 }
 
 fn bed_save_stored(ctx: &Arc<Ctx>, cfg: &bed::BedCfg) {
-    match serde_json::to_value(cfg) {
+    // 「上传图片路径」不落盘：它是一次性的本机文件选择，记住反而会让下次打开面板
+    // 指向一个可能已经不存在的文件（用户明确要求除它之外都持久化）。
+    let mut saved = cfg.clone();
+    saved.upload_path = String::new();
+    match serde_json::to_value(&saved) {
         Ok(v) => {
             if let Err(e) = ctx.store.set(bed::NS, bed::KEY, v) {
                 eprintln!("保存图床面板配置失败: {e:#}");
@@ -9003,6 +9108,84 @@ fn bed_save_stored(ctx: &Arc<Ctx>, cfg: &bed::BedCfg) {
         }
         Err(e) => eprintln!("图床面板配置序列化失败: {e}"),
     }
+}
+
+/// 目标目录里已有的文件名（同名判断用）：k-vault 走站点索引，其余走 rclone list。
+///
+/// 读不到就当「没有同名文件」：这只是一层提示/改名判断，不该因为它把上传拦下来，
+/// 真出错让后面的上传自己去报。
+async fn bed_list_names(ctx: &Arc<Ctx>, remote: &str, dir: &str) -> Vec<String> {
+    if let Some(kcfg) = kv_cfg_for(ctx, remote).await {
+        if kcfg.token.is_empty() {
+            return Vec::new();
+        }
+        let folder = kv_upload_folder(&kcfg, dir);
+        return match kvault::list_files(&kcfg.base, &kcfg.token).await {
+            Ok(files) => files
+                .into_iter()
+                .filter(|f| f.folder == folder)
+                .map(|f| f.name)
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+    }
+    let client = ctx.rc.client().await;
+    let fs = format!("{remote}:");
+    client
+        .list(&fs, dir, None)
+        .await
+        .map(|v| v.into_iter().filter(|e| !e.is_dir).map(|e| e.name).collect())
+        .unwrap_or_default()
+}
+
+/// 列「某个目录下的一层子目录」，给面板的「浏览」用；路径由面板自己拼。
+///
+/// 注意这里**不能**走 `kv_upload_folder`：那个函数在没有指定路径时会退回配置里的
+/// 上传目录，用在浏览上就变成「标题写着 /，列出来的却是 image_bed 的子目录」。
+/// 浏览看的是用户点到的位置本身。
+async fn bed_list_dirs(ctx: &Arc<Ctx>, remote: &str, dir: &str) -> Vec<String> {
+    if let Some(kcfg) = kv_cfg_for(ctx, remote).await {
+        if kcfg.token.is_empty() {
+            return Vec::new();
+        }
+        let folder = dir.trim().trim_matches('/').to_string();
+        return match kvault::list_files(&kcfg.base, &kcfg.token).await {
+            Ok(files) => kvault::list_folder(&files, &folder, "name", false)
+                .into_iter()
+                .filter(|i| i.is_dir)
+                .map(|i| i.name)
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+    }
+    let client = ctx.rc.client().await;
+    let fs = format!("{remote}:");
+    client
+        .list(&fs, dir, None)
+        .await
+        .map(|v| v.into_iter().filter(|e| e.is_dir).map(|e| e.name).collect())
+        .unwrap_or_default()
+}
+
+/// 面板上「存储的远程」下拉框当前选的名字（不带冒号）。
+fn bed_remote_of(g: &PluginsG) -> String {
+    let idx = g.get_bed_remote_idx();
+    if idx < 0 {
+        return String::new();
+    }
+    g.get_bed_remotes()
+        .row_data(idx as usize)
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
+/// 把浏览到的一层目录铺给面板：路径、子目录表、弹窗开关一起设。
+fn bed_show_browse(ui: &MainWindow, path: &str, dirs: Vec<String>) {
+    let g = ui.global::<PluginsG>();
+    let list: Vec<slint::SharedString> = dirs.into_iter().map(slint::SharedString::from).collect();
+    g.set_bed_brow_path(path.into());
+    g.set_bed_brow_dirs(ModelRc::from(Rc::new(VecModel::from(list))));
+    g.set_bed_browsing(true);
 }
 
 /// 把已保存的配置铺回面板（打开插件面板时调用）。
@@ -9019,12 +9202,22 @@ async fn load_bed(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         .map(|i| i as i32)
         .unwrap_or(if remotes.is_empty() { -1 } else { 0 });
     let remotes: Vec<slint::SharedString> = remotes.into_iter().map(slint::SharedString::from).collect();
+    let history: Vec<slint::SharedString> = cfg
+        .path_history
+        .iter()
+        .map(|p| slint::SharedString::from(p.as_str()))
+        .collect();
+    let dedupe = cfg.dedupe;
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let g = ui.global::<PluginsG>();
         g.set_bed_remotes(ModelRc::from(Rc::new(VecModel::from(remotes))));
         g.set_bed_remote_idx(idx);
         g.set_bed_path(cfg.path.as_str().into());
-        g.set_bed_upload_path(cfg.upload_path.as_str().into());
+        // 上传图片路径不持久化：每次打开面板都从空白开始
+        g.set_bed_upload_path("".into());
+        g.set_bed_history(ModelRc::from(Rc::new(VecModel::from(history))));
+        g.set_bed_history_idx(-1);
+        g.set_bed_dedupe(dedupe);
         g.set_bed_tpl_idx(cfg.short_tpl.clamp(0, bed::TEMPLATES.len() - 1) as i32);
         g.set_bed_fmt_idx(cfg.short_fmt.clamp(0, bed::FORMATS.len() - 1) as i32);
         g.set_bed_callback(cfg.short_callback.as_str().into());
@@ -9103,19 +9296,47 @@ async fn bed_run(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         format!("{fs}{dir}")
     };
 
+    // 同名处理（面板上的「去重」勾选框）：
+    // - 勾上（默认）：目标路径已有同名文件 → 提示一句、取消本次上传；
+    // - 不勾：按文件页上传的同一套规则改名成 `名字 (1).扩展名`，不静默覆盖。
+    let existing = bed_list_names(ctx, &cfg.remote, &dir).await;
+    let dest_name = if existing.iter().any(|e| e.eq_ignore_ascii_case(&name)) {
+        if cfg.dedupe {
+            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<PluginsG>().set_bed_busy(false));
+            toast(
+                ui,
+                2,
+                format!(
+                    "已上传过同名文件：{}（已取消上传；取消勾选「去重」可改名 {} 再传）",
+                    bed::join_stored(&dir, &name),
+                    unique_file_name(&name, &existing)
+                ),
+            );
+            return;
+        }
+        unique_file_name(&name, &existing)
+    } else {
+        name.clone()
+    };
+    // 路径历史：这次真要传了才记，成功的保存会把历史一起落盘
+    cfg.remember_path(&dir);
+
     // K-Vault 远程：站点的 DAV 端点只放行读方法，COPY/PUT 一律 403，
     // 所以上传走 `POST /api/v1/upload`，直链直接用站点返回的签名链接。
     // 这条路自己收尾（不落到下面的 copyfile/直链推导）。
     if let Some(kcfg) = kv_cfg_for(ctx, &cfg.remote).await {
         let folder = kv_upload_folder(&kcfg, &dir);
-        match kvault::upload(&kcfg, &src, &name, &folder).await {
+        match kvault::upload(&kcfg, &src, &dest_name, &folder).await {
             Ok(up) => {
                 let stored = bed::join_stored(&folder, &up.name);
                 cfg.last_link = up.link.clone();
                 bed_save_stored(ctx, &cfg);
                 let show = up.link.clone();
                 let _ = ui.upgrade_in_event_loop(move |ui| {
-                    ui.global::<PluginsG>().set_bed_link(show.as_str().into())
+                    let g = ui.global::<PluginsG>();
+                    g.set_bed_link(show.as_str().into());
+                    // 「上传图片路径」按设计不落盘、也不跨次复用：传完就清掉
+                    g.set_bed_upload_path("".into());
                 });
                 let extra = if up.dedup {
                     "；站点已有同一份内容，直接复用了直链"
@@ -9141,13 +9362,6 @@ async fn bed_run(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         return;
     }
 
-    // 同名一律改名（与文件页上传一致）：静默覆盖不是安全默认
-    let existing: Vec<String> = client
-        .list(&fs, &dir, None)
-        .await
-        .map(|v| v.into_iter().map(|e| e.name).collect())
-        .unwrap_or_default();
-    let dest_name = unique_file_name(&name, &existing);
     let src_fs = local_fs(src.parent().unwrap_or(Path::new(".")));
     let uploaded = client.copyfile(&src_fs, &name, &dst_fs, &dest_name).await;
     if let Err(e) = uploaded {
@@ -9178,7 +9392,10 @@ async fn bed_run(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             bed_save_stored(ctx, &cfg);
             let show = url.clone();
             let _ = ui.upgrade_in_event_loop(move |ui| {
-                ui.global::<PluginsG>().set_bed_link(show.as_str().into())
+                let g = ui.global::<PluginsG>();
+                g.set_bed_link(show.as_str().into());
+                // 同上：上传图片路径不跨次保留
+                g.set_bed_upload_path("".into());
             });
             toast(
                 ui,
@@ -10389,6 +10606,37 @@ fn wire_callbacks(
         let tx = tx.clone();
         move || {
             let _ = tx.send(Cmd::BedRefreshRemotes);
+        }
+    });
+    // ---- 路径浏览（弹窗里的进入/上一级/选中/关闭）----
+    ui.on_bed_browse({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::BedBrowOpen);
+        }
+    });
+    ui.on_bed_brow_into({
+        let tx = tx.clone();
+        move |idx| {
+            let _ = tx.send(Cmd::BedBrowInto { idx: idx.max(0) as usize });
+        }
+    });
+    ui.on_bed_brow_up({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::BedBrowUp);
+        }
+    });
+    ui.on_bed_brow_select({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::BedBrowSelect);
+        }
+    });
+    ui.on_bed_brow_close({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(Cmd::BedBrowClose);
         }
     });
     ui.on_bed_make_short({

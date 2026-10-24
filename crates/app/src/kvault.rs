@@ -1153,4 +1153,5 @@ mod tests {
         assert_eq!(encode_id("r2:dir/a b.png"), "r2:dir/a%20b.png");
         assert_eq!(encode_id("tg:a#b"), "tg:a%23b");
     }
+
 }
