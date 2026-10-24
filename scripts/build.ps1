@@ -31,6 +31,9 @@ $ErrorActionPreference = "Continue"
 
 function Invoke-Native {
     param([scriptblock]$Command, [string]$What)
+    # 先清零：fetch_plugins.ps1 成功时只写 Write-Host，不会设置 $LASTEXITCODE，
+    # 残留值或 $null 会让 `$LASTEXITCODE -ne 0` 把成功误判成失败。
+    $global:LASTEXITCODE = 0
     & $Command
     if ($LASTEXITCODE -ne 0) {
         throw "$What 失败（退出码 $LASTEXITCODE）"
