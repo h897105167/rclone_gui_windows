@@ -8393,7 +8393,6 @@ async fn rescan_plugins(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         .await
         .unwrap_or_default();
     let rows = plugins::filter_rows(&all, &needle);
-    let imagehost = all.iter().any(|r| r.id == "imagehost" && r.enabled);
     let dir_text = plugins::plugins_dir().display().to_string();
     // 已卸载但仍可恢复的内置插件：列表里已经没有它们的卡片，
     // 只能靠顶部这一条入口把「恢复内置」按钮留住。
@@ -8407,7 +8406,6 @@ async fn rescan_plugins(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         let g = ui.global::<PluginsG>();
         let list = plugins::rows_to_slint(&rows);
         g.set_rows(ModelRc::from(Rc::new(VecModel::from(list))));
-        g.set_loaded(imagehost);
         g.set_dir(dir_text.into());
         let rb = removed
             .iter()

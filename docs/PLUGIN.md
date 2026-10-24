@@ -96,6 +96,7 @@ myplugin/
   "tags": ["示例", "hello"],          // 可选。插件列表检索用
   "platform": "any",                 // 可选。any / windows，见 §3.4
   "builtin": false,                  // 可选。true 表示"随本体分发"，见 §6.4
+  "http_entry": false,               // 可选。true 表示接管内嵌 HTTP 路由，见 §5.7
   "capabilities": ["kv", "ui"],      // 必填（可为空数组）。能力组，见 §5
   "plugin_setting": {                // 可选。插件页的声明式界面，见 §4
     "version": 1,
@@ -333,6 +334,7 @@ call_plugin(ctx, id, action_key, form) → 方法 "request"，params 至少含�
 | `params.live` | 宿主当前长任务进度 `{"busy","label","done","total"}`，无需 need |
 | `params.now` | 宿主时间与版本等环境信息 |
 | `params.req_id` | 本次调用的唯一 id，便于日志关联 |
+| `params.http` | 仅 HTTP 入口调用时出现：这次请求的快照，见 §5.7 |
 
 ### 5.3 插件 → 宿主
 
@@ -388,6 +390,47 @@ call_plugin(ctx, id, action_key, form) → 方法 "request"，params 至少含�
 | `rclone.upload_file` | `fs`, `remote_path`, `filename`, `data_b64` | 上传到 rclone 远程 |
 
 需要**读**数据的，一律走 `need`；`ops` 只放写入类动作，这样重试时不会重复读。
+
+### 5.7 内嵌 HTTP 入口（`http_entry`）
+
+本体自带一个 HTTP 服务（端口在设置页配）。它**只认路由前缀，不认业务路径**：
+
+| 路由 | 行为 |
+|---|---|
+| `GET /api/health` | 探活，固定返回宿主状态 |
+| `ANY /plugin/{id}`、`ANY /plugin/{id}/{*rest}` | 转给 `config.json` 里 `http_entry: true` 的插件 |
+| `ANY /api/plugin/{id}/{*rest}` | 旧别名，等价于上一条（保留兼容） |
+
+声明 `http_entry: true` 后，一次请求会以 `method: "request"` 调起该插件，
+`params.http` 就是这次请求的完整快照：
+
+| 字段 | 说明 |
+|---|---|
+| `method` | `GET` / `POST` / …（大写） |
+| `path` | **已去掉前缀的**剩余路径，如 `/plugin/imagehost/upload` → `/upload` |
+| `query` | 查询串，`{键: 值}`（同名参数只留最后一个） |
+| `headers` | 除 `authorization` / `host` / `content-length` 外的全部请求头，键小写 |
+| `authorization` | 原始 `Authorization` 头（鉴权由插件自己判） |
+| `body_b64` | 原始请求体，base64；`multipart/form-data` 时为空串 |
+| `multipart` | 仅 `multipart/form-data`：`{"fields":{…},"files":[{"filename","dataB64"}]}` |
+| `origin` | 由 `Host` 拼出的源，如 `http://127.0.0.1:8737`，插件可用它拼回绝对链接 |
+| `remote_addr` | `X-Forwarded-For` 优先，否则 `127.0.0.1` |
+| `req_id` | 本次请求的唯一 id，便于和日志对上 |
+
+插件照常回 `result`，本体会把它翻成 HTTP 响应：
+
+| 字段 | 说明 |
+|---|---|
+| `status` | HTTP 状态码，缺省 200 |
+| `body` | JSON 响应体（`application/json`） |
+| `body_b64` + `content_type` | 二进制响应（图片、文件流）；给了它就忽略 `body` |
+| `headers` | 附加响应头 `{键: 值}` |
+
+请求体上限 100 MB（`BODY_LIMIT`），超了直接 400。
+插件未启用时返回 403 并提示去「插件」页启用；插件报错时返回 500，错误文本带插件 id。
+
+> 这套东西是**通用**的：宿主里没有任何插件 id 或业务路径。图床的 `/upload`、`/i/…`、
+> `/s/…` 全部在 `rcgui-plugin-imagehost` 自己的 `match path` 里。
 
 ---
 
@@ -582,6 +625,28 @@ checkout → rust toolchain(stable) → cargo cache
 | 升级 | 内置包版本 > 用户目录版本时自动替换 |
 
 墓碑（`removed_builtins`）存在的意义：用户删了内置插件，下次启动不能又冒出来。
+
+### 7.7 为什么要改成 Release 分发
+
+最早的设想是「做个扩展 crate，本体 `cargo add` 它」。但这与"插件单独一个仓库、
+独立发版"直接冲突：
+
+| 方案 | 问题 |
+|---|---|
+| Cargo 依赖（git 或 path） | 升级插件要改本体 `Cargo.toml` + 重新编译本体；用户拿到的是"重新编译过的 exe"，不是插件升级 |
+| `[patch]` 覆盖 | 同上，且 `plugin_host` 的类型要跨 crate 统一，插件仓库得反向依赖本体 crate（循环依赖） |
+| 动态库（cdylib） | Rust 没有稳定 ABI；Windows 上还要处理加载路径、符号解析 |
+
+只剩两条真正可用的路：**WASM 运行时加载**与**子进程**。本项目选前者（沙箱内、
+无 ABI 问题、跨平台），于是"插件的交付物"必然是一个字节流，而"本体仓库只留锁文件、
+构建时从 Release 拉"成为自然结论。这也顺带解决了三个老问题：
+
+1. 本体仓库不再因为插件源码而变胖、变慢（CI 不再编译插件）；
+2. 插件可以独立迭代、独立 issue/PR，不必碰本体；
+3. 插件崩了只死一次调用，本体继续跑（进程内 WASM 的 fuel/超时隔离）。
+
+代价是本体的"内置插件"变成"构建时下载的外来包"，因此必须有两层校验
+（zip 的 sha256 + 包内 `check.sha256`），并且在没网时能以"零插件"启动。
 
 ---
 
@@ -782,3 +847,4 @@ fn main() {
 |---|---|
 | 1 | 初版：目录包 + `config.json`/`check.sha256`、declarative panel、`need`/`provided` 协商、8 个能力组、`plugins/manifest.json` 构建期拉取 |
 | 1.1 | 契约版本仍为 1，以下为同一版本内的兼容扩展：新增通用能力 `http.request`（短链/任意 HTTP）、`ui.copy`（剪贴板）、`rclone.cat`（读远程小文件）、`fs.read_b64`；`imagehost` 插件移出本体、改由 Release 分发；本体删除 `bed.rs` 与图床专属界面 |
+| 1.2 | 补齐文档缺口：`config.json.http_entry` 与 §5.7 内嵌 HTTP 入口（请求快照 + 响应约定）、§7.7 为什么用 Release 分发；本体删掉最后一处 `id == "imagehost"` 特判与已废弃的 `PluginsG.loaded` |
