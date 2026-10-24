@@ -210,7 +210,7 @@ id 决定的东西：kv 存储目录、`config.json` 的 `id`、本体的安装�
 | 字段 | 类型 | 适用 kind | 说明 |
 |---|---|---|---|
 | `kind` | string | 全部 | `group` `field` `action` `checks` `status` `hint` `progress` `divider` |
-| `key` | string | 除 `divider` | 唯一标识。`field` 的 key 就是表单字段名 |
+| `key` | string | 除 `divider` | 唯一标识。`field` 的 key 就是表单字段名。⚠️ **`group` / `hint` / `status` 也必须写 key**：装载时会跑 `PluginSetting::validate`，缺 key 或 key 重复会让整份 `config.json` 校验失败，插件卡片直接显示「校验失败」（渲染层其实容忍 group 无 key，但校验层不容忍） |
 | `label` | string | all | 显示文字；`action` 必填（按钮文字） |
 | `text` | string | hint / status / checks | 正文；`hint` 支持多行，`checks` 里是"清单为空时的提示" |
 | `placeholder` | string | field | 输入提示 |
