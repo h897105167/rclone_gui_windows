@@ -492,6 +492,13 @@ call_plugin(ctx, id, action_key, form) → 方法 "request"，params 至少含�
 而是 `operations/copyfile` 到 `<data>/tmp/cat-<pid>/` 再读回本地，读完即删；
 所以它适合取几 MB 以内的对象（头像、配置文件），不适合大文件。
 
+`rclone.upload_file` 的返回值随远端类型变化：
+
+- 普通远端 → `{}`（走 rclone `operations/copyfile`）；
+- **k-vault 远端**（远端类型 `kvault`）→ `{ link, name, deduped }`，因为站点 DAV 写入
+  一律 403，只能走 `POST /api/v1/upload`；分流按**远端类型**判断，与本插件无关，
+  所以任何插件上传到 kvault 远端都拿到 `link`。`deduped: true` 表示站点判为重复并复用了旧文件。
+
 ### 6.3 kv 存储位置
 
 ```
