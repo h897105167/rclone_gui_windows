@@ -64,7 +64,7 @@ pub fn cap_of_op(op: &str) -> Option<&'static str> {
         "http.download" | "http.json" | "http.text" | "http.request" => "http",
         "proc.start" | "proc.stop" | "proc.status" | "proc.run" => "proc",
         "net.port_open" => "net",
-        "rclone.call" | "rclone.upload_file" | "rclone.cat" => "rclone",
+        "rclone.call" | "rclone.upload_file" | "rclone.cat" | "rclone.remotes" => "rclone",
         "env.info" => "env",
         _ => return None,
     })
@@ -245,6 +245,9 @@ pub struct Control {
     /// 初始是否可用（运行期可被插件覆盖）
     #[serde(default = "d_true")]
     pub enabled: bool,
+    /// 选项由插件运行时下发（`body.choices`）——此时 `select` 允许 `options` 为空
+    #[serde(default)]
+    pub dynamic: bool,
 }
 
 impl Default for Control {
@@ -265,6 +268,7 @@ impl Default for Control {
             filters: Vec::new(),
             default: String::new(),
             enabled: true,
+            dynamic: false,
         }
     }
 }
@@ -326,8 +330,10 @@ impl PluginSetting {
             }
             if kind == ControlKind::Field {
                 let fk = c.field_enum().with_context(|| format!("{at}.field 不合法"))?;
-                if fk == FieldKind::Select && c.options.is_empty() {
-                    bail!("{at} 是下拉框但没有 options");
+                if fk == FieldKind::Select && c.options.is_empty() && !c.dynamic {
+                    bail!(
+                        "{at} 是下拉框但没有 options（选项由插件运行时下发时请写 \"dynamic\": true）"
+                    );
                 }
             }
             if kind == ControlKind::Action && c.label.trim().is_empty() {

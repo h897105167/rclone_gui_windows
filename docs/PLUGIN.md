@@ -215,7 +215,8 @@ id 决定的东西：kv 存储目录、`config.json` 的 `id`、本体的安装�
 | `text` | string | hint / status / checks | 正文；`hint` 支持多行，`checks` 里是"清单为空时的提示" |
 | `placeholder` | string | field | 输入提示 |
 | `field` | string | field | `text` `password` `number` `bool` `select` `path` |
-| `options` | string[] | field(select) | 下拉选项；**必填**。想按运行时情况变化（比如列出 rclone 远程），照旧写一个占位选项，再用返回值的 `choices` 覆盖 |
+| `options` | string[] | field(select) | 下拉选项。静态候选就写在这里；候选项要在运行时才知道（比如列出 rclone 远程）就留空并置 `dynamic` |
+| `dynamic` | bool | field(select) | `true` = 候选项全部由返回值 `choices` 提供，允许 `options` 为空（校验通过）。`false`（默认）时 `options` 必填 |
 | `style` | string | action | `secondary`（默认）/ `primary` / `danger` |
 | `line` | string | field / action | 同一 `line` 非空值的控件排在**同一行** |
 | `width` | number | field | 像素宽度，0 = 自适应 |
@@ -451,7 +452,7 @@ call_plugin(ctx, id, action_key, form) → 方法 "request"，params 至少含�
 | `http` | `http.download` `http.request` `http.text` `http.json` | 下载与请求 |
 | `proc` | `proc.start` `proc.stop` `proc.status` `proc.run` | 子进程 |
 | `net` | `net.port_open` | 端口探测 |
-| `rclone` | `rclone.call` `rclone.upload_file` `rclone.cat` | 调用已连接的 rclone RC |
+| `rclone` | `rclone.call` `rclone.upload_file` `rclone.cat` `rclone.remotes` | 调用已连接的 rclone RC |
 | `env` | `env.info` | 宿主版本、架构、是否提权 |
 
 单条操作到组的映射表是 `crates/plugin/src/config.rs::cap_of_op`，本体调用侧
@@ -484,7 +485,12 @@ call_plugin(ctx, id, action_key, form) → 方法 "request"，params 至少含�
 // rclone.call { method, params }                          → rclone RC 返回值
 // rclone.upload_file { fs, remote_path, filename, data_b64 }
 // rclone.cat  { remote, path, max_bytes? }                → { data_b64, size }  （走临时文件，见下）
+// rclone.remotes { }                                      → ["k-vault","gdrive"]  本地配置里的远程名
 ```
+
+`rclone.remotes` 只读 `rclone.conf`（本体已经持有），不经过 RC。需要"远程下拉"的插件
+应该用它而不是 `rclone.call config/listremotes`：控制台没连上或 RC 口令不对时，
+`rclone.call` 会返回 401，把整个面板拖成报错。
 
 早期命名 `fs.inspect_exe` / `fs.write_file` / `fs.remove_dir` 仍作为别名保留，
 新插件不要用。
@@ -789,6 +795,7 @@ fn main() {
 | 本地直跑 | `echo '{"id":1,"method":"manifest"}' \| wasmtime run main.wasm` |
 | 看 stdout 污染 | 解析失败时本体把原始 stdout 贴进错误信息 |
 | 单测 | 把 `handle(req) -> Value` 抽成纯函数，在插件仓库里用普通 `cargo test` 测 |
+| 看面板实际收到什么 | `RCGUI_PANEL_DUMP=<插件 id> ./rclone-gui` —— 不走界面，只把 `build_panel` 算出的每一行（kind / key / label / value / options / 选中项 / 按钮 / 灯）打到 stdout 后退出。面板"看起来不对"时先用它分辨是插件返回错了，还是界面渲染错了 |
 
 ---
 
@@ -857,3 +864,4 @@ fn main() {
 | 1.1 | 契约版本仍为 1，以下为同一版本内的兼容扩展：新增通用能力 `http.request`（短链/任意 HTTP）、`ui.copy`（剪贴板）、`rclone.cat`（读远程小文件）、`fs.read_b64`；`imagehost` 插件移出本体、改由 Release 分发；本体删除 `bed.rs` 与图床专属界面 |
 | 1.2 | 补齐文档缺口：`config.json.http_entry` 与 §5.7 内嵌 HTTP 入口（请求快照 + 响应约定）、§7.7 为什么用 Release 分发；本体删掉最后一处 `id == "imagehost"` 特判与已废弃的 `PluginsG.loaded` |
 | 1.3 | `body.choices` 对 `select` 字段生效（运行时拉到的候选覆盖静态 `options`；`path` 仍只认 `choices`），候选与当前值一起持久化，面板重拉后不丢；`imagehost` v0.4.0 用它列出 rclone 远程与子目录 |
+| 1.4 | `select` 新增 `dynamic` 字段（候选项全由 `choices` 提供，`options` 可空）；新增 `rclone.remotes`（读本地 `rclone.conf`，绕开 RC 401）；面板加载失败时先清空行再显示错误，不再残留上一个插件的界面；`imagehost` v0.4.1 改用 `rclone.remotes`，v0.4.2 修掉首屏把已配置远程覆盖成候选列表第一个的毛病 |
