@@ -215,7 +215,7 @@ id 决定的东西：kv 存储目录、`config.json` 的 `id`、本体的安装�
 | `text` | string | hint / status / checks | 正文；`hint` 支持多行，`checks` 里是"清单为空时的提示" |
 | `placeholder` | string | field | 输入提示 |
 | `field` | string | field | `text` `password` `number` `bool` `select` `path` |
-| `options` | string[] | field(select) | 下拉选项；**必填** |
+| `options` | string[] | field(select) | 下拉选项；**必填**。想按运行时情况变化（比如列出 rclone 远程），照旧写一个占位选项，再用返回值的 `choices` 覆盖 |
 | `style` | string | action | `secondary`（默认）/ `primary` / `danger` |
 | `line` | string | field / action | 同一 `line` 非空值的控件排在**同一行** |
 | `width` | number | field | 像素宽度，0 = 自适应 |
@@ -273,6 +273,7 @@ call_plugin(ctx, id, action_key, form) → 方法 "request"，params 至少含�
 | 键 | 类型 | 作用 |
 |---|---|---|
 | `values` | object | 回填字段值（`{"host": "..."}`） |
+| `choices` | object | 动态选项：`{"remote": ["k-vault","gdrive"]}`。`select` 字段有值就覆盖 `options`，没值退回静态 `options`；`path` 字段只认它（历史路径 / 子目录）。候选静默存进 kv，下次打开仍生效（空数组 = 清空候选） |
 | `checks` | array | `[{"label":"rclone 已连接","value":"…","ok":true}]` |
 | `status` | string | 状态行文字 |
 | `lamp` | string | 覆盖状态指示灯 `ok` / `warn` / `err` |
@@ -855,3 +856,4 @@ fn main() {
 | 1 | 初版：目录包 + `config.json`/`check.sha256`、declarative panel、`need`/`provided` 协商、8 个能力组、`plugins/manifest.json` 构建期拉取 |
 | 1.1 | 契约版本仍为 1，以下为同一版本内的兼容扩展：新增通用能力 `http.request`（短链/任意 HTTP）、`ui.copy`（剪贴板）、`rclone.cat`（读远程小文件）、`fs.read_b64`；`imagehost` 插件移出本体、改由 Release 分发；本体删除 `bed.rs` 与图床专属界面 |
 | 1.2 | 补齐文档缺口：`config.json.http_entry` 与 §5.7 内嵌 HTTP 入口（请求快照 + 响应约定）、§7.7 为什么用 Release 分发；本体删掉最后一处 `id == "imagehost"` 特判与已废弃的 `PluginsG.loaded` |
+| 1.3 | `body.choices` 对 `select` 字段生效（运行时拉到的候选覆盖静态 `options`；`path` 仍只认 `choices`），候选与当前值一起持久化，面板重拉后不丢；`imagehost` v0.4.0 用它列出 rclone 远程与子目录 |
