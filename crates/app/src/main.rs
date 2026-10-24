@@ -2918,6 +2918,16 @@ fn main() {
     // 之间来回猜。
     if let Ok(id) = std::env::var("RCGUI_PANEL_DUMP") {
         if !id.is_empty() {
+            // 内置插件平时是在 UI setup 阶段（下面 1.35 段 `ensure_builtin`）才释放到
+            // 用户插件目录的，而本分支在此之前就 dump 并退出 —— 于是「全新安装下内置
+            // 插件长什么样」永远看不到（只会得到「找不到 config.json」）。这里先释放一次，
+            // 让调试开关看到的面板与真实首启一致。
+            {
+                let added = plugins::ensure_builtin(&ctx);
+                if !added.is_empty() {
+                    eprintln!("[plugin] 已释放内置插件: {}", added.join(", "));
+                }
+            }
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .thread_stack_size(BACKEND_THREAD_STACK)
