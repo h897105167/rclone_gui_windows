@@ -402,12 +402,12 @@ call_plugin(ctx, id, action_key, form) → 方法 "request"，params 至少含�
 | 组 | 授权的操作 | 用途 |
 |---|---|---|
 | `kv` | `kv.get` `kv.set` `kv.delete` `kv.get_all` | 插件私有键值存储 |
-| `ui` | `ui.toast` `ui.confirm` | 通知、确认框 |
-| `fs` | `fs.meta` `fs.sha256` `fs.read_text` `fs.write_text` `fs.copy` `fs.mkdir` `fs.remove` `fs.list_dir` `fs.find` `fs.unzip` `fs.pick_file` `fs.pick_dir` `fs.open_dir` `fs.pe_info` `fs.signature` `fs.search_exe` | 文件与可执行文件探测 |
-| `http` | `http.download`（+ 预留 `http.json` `http.text`） | 下载与请求 |
+| `ui` | `ui.toast` `ui.confirm` `ui.copy` | 通知、确认框、写剪贴板 |
+| `fs` | `fs.meta` `fs.sha256` `fs.read_text` `fs.read_b64` `fs.write_text` `fs.copy` `fs.mkdir` `fs.remove` `fs.list_dir` `fs.find` `fs.unzip` `fs.pick_file` `fs.pick_dir` `fs.open_dir` `fs.pe_info` `fs.signature` `fs.search_exe` | 文件与可执行文件探测 |
+| `http` | `http.download` `http.request` `http.text` `http.json` | 下载与请求 |
 | `proc` | `proc.start` `proc.stop` `proc.status` `proc.run` | 子进程 |
 | `net` | `net.port_open` | 端口探测 |
-| `rclone` | `rclone.call` `rclone.upload_file` | 调用已连接的 rclone RC |
+| `rclone` | `rclone.call` `rclone.upload_file` `rclone.cat` | 调用已连接的 rclone RC |
 | `env` | `env.info` | 宿主版本、架构、是否提权 |
 
 单条操作到组的映射表是 `crates/plugin/src/config.rs::cap_of_op`，本体调用侧
@@ -418,12 +418,15 @@ call_plugin(ctx, id, action_key, form) → 方法 "request"，params 至少含�
 ```jsonc
 // fs.meta     { path }                                   → { exists, is_dir, size, mtime }
 // fs.read_text{ path }                                   → { text }
+// fs.read_b64 { path, max_bytes? }                        → { data_b64, size }
 // fs.write_text{ path, text, append? }                    → { bytes }
 // fs.list_dir { path, recursive? }                        → { items: [{ name, path, is_dir, size }] }
 // fs.find     { root, pattern, max? }                     → { items: [...] }
 // fs.unzip    { src, dest }                               → { files }
 // fs.pick_file{ title?, filters? }                        → { path }  (用户取消为 null)
 // http.download{ url, dest, max_bytes? }                  → { path, bytes, sha256 }
+// http.request { method?, url, headers?, body?, timeout_ms?, max_bytes? }
+//                                                          → { status, content_type, body, size }
 // proc.run    { program, args, timeout_ms? }              → { code, stdout, stderr }
 // proc.start  { program, args, cwd? }                     → { pid }
 // proc.status { pid }                                     → { running, code? }
@@ -433,9 +436,18 @@ call_plugin(ctx, id, action_key, form) → 方法 "request"，params 至少含�
 // kv.get_all  { }                                         → { … }  该插件的全部 kv
 // kv.set      { key, value } / kv.delete { key }
 // ui.confirm  { title, message }                          → { ok }
+// ui.copy     { text }                                    → { ok }  写系统剪贴板
 // rclone.call { method, params }                          → rclone RC 返回值
 // rclone.upload_file { fs, remote_path, filename, data_b64 }
+// rclone.cat  { remote, path, max_bytes? }                → { data_b64, size }  （走临时文件，见下）
 ```
+
+早期命名 `fs.inspect_exe` / `fs.write_file` / `fs.remove_dir` 仍作为别名保留，
+新插件不要用。
+
+`rclone.cat` 内部并不是 `operations/cat`（部分 rclone 版本没有这个接口，实测 404），
+而是 `operations/copyfile` 到 `<data>/tmp/cat-<pid>/` 再读回本地，读完即删；
+所以它适合取几 MB 以内的对象（头像、配置文件），不适合大文件。
 
 ### 6.3 kv 存储位置
 
@@ -769,3 +781,4 @@ fn main() {
 | 契约版本 | 变更 |
 |---|---|
 | 1 | 初版：目录包 + `config.json`/`check.sha256`、declarative panel、`need`/`provided` 协商、8 个能力组、`plugins/manifest.json` 构建期拉取 |
+| 1.1 | 契约版本仍为 1，以下为同一版本内的兼容扩展：新增通用能力 `http.request`（短链/任意 HTTP）、`ui.copy`（剪贴板）、`rclone.cat`（读远程小文件）、`fs.read_b64`；`imagehost` 插件移出本体、改由 Release 分发；本体删除 `bed.rs` 与图床专属界面 |
