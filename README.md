@@ -168,9 +168,14 @@ plugins/
 scripts/     # build.ps1 / fetch_plugins.ps1 等构建脚本
 docs/
   PLUGIN.md  # 插件框架与接入规则（写插件先看这个）
+  CHANGELOG.md  # 按日期记录的阶段性变更
 ```
 
 插件源码不在本仓库，见上面的内置插件表。
+
+## 变更记录
+
+按日期记录每个阶段做了什么，不维护语义化版本号：[docs/CHANGELOG.md](docs/CHANGELOG.md)。
 
 ## 安全提示
 
