@@ -134,7 +134,7 @@ socks_proxy = ...
 ### 隔离环境启动命令
 
 ```powershell
-$iso = "D:\Administrator\Documents\***REMOVED***\probe_proxy\iso"
+$iso = "D:\work\Documents\projects\probe_proxy\iso"
 rclone rcd --config "$iso\rclone.conf" --log-file "$iso\..\rcd.log" --log-level DEBUG `
            --rc-addr 127.0.0.1:5599 --rc-user t --rc-pass t
 ```

@@ -1,6 +1,6 @@
 # RCGUI 交接总结（供新对话使用）
 
-> 生成时间：2026-10-17 · 仓库：`D:\Administrator\Documents\***REMOVED***\rclone_gui_windows`
+> 生成时间：2026-10-17 · 仓库：`D:\work\Documents\projects\rclone_gui_windows`
 > 分支 `main` · HEAD `c6e328a` · 工作树**干净** · 与 `origin/main` 完全同步（0 ahead / 0 behind）
 
 ---

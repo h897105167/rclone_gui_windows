@@ -188,7 +188,7 @@ imagehost-plugin (plugins/imagehost)  cdylib→wasm32-wasip1, 928 行, 无工作
 ### 已实测的 rclone 能力面（活体验证，端口 5574）
 
 - 版本：`v1.75.2-extra-11-g066443b42`（gulp79/rclone-extra，`goTags=cmount`，Windows 挂载必需）
-- `config/paths` → `config: ***REMOVED***\AppData\Roaming\rclone\rclone.conf`（**无需子进程**）
+- `config/paths` → `config: C:\Users\User\AppData\Roaming\rclone\rclone.conf`（**无需子进程**）
 - `rc/list` 共 **95** 个方法；本应用需要的全部存在：
   `config/{providers,dump,paths,create,update,delete,setpath}`、`mount/{mount,unmount,listmounts}`、`serve/{start,stop,list}`、`core/{quit,stats,transferred,bwlimit}`、`options/{get,set}`、`operations/{copyfile,movefile}`、`job/{list,status,stop}`
 
