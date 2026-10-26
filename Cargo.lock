@@ -4809,6 +4809,7 @@ dependencies = [
  "base64 0.22.1",
  "crc32fast",
  "flate2",
+ "rcgui-i18n",
  "semver",
  "serde",
  "serde_json",
@@ -5184,10 +5185,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcgui-i18n"
+version = "0.1.0"
+
+[[package]]
 name = "rcgui-profile"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "rcgui-i18n",
  "serde",
  "serde_json",
 ]
@@ -5196,6 +5202,7 @@ dependencies = [
 name = "rcgui-rc"
 version = "0.1.0"
 dependencies = [
+ "rcgui-i18n",
  "reqwest",
  "serde",
  "serde_json",
@@ -5215,6 +5222,7 @@ dependencies = [
  "image",
  "plugin_host",
  "rand 0.8.8",
+ "rcgui-i18n",
  "rcgui-profile",
  "rcgui-rc",
  "rclone_client",
@@ -5240,6 +5248,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rand 0.8.8",
+ "rcgui-i18n",
  "rcgui-rc",
  "serde",
  "serde_json",

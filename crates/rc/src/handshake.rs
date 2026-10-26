@@ -21,7 +21,8 @@ pub struct MethodReq {
     pub alternatives: &'static [&'static str],
     /// 缺失时是否阻断主功能（远程/挂载/服务/配置 四类核心操作）。
     pub required: bool,
-    /// 面向用户的能力名（用于拼提示）。
+    /// 面向用户的能力名（用于拼提示）。存的是**中文原文**，也就是翻译表的 msgid：
+    /// 这张表是 `const`，编译期不能查表（否则 E0015），所以显示前才调 `t()`。
     pub capability: &'static str,
 }
 
@@ -89,12 +90,7 @@ impl Handshake {
 
         if !hs.version.at_least(MIN_MAJOR, MIN_MINOR) {
             hs.too_old = true;
-            hs.warnings.push(format!(
-                "rclone {} 低于建议版本 {}.{}，部分接口可能缺失",
-                if hs.version.version.is_empty() { "（未知版本）" } else { &hs.version.version },
-                MIN_MAJOR,
-                MIN_MINOR
-            ));
+            hs.warnings.push(rcgui_i18n::f("rclone {} 低于建议版本 {}.{}，部分接口可能缺失", &[&(if hs.version.version.is_empty() { rcgui_i18n::t("（未知版本）") } else { &hs.version.version }), &(MIN_MAJOR), &(MIN_MINOR)]));
         }
 
         // 鉴权探测：`core/version` 是 NoAuth 接口，它答得上来**不代表能干活**。
@@ -109,16 +105,16 @@ impl Handshake {
             Err(e) if e.is_auth_not_configured() => auth_unset = true,
             // 老版本没有 rc/noopauth：探测不了，不能当成「没配鉴权」（否则会把好实例判死）
             Err(e) if e.is_unsupported() => {}
-            Err(e) => hs.warnings.push(format!("鉴权探测失败：{}", e.describe())),
+            Err(e) => hs.warnings.push(rcgui_i18n::f("鉴权探测失败：{}", &[&(e.describe())])),
         }
         if auth_unset {
             // 后面每个调用都会 403，索性只报这一个原因，不再堆一串误导性的
             // 「读取配置文件路径：鉴权失败」「该实例不支持特性探测」。
             hs.auth_unset = true;
             hs.warnings.push(
-                "对端 rclone 没有配置 RC 鉴权：除 core/version 外的接口都会返回 403，\
+                rcgui_i18n::t("对端 rclone 没有配置 RC 鉴权：除 core/version 外的接口都会返回 403，\
                  挂载、服务、运行参数全部不可用。请用 --rc-user/--rc-pass 或 --rc-no-auth \
-                 重启 rclone 后重新握手（内置插件「一键 rclone」默认会带上用户名）"
+                 重启 rclone 后重新握手（内置插件「一键 rclone」默认会带上用户名）")
                     .to_string(),
             );
             return Ok(hs);
@@ -127,43 +123,45 @@ impl Handshake {
         // 配置路径：可选能力，失败不阻断
         match client.config_paths().await {
             Ok(p) => hs.config = Some(p),
-            Err(e) => hs.warnings.push(format!("无法读取配置文件路径：{}", e.kind.label())),
+            Err(e) => hs.warnings.push(rcgui_i18n::f("无法读取配置文件路径：{}", &[&(e.kind.label())])),
         }
 
         // 方法表：老版本可能没有 rc/list
         match client.rc_methods().await {
             Ok(list) => {
-                let missing: Vec<(String, String)> = METHOD_REQS
+                // 表里存的是 msgid，显示前才查表；顺手把 required 一起带出来，
+                // 免得再拿译过的文本回头去表里比对。
+                let missing: Vec<(String, String, bool)> = METHOD_REQS
                     .iter()
                     .filter(|r| !has_any(&list, r))
                     .map(|r| {
                         (
-                            r.capability.to_string(),
+                            rcgui_i18n::t(r.capability).to_string(),
                             if r.alternatives.is_empty() {
                                 r.name.to_string()
                             } else {
-                                format!("{} 或 {}", r.name, r.alternatives.join(" / "))
+                                rcgui_i18n::f(
+                                    "{} 或 {}",
+                                    &[&(r.name), &(r.alternatives.join(" / "))],
+                                )
                             },
+                            r.required,
                         )
                     })
                     .collect();
-                for (cap, method) in &missing {
-                    let required = METHOD_REQS
-                        .iter()
-                        .find(|r| r.capability == cap.as_str())
-                        .map(|r| r.required)
-                        .unwrap_or(false);
-                    if required {
+                for (cap, method, required) in &missing {
+                    if *required {
                         hs.missing_required.push((cap.clone(), method.clone()));
                     } else {
-                        hs.warnings.push(format!("缺少「{cap}」能力（需要 {method}）"));
+                        hs.warnings
+                            .push(rcgui_i18n::f("缺少「{}」能力（需要 {}）", &[&(cap), &(method)]));
                     }
                 }
                 hs.methods = Some(list);
             }
             Err(e) => hs
                 .warnings
-                .push(format!("该实例不支持特性探测（rc/list：{}）", e.kind.label())),
+                .push(rcgui_i18n::f("该实例不支持特性探测（rc/list：{}）", &[&(e.kind.label())])),
         }
 
         Ok(hs)
@@ -206,10 +204,7 @@ impl Handshake {
         if missing.is_empty() {
             Ok(())
         } else {
-            Err(format!(
-                "该 rclone 实例缺少 {}，无法按远程分配代理（升级 rclone 后重试）",
-                missing.join(" / ")
-            ))
+            Err(rcgui_i18n::f("该 rclone 实例缺少 {}，无法按远程分配代理（升级 rclone 后重试）", &[&(missing.join(" / "))]))
         }
     }
 
@@ -224,19 +219,19 @@ impl Handshake {
     /// 一行摘要（用于 toast / 状态栏）。
     pub fn summary(&self) -> String {
         let ver = if self.version.version.is_empty() {
-            "未知版本".to_string()
+            rcgui_i18n::t("未知版本").to_string()
         } else {
             self.version.version.clone()
         };
-        let mut s = format!("已连接 rclone {ver}");
+        let mut s = rcgui_i18n::f("已连接 rclone {}", &[&(ver)]);
         if let Some(n) = self.methods.as_ref().map(|m| m.len()) {
-            s.push_str(&format!(" · {n} 个 RC 方法"));
+            s.push_str(&rcgui_i18n::f(" · {} 个 RC 方法", &[&(n)]));
         }
         if self.auth_unset {
-            s.push_str(" · 对端未配置 RC 鉴权");
+            s.push_str(rcgui_i18n::t(" · 对端未配置 RC 鉴权"));
         }
         if !self.missing_required.is_empty() {
-            s.push_str(&format!(" · 缺 {} 项必需能力", self.missing_required.len()));
+            s.push_str(&rcgui_i18n::f(" · 缺 {} 项必需能力", &[&(self.missing_required.len())]));
         }
         s
     }

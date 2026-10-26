@@ -276,12 +276,12 @@ impl Default for Control {
 impl Control {
     pub fn kind_enum(&self) -> Result<ControlKind> {
         serde_json::from_value::<ControlKind>(Value::String(self.kind.clone()))
-            .map_err(|_| anyhow::anyhow!("未知控件类型: {}", self.kind))
+            .map_err(|_| anyhow::anyhow!("{}", rcgui_i18n::f("未知控件类型: {}", &[&(self.kind)])))
     }
 
     pub fn field_enum(&self) -> Result<FieldKind> {
         serde_json::from_value::<FieldKind>(Value::String(self.field.clone()))
-            .map_err(|_| anyhow::anyhow!("未知字段类型: {}", self.field))
+            .map_err(|_| anyhow::anyhow!("{}", rcgui_i18n::f("未知字段类型: {}", &[&(self.field)])))
     }
 }
 
@@ -316,28 +316,26 @@ impl PluginSetting {
         let mut keys = BTreeSet::new();
         for (i, c) in self.controls.iter().enumerate() {
             let at = format!("plugin_setting.controls[{i}]");
-            let kind = c.kind_enum().with_context(|| format!("{at}.kind 不合法"))?;
+            let kind = c.kind_enum().with_context(|| rcgui_i18n::f("{}.kind 不合法", &[&(at)]))?;
             match kind {
                 ControlKind::Divider => continue,
                 _ => {
                     if c.key.trim().is_empty() {
-                        bail!("{at} 缺少 key（{:?} 控件必须能按 key 取值/回调）", kind);
+                        bail!("{}", rcgui_i18n::f("{} 缺少 key（{} 控件必须能按 key 取值/回调）", &[&(at), &(format!("{:?}", kind))]));
                     }
                     if !keys.insert(c.key.clone()) {
-                        bail!("{at} 的 key 重复：{}", c.key);
+                        bail!("{}", rcgui_i18n::f("{} 的 key 重复：{}", &[&(at), &(c.key)]));
                     }
                 }
             }
             if kind == ControlKind::Field {
-                let fk = c.field_enum().with_context(|| format!("{at}.field 不合法"))?;
+                let fk = c.field_enum().with_context(|| rcgui_i18n::f("{}.field 不合法", &[&(at)]))?;
                 if fk == FieldKind::Select && c.options.is_empty() && !c.dynamic {
-                    bail!(
-                        "{at} 是下拉框但没有 options（选项由插件运行时下发时请写 \"dynamic\": true）"
-                    );
+                    bail!("{}", rcgui_i18n::f("{} 是下拉框但没有 options（选项由插件运行时下发时请写 \"dynamic\": true）", &[&(at)]));
                 }
             }
             if kind == ControlKind::Action && c.label.trim().is_empty() {
-                bail!("{at} 是按钮但没有 label");
+                bail!("{}", rcgui_i18n::f("{} 是按钮但没有 label", &[&(at)]));
             }
         }
         Ok(())
@@ -398,53 +396,47 @@ impl PluginConfig {
     /// 校验必需字段与取值合法性。
     pub fn validate(&self) -> Result<()> {
         if self.id.trim().is_empty() {
-            bail!("config.json 缺少 id");
+            bail!("{}", rcgui_i18n::t("config.json 缺少 id"));
         }
         if !valid_id(&self.id) {
-            bail!(
-                "config.json 的 id 不合法（只能用字母、数字、`.`、`-`、`_`，2–64 个字符）：{}",
-                self.id
-            );
+            bail!("{}", rcgui_i18n::f("config.json 的 id 不合法（只能用字母、数字、`.`、`-`、`_`，2–64 个字符）：{}", &[&(self.id)]));
         }
         if self.name.trim().is_empty() {
-            bail!("config.json 缺少 name");
+            bail!("{}", rcgui_i18n::t("config.json 缺少 name"));
         }
         if self.version.trim().is_empty() {
-            bail!("config.json 缺少 version");
+            bail!("{}", rcgui_i18n::t("config.json 缺少 version"));
         }
         semver::Version::parse(self.version.trim())
-            .with_context(|| format!("config.json 的 version 不是合法语义化版本：{}", self.version))?;
+            .with_context(|| rcgui_i18n::f("config.json 的 version 不是合法语义化版本：{}", &[&(self.version)]))?;
         if !self.min_gui_version.trim().is_empty() {
             semver::Version::parse(self.min_gui_version.trim()).with_context(|| {
-                format!("config.json 的 min_gui_version 不是合法语义化版本：{}", self.min_gui_version)
+                rcgui_i18n::f("config.json 的 min_gui_version 不是合法语义化版本：{}", &[&(self.min_gui_version)])
             })?;
         }
         if self.entry.trim().is_empty() {
-            bail!("config.json 缺少 entry（一般是 main.wasm）");
+            bail!("{}", rcgui_i18n::t("config.json 缺少 entry（一般是 main.wasm）"));
         }
         // `platform` 只用来挡「明显不是这台机器的插件」。宿主本身是 Windows 应用，
         // 而插件跑在 WASI 沙箱里：`any`（或不填）与 `windows` 都能跑，其余拒绝。
         let platform = self.platform.trim();
         if !platform.is_empty() && platform != "windows" && platform != "any" {
-            bail!("插件声明的平台不受支持：{platform}（仅支持 windows / any）");
+            bail!("{}", rcgui_i18n::f("插件声明的平台不受支持：{}（仅支持 windows / any）", &[&(platform)]));
         }
         if self.tags.len() > 32 {
-            bail!("config.json 的 tags 过多（{} > 32）", self.tags.len());
+            bail!("{}", rcgui_i18n::f("config.json 的 tags 过多（{} > 32）", &[&(self.tags.len())]));
         }
         for t in &self.tags {
             if t.trim().is_empty() {
-                bail!("config.json 的 tags 里有空标签");
+                bail!("{}", rcgui_i18n::t("config.json 的 tags 里有空标签"));
             }
             if t.chars().count() > 24 {
-                bail!("tag 过长（> 24 字符）：{t}");
+                bail!("{}", rcgui_i18n::f("tag 过长（> 24 字符）：{}", &[&(t)]));
             }
         }
         for c in &self.capabilities {
             if !CAP_GROUPS.contains(&c.as_str()) {
-                bail!(
-                    "config.json 声明了宿主不认识的能力组：{c}（可用：{}）",
-                    CAP_GROUPS.join(" / ")
-                );
+                bail!("{}", rcgui_i18n::f("config.json 声明了宿主不认识的能力组：{}（可用：{}）", &[&(c), &(CAP_GROUPS.join(" / "))]));
             }
         }
         self.plugin_setting.validate()?;
@@ -458,13 +450,9 @@ impl PluginConfig {
         }
         let need = semver::Version::parse(self.min_gui_version.trim())?;
         let have = semver::Version::parse(gui_version.trim())
-            .with_context(|| format!("宿主版本号无法解析：{gui_version}"))?;
+            .with_context(|| rcgui_i18n::f("宿主版本号无法解析：{}", &[&(gui_version)]))?;
         if have < need {
-            bail!(
-                "插件需要宿主版本 >= {}，当前为 {}",
-                self.min_gui_version,
-                gui_version
-            );
+            bail!("{}", rcgui_i18n::f("插件需要宿主版本 >= {}，当前为 {}", &[&(self.min_gui_version), &(gui_version)]));
         }
         Ok(())
     }
@@ -484,7 +472,7 @@ impl PluginConfig {
         if self.entry_is_wasm() {
             "WASM"
         } else {
-            "程序"
+            rcgui_i18n::t("程序")
         }
     }
 

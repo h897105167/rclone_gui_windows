@@ -6,6 +6,7 @@ description = "rclone 进程管理（legacy）：RC 客户端与连接状态已�
 
 [dependencies]
 rcgui-rc = { path = "../rc" }
+rcgui-i18n = { path = "../i18n" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

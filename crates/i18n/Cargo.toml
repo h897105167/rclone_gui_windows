@@ -1,0 +1,7 @@
+[package]
+name = "rcgui-i18n"
+version.workspace = true
+edition.workspace = true
+description = "RCGUI 运行时文案翻译（Rust 侧）"
+
+[dependencies]

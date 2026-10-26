@@ -46,7 +46,7 @@ impl Endpoint {
     /// 面向 UI 的安全展示串：只显示地址与用户名，绝不含密码。
     pub fn display(&self) -> String {
         match &self.user {
-            Some(u) if !u.is_empty() => format!("{}（用户 {u}{}）", self.url, if self.has_pass { "，含密码" } else { "" }),
+            Some(u) if !u.is_empty() => rcgui_i18n::f("{}（用户 {}{}）", &[&(self.url), &(u), &(if self.has_pass { rcgui_i18n::t("，含密码") } else { "" })]),
             _ => self.url.clone(),
         }
     }
@@ -67,9 +67,9 @@ pub enum ConnStatus {
 impl ConnStatus {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Disconnected => "未连接",
-            Self::Connected => "已连接",
-            Self::Stale => "已断开（显示的是上次快照）",
+            Self::Disconnected => rcgui_i18n::t("未连接"),
+            Self::Connected => rcgui_i18n::t("已连接"),
+            Self::Stale => rcgui_i18n::t("已断开（显示的是上次快照）"),
         }
     }
 

@@ -59,7 +59,7 @@ pub async fn fetch_to_temp(
         RcError::new(
             RcErrorKind::Api,
             "fetch_to_temp",
-            format!("创建临时目录 {} 失败: {e}", tmp_dir.display()),
+            rcgui_i18n::f("创建临时目录 {} 失败: {}", &[&(tmp_dir.display()), &(e)]),
         )
     })?;
     // 先建守卫再复制：复制中途失败可能留下半截文件
@@ -79,7 +79,7 @@ pub async fn fetch_to_temp(
         RcError::new(
             RcErrorKind::Api,
             "fetch_to_temp",
-            format!("读取临时文件失败: {e}"),
+            rcgui_i18n::f("读取临时文件失败: {}", &[&(e)]),
         )
     })
 }

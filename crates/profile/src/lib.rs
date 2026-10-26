@@ -141,7 +141,7 @@ impl Default for ProfileDoc {
             schema_version: SCHEMA_VERSION,
             meta: ProfileMeta {
                 id: "default".to_string(),
-                name: "默认档案".to_string(),
+                name: rcgui_i18n::t("默认档案").to_string(),
                 created_at: now_iso(),
                 updated_at: now_iso(),
             },
@@ -173,10 +173,10 @@ pub enum DesiredState {
 impl DesiredState {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Saved => "已保存",
-            Self::Running => "运行中",
-            Self::Pending => "待生效",
-            Self::Stale => "陈旧",
+            Self::Saved => rcgui_i18n::t("已保存"),
+            Self::Running => rcgui_i18n::t("运行中"),
+            Self::Pending => rcgui_i18n::t("待生效"),
+            Self::Stale => rcgui_i18n::t("陈旧"),
         }
     }
 }
@@ -317,12 +317,9 @@ pub enum StoreError {
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "档案读写失败: {e}"),
-            Self::Parse(e) => write!(f, "档案格式无效: {e}"),
-            Self::VersionTooNew { found, supported } => write!(
-                f,
-                "档案版本 {found} 高于本程序支持的 {supported}，请升级 RCGUI（已拒绝写入以免损坏数据）"
-            ),
+            Self::Io(e) => write!(f, "{}", rcgui_i18n::f("档案读写失败: {}", &[&(e)])),
+            Self::Parse(e) => write!(f, "{}", rcgui_i18n::f("档案格式无效: {}", &[&(e)])),
+            Self::VersionTooNew { found, supported } => write!(f, "{}", rcgui_i18n::f("档案版本 {} 高于本程序支持的 {}，请升级 RCGUI（已拒绝写入以免损坏数据）", &[&(found), &(supported)])),
         }
     }
 }
@@ -337,7 +334,7 @@ impl StoreError {
         match self {
             Self::Io(m) => {
                 m.contains("os error 5")
-                    || m.contains("拒绝访问")
+                    || m.contains(rcgui_i18n::t("拒绝访问"))
                     || m.contains("Access is denied")
                     || m.contains("Permission denied")
             }
@@ -445,7 +442,7 @@ impl Store {
             d.meta.id = "default".to_string();
         }
         if d.meta.name.is_empty() {
-            d.meta.name = "默认档案".to_string();
+            d.meta.name = rcgui_i18n::t("默认档案").to_string();
         }
         let data = serde_json::to_vec_pretty(&d).map_err(|e| StoreError::Parse(e.to_string()))?;
         let tmp = self

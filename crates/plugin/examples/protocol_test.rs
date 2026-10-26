@@ -69,7 +69,7 @@ fn wasm_path() -> PathBuf {
 #[tokio::main]
 async fn main() -> Result<()> {
     let wasm = wasm_path();
-    assert!(wasm.exists(), "缺少 wasm：{}", wasm.display());
+    assert!(wasm.exists(), "{}", rcgui_i18n::f("缺少 wasm：{}", &[&(wasm.display())]));
     let host = PluginHost::new()?;
 
     // 1) manifest
@@ -107,9 +107,9 @@ async fn main() -> Result<()> {
         "files": [{"filename": "cat.png", "dataB64": base64_of(png)}],
     });
     let r = host.invoke(&wasm, "request", http("POST", "/upload", json!({}), Some(mp)), Some(caps.clone()), "imagehost").await?;
-    assert_eq!(r["status"], 200, "upload 响应: {r}");
+    assert_eq!(r["status"], 200, "{}", rcgui_i18n::f("upload 响应: {}", &[&(r)]));
     let item = &r["body"]["items"][0];
-    assert_eq!(item["name"], "20261015213000123.png", "实际: {item}");
+    assert_eq!(item["name"], "20261015213000123.png", "{}", rcgui_i18n::f("实际: {}", &[&(item)]));
     assert_eq!(item["storedPath"], "wallpaper/20261015213000123.png");
     assert_eq!(item["url"], "http://127.0.0.1:5273/i/default/wallpaper/20261015213000123.png");
     assert_eq!(item["deduped"], false);
@@ -122,8 +122,8 @@ async fn main() -> Result<()> {
         "files": [{"filename": "again.png", "dataB64": base64_of(png)}],
     });
     let r = host.invoke(&wasm, "request", http("POST", "/upload", json!({}), Some(mp)), Some(caps.clone()), "imagehost").await?;
-    assert_eq!(r["body"]["items"][0]["deduped"], true, "实际: {r}");
-    assert_eq!(caps.uploads.lock().unwrap().len(), 1, "去重后不应再上传");
+    assert_eq!(r["body"]["items"][0]["deduped"], true, "{}", rcgui_i18n::f("实际: {}", &[&(r)]));
+    assert_eq!(caps.uploads.lock().unwrap().len(), 1, "{}", rcgui_i18n::t("去重后不应再上传"));
     println!("[test] dedupe ok");
 
     // 5) seq 命名：目录已有 001.png → 002.png
@@ -132,17 +132,17 @@ async fn main() -> Result<()> {
         "files": [{"filename": "x.png", "dataB64": base64_of(b"other-bytes")}],
     });
     let r = host.invoke(&wasm, "request", http("POST", "/upload", json!({}), Some(mp)), Some(caps.clone()), "imagehost").await?;
-    assert_eq!(r["body"]["items"][0]["name"], "002.png", "实际: {r}");
+    assert_eq!(r["body"]["items"][0]["name"], "002.png", "{}", rcgui_i18n::f("实际: {}", &[&(r)]));
     println!("[test] seq naming ok");
 
     // 6) obsidian 布局：app=obsidian, vault=MyVault, notePath=日记/2026/abc.md, layout=note
     //    默认配置 dirLayout=note → obsidian/MyVault/日记/2026/
     let mp = json!({
-        "fields": {"app": "obsidian", "vault": "MyVault", "notePath": "日记/2026/abc.md"},
+        "fields": {"app": "obsidian", "vault": "MyVault", "notePath": rcgui_i18n::t("日记/2026/abc.md")},
         "files": [{"filename": "shot.png", "dataB64": base64_of(b"shot-bytes")}],
     });
     let r = host.invoke(&wasm, "request", http("POST", "/upload", json!({}), Some(mp)), Some(caps.clone()), "imagehost").await?;
-    assert_eq!(r["body"]["items"][0]["storedPath"], "obsidian/MyVault/日记/2026/20261015213000123.png", "实际: {r}");
+    assert_eq!(r["body"]["items"][0]["storedPath"], "{}", rcgui_i18n::t("obsidian/MyVault/日记/2026/20261015213000123.png"));
     println!("[test] obsidian layout ok");
 
     // 7) raw body 模式（Obsidian 插件路径）
@@ -150,7 +150,7 @@ async fn main() -> Result<()> {
     params["http"]["query"] = json!({"filename": "raw.png", "app": "obsidian", "vault": "V", "notePath": "n.md"});
     params["http"]["bodyB64"] = Value::String(base64_of(b"raw-body"));
     let r = host.invoke(&wasm, "request", params, Some(caps.clone()), "imagehost").await?;
-    assert_eq!(r["status"], 200, "实际: {r}");
+    assert_eq!(r["status"], 200, "{}", rcgui_i18n::f("实际: {}", &[&(r)]));
     println!("[test] raw body upload ok");
 
     // 8) token 流程

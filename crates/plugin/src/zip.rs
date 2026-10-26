@@ -39,9 +39,9 @@ const METHOD_DEFLATE: u16 = 8;
 /// 读取 zip 的中央目录。
 pub fn read_entries(data: &[u8]) -> Result<Vec<ZipEntry>> {
     if data.len() < 22 {
-        bail!("文件太小，不是有效的 zip");
+        bail!("{}", rcgui_i18n::t("文件太小，不是有效的 zip"));
     }
-    let eocd_off = find_eocd(data).ok_or_else(|| anyhow!("未找到 zip 结尾标记（EOCD），文件可能已损坏"))?;
+    let eocd_off = find_eocd(data).ok_or_else(|| anyhow!("{}", rcgui_i18n::t("未找到 zip 结尾标记（EOCD），文件可能已损坏")))?;
     let mut cen_count = u16::from_le_bytes([data[eocd_off + 10], data[eocd_off + 11]]) as u64;
     let mut cen_off = u32::from_le_bytes([
         data[eocd_off + 16],
@@ -65,11 +65,11 @@ pub fn read_entries(data: &[u8]) -> Result<Vec<ZipEntry>> {
     let mut p = cen_off as usize;
     for _ in 0..cen_count {
         if p + 46 > data.len() {
-            bail!("zip 中央目录越界，文件可能已损坏");
+            bail!("{}", rcgui_i18n::t("zip 中央目录越界，文件可能已损坏"));
         }
         let sig = u32::from_le_bytes(data[p..p + 4].try_into().unwrap());
         if sig != CEN_SIG {
-            bail!("zip 中央目录签名错误（偏移 {p}）");
+            bail!("{}", rcgui_i18n::f("zip 中央目录签名错误（偏移 {}）", &[&(p)]));
         }
         let method = u16::from_le_bytes([data[p + 10], data[p + 11]]);
         let crc32 = u32::from_le_bytes(data[p + 16..p + 20].try_into().unwrap());
@@ -81,7 +81,7 @@ pub fn read_entries(data: &[u8]) -> Result<Vec<ZipEntry>> {
         let mut local_off = u32::from_le_bytes(data[p + 42..p + 46].try_into().unwrap()) as u64;
 
         if p + 46 + name_len > data.len() {
-            bail!("zip 条目名越界，文件可能已损坏");
+            bail!("{}", rcgui_i18n::t("zip 条目名越界，文件可能已损坏"));
         }
         let raw_name = &data[p + 46..p + 46 + name_len];
         // 注意：部分打包工具（含 Windows 自带的 Compress-Archive）在归档名里
@@ -101,10 +101,10 @@ pub fn read_entries(data: &[u8]) -> Result<Vec<ZipEntry>> {
         // 本地头长度可能比中央目录记录的 extra 更长，需按本地头重新定位数据起点
         let lo = local_off as usize;
         if lo + 30 > data.len() {
-            bail!("zip 本地头越界（条目 {name}）");
+            bail!("{}", rcgui_i18n::f("zip 本地头越界（条目 {}）", &[&(name)]));
         }
         if u32::from_le_bytes(data[lo..lo + 4].try_into().unwrap()) != LOCAL_SIG {
-            bail!("zip 本地头签名错误（条目 {name}）");
+            bail!("{}", rcgui_i18n::f("zip 本地头签名错误（条目 {}）", &[&(name)]));
         }
         let l_name_len = u16::from_le_bytes([data[lo + 26], data[lo + 27]]) as usize;
         let l_extra_len = u16::from_le_bytes([data[lo + 28], data[lo + 29]]) as usize;
@@ -217,9 +217,9 @@ pub fn read_entry(data: &[u8], e: &ZipEntry) -> Result<Vec<u8>> {
     let start = e.data_offset as usize;
     let end = start
         .checked_add(e.compressed_size as usize)
-        .ok_or_else(|| anyhow!("条目大小溢出: {}", e.name))?;
+        .ok_or_else(|| anyhow!("{}", rcgui_i18n::f("条目大小溢出: {}", &[&(e.name)])))?;
     if end > data.len() {
-        bail!("zip 数据越界（条目 {}）", e.name);
+        bail!("{}", rcgui_i18n::f("zip 数据越界（条目 {}）", &[&(e.name)]));
     }
     let raw = &data[start..end];
     let out = match e.method {
@@ -228,10 +228,10 @@ pub fn read_entry(data: &[u8], e: &ZipEntry) -> Result<Vec<u8>> {
             let mut out = Vec::with_capacity(e.uncompressed_size as usize);
             flate2::read::DeflateDecoder::new(Cursor::new(raw))
                 .read_to_end(&mut out)
-                .with_context(|| format!("解压失败（条目 {}）", e.name))?;
+                .with_context(|| rcgui_i18n::f("解压失败（条目 {}）", &[&(e.name)]))?;
             out
         }
-        m => bail!("不支持的 zip 压缩方法 {m}（条目 {}）", e.name),
+        m => bail!("{}", rcgui_i18n::f("不支持的 zip 压缩方法 {}（条目 {}）", &[&(m), &(e.name)])),
     };
     // 校验 CRC-32：能发现 zip 在传输/下载中损坏，避免把坏文件当插件装上
     if e.crc32 != 0 || !out.is_empty() {
@@ -239,10 +239,7 @@ pub fn read_entry(data: &[u8], e: &ZipEntry) -> Result<Vec<u8>> {
         h.update(&out);
         let got = h.finalize();
         if got != e.crc32 {
-            bail!(
-                "zip 条目校验失败（{}）：CRC-32 不匹配，文件可能已损坏",
-                e.name
-            );
+            bail!("{}", rcgui_i18n::f("zip 条目校验失败（{}）：CRC-32 不匹配，文件可能已损坏", &[&(e.name)]));
         }
     }
     Ok(out)
@@ -257,8 +254,8 @@ pub fn safe_join(root: &Path, name: &str) -> Result<PathBuf> {
         match comp {
             Component::Normal(c) => out.push(c),
             Component::CurDir => {}
-            Component::ParentDir => bail!("插件包内含非法路径（..）: {name}"),
-            Component::RootDir | Component::Prefix(_) => bail!("插件包内含绝对路径: {name}"),
+            Component::ParentDir => bail!("{}", rcgui_i18n::f("插件包内含非法路径（..）: {}", &[&(name)])),
+            Component::RootDir | Component::Prefix(_) => bail!("{}", rcgui_i18n::f("插件包内含绝对路径: {}", &[&(name)])),
         }
     }
     Ok(out)
@@ -274,10 +271,7 @@ pub fn extract_all(data: &[u8], dest: &Path, max_total: u64) -> Result<usize> {
     for e in &entries {
         total = total.saturating_add(e.uncompressed_size);
         if total > max_total {
-            bail!(
-                "解压后体积超过上限（{} MB），已中止",
-                max_total / 1024 / 1024
-            );
+            bail!("{}", rcgui_i18n::f("解压后体积超过上限（{} MB），已中止", &[&(max_total / 1024 / 1024)]));
         }
         let path = safe_join(dest, &e.name)?;
         if e.is_dir {
@@ -289,7 +283,7 @@ pub fn extract_all(data: &[u8], dest: &Path, max_total: u64) -> Result<usize> {
         }
         let content = read_entry(data, e)?;
         let mut f = std::fs::File::create(&path)
-            .with_context(|| format!("写入失败: {}", path.display()))?;
+            .with_context(|| rcgui_i18n::f("写入失败: {}", &[&(path.display())]))?;
         f.write_all(&content)?;
         files += 1;
     }
@@ -336,7 +330,7 @@ pub fn sha256_hex(data: &[u8]) -> String {
 pub fn sha256_file(path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut f = std::fs::File::open(path)
-        .with_context(|| format!("打开文件失败: {}", path.display()))?;
+        .with_context(|| rcgui_i18n::f("打开文件失败: {}", &[&(path.display())]))?;
     let mut h = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {

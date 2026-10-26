@@ -629,7 +629,7 @@ fn winfsp_installed() -> (bool, String) {
     }
     (
         false,
-        "未检测到 WinFsp。挂载功能需要安装 WinFsp：https://winfsp.dev/rel/ 安装后重启本程序。".into(),
+        rcgui_i18n::t("未检测到 WinFsp。挂载功能需要安装 WinFsp：https://winfsp.dev/rel/ 安装后重启本程序。").into(),
     )
 }
 
@@ -673,7 +673,7 @@ fn tail_line(stdout: &[u8], stderr: &[u8]) -> String {
             return one;
         }
     }
-    "（无输出）".into()
+    rcgui_i18n::t("（无输出）").into()
 }
 
 /// winget 的「没有可用的较新版本」退出码（0x8A15002B）。
@@ -700,7 +700,7 @@ async fn install_winfsp(ui: &Weak<MainWindow>, mirror: bool, mirror_source: Stri
         toast(
             ui,
             2,
-            "还没配置 winget 镜像源名：请到「设置 → winget 镜像源」填写，或改用官方源",
+            rcgui_i18n::t("还没配置 winget 镜像源名：请到「设置 → winget 镜像源」填写，或改用官方源"),
         );
         return;
     }
@@ -710,7 +710,7 @@ async fn install_winfsp(ui: &Weak<MainWindow>, mirror: bool, mirror_source: Stri
         winfsp_banner(
             ui,
             false,
-            Some("WinFsp 已安装，重启本程序后生效"),
+            Some(rcgui_i18n::t("WinFsp 已安装，重启本程序后生效")),
             Some(true),
         );
         return;
@@ -718,7 +718,7 @@ async fn install_winfsp(ui: &Weak<MainWindow>, mirror: bool, mirror_source: Stri
     winfsp_banner(
         ui,
         true,
-        Some("正在用 winget 安装 WinFsp，如弹出授权窗口请点「是」…"),
+        Some(rcgui_i18n::t("正在用 winget 安装 WinFsp，如弹出授权窗口请点「是」…")),
         None,
     );
 
@@ -759,60 +759,60 @@ async fn install_winfsp(ui: &Weak<MainWindow>, mirror: bool, mirror_source: Stri
                 winfsp_banner(
                     ui,
                     false,
-                    Some("WinFsp 已安装，重启本程序后生效"),
+                    Some(rcgui_i18n::t("WinFsp 已安装，重启本程序后生效")),
                     Some(true),
                 );
-                toast(ui, 1, "WinFsp 安装成功：重启本程序后即可使用挂载");
+                toast(ui, 1, rcgui_i18n::t("WinFsp 安装成功：重启本程序后即可使用挂载"));
             } else if out.status.success() {
                 // 退出码 0 但目录还是不在：常见于 winget 把它当「已是最新」跳过
                 winfsp_banner(
                     ui,
                     false,
-                    Some("winget 报告成功，但仍未检测到 WinFsp；请重启本程序再试或手动安装"),
+                    Some(rcgui_i18n::t("winget 报告成功，但仍未检测到 WinFsp；请重启本程序再试或手动安装")),
                     None,
                 );
-                toast(ui, 2, "winget 结束了，但没检测到 WinFsp");
+                toast(ui, 2, rcgui_i18n::t("winget 结束了，但没检测到 WinFsp"));
             } else if out.status.code() == Some(WINGET_ERR_UPDATE_NOT_APPLICABLE) {
                 // winget 说「没有可用的较新版本」，即它认为已经装着；可我们检测不到。
                 // 这种自相矛盾要如实讲，别报成「安装失败」把用户引去重装。
                 winfsp_banner(
                     ui,
                     false,
-                    Some("winget 认为已是最新版本，但没检测到 WinFsp；请重启本程序再试"),
+                    Some(rcgui_i18n::t("winget 认为已是最新版本，但没检测到 WinFsp；请重启本程序再试")),
                     None,
                 );
-                toast(ui, 2, "winget 认为已是最新，但没检测到 WinFsp");
+                toast(ui, 2, rcgui_i18n::t("winget 认为已是最新，但没检测到 WinFsp"));
             } else {
                 let why = tail_line(&out.stdout, &out.stderr);
                 winfsp_banner(
                     ui,
                     false,
-                    Some(&format!("安装失败：{why}")),
+                    Some(&rcgui_i18n::f("安装失败：{}", &[&(why)])),
                     None,
                 );
-                toast(ui, 2, format!("WinFsp 安装失败：{why}"));
+                toast(ui, 2, rcgui_i18n::f("WinFsp 安装失败：{}", &[&(why)]));
             }
         }
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             winfsp_banner(
                 ui,
                 false,
-                Some("系统里找不到 winget（App Installer 未安装）：请手动下载安装 WinFsp"),
+                Some(rcgui_i18n::t("系统里找不到 winget（App Installer 未安装）：请手动下载安装 WinFsp")),
                 None,
             );
             toast(
                 ui,
                 2,
-                "找不到 winget：请从 https://winfsp.dev/rel/ 手动安装，或先装「应用安装程序」",
+                rcgui_i18n::t("找不到 winget：请从 https://winfsp.dev/rel/ 手动安装，或先装「应用安装程序」"),
             );
         }
         Ok(Err(e)) => {
-            winfsp_banner(ui, false, Some(&format!("启动 winget 失败：{e}")), None);
-            toast(ui, 2, format!("启动 winget 失败：{e}"));
+            winfsp_banner(ui, false, Some(&rcgui_i18n::f("启动 winget 失败：{}", &[&(e)])), None);
+            toast(ui, 2, rcgui_i18n::f("启动 winget 失败：{}", &[&(e)]));
         }
         Err(e) => {
-            winfsp_banner(ui, false, Some(&format!("安装线程异常：{e}")), None);
-            toast(ui, 2, format!("安装线程异常：{e}"));
+            winfsp_banner(ui, false, Some(&rcgui_i18n::f("安装线程异常：{}", &[&(e)])), None);
+            toast(ui, 2, rcgui_i18n::f("安装线程异常：{}", &[&(e)]));
         }
     }
 }
@@ -1262,7 +1262,7 @@ async fn apply_remotes_filter(ui: &Weak<MainWindow>, full: &[(String, String, St
             usage: u.clone().into(),
             needs_auth: *needs.get(n).unwrap_or(&false),
             // 代理列由下面的 set_rows 之后再统一填（需要读档案，避免这里再开一次盘）
-            proxy_label: "不代理".into(),
+            proxy_label: rcgui_i18n::t("不代理").into(),
             proxy_pending: false,
             proxy_conflict: false,
             proxy_index: 0,
@@ -1285,21 +1285,21 @@ async fn apply_proxy_column(ui: &Weak<MainWindow>) {
         let d = doc.unwrap_or_default();
         let reg = rcgui_profile::ProxyRegistry::new(&d.proxies, &d.remote_proxies);
         // 下拉框候选项（第 0 项固定「不代理」），顺序即 proxies 顺序
-        let mut options: Vec<slint::SharedString> = vec!["不代理".into()];
-        let mut hints: Vec<slint::SharedString> = vec![proxy::DIRECT_HINT.into()];
+        let mut options: Vec<slint::SharedString> = vec![rcgui_i18n::t("不代理").into()];
+        let mut hints: Vec<slint::SharedString> = vec![proxy::direct_hint().into()];
         for p in &d.proxies {
             options.push(format!("{}（{}）", p.name, p.display_target()).into());
-            hints.push(proxy::CREDENTIAL_HINT.into());
+            hints.push(proxy::credential_hint().into());
         }
         let mut rows_state: std::collections::HashMap<String, (String, bool, bool, i32)> =
             std::collections::HashMap::new();
         for b in &d.remote_proxies {
             let bound = reg.by_id(&b.proxy_id);
             let label = match (b.is_direct(), bound) {
-                (true, _) => "不代理".to_string(),
+                (true, _) => rcgui_i18n::t("不代理").to_string(),
                 (false, Some(p)) => p.display_target(),
                 // 悬空引用：不能假装代理已生效
-                (false, None) => "配置已删除".to_string(),
+                (false, None) => rcgui_i18n::t("配置已删除").to_string(),
             };
             let idx = if b.is_direct() {
                 0
@@ -1329,7 +1329,7 @@ async fn apply_proxy_column(ui: &Weak<MainWindow>) {
                 let (label, pending, conflict, idx) = state
                     .get(&name)
                     .cloned()
-                    .unwrap_or_else(|| ("不代理".to_string(), false, false, 0));
+                    .unwrap_or_else(|| (rcgui_i18n::t("不代理").to_string(), false, false, 0));
                 r.proxy_label = label.into();
                 r.proxy_pending = pending;
                 r.proxy_conflict = conflict;
@@ -1588,7 +1588,7 @@ fn task_op(it: &TItem, hint: Option<&str>) -> String {
     let src_remote = remote_name_of(&it.src);
     let dst_remote = remote_name_of(&it.dst);
     if it.what == "deleting" {
-        return "删除".to_string();
+        return rcgui_i18n::t("删除").to_string();
     }
     if it.bytes == 0.0 {
         if let Some(kind) = hint {
@@ -1597,17 +1597,17 @@ fn task_op(it: &TItem, hint: Option<&str>) -> String {
     }
     if it.bytes == 0.0 && it.size > 0.0 && !it.src.is_empty() && !it.dst.is_empty() {
         if it.src == it.dst {
-            return "重命名".to_string();
+            return rcgui_i18n::t("重命名").to_string();
         }
         if src_remote.is_some() && dst_remote.is_some() {
-            return "移动".to_string();
+            return rcgui_i18n::t("移动").to_string();
         }
     }
     if dst_remote.is_some() && src_remote.is_none() {
-        return "上传".to_string();
+        return rcgui_i18n::t("上传").to_string();
     }
     if src_remote.is_some() && dst_remote.is_none() {
-        return "下载".to_string();
+        return rcgui_i18n::t("下载").to_string();
     }
     String::new()
 }
@@ -1707,7 +1707,7 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         if hide && !running {
             continue;
         }
-        let status = if running { "运行中" } else { "已完成" }.to_string();
+        let status = if running { rcgui_i18n::t("运行中") } else { rcgui_i18n::t("已完成") }.to_string();
         let speed = if running {
             rmap.get(group).map(|v| fmt_speed(*v)).unwrap_or_else(|| "—".into())
         } else if it.bytes > 0.0 {
@@ -1779,11 +1779,7 @@ async fn apply_global_limit(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let disp = if up.is_none() && down.is_none() {
         String::new()
     } else {
-        format!(
-            "上传 {} · 下载 {}",
-            up.map(fmt_bytes).unwrap_or_else(|| "不限".into()),
-            down.map(fmt_bytes).unwrap_or_else(|| "不限".into())
-        )
+        rcgui_i18n::f("上传 {} · 下载 {}", &[&(up.map(fmt_bytes).unwrap_or_else(|| rcgui_i18n::t("不限").into())), &(down.map(fmt_bytes).unwrap_or_else(|| rcgui_i18n::t("不限").into()))])
     };
     set_effective(ui, disp);
 }
@@ -2413,7 +2409,7 @@ fn update_editor_fields(ui: &Weak<MainWindow>, providers: &Value, type_name: &st
         let _ = ui.upgrade_in_event_loop(|ui| {
             let g = ui.global::<RemotesG>();
             g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(Vec::<FieldRow>::new()))));
-            g.set_provider_desc(KV_DESC.into());
+            g.set_provider_desc(kv_desc().into());
             g.set_kv_editor(true);
         });
         return;
@@ -2437,8 +2433,10 @@ fn update_editor_fields(ui: &Weak<MainWindow>, providers: &Value, type_name: &st
 // 写方法一律 403，所以这里自己发 `POST /api/v1/upload`。
 
 /// 选中 `k-vault` 类型时显示在类型下拉框下方的说明。
-const KV_DESC: &str = "K-Vault 站点：浏览/下载走只读 WebDAV，上传走站点 API。\
-令牌在站点的「API 令牌」页创建（需要 upload 权限）；只填用户名/密码时只能浏览。";
+fn kv_desc() -> &'static str {
+    rcgui_i18n::t("K-Vault 站点：浏览/下载走只读 WebDAV，上传走站点 API。\
+令牌在站点的「API 令牌」页创建（需要 upload 权限）；只填用户名/密码时只能浏览。")
+}
 
 /// 读一个远程的参数，判断它是不是 K-Vault 远程；是则返回配置（含明文令牌）。
 ///
@@ -2711,7 +2709,7 @@ async fn kv_upload_paths(cfg: &kvault::KvCfg, folder: &str, paths: &[PathBuf]) -
         if p.is_dir() {
             let files = kv_walk(p);
             if files.is_empty() {
-                out.failed.push(format!("{name}: 目录里没有文件"));
+                out.failed.push(rcgui_i18n::f("{}: 目录里没有文件", &[&(name)]));
                 continue;
             }
             let base_dir = join_path(folder, &name);
@@ -2755,31 +2753,22 @@ async fn kv_upload_paths(cfg: &kvault::KvCfg, folder: &str, paths: &[PathBuf]) -
 /// 上传结果 → 一句 toast（成功 1 / 失败 2）。
 fn kv_upload_report(up: &KvUpload, where_: &str) -> (i32, String) {
     let place = if where_.is_empty() {
-        "站点根目录"
+        rcgui_i18n::t("站点根目录")
     } else {
         where_
     };
     if up.failed.is_empty() {
-        let mut msg = format!("已上传 {} 个文件到 {}", up.ok, place);
+        let mut msg = rcgui_i18n::f("已上传 {} 个文件到 {}", &[&(up.ok), &(place)]);
         if up.dedup > 0 {
-            msg.push_str(&format!(
-                "；其中 {} 个站点已有同一份内容，直接复用了直链",
-                up.dedup
-            ));
+            msg.push_str(&rcgui_i18n::f("；其中 {} 个站点已有同一份内容，直接复用了直链", &[&(up.dedup)]));
         }
         return (1, msg);
     }
     // 失败项只列前 3 条：toast 是一行字，全塞进去就看不清了。
     let shown: Vec<String> = up.failed.iter().take(3).cloned().collect();
-    let mut msg = format!(
-        "上传完成 {}/{}，失败 {}：{}",
-        up.ok,
-        up.total,
-        up.failed.len(),
-        shown.join("；")
-    );
+    let mut msg = rcgui_i18n::f("上传完成 {}/{}，失败 {}：{}", &[&(up.ok), &(up.total), &(up.failed.len()), &(shown.join("；"))]);
     if up.failed.len() > shown.len() {
-        msg.push_str(&format!("（另有 {} 条未列出）", up.failed.len() - shown.len()));
+        msg.push_str(&rcgui_i18n::f("（另有 {} 条未列出）", &[&(up.failed.len() - shown.len())]));
     }
     (2, msg)
 }
@@ -2789,8 +2778,8 @@ fn kv_upload_report(up: &KvUpload, where_: &str) -> (i32, String) {
 /// 原因，而不是让 rclone 回一个干巴巴的 403。
 async fn kv_write_blocked(ctx: &Arc<Ctx>, remote: &str) -> Option<String> {
     kv_cfg_for(ctx, remote).await.map(|_| {
-        "K-Vault 远程不支持改名/移动/新建目录：站点只读（WebDAV 写方法一律 403），\
-API 也只开放上传、列表、删除。要在站点上调整目录，请到站点网页端操作。"
+        rcgui_i18n::t("K-Vault 远程不支持改名/移动/新建目录：站点只读（WebDAV 写方法一律 403），\
+API 也只开放上传、列表、删除。要在站点上调整目录，请到站点网页端操作。")
             .to_string()
     })
 }
@@ -2858,7 +2847,7 @@ async fn kv_delete_into(
         toast(
             &ui,
             2,
-            "删除站点文件需要 API 令牌（WebDAV 通道只读）。请编辑该远程填入令牌。",
+            rcgui_i18n::t("删除站点文件需要 API 令牌（WebDAV 通道只读）。请编辑该远程填入令牌。"),
         );
         return false;
     }
@@ -2868,7 +2857,7 @@ async fn kv_delete_into(
         Ok(f) => f,
         Err(e) => {
             let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_busy(false));
-            toast(&ui, 2, format!("读取站点索引失败: {e}"));
+            toast(&ui, 2, rcgui_i18n::f("读取站点索引失败: {}", &[&(e)]));
             return false;
         }
     };
@@ -2884,10 +2873,7 @@ async fn kv_delete_into(
         // 站点允许同一目录里同名文件共存（靠主键区分）。删哪一条都不是用户在
         // GUI 里看到的「那一条」，所以宁可不删，把话说明白。
         if !*is_dir && ids.len() > 1 {
-            failed.push(format!(
-                "{name}: 站点有 {} 个同名文件，请到站点网页端处理",
-                ids.len()
-            ));
+            failed.push(rcgui_i18n::f("{}: 站点有 {} 个同名文件，请到站点网页端处理", &[&(name), &(ids.len())]));
             continue;
         }
         let mut err: Option<String> = None;
@@ -2907,19 +2893,16 @@ async fn kv_delete_into(
         let names = gone.clone();
         let _ = ui.upgrade_in_event_loop(move |ui| prune_file_rows(&ui, &names));
     }
-    let mut msg = format!("已删除 {} 项", gone.len());
+    let mut msg = rcgui_i18n::f("已删除 {} 项", &[&(gone.len())]);
     if !gone.is_empty() {
-        msg.push_str("（站点目录树有 5 分钟缓存，其它视图可能还会显示一会儿）");
+        msg.push_str(rcgui_i18n::t("（站点目录树有 5 分钟缓存，其它视图可能还会显示一会儿）"));
     }
     if !missing.is_empty() {
-        msg.push_str(&format!(
-            "；{} 项在站点索引里找不到（可能已被删或改过名）",
-            missing.len()
-        ));
+        msg.push_str(&rcgui_i18n::f("；{} 项在站点索引里找不到（可能已被删或改过名）", &[&(missing.len())]));
     }
     if !failed.is_empty() {
         let shown: Vec<String> = failed.iter().take(2).cloned().collect();
-        msg.push_str(&format!("；失败 {}：{}", failed.len(), shown.join("；")));
+        msg.push_str(&rcgui_i18n::f("；失败 {}：{}", &[&(failed.len()), &(shown.join("；"))]));
     }
     let level = if failed.is_empty() && missing.is_empty() {
         1
@@ -2944,7 +2927,7 @@ fn looks_like_transient_net(msg: &str) -> bool {
         "broken pipe",
         "tls handshake",
         "timeout awaiting",
-        "请求超时",
+        rcgui_i18n::t("请求超时"),
         "i/o timeout",
     ]
     .iter()
@@ -2986,7 +2969,7 @@ async fn kv_upload_into(
     }
     let (level, mut msg) = kv_upload_report(&up, &folder);
     if copied {
-        msg.push_str(&format!("；{} 的直链已复制到剪贴板", up.name));
+        msg.push_str(&rcgui_i18n::f("；{} 的直链已复制到剪贴板", &[&(up.name)]));
     }
     toast(&ui, level, msg);
     false
@@ -3014,6 +2997,56 @@ const BACKEND_THREAD_STACK: usize = 16 * 1024 * 1024;
 
 // ---------------- 主入口 ----------------
 
+/// 系统界面语言（简体 / 繁体中文都算中文，其余按英文）。
+///
+/// 用 `GetUserDefaultUILanguage` 而不是 `sys_locale`：前者就是 Windows 自己
+/// 判定的「用户界面语言」，与资源管理器显示的一致；返回值低 10 位是主语言 ID，
+/// `0x04` 即 LANG_CHINESE（不区分简繁）。
+fn system_lang() -> rcgui_i18n::Lang {
+    use windows::Win32::Globalization::GetUserDefaultUILanguage;
+    // SAFETY: 无参数、无副作用的查询；返回值是 LANGID，失败时同样是合法数字。
+    let id = unsafe { GetUserDefaultUILanguage() } as u32;
+    if id & 0x3ff == 0x04 {
+        rcgui_i18n::Lang::Zh
+    } else {
+        rcgui_i18n::Lang::En
+    }
+}
+
+/// 设置里的语言标签 → 实际生效的语言（`system` / 空串 / 脏值都走系统检测）。
+fn resolve_lang(tag: &str) -> rcgui_i18n::Lang {
+    rcgui_i18n::Lang::from_tag(tag).unwrap_or_else(system_lang)
+}
+
+/// 设置页「界面语言」下拉的索引 ↔ 配置标签：0 跟随系统 / 1 简体中文 / 2 English。
+fn lang_idx_to_tag(idx: i32) -> &'static str {
+    match idx {
+        1 => "zh",
+        2 => "en",
+        _ => rcgui_i18n::TAG_SYSTEM,
+    }
+}
+
+fn tag_to_lang_idx(tag: &str) -> i32 {
+    match rcgui_i18n::Lang::from_tag(tag) {
+        Some(rcgui_i18n::Lang::Zh) => 1,
+        Some(rcgui_i18n::Lang::En) => 2,
+        None => 0,
+    }
+}
+
+/// 切换 Slint 侧 `@tr` 的译文。
+///
+/// 必须在第一个组件（`MainWindow::new()`）之后调用：打包进去的语言是随组件
+/// 创建一起登记的，之前调用会返回 `NoTranslationsBundled`。切换会置脏
+/// `translations_dirty`，所有 `@tr` 属性随之重算，因此不需要重建窗口。
+fn apply_slint_language(lang: rcgui_i18n::Lang) {
+    if let Err(e) = slint::select_bundled_translation(lang.slint_language()) {
+        // 只影响界面语言，不该拦住启动；日志按全局约定不翻译。
+        eprintln!("select_bundled_translation({:?}) 失败: {e}", lang);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let silent_flag = args.iter().any(|a| a == "--silent");
@@ -3030,8 +3063,14 @@ fn main() {
     profiles::install_permission_healer();
     let cfg = config::load();
 
+    // 界面语言：先定 Rust 侧的语言（`MainWindow::new()` 失败时的提示、以及后面
+    // 写进界面的所有文案都要用它），建出窗口之后再切 Slint 侧的 `@tr` 译文。
+    let lang = resolve_lang(&cfg.language);
+    rcgui_i18n::set_lang(lang);
+
     // Slint UI
-    let ui = MainWindow::new().expect("UI 初始化失败");
+    let ui = MainWindow::new().expect(rcgui_i18n::t("UI 初始化失败"));
+    apply_slint_language(lang);
     apply_theme(&ui, cfg.theme_mode);
     ui.global::<SettingsG>().set_rc_user(cfg.rclone.user.clone().into());
     ui.global::<SettingsG>().set_rc_pass(cfg.rclone.pass.clone().into());
@@ -3039,6 +3078,8 @@ fn main() {
     ui.global::<SettingsG>()
         .set_connect_on_start(cfg.rclone.connect_on_start);
     ui.global::<SettingsG>().set_theme_idx(cfg.theme_mode as i32);
+    ui.global::<SettingsG>()
+        .set_language_idx(tag_to_lang_idx(&cfg.language));
     ui.global::<ThemeG>().set_accent_idx(cfg.accent_idx as i32);
     ui.global::<SettingsG>().set_accent_idx(cfg.accent_idx as i32);
     ui.global::<SettingsG>().set_autostart(get_autostart());
@@ -3063,7 +3104,7 @@ fn main() {
     }
 
     // 插件宿主
-    let host = Arc::new(plugin_host::PluginHost::new().expect("wasm 引擎初始化失败"));
+    let host = Arc::new(plugin_host::PluginHost::new().expect(rcgui_i18n::t("wasm 引擎初始化失败")));
     let store = Arc::new(kv::KvStore::new(config::data_dir().join("plugins")));
 
     // 命令通道
@@ -3124,7 +3165,7 @@ fn main() {
                 .thread_stack_size(BACKEND_THREAD_STACK)
                 .enable_all()
                 .build()
-                .expect("tokio runtime 启动失败");
+                .expect(rcgui_i18n::t("tokio runtime 启动失败"));
             match rt.block_on(plugins::build_panel(&ctx, &id)) {
                 Ok(rows) => {
                     for r in &rows {
@@ -3170,7 +3211,7 @@ fn main() {
                 .thread_stack_size(BACKEND_THREAD_STACK)
                 .enable_all()
                 .build()
-                .expect("tokio runtime 启动失败");
+                .expect(rcgui_i18n::t("tokio runtime 启动失败"));
             rt.block_on(backend_main(ctx, ui_weak, &mut rx));
         });
     }
@@ -3256,7 +3297,7 @@ fn main() {
     spawn_tray(ui.as_weak(), tx.clone());
 
     if !silent_flag && !cfg.silent_start {
-        ui.show().expect("窗口显示失败");
+        ui.show().expect(rcgui_i18n::t("窗口显示失败"));
     }
 
     // 窗口 / 任务栏图标。
@@ -3280,7 +3321,7 @@ fn main() {
             },
         );
     }
-    slint::run_event_loop_until_quit().expect("事件循环启动失败");}
+    slint::run_event_loop_until_quit().expect(rcgui_i18n::t("事件循环启动失败"));}
 
 /// 取主窗口的 HWND。
 ///
@@ -3700,14 +3741,14 @@ fn relaunch_self(elevate: bool) -> anyhow::Result<()> {
             ShellExecuteW(None, &verb, &file, &params, PCWSTR::null(), SW_SHOWNORMAL).0 as isize
         };
         if code <= 32 {
-            anyhow::bail!("以管理员身份重启失败（错误码 {code}，可能是取消了 UAC 提示）");
+            anyhow::bail!("{}", rcgui_i18n::f("以管理员身份重启失败（错误码 {}，可能是取消了 UAC 提示）", &[&(code)]));
         }
     } else {
         std::process::Command::new("explorer.exe")
             .arg(&exe)
             .args(&args)
             .spawn()
-            .map_err(|e| anyhow!("以普通权限重启失败: {e}"))?;
+            .map_err(|e| anyhow!("{}", rcgui_i18n::f("以普通权限重启失败: {}", &[&(e)])))?;
     }
     Ok(())
 }
@@ -3836,10 +3877,10 @@ async fn handshake_only(ctx: &Arc<Ctx>) -> ConnOutcome {
                 // 挂载 / 服务 / 参数读取都做不了。状态说得比「能力受限」更明确；
                 // 具体文案由握手自己塞进 warnings（下面统一并入 notes），
                 // 这里不要再补一条，否则同一件事在界面上会被说两遍。
-                view.status = "已连接（对端未配置鉴权）".to_string();
+                view.status = rcgui_i18n::t("已连接（对端未配置鉴权）").to_string();
             } else if !hs.is_compatible() {
-                view.status = "已连接（能力受限）".to_string();
-                notes.push(format!("缺少必需能力：{}", hs.missing_text()));
+                view.status = rcgui_i18n::t("已连接（能力受限）").to_string();
+                notes.push(rcgui_i18n::f("缺少必需能力：{}", &[&(hs.missing_text())]));
             }
             notes.extend(hs.warnings.iter().cloned());
             view.error = notes.join("；");
@@ -3915,7 +3956,7 @@ async fn conn_action(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, which: ConnAction) {
         .conn_busy
         .swap(true, std::sync::atomic::Ordering::SeqCst)
     {
-        toast(ui, 0, "正在连接，请稍候");
+        toast(ui, 0, rcgui_i18n::t("正在连接，请稍候"));
         return;
     }
     let _ = ui.upgrade_in_event_loop(|ui| ui.global::<SettingsG>().set_conn_busy(true));
@@ -3930,7 +3971,7 @@ async fn conn_action(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, which: ConnAction) {
     apply_conn_view(ui, out.view);
     if live {
         if err.is_empty() {
-            toast(ui, 1, "连接成功");
+            toast(ui, 1, rcgui_i18n::t("连接成功"));
         } else {
             toast(ui, 2, err);
         }
@@ -3939,7 +3980,7 @@ async fn conn_action(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, which: ConnAction) {
         // 否则刚重建的挂载/服务会用到旧代理。
         spawn_restore(ctx, ui);
     } else {
-        toast(ui, 2, format!("连接失败：{err}"));
+        toast(ui, 2, rcgui_i18n::f("连接失败：{}", &[&(err)]));
     }
 }
 
@@ -4068,7 +4109,7 @@ async fn replay_pending_proxies(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         toast(
             ui,
             1,
-            format!("已应用 {changed} 条代理配置。{}", proxy::RESTART_HINT),
+            rcgui_i18n::f("已应用 {} 条代理配置。{}", &[&(changed), &(proxy::restart_hint())]),
         );
     }
     if !skipped.is_empty() {
@@ -4110,7 +4151,7 @@ async fn delete_proxy_now(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
         // 绑定也要清掉：留着就是悬空引用
         cfg.proxy_bindings.retain(|b| b.proxy_id != id);
         if let Err(e) = profiles::save_from_cfg(&cfg) {
-            toast(ui, 2, format!("删除代理配置失败: {e}"));
+            toast(ui, 2, rcgui_i18n::f("删除代理配置失败: {}", &[&(e)]));
             return;
         }
         (affected, name, bindings_before)
@@ -4143,13 +4184,9 @@ async fn delete_proxy_now(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
         toast(ui, 2, errs.join("；"));
     }
     let msg = if affected.is_empty() {
-        format!("已删除代理配置「{name}」")
+        rcgui_i18n::f("已删除代理配置「{}」", &[&(name)])
     } else {
-        format!(
-            "已删除代理配置「{name}」，{} 个远程已回落到「不代理」（{}）",
-            affected.len(),
-            affected.join("、")
-        )
+        rcgui_i18n::f("已删除代理配置「{}」，{} 个远程已回落到「不代理」（{}）", &[&(name), &(affected.len()), &(affected.join("、"))])
     };
     toast(ui, 1, msg);
     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ProxyListRefresh)).await;
@@ -4159,7 +4196,7 @@ async fn delete_proxy_now(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
 async fn disconnect_now(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {    ctx.rc.set_disconnected(None).await;
     let v = snapshot_view(ctx).await;
     apply_conn_view(ui, v);
-    toast(ui, 0, "已断开连接（界面保留上次快照）");
+    toast(ui, 0, rcgui_i18n::t("已断开连接（界面保留上次快照）"));
 }
 
 /// 真正的导出动作（唯一实现）。`include_secrets` 由调用方给出。
@@ -4198,25 +4235,16 @@ async fn export_conf(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, path: PathBuf, inclu
     let summary = conf.summary();
     match conf_io::write_bundle(&path, &conf) {
         Ok(()) => {
-            let mut msg = format!(
-                "已导出 {}（远程 {} · 挂载 {} · 服务 {}）",
-                path.display(),
-                summary.remote_count,
-                summary.mount_count,
-                summary.serve_count
-            );
+            let mut msg = rcgui_i18n::f("已导出 {}（远程 {} · 挂载 {} · 服务 {}）", &[&(path.display()), &(summary.remote_count), &(summary.mount_count), &(summary.serve_count)]);
             if summary.sensitive {
-                msg.push_str(&format!("；⚠ 含 {} 个远程的凭据，请妥善保管", summary.sensitives));
+                msg.push_str(&rcgui_i18n::f("；⚠ 含 {} 个远程的凭据，请妥善保管", &[&(summary.sensitives)]));
             }
             if summary.needs_auth > 0 {
-                msg.push_str(&format!(
-                    "；{} 个远程的凭据未随包导出（可能需要重新认证）",
-                    summary.needs_auth
-                ));
+                msg.push_str(&rcgui_i18n::f("；{} 个远程的凭据未随包导出（可能需要重新认证）", &[&(summary.needs_auth)]));
             }
             toast(ui, if summary.sensitive { 2 } else { 1 }, msg);
         }
-        Err(e) => toast(ui, 2, format!("导出失败: {e}")),
+        Err(e) => toast(ui, 2, rcgui_i18n::f("导出失败: {}", &[&(e)])),
     }
 }
 
@@ -4234,7 +4262,7 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
         // 否则关掉「启动时自动连接」后会看到一个自己没配过的端口（会话 11 实测踩到）。
         let saved = ctx.cfg.lock().unwrap().rclone.url.clone();
         v.endpoint_url = startup_endpoint_url(&saved, &v.endpoint_url);
-        v.error = "启动时未自动连接（可在设置里点「连接 / 握手」）".to_string();
+        v.error = rcgui_i18n::t("启动时未自动连接（可在设置里点「连接 / 握手」）").to_string();
         ConnOutcome {
             view: v,
             version: None,
@@ -4248,7 +4276,7 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
             toast(&ui, 2, conn.view.error.clone());
         }
     } else {
-        toast(&ui, 2, format!("未连接：{}", conn.view.error));
+        toast(&ui, 2, rcgui_i18n::f("未连接：{}", &[&(conn.view.error)]));
     }
     {
         let managed = false; // RCGUI 已无「托管模式」：永远连接外部实例
@@ -4658,15 +4686,15 @@ async fn wait_mount_ready_rc(
 async fn report_mount_not_visible(ui: &Weak<MainWindow>, fs: &str, point: &str) {
     let (ok, msg) = winfsp_installed();
     if !ok {
-        toast(ui, 2, format!("挂载 {point} 失败：{msg}"));
+        toast(ui, 2, rcgui_i18n::f("挂载 {} 失败：{}", &[&(point), &(msg)]));
         return;
     }
     let hint = if mount_point_ready(point) {
-        "该盘符已被占用，请换一个盘符"
+        rcgui_i18n::t("该盘符已被占用，请换一个盘符")
     } else {
-        "WinFsp 正常，但盘符未出现（网盘首次挂载可能较慢；也可能是盘符被占用或隐藏）"
+        rcgui_i18n::t("WinFsp 正常，但盘符未出现（网盘首次挂载可能较慢；也可能是盘符被占用或隐藏）")
     };
-    toast(ui, 2, format!("挂载 {fs} 到 {point} 未生效：{hint}"));
+    toast(ui, 2, rcgui_i18n::f("挂载 {} 到 {} 未生效：{}", &[&(fs), &(point), &(hint)]));
 }
 
 /// 启动（或重启）内嵌 HTTP 服务。
@@ -4684,11 +4712,11 @@ async fn spawn_http(ctx: &Arc<Ctx>, port: u16, ui: Weak<MainWindow>) {
         Ok(l) => l,
         Err(e) => {
             let hint = if e.kind() == std::io::ErrorKind::AddrInUse {
-                "端口已被其他程序占用，请在设置中改用其他端口"
+                rcgui_i18n::t("端口已被其他程序占用，请在设置中改用其他端口")
             } else {
-                "请检查端口设置"
+                rcgui_i18n::t("请检查端口设置")
             };
-            toast(&ui, 2, format!("HTTP 服务启动失败（端口 {port}）：{e}；{hint}"));
+            toast(&ui, 2, rcgui_i18n::f("HTTP 服务启动失败（端口 {}）：{}；{}", &[&(port), &(e), &(hint)]));
             return;
         }
     };
@@ -4752,7 +4780,7 @@ async fn apply_bundle_to_rclone(
         };
         match res {
             Ok(()) => ok_remotes += 1,
-            Err(e) => errs.push(format!("远程 {}: {e}", r.name)),
+            Err(e) => errs.push(rcgui_i18n::f("远程 {}: {}", &[&(r.name), &(e)])),
         }
     }
 
@@ -4786,7 +4814,7 @@ async fn apply_bundle_to_rclone(
             if let Err(e) =
                 persist::remember_mount(&mut cfg, &m.remote, &m.sub_path, &point, m.ro, &m.cache)
             {
-                errs.push(format!("记录挂载 {point}: {e}"));
+                errs.push(rcgui_i18n::f("记录挂载 {}: {}", &[&(point), &(e)]));
             }
         }
         if needs_auth.contains(&m.remote.to_ascii_lowercase()) {
@@ -4805,8 +4833,8 @@ async fn apply_bundle_to_rclone(
         let opts = json!({ "vfs_cache_mode": m.cache, "read_only": m.ro });
         match tokio::time::timeout(MOUNT_RC_TIMEOUT, client.mount(&fs, &point, opts)).await {
             Ok(Ok(_)) => ok_mounts += 1,
-            Ok(Err(e)) => errs.push(format!("挂载 {fs} → {point}: {e}")),
-            Err(_) => errs.push(format!("挂载 {fs} → {point}: 超时")),
+            Ok(Err(e)) => errs.push(rcgui_i18n::f("挂载 {} → {}: {}", &[&(fs), &(point), &(e)])),
+            Err(_) => errs.push(rcgui_i18n::f("挂载 {} → {}: 超时", &[&(fs), &(point)])),
         }
     }
 
@@ -4844,7 +4872,7 @@ async fn apply_bundle_to_rclone(
             if let Err(e) = persist::remember_serve(
                 &mut cfg, &s.stype, &s.remote, &s.sub_path, &s.addr, &s.user, &s.pass,
             ) {
-                errs.push(format!("记录服务 {}: {e}", s.addr));
+                errs.push(rcgui_i18n::f("记录服务 {}: {}", &[&(s.addr), &(e)]));
             }
         }
         // 已在监听该地址 → 视为成功，不重复启动
@@ -4867,7 +4895,7 @@ async fn apply_bundle_to_rclone(
             .await
         {
             Ok(_) => ok_serves += 1,
-            Err(e) => errs.push(format!("服务 {} {}: {e}", s.stype, s.addr)),
+            Err(e) => errs.push(rcgui_i18n::f("服务 {} {}: {}", &[&(s.stype), &(s.addr), &(e)])),
         }
     }
 
@@ -4875,10 +4903,7 @@ async fn apply_bundle_to_rclone(
     // 归到 errs 会让「失败 N 项」看起来像程序缺陷，所以单独一条说明。
     if !skipped_auth.is_empty() {
         let names: Vec<String> = skipped_auth.into_iter().collect();
-        errs.push(format!(
-            "以下远程的凭据未随包导出，已跳过其挂载/服务的启动（导入后在「远程」页补全凭据即可启用）：{}",
-            names.join("、")
-        ));
+        errs.push(rcgui_i18n::f("以下远程的凭据未随包导出，已跳过其挂载/服务的启动（导入后在「远程」页补全凭据即可启用）：{}", &[&(names.join("、"))]));
     }
 
     (ok_remotes, ok_mounts, ok_serves, errs)
@@ -4908,7 +4933,7 @@ async fn files_navigate(
         client.list(&fs, &target, None),
     )
     .await
-    .map_err(|_| anyhow!("请求超时"))
+    .map_err(|_| anyhow!("{}", rcgui_i18n::t("请求超时")))
     .and_then(|r| r.map_err(anyhow::Error::from));
 
     let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq())
@@ -5168,7 +5193,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         Ok(rows) => set_file_entries(&ui, rows),
                         Err(e) => {
                             set_file_entries(&ui, Vec::<FileRow>::new());
-                            toast_ui(&ui, 2, format!("列目录失败: {e}"));
+                            toast_ui(&ui, 2, rcgui_i18n::f("列目录失败: {}", &[&(e)]));
                         }
                     }
                     apply_crumbs(&ui, file_crumbs(&remote, &path));
@@ -5184,7 +5209,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 client.list(&fs, &path, None),
             )
             .await
-            .map_err(|_| anyhow!("请求超时"))
+            .map_err(|_| anyhow!("{}", rcgui_i18n::t("请求超时")))
             .and_then(|r| r.map_err(anyhow::Error::from));
             // 站点在 Cloudflare 后面，HTTP/2 建连偶发抖动（"http2: client conn could not
             // be established"）；这种错误自己会好，重试一次远好过让用户盯着红色报错。
@@ -5196,7 +5221,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         client.list(&fs, &path, None),
                     )
                     .await
-                    .map_err(|_| anyhow!("重试仍超时"))
+                    .map_err(|_| anyhow!("{}", rcgui_i18n::t("重试仍超时")))
                     .and_then(|r| r.map_err(anyhow::Error::from));
                 }
             }
@@ -5219,7 +5244,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         Err(e) => {
                             set_file_entries(&ui, Vec::<FileRow>::new());
                             let msg = crate::proxy::annotate_error(
-                                &format!("列目录失败: {e}"),
+                                &rcgui_i18n::f("列目录失败: {}", &[&(e)]),
                                 proxy_ep.as_deref(),
                             );
                             toast_ui(&ui, 2, msg);
@@ -5236,17 +5261,17 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         Cmd::FilesEnter { name, seq } => {
             let (_, path) = ui_files_pos(ui).await;
             let target = join_path(&path, &name);
-            let fail = format!("无法进入 {name}");
+            let fail = rcgui_i18n::f("无法进入 {}", &[&(name)]);
             files_navigate(ctx, ui, target, seq, fail).await;
             false
         }
         Cmd::FilesJump { path, seq } => {
-            files_navigate(ctx, ui, path, seq, "无法打开该路径".into()).await;
+            files_navigate(ctx, ui, path, seq, rcgui_i18n::t("无法打开该路径").into()).await;
             false
         }
         Cmd::FilesUp { seq } => {
             let (_, path) = ui_files_pos(ui).await;
-            files_navigate(ctx, ui, parent_path(&path), seq, "返回上级失败".into()).await;
+            files_navigate(ctx, ui, parent_path(&path), seq, rcgui_i18n::t("返回上级失败").into()).await;
             false
         }
         Cmd::FilesDownload { name, local } => {
@@ -5267,8 +5292,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 )
                 .await;
             match res {
-                Ok(_) => toast(ui, 1, format!("已下载到 {}", local.display())),
-                Err(e) => toast(ui, 2, format!("下载失败: {e}")),
+                Ok(_) => toast(ui, 1, rcgui_i18n::f("已下载到 {}", &[&(local.display())])),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("下载失败: {}", &[&(e)])),
             }
             false
         }
@@ -5281,14 +5306,14 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 // 文件夹：递归复制到「所选目录/文件夹名」；同名时另起带序号的目录
                 let target = unique_local_dir(&dir, &name);
                 if let Err(e) = std::fs::create_dir_all(&target) {
-                    toast(ui, 2, format!("无法创建本地目录 {}: {e}", target.display()));
+                    toast(ui, 2, rcgui_i18n::f("无法创建本地目录 {}: {}", &[&(target.display()), &(e)]));
                     return false;
                 }
                 let src_fs = format!("{remote}:{}", join_path(&path, &name));
                 let dst_fs = local_fs(&target);
                 let ctx2 = ctx.clone();
                 let ui2 = ui.clone();
-                toast(ui, 0, format!("正在下载文件夹 {name}…"));
+                toast(ui, 0, rcgui_i18n::f("正在下载文件夹 {}…", &[&(name)]));
                 // 大目录可能复制很久：后台线程执行，不阻塞命令队列
                 std::thread::spawn(move || {
                     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -5301,8 +5326,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     rt.block_on(async move {
                         let client = ctx2.rc.client().await;
                         match client.sync_copy(&src_fs, &dst_fs, true).await {
-                            Ok(_) => toast(&ui2, 1, format!("已下载到 {}", target.display())),
-                            Err(e) => toast(&ui2, 2, format!("下载失败: {e}")),
+                            Ok(_) => toast(&ui2, 1, rcgui_i18n::f("已下载到 {}", &[&(target.display())])),
+                            Err(e) => toast(&ui2, 2, rcgui_i18n::f("下载失败: {}", &[&(e)])),
                         }
                     });
                 });
@@ -5325,8 +5350,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 )
                 .await;
             match res {
-                Ok(_) => toast(ui, 1, format!("已下载到 {}", local.display())),
-                Err(e) => toast(ui, 2, format!("下载失败: {e}")),
+                Ok(_) => toast(ui, 1, rcgui_i18n::f("已下载到 {}", &[&(local.display())])),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("下载失败: {}", &[&(e)])),
             }
             false
         }
@@ -5342,7 +5367,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 client.list(&fs, &path, None),
             )
             .await
-            .map_err(|_| anyhow!("请求超时"))
+            .map_err(|_| anyhow!("{}", rcgui_i18n::t("请求超时")))
             .and_then(|r| r.map_err(anyhow::Error::from));
             let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_move_seq())
                 .await
@@ -5367,7 +5392,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         g.set_move_dirs(ModelRc::from(Rc::new(VecModel::from(dirs))));
                         g.set_move_path(path.clone().into());
                     }
-                    Err(e) => toast_ui(&ui, 2, format!("读取目标目录失败: {e}")),
+                    Err(e) => toast_ui(&ui, 2, rcgui_i18n::f("读取目标目录失败: {}", &[&(e)])),
                 }
             });
             false
@@ -5387,11 +5412,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             }
             let src = join_path(&path, &name);
             if dest == path {
-                toast(ui, 2, "目标就是当前目录，无需移动");
+                toast(ui, 2, rcgui_i18n::t("目标就是当前目录，无需移动"));
                 return false;
             }
             if is_dir && is_same_or_inside(&dest, &src) {
-                toast(ui, 2, "不能把文件夹移动到它自己或它的子目录里");
+                toast(ui, 2, rcgui_i18n::t("不能把文件夹移动到它自己或它的子目录里"));
                 return false;
             }
             let client = ctx.rc.client().await;
@@ -5403,16 +5428,13 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         toast(
                             ui,
                             2,
-                            format!(
-                                "目标目录已有同名{}，请先改名或换一个目录",
-                                if is_dir { "文件夹" } else { "文件" }
-                            ),
+                            rcgui_i18n::f("目标目录已有同名{}，请先改名或换一个目录", &[&(if is_dir { rcgui_i18n::t("文件夹") } else { rcgui_i18n::t("文件") })]),
                         );
                         return false;
                     }
                 }
                 Err(e) => {
-                    toast(ui, 2, format!("无法检查目标目录: {e}"));
+                    toast(ui, 2, rcgui_i18n::f("无法检查目标目录: {}", &[&(e)]));
                     return false;
                 }
             }
@@ -5431,7 +5453,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let src_fs = format!("{remote}:{src}");
                 let dst_fs = format!("{remote}:{dst}");
                 // 先登记再动手：core/transferred 分不清目录改名与目录移动（见 OpHints）
-                ctx.op_hints.lock().unwrap().put(&fs, &src, "移动");
+                ctx.op_hints.lock().unwrap().put(&fs, &src, rcgui_i18n::t("移动"));
                 // 用「独立线程 + current_thread runtime」而不是 tokio::spawn：
                 // 目录移动完成后要复用 `handle_cmd` 刷新列表，而它整体不是 Send。
                 std::thread::spawn(move || {
@@ -5455,31 +5477,31 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                                     Cmd::FilesRefresh { seq: -1 },
                                 ))
                                 .await;
-                                toast(&ui2, 1, format!("已移动到 {where_}"));
+                                toast(&ui2, 1, rcgui_i18n::f("已移动到 {}", &[&(where_)]));
                             }
-                            Err(e) => toast(&ui2, 2, format!("移动失败: {e}")),
+                            Err(e) => toast(&ui2, 2, rcgui_i18n::f("移动失败: {}", &[&(e)])),
                         }
                     });
                 });
                 return false;
             }
             // 先登记再动手：同一 root 下的改名与移动在记账里同形（见 OpHints）
-            ctx.op_hints.lock().unwrap().put(&fs, &src, "移动");
+            ctx.op_hints.lock().unwrap().put(&fs, &src, rcgui_i18n::t("移动"));
             // 文件移动通常很快，直接等待，失败可立即提示
             let res = tokio::time::timeout(
                 std::time::Duration::from_secs(120),
                 client.movefile(&fs, &src, &fs, &dst),
             )
             .await
-            .map_err(|_| anyhow!("移动超时"))
+            .map_err(|_| anyhow!("{}", rcgui_i18n::t("移动超时")))
             .and_then(|r| r.map_err(anyhow::Error::from));
             let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
             match res {
                 Ok(_) => {
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
-                    toast(ui, 1, format!("已移动到 {where_}"));
+                    toast(ui, 1, rcgui_i18n::f("已移动到 {}", &[&(where_)]));
                 }
-                Err(e) => toast(ui, 2, format!("移动失败: {e}")),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("移动失败: {}", &[&(e)])),
             }
             false
         }
@@ -5506,7 +5528,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 // 列目录失败不阻断创建：退回默认名，让 rclone 自己判断
                 _ => Vec::new(),
             };
-            let name = unique_dir_name("新建文件夹", &existing);
+            let name = unique_dir_name(rcgui_i18n::t("新建文件夹"), &existing);
             let res = client.mkdir(&fs, &join_path(&path, &name)).await;
             match res {
                 Ok(_) => {
@@ -5517,9 +5539,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         },
                     );
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
-                    toast(ui, 1, format!("文件夹已创建：{name}（选中后可重命名）"));
+                    toast(ui, 1, rcgui_i18n::f("文件夹已创建：{}（选中后可重命名）", &[&(name)]));
                 }
-                Err(e) => toast(ui, 2, format!("创建失败: {e}")),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("创建失败: {}", &[&(e)])),
             }
             false
         }
@@ -5542,9 +5564,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             match res {
                 Ok(_) => {
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
-                    toast(ui, 1, format!("已删除 {name}"));
+                    toast(ui, 1, rcgui_i18n::f("已删除 {}", &[&(name)]));
                 }
-                Err(e) => toast(ui, 2, format!("删除失败: {e}")),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("删除失败: {}", &[&(e)])),
             }
             false
         }
@@ -5555,7 +5577,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // 只接受单层名字：带路径分隔符就不是「重命名」而是「移动」了，
             // 语义不同（移动还要检查子目录、同名冲突），这里明确拒绝。
             if to.contains('/') || to.contains('\\') {
-                toast(ui, 2, "名称不能包含路径分隔符");
+                toast(ui, 2, rcgui_i18n::t("名称不能包含路径分隔符"));
                 return false;
             }
             let (remote, path) = ui_files_pos(ui).await;
@@ -5572,12 +5594,12 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 match client.list(&fs, &path, None).await {
                     Ok(entries) => {
                         if entries.iter().any(|e| e.name.eq_ignore_ascii_case(&to)) {
-                            toast(ui, 2, format!("当前目录已有同名项：{to}"));
+                            toast(ui, 2, rcgui_i18n::f("当前目录已有同名项：{}", &[&(to)]));
                             return false;
                         }
                     }
                     Err(e) => {
-                        toast(ui, 2, format!("无法检查目录内容: {e}"));
+                        toast(ui, 2, rcgui_i18n::f("无法检查目录内容: {}", &[&(e)]));
                         return false;
                     }
                 }
@@ -5590,7 +5612,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 ctx.op_hints
                     .lock()
                     .unwrap()
-                    .put(&fs, &join_path(&path, &from), "重命名");
+                    .put(&fs, &join_path(&path, &from), rcgui_i18n::t("重命名"));
                 // 与目录移动同样的理由：可能很久，放后台线程，
                 // 用 current_thread runtime 复用 `handle_cmd`（它不是 Send）。
                 std::thread::spawn(move || {
@@ -5617,9 +5639,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                                     Cmd::FilesRefresh { seq: -1 },
                                 ))
                                 .await;
-                                toast(&ui2, 1, "重命名完成");
+                                toast(&ui2, 1, rcgui_i18n::t("重命名完成"));
                             }
-                            Err(e) => toast(&ui2, 2, format!("重命名失败: {e}")),
+                            Err(e) => toast(&ui2, 2, rcgui_i18n::f("重命名失败: {}", &[&(e)])),
                         }
                     });
                 });
@@ -5629,7 +5651,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             ctx.op_hints
                 .lock()
                 .unwrap()
-                .put(&fs, &join_path(&path, &from), "重命名");
+                .put(&fs, &join_path(&path, &from), rcgui_i18n::t("重命名"));
             let res = client
                 .movefile(&fs, &join_path(&path, &from), &fs, &join_path(&path, &to))
                 .await;
@@ -5641,9 +5663,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         },
                     );
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
-                    toast(ui, 1, "重命名完成");
+                    toast(ui, 1, rcgui_i18n::t("重命名完成"));
                 }
-                Err(e) => toast(ui, 2, format!("重命名失败: {e}")),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("重命名失败: {}", &[&(e)])),
             }
             false
         }
@@ -5683,9 +5705,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                                     Cmd::FilesRefresh { seq: -1 },
                                 ))
                                 .await;
-                                toast(&ui2, 1, format!("已复制为 {cand2}"));
+                                toast(&ui2, 1, rcgui_i18n::f("已复制为 {}", &[&(cand2)]));
                             }
-                            Err(e) => toast(&ui2, 2, format!("复制失败: {e}")),
+                            Err(e) => toast(&ui2, 2, rcgui_i18n::f("复制失败: {}", &[&(e)])),
                         }
                     });
                 });
@@ -5705,9 +5727,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             match res {
                 Ok(_) => {
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
-                    toast(ui, 1, format!("已复制为 {cand}"));
+                    toast(ui, 1, rcgui_i18n::f("已复制为 {}", &[&(cand)]));
                 }
-                Err(e) => toast(ui, 2, format!("复制失败: {e}")),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("复制失败: {}", &[&(e)])),
             }
             false
         }
@@ -5745,7 +5767,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // 而「把新版本传上去」是最常见的同名场景，静默覆盖不是安全的默认行为。
             let (remote, mut path) = ui_files_pos(ui).await;
             if remote.is_empty() {
-                toast(ui, 2, "请先选择远程仓库");
+                toast(ui, 2, rcgui_i18n::t("请先选择远程仓库"));
                 return false;
             }
             if paths.is_empty() {
@@ -5809,20 +5831,16 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             };
             if failed.is_empty() {
                 let extra = if renamed > 0 {
-                    format!("（{renamed} 个同名文件已自动改名）")
+                    rcgui_i18n::f("（{} 个同名文件已自动改名）", &[&(renamed)])
                 } else {
                     String::new()
                 };
-                toast(ui, 1, format!("已上传 {ok}/{total} 项到 {where_}{extra}"));
+                toast(ui, 1, rcgui_i18n::f("已上传 {}/{} 项到 {}{}", &[&(ok), &(total), &(where_), &(extra)]));
             } else {
                 toast(
                     ui,
                     2,
-                    format!(
-                        "上传完成 {ok}/{total}，失败 {}：{}",
-                        failed.len(),
-                        failed.join("；")
-                    ),
+                    rcgui_i18n::f("上传完成 {}/{}，失败 {}：{}", &[&(ok), &(total), &(failed.len()), &(failed.join("；"))]),
                 );
             }
             false
@@ -5933,10 +5951,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         let res = if *is_dir {
                             let target = unique_local_dir(&dir, name);
                             if let Err(e) = std::fs::create_dir_all(&target) {
-                                failed.push(format!("{name}: 无法创建本地目录 {e}"));
+                                failed.push(rcgui_i18n::f("{}: 无法创建本地目录 {}", &[&(name), &(e)]));
                                 continue;
                             }
-                            toast(&ui2, 0, format!("正在下载文件夹 {name}…"));
+                            toast(&ui2, 0, rcgui_i18n::f("正在下载文件夹 {}…", &[&(name)]));
                             client
                                 .sync_copy(&format!("{fs}{src}"), &local_fs(&target), true)
                                 .await
@@ -5962,16 +5980,12 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     }
                     let _ = ui2.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_busy(false));
                     if failed.is_empty() {
-                        toast(&ui2, 1, format!("已下载 {ok}/{total} 项到 {}", dir.display()));
+                        toast(&ui2, 1, rcgui_i18n::f("已下载 {}/{} 项到 {}", &[&(ok), &(total), &(dir.display())]));
                     } else {
                         toast(
                             &ui2,
                             2,
-                            format!(
-                                "下载完成 {ok}/{total}，失败 {}：{}",
-                                failed.len(),
-                                failed.join("；")
-                            ),
+                            rcgui_i18n::f("下载完成 {}/{}，失败 {}：{}", &[&(ok), &(total), &(failed.len()), &(failed.join("；"))]),
                         );
                     }
                 });
@@ -6013,16 +6027,12 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // 刷新会重建 entries 并清空勾选（此时仍留在多选模式，方便继续操作）
             let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
             if failed.is_empty() {
-                toast(ui, 1, format!("已删除 {ok} 项"));
+                toast(ui, 1, rcgui_i18n::f("已删除 {} 项", &[&(ok)]));
             } else {
                 toast(
                     ui,
                     2,
-                    format!(
-                        "删除完成 {ok}/{total}，失败 {}：{}",
-                        failed.len(),
-                        failed.join("；")
-                    ),
+                    rcgui_i18n::f("删除完成 {}/{}，失败 {}：{}", &[&(ok), &(total), &(failed.len()), &(failed.join("；"))]),
                 );
             }
             false
@@ -6065,7 +6075,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     }
                     Err(e) => {
                         // 路径无效 / 无权限：保留旧列表，只提示，不清空（避免界面突然空掉）
-                        toast_ui(&ui, 2, format!("读取本机目录失败: {e}"));
+                        toast_ui(&ui, 2, rcgui_i18n::f("读取本机目录失败: {}", &[&(e)]));
                     }
                 }
                 g.set_loading(false);
@@ -6108,7 +6118,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         }
         Cmd::LocalChooseDir => {
             if let Some(dir) = rfd::FileDialog::new()
-                .set_title("选择本机目录")
+                .set_title(rcgui_i18n::t("选择本机目录"))
                 .pick_folder()
             {
                 let _ = Box::pin(handle_cmd(
@@ -6126,7 +6136,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // 本机这一项 → 远程当前目录：文件用 copyfile，目录递归 sync/copy 并另起不重名目录。
             let (remote, path) = ui_files_pos(ui).await;
             if remote.is_empty() {
-                toast(ui, 2, "请先选择远程仓库");
+                toast(ui, 2, rcgui_i18n::t("请先选择远程仓库"));
                 return false;
             }
             let cur = read_ui(ui, |ui| ui.global::<LocalG>().get_path().to_string())
@@ -6149,7 +6159,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let dst_fs = format!("{remote}:{}", join_path(&path, &cand));
                 let src_fs = local_fs(&src);
                 let _ = ui.upgrade_in_event_loop(|ui| ui.global::<LocalG>().set_busy(true));
-                toast(ui, 0, format!("正在上传文件夹 {name}…"));
+                toast(ui, 0, rcgui_i18n::f("正在上传文件夹 {}…", &[&(name)]));
                 let ctx2 = ctx.clone();
                 let ui2 = ui.clone();
                 // 大目录可能很久：专用线程 + current_thread 运行时
@@ -6174,9 +6184,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                                     Cmd::FilesRefresh { seq: -1 },
                                 ))
                                 .await;
-                                toast(&ui2, 1, format!("已上传文件夹 {cand}"));
+                                toast(&ui2, 1, rcgui_i18n::f("已上传文件夹 {}", &[&(cand)]));
                             }
-                            Err(e) => toast(&ui2, 2, format!("上传失败: {e}")),
+                            Err(e) => toast(&ui2, 2, rcgui_i18n::f("上传失败: {}", &[&(e)])),
                         }
                     });
                 });
@@ -6191,10 +6201,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             match res {
                 Ok(_) => {
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
-                    let extra = if cand != name { "（同名已自动改名）" } else { "" };
-                    toast(ui, 1, format!("已上传 {cand}{extra}"));
+                    let extra = if cand != name { rcgui_i18n::t("（同名已自动改名）") } else { "" };
+                    toast(ui, 1, rcgui_i18n::f("已上传 {}{}", &[&(cand), &(extra)]));
                 }
-                Err(e) => toast(ui, 2, format!("上传失败: {e}")),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("上传失败: {}", &[&(e)])),
             }
             false
         }
@@ -6334,8 +6344,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         g.set_up_dirs(ModelRc::from(Rc::new(VecModel::from(dirs))));
                         g.set_up_path(path.clone().into());
                     }
-                    Ok(Err(e)) => toast_ui(&ui, 2, format!("读取远程目录失败: {e}")),
-                    Err(_) => toast_ui(&ui, 2, "读取远程目录超时"),
+                    Ok(Err(e)) => toast_ui(&ui, 2, rcgui_i18n::f("读取远程目录失败: {}", &[&(e)])),
+                    Err(_) => toast_ui(&ui, 2, rcgui_i18n::t("读取远程目录超时")),
                 }
             });
             false
@@ -6344,7 +6354,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // 「上传到…」：把本机勾选项（没有勾选时是右键那一项）传到指定远程目录。
             let (remote, _) = ui_files_pos(ui).await;
             if remote.is_empty() {
-                toast(ui, 2, "请先选择远程仓库");
+                toast(ui, 2, rcgui_i18n::t("请先选择远程仓库"));
                 return false;
             }
             let (cur, items) = read_ui(ui, |ui| {
@@ -6428,16 +6438,12 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             });
             let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
             if failed.is_empty() {
-                toast(ui, 1, format!("已上传 {ok}/{total} 项到 {dest}"));
+                toast(ui, 1, rcgui_i18n::f("已上传 {}/{} 项到 {}", &[&(ok), &(total), &(dest)]));
             } else {
                 toast(
                     ui,
                     2,
-                    format!(
-                        "上传完成 {ok}/{total}，失败 {}：{}",
-                        failed.len(),
-                        failed.join("；")
-                    ),
+                    rcgui_i18n::f("上传完成 {}/{}，失败 {}：{}", &[&(ok), &(total), &(failed.len()), &(failed.join("；"))]),
                 );
             }
             false
@@ -6481,7 +6487,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             .await
             .unwrap_or_default();
             if remote.is_empty() {
-                toast(ui, 2, "请先在「远程」页添加仓库，再选择仓库");
+                toast(ui, 2, rcgui_i18n::t("请先在「远程」页添加仓库，再选择仓库"));
                 return false;
             }
             let fs = compose_fs(&remote, &sub_path);
@@ -6497,7 +6503,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     .iter()
                     .any(|r| mount_key(&r.mount_point) == mount_key(&point));
                 if dup {
-                    toast(ui, 2, format!("挂载点 {point} 已被占用，请修改盘符"));
+                    toast(ui, 2, rcgui_i18n::f("挂载点 {} 已被占用，请修改盘符", &[&(point)]));
                     return false;
                 }
             }
@@ -6520,7 +6526,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // 给足时间：RC 调用会阻塞到挂载完成（网盘首次挂载可能 15~30s 甚至更久）
             let res = tokio::time::timeout(MOUNT_RC_TIMEOUT, client.mount(&fs, &point, opts))
                 .await
-                .map_err(|_| anyhow!("挂载超时（{}s）", MOUNT_RC_TIMEOUT.as_secs()))
+                .map_err(|_| anyhow!("{}", rcgui_i18n::f("挂载超时（{}s）", &[&(MOUNT_RC_TIMEOUT.as_secs())])))
                 .and_then(|r| r.map_err(anyhow::Error::from));
             // 无论成败都先摘掉 pending，并立刻重绘一次：
             // 活动挂载列表是靠 `pending` 渲染 spinner 的，只从 ctx.pending_mounts 里删掉
@@ -6585,12 +6591,12 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         .unwrap()
                         .retain(|k| k != &mount_key(&actual));
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
-                    toast(ui, 1, format!("挂载成功：{actual}"));
+                    toast(ui, 1, rcgui_i18n::f("挂载成功：{}", &[&(actual)]));
                 }
                 Err(e) => {
                     // 失败：刷新列表（pending 已摘除，条目自动消失）
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
-                    toast(ui, 2, format!("挂载失败：{e}"));
+                    toast(ui, 2, rcgui_i18n::f("挂载失败：{}", &[&(e)]));
                 }
             }
             false
@@ -6623,9 +6629,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         let _ = config::save(&cfg);
                     }
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
-                    toast(ui, 1, format!("已卸载 {point}"));
+                    toast(ui, 1, rcgui_i18n::f("已卸载 {}", &[&(point)]));
                 }
-                Err(e) => toast(ui, 2, format!("卸载失败: {e}")),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("卸载失败: {}", &[&(e)])),
             }
             false
         }
@@ -6880,21 +6886,19 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         .lock()
                         .unwrap()
                         .clone()
-                        .unwrap_or_else(|| "rclone 未返回后端类型列表".to_string());
+                        .unwrap_or_else(|| rcgui_i18n::t("rclone 未返回后端类型列表").to_string());
                     // rclone 对 config/* 这类敏感接口要求配置 RC 认证；只连上
                     // core/version 并不代表能读配置（实测踩过）。给一句能照做的指引。
                     let auth_hint = if why.to_ascii_lowercase().contains("authentication must be set up") {
-                        "rclone 没有启用 RC 认证：请加 --rc-user/--rc-pass（与「设置」里的一致）或 --rc-no-auth 后重启 rclone，再点「重新握手」。"
+                        rcgui_i18n::t("rclone 没有启用 RC 认证：请加 --rc-user/--rc-pass（与「设置」里的一致）或 --rc-no-auth 后重启 rclone，再点「重新握手」。")
                     } else {
-                        "请到「设置」点「连接/握手」或「重新握手」。"
+                        rcgui_i18n::t("请到「设置」点「连接/握手」或「重新握手」。")
                     };
                     toast(
                         &ui2,
                         2,
-                        format!(
-                            "无法从 rclone 获取远程类型（{why}），已先列出常见类型；\
-                             参数表单需要连接后才能加载。{auth_hint}"
-                        ),
+                        rcgui_i18n::f("无法从 rclone 获取远程类型（{}），已先列出常见类型；\
+                             参数表单需要连接后才能加载。{}", &[&(why), &(auth_hint)]),
                     );
                 }
                 update_editor_fields(&ui2, &providers, &first_type);
@@ -6945,7 +6949,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let _ = ui.upgrade_in_event_loop(|ui| {
                     let g = ui.global::<RemotesG>();
                     g.set_kv_testing(false);
-                    g.set_kv_status("请先填站点地址（根地址，不要带 /dav）".into());
+                    g.set_kv_status(rcgui_i18n::t("请先填站点地址（根地址，不要带 /dav）").into());
                     g.set_kv_status_level(3);
                 });
                 return false;
@@ -6953,7 +6957,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let _ = ui.upgrade_in_event_loop(|ui| {
                 let g = ui.global::<RemotesG>();
                 g.set_kv_testing(true);
-                g.set_kv_status("正在连接站点…".into());
+                g.set_kv_status(rcgui_i18n::t("正在连接站点…").into());
                 g.set_kv_status_level(0);
             });
             // 令牌框留空时用已存的那份：点「测试连接」多半就是想验证现有配置。
@@ -6968,7 +6972,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 g.set_kv_testing(false);
                 match res {
                     Err(e) => {
-                        g.set_kv_status(format!("连接失败：{e}").into());
+                        g.set_kv_status(rcgui_i18n::f("连接失败：{}", &[&(e)]).into());
                         g.set_kv_status_level(3);
                     }
                     Ok(p) => {
@@ -6976,33 +6980,30 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         let mut level = 1;
                         if p.id.is_empty() {
                             notes.push(
-                                "站点可访问；未填令牌，只验证到站点本身（浏览可用，上传需要令牌）"
+                                rcgui_i18n::t("站点可访问；未填令牌，只验证到站点本身（浏览可用，上传需要令牌）")
                                     .to_string(),
                             );
                             level = 2;
                         } else {
-                            notes.push(format!(
-                                "令牌 {}",
-                                if p.name.is_empty() {
+                            notes.push(rcgui_i18n::f("令牌 {}", &[&(if p.name.is_empty() {
                                     p.id.clone()
                                 } else {
                                     format!("{}（{}）", p.id, p.name)
-                                }
-                            ));
+                                })]));
                             if !p.scopes.is_empty() {
-                                notes.push(format!("作用域 {}", p.scopes.join(",")));
+                                notes.push(rcgui_i18n::f("作用域 {}", &[&(p.scopes.join(","))]));
                             }
                             if !p.storages.is_empty() {
-                                notes.push(format!("可用存储 {}", p.storages.join(",")));
+                                notes.push(rcgui_i18n::f("可用存储 {}", &[&(p.storages.join(","))]));
                             }
                             if p.max_file > 0 {
-                                notes.push(format!("单文件上限 {}", fmt_size_bytes(p.max_file as i64)));
+                                notes.push(rcgui_i18n::f("单文件上限 {}", &[&(fmt_size_bytes(p.max_file as i64))]));
                             }
                             if !p.folder_prefix.is_empty() {
-                                notes.push(format!("目录前缀 /{}", p.folder_prefix));
+                                notes.push(rcgui_i18n::f("目录前缀 /{}", &[&(p.folder_prefix)]));
                             }
                             if !p.scopes.iter().any(|s| s.as_str() == "upload") {
-                                notes.push("令牌没有 upload 作用域，上传会被站点拒绝".to_string());
+                                notes.push(rcgui_i18n::t("令牌没有 upload 作用域，上传会被站点拒绝").to_string());
                                 level = 2;
                             }
                             // 存储选错会被 POLICY_STORAGE_DENIED 拒；只剩一个可选时
@@ -7010,7 +7011,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                             let picked_ok = p.storages.is_empty()
                                 || p.storages.iter().any(|s| s == &form.storage);
                             if !picked_ok {
-                                notes.push(format!("当前存储 {} 不在允许列表里", form.storage));
+                                notes.push(rcgui_i18n::f("当前存储 {} 不在允许列表里", &[&(form.storage)]));
                                 level = 2;
                                 if p.storages.len() == 1 {
                                     let only = p.storages[0].clone();
@@ -7092,7 +7093,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 g.set_edit_params(params_text.into());
                 match kv_cfg {
                     Some(cfg) => {
-                        g.set_provider_desc(KV_DESC.into());
+                        g.set_provider_desc(kv_desc().into());
                         g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(Vec::<FieldRow>::new()))));
                         apply_kv_form(&ui, &cfg, kv_token_set, kv_pass_set);
                     }
@@ -7124,7 +7125,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             .await
             .unwrap_or_default();
             if name.trim().is_empty() || name.contains(':') || name.contains(' ') {
-                toast(ui, 2, "名称不能为空，且不能包含空格或冒号");
+                toast(ui, 2, rcgui_i18n::t("名称不能为空，且不能包含空格或冒号"));
                 return false;
             }
             // K-Vault 走专用表单：下拉框里是 k-vault，落盘的是 webdav + `kvault=1` 标记。
@@ -7132,14 +7133,14 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if kv_form.editor && type_str == kvault::TYPE {
                 let cfg = kv_form.to_cfg();
                 if cfg.base.trim().is_empty() {
-                    toast(ui, 2, "站点地址不能为空");
+                    toast(ui, 2, rcgui_i18n::t("站点地址不能为空"));
                     return false;
                 }
                 if cfg.token.is_empty() && cfg.user.is_empty() && !kv_form.token_set && !kv_form.pass_set {
                     toast(
                         ui,
                         2,
-                        "至少填 API 令牌（推荐）或用户名/密码：没有凭据的 K-Vault 远程只能看到 401",
+                        rcgui_i18n::t("至少填 API 令牌（推荐）或用户名/密码：没有凭据的 K-Vault 远程只能看到 401"),
                     );
                     return false;
                 }
@@ -7162,11 +7163,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                             ui.global::<RemotesG>().set_show_editor(false);
                         });
                         let _ = Box::pin(handle_cmd(&ctx.clone(), ui, Cmd::RemotesRefresh)).await;
-                        toast(ui, 1, format!("K-Vault 远程 {} 已保存", name));
+                        toast(ui, 1, rcgui_i18n::f("K-Vault 远程 {} 已保存", &[&(name)]));
                         false
                     }
                     Err(e) => {
-                        toast(ui, 2, format!("保存失败: {e}"));
+                        toast(ui, 2, rcgui_i18n::f("保存失败: {}", &[&(e)]));
                         false
                     }
                 };
@@ -7194,9 +7195,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         ui.global::<RemotesG>().set_show_editor(false);
                     });
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::RemotesRefresh)).await;
-                    toast(ui, 1, format!("远程存储 {} 已保存", name));
+                    toast(ui, 1, rcgui_i18n::f("远程存储 {} 已保存", &[&(name)]));
                 }
-                Err(e) => toast(ui, 2, format!("保存失败: {e}")),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("保存失败: {}", &[&(e)])),
             }
             false
         }
@@ -7296,13 +7297,13 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             for (addr, id) in &live_serves {
                 match client.serve_stop(id).await {
                     Ok(()) => {}
-                    Err(e) => errs.push(format!("停止服务 {addr}: {e}")),
+                    Err(e) => errs.push(rcgui_i18n::f("停止服务 {}: {}", &[&(addr), &(e)])),
                 }
             }
             for p in &points_to_unmount {
                 match client.unmount(p).await {
                     Ok(()) => {}
-                    Err(e) => errs.push(format!("卸载 {p}: {e}")),
+                    Err(e) => errs.push(rcgui_i18n::f("卸载 {}: {}", &[&(p), &(e)])),
                 }
             }
 
@@ -7323,21 +7324,17 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::RemotesRefresh)).await;
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ServesRefresh)).await;
-                    let mut msg = format!(
-                        "已删除 {name}（停止服务 {} 个、卸载挂载 {} 个）",
-                        live_serves.len(),
-                        points_to_unmount.len()
-                    );
+                    let mut msg = rcgui_i18n::f("已删除 {}（停止服务 {} 个、卸载挂载 {} 个）", &[&(name), &(live_serves.len()), &(points_to_unmount.len())]);
                     if had_proxy {
-                        msg.push_str("，代理绑定已清除");
+                        msg.push_str(rcgui_i18n::t("，代理绑定已清除"));
                     }
                     if !errs.is_empty() {
-                        toast(ui, 2, format!("{msg}；但有 {} 项清理失败：{}", errs.len(), errs.join("；")));
+                        toast(ui, 2, rcgui_i18n::f("{}；但有 {} 项清理失败：{}", &[&(msg), &(errs.len()), &(errs.join("；"))]));
                     } else {
                         toast(ui, 1, msg);
                     }
                 }
-                Err(e) => toast(ui, 2, format!("删除失败: {e}")),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("删除失败: {}", &[&(e)])),
             }
             false
         }
@@ -7360,7 +7357,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                             name: p.name.clone().into(),
                             protocol: p.protocol.label().into(),
                             target: p.display_target().into(),
-                            auth: if p.has_auth() { "有凭据".into() } else { "无".into() },
+                            auth: if p.has_auth() { rcgui_i18n::t("有凭据").into() } else { rcgui_i18n::t("无").into() },
                             used_by: if used.is_empty() {
                                 "—".into()
                             } else {
@@ -7384,10 +7381,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 toast(
                     ui,
                     2,
-                    format!(
-                        "以下远程引用的代理配置已不存在，请重新选择：{}",
-                        dangling.join("、")
-                    ),
+                    rcgui_i18n::f("以下远程引用的代理配置已不存在，请重新选择：{}", &[&(dangling.join("、"))]),
                 );
             }
             apply_proxy_column(ui).await;
@@ -7456,7 +7450,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let port: u16 = match port_text.trim().parse() {
                 Ok(p) => p,
                 Err(_) => {
-                    toast(ui, 2, "端口必须是 1–65535 的数字");
+                    toast(ui, 2, rcgui_i18n::t("端口必须是 1–65535 的数字"));
                     return false;
                 }
             };
@@ -7487,7 +7481,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let exclude = if edit_id_is_new { "" } else { profile.id.as_str() };
                 if let Some(dup) = proxy::proxy_name_conflict(&cfg.proxies, &profile.name, exclude) {
                     drop(cfg);
-                    toast(ui, 2, format!("已存在同名代理配置「{dup}」，请换一个名称"));
+                    toast(ui, 2, rcgui_i18n::f("已存在同名代理配置「{}」，请换一个名称", &[&(dup)]));
                     return false;
                 }
             }
@@ -7500,7 +7494,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let affected: Vec<String> = {
                 let mut cfg = ctx.cfg.lock().unwrap();
                 let is_new = !cfg.proxies.iter().any(|p| p.id == profile.id);
-                let label = if is_new { "已新增" } else { "已更新" };
+                let label = if is_new { rcgui_i18n::t("已新增") } else { rcgui_i18n::t("已更新") };
                 cfg.proxies.retain(|p| p.id != profile.id);
                 cfg.proxies.push(profile.clone());
                 // 改动配置内容后，用它的 remote 都标记为「待应用」，由下面的
@@ -7519,10 +7513,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     }
                 }
                 if let Err(e) = profiles::save_from_cfg(&cfg) {
-                    toast(ui, 2, format!("保存代理配置失败: {e}"));
+                    toast(ui, 2, rcgui_i18n::f("保存代理配置失败: {}", &[&(e)]));
                     return false;
                 }
-                toast(ui, 1, format!("代理配置「{}」{label}", profile.name));
+                toast(ui, 1, rcgui_i18n::f("代理配置「{}」{}", &[&(profile.name), &(label)]));
                 affected
             };
             {
@@ -7554,17 +7548,14 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     toast(
                         ui,
                         1,
-                        format!("{}。{}", rep.summary(), proxy::RESTART_HINT),
+                        format!("{}。{}", rep.summary(), proxy::restart_hint()),
                     );
                 }
             } else if !affected.is_empty() {
                 toast(
                     ui,
                     0,
-                    format!(
-                        "代理配置已保存，{} 个远程标记为待应用（连接后将自动下发）",
-                        affected.len()
-                    ),
+                    rcgui_i18n::f("代理配置已保存，{} 个远程标记为待应用（连接后将自动下发）", &[&(affected.len())]),
                 );
             }
             let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ProxyListRefresh)).await;
@@ -7582,13 +7573,13 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 (name, proxy::remotes_using(&cfg, &id))
             };
             if name.is_empty() {
-                toast(ui, 2, "该代理配置已不存在，请刷新后重试");
+                toast(ui, 2, rcgui_i18n::t("该代理配置已不存在，请刷新后重试"));
                 return false;
             }
             let affected_text = if affected.is_empty() {
                 String::new()
             } else {
-                format!("以下远程会回落到「不代理」：{}", affected.join("、"))
+                rcgui_i18n::f("以下远程会回落到「不代理」：{}", &[&(affected.join("、"))])
             };
             // 没有关联时不必二次确认，直接删
             if affected.is_empty() {
@@ -7618,7 +7609,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         Some(p) => (Some(p.clone()), p.id.clone()),
                         None => {
                             drop(cfg);
-                            toast(ui, 2, "选择的代理配置已不存在，请刷新后重试");
+                            toast(ui, 2, rcgui_i18n::t("选择的代理配置已不存在，请刷新后重试"));
                             return false;
                         }
                     }
@@ -7629,7 +7620,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let mut cfg = ctx.cfg.lock().unwrap();
                 cfg.bind_proxy_slot(&remote, &proxy_id);
                 if let Err(e) = profiles::save_from_cfg(&cfg) {
-                    toast(ui, 2, format!("保存代理绑定失败: {e}"));
+                    toast(ui, 2, rcgui_i18n::f("保存代理绑定失败: {}", &[&(e)]));
                     return false;
                 }
             }
@@ -7687,7 +7678,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         format!(
                             "{}。{}{}",
                             rep.summary(),
-                            proxy::RESTART_HINT,
+                            proxy::restart_hint(),
                             native_hint.unwrap_or("")
                         ),
                     );
@@ -7696,11 +7687,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 toast(
                     ui,
                     0,
-                    format!(
-                        "{remote} 的代理已保存，当前未连接 rclone，将在连接后自动应用。{}{}",
-                        proxy::RESTART_HINT,
-                        native_hint.unwrap_or("")
-                    ),
+                    rcgui_i18n::f("{} 的代理已保存，当前未连接 rclone，将在连接后自动应用。{}{}", &[&(remote), &(proxy::restart_hint()), &(native_hint.unwrap_or(""))]),
                 );
             }
             let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ProxyListRefresh)).await;
@@ -7738,14 +7725,14 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 .await
                 .unwrap_or_default();
             if remote.is_empty() {
-                toast(ui, 2, "请先在「远程」页添加仓库，再选择仓库");
+                toast(ui, 2, rcgui_i18n::t("请先在「远程」页添加仓库，再选择仓库"));
                 return false;
             }
             let sub_path = sub_path.trim().trim_matches('/').to_string();
             let fs = compose_fs(&remote, &sub_path);
             let addr_t = addr.trim().to_string();
             if addr_t.is_empty() {
-                toast(ui, 2, "请填写监听地址");
+                toast(ui, 2, rcgui_i18n::t("请填写监听地址"));
                 return false;
             }
             // 服务显示名重名校验：必须在**启动之前**拦，否则服务已经起来了才发现重名，
@@ -7761,7 +7748,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         toast(
                             ui,
                             2,
-                            format!("已存在同名服务「{dup}」，请换一个名称"),
+                            rcgui_i18n::f("已存在同名服务「{}」，请换一个名称", &[&(dup)]),
                         );
                         return false;
                     }
@@ -7810,9 +7797,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         toast(ui, 2, e);
                     }
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ServesRefresh)).await;
-                    toast(ui, 1, format!("服务已启动: {id}"));
+                    toast(ui, 1, rcgui_i18n::f("服务已启动: {}", &[&(id)]));
                 }
-                Err(e) => toast(ui, 2, format!("启动失败: {e}")),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("启动失败: {}", &[&(e)])),
             }
             false
         }
@@ -7838,9 +7825,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         let _ = config::save(&cfg);
                     }
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ServesRefresh)).await;
-                    toast(ui, 1, format!("已停止 {id}"));
+                    toast(ui, 1, rcgui_i18n::f("已停止 {}", &[&(id)]));
                 }
-                Err(e) => toast(ui, 2, format!("停止失败: {e}")),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("停止失败: {}", &[&(e)])),
             }
             false
         }
@@ -7886,7 +7873,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let _ = config::save(&cfg);
             }
             apply_global_limit(ctx, ui).await;
-            toast(ui, 1, "限速已应用");
+            toast(ui, 1, rcgui_i18n::t("限速已应用"));
             false
         }
         Cmd::JobStop { id } => {
@@ -7894,9 +7881,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             match client.job_stop(id).await {
                 Ok(()) => {
                     build_tasks(ctx, ui).await;
-                    toast(ui, 1, format!("任务 #{} 已停止", id));
+                    toast(ui, 1, rcgui_i18n::f("任务 #{} 已停止", &[&(id)]));
                 }
-                Err(e) => toast(ui, 2, format!("停止失败: {e}")),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("停止失败: {}", &[&(e)])),
             }
             false
         }
@@ -7928,7 +7915,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         g.set_log_level_idx(idx);
                     });
                 }
-                Err(e) => toast(ui, 2, format!("读取参数失败: {e}")),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("读取参数失败: {}", &[&(e)])),
             }
             false
         }
@@ -7959,8 +7946,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             });
             let client = ctx.rc.client().await;
             match client.options_set(opts).await {
-                Ok(()) => toast(ui, 1, "运行参数已保存"),
-                Err(e) => toast(ui, 2, format!("保存失败: {e}")),
+                Ok(()) => toast(ui, 1, rcgui_i18n::t("运行参数已保存")),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("保存失败: {}", &[&(e)])),
             }
             false
         }
@@ -7990,11 +7977,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             toast(
                 ui,
                 if opened { 1 } else { 2 },
-                format!(
-                    "{}插件目录：{}",
-                    if opened { "已请求打开" } else { "无法打开" },
-                    d.display()
-                ),
+                rcgui_i18n::f("{}插件目录：{}", &[&(if opened { rcgui_i18n::t("已请求打开") } else { rcgui_i18n::t("无法打开") }), &(d.display())]),
             );
             false
         }
@@ -8018,7 +8001,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if let Some((id, old_enabled, _kind, verified, path)) = row {
                 // 未通过完整性校验的插件一律不允许启用
                 if !old_enabled && !verified {
-                    toast(ui, 2, format!("插件 {id} 未通过完整性校验，无法启用"));
+                    toast(ui, 2, rcgui_i18n::f("插件 {} 未通过完整性校验，无法启用", &[&(id)]));
                     return false;
                 }
                 let enabled = !old_enabled;
@@ -8035,35 +8018,35 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                                 if let Err(e) =
                                     plugin_host::package::load_from_dir(&dir, &gui_version())
                                 {
-                                    toast(ui, 2, format!("插件 {id} 校验失败: {e:#}"));
+                                    toast(ui, 2, rcgui_i18n::f("插件 {} 校验失败: {}", &[&(id), &(format!("{:#}", e))]));
                                     return false;
                                 }
-                                toast(ui, 1, format!("正在执行插件 {id} 的入口文件…"));
+                                toast(ui, 1, rcgui_i18n::f("正在执行插件 {} 的入口文件…", &[&(id)]));
                                 let r = tokio::task::spawn_blocking(move || {
                                     plugin_host::package::run_entry_file(&dir, &meta)
                                 })
                                 .await;
                                 match r {
                                     Ok(Ok(0)) => {
-                                        toast(ui, 1, format!("插件 {id} 已启用（入口文件执行成功）"))
+                                        toast(ui, 1, rcgui_i18n::f("插件 {} 已启用（入口文件执行成功）", &[&(id)]))
                                     }
                                     Ok(Ok(code)) => toast(
                                         ui,
                                         2,
-                                        format!("插件 {id} 入口文件退出码 {code}（可能未成功，请检查）"),
+                                        rcgui_i18n::f("插件 {} 入口文件退出码 {}（可能未成功，请检查）", &[&(id), &(code)]),
                                     ),
                                     Ok(Err(e)) => {
-                                        toast(ui, 2, format!("插件 {id} 启动失败: {e:#}"));
+                                        toast(ui, 2, rcgui_i18n::f("插件 {} 启动失败: {}", &[&(id), &(format!("{:#}", e))]));
                                         return false; // 执行失败不记录为已启用
                                     }
                                     Err(e) => {
-                                        toast(ui, 2, format!("插件 {id} 执行线程异常: {e}"));
+                                        toast(ui, 2, rcgui_i18n::f("插件 {} 执行线程异常: {}", &[&(id), &(e)]));
                                         return false;
                                     }
                                 }
                             }
                             None => {
-                                toast(ui, 2, format!("插件 {id} 的 plugin.json 无法读取"));
+                                toast(ui, 2, rcgui_i18n::f("插件 {} 的 plugin.json 无法读取", &[&(id)]));
                                 return false;
                             }
                         }
@@ -8085,7 +8068,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     toast_ui(
                         &ui,
                         1,
-                        format!("插件 {} 已{}", id, if enabled { "启用" } else { "停用" }),
+                        rcgui_i18n::f("插件 {} 已{}", &[&(id), &(if enabled { rcgui_i18n::t("启用") } else { rcgui_i18n::t("停用") })]),
                     );
                 });
             }
@@ -8116,9 +8099,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let fail = if verified {
                     String::new()
                 } else if status.trim().is_empty() {
-                    "插件未通过完整性校验，设置面板不可用".to_string()
+                    rcgui_i18n::t("插件未通过完整性校验，设置面板不可用").to_string()
                 } else {
-                    format!("插件未通过完整性校验：{status}")
+                    rcgui_i18n::f("插件未通过完整性校验：{}", &[&(status)])
                 };
                 let fail_ui = fail.clone();
                 let _ = ui.upgrade_in_event_loop(move |ui| {
@@ -8270,7 +8253,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         g.set_panel_busy_action("".into());
                         g.set_panel_busy_label("".into());
                     });
-                    toast(ui, 2, format!("插件动作失败: {msg}"));
+                    toast(ui, 2, rcgui_i18n::f("插件动作失败: {}", &[&(msg)]));
                 }
             }
             false
@@ -8298,9 +8281,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     Ok(removed) => {
                         let recoverable = plugins::ships_with_app(&id);
                         let msg = if recoverable {
-                            format!("已卸载「{name}」；如需再次使用，可在插件页点「恢复内置」")
+                            rcgui_i18n::f("已卸载「{}」；如需再次使用，可在插件页点「恢复内置」", &[&(name)])
                         } else {
-                            format!("已卸载「{name}」")
+                            rcgui_i18n::f("已卸载「{}」", &[&(name)])
                         };
                         eprintln!("[plugin] 已卸载 {id}: {}", removed.display());
                         toast(ui, 1, msg);
@@ -8328,7 +8311,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         // 再按磁盘真相重扫一次（校准条数、已卸载入口、图床面板等）
                         rescan_plugins(ctx, ui).await;
                     }
-                    Err(e) => toast(ui, 2, format!("卸载失败: {e:#}")),
+                    Err(e) => toast(ui, 2, rcgui_i18n::f("卸载失败: {}", &[&(format!("{:#}", e))])),
                 }
             }
             false
@@ -8345,7 +8328,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if let Some((id, name)) = row {
                 match plugins::restore_builtin(ctx, &id) {
                     Ok(()) => {
-                        toast(ui, 1, format!("已恢复内置插件「{name}」"));
+                        toast(ui, 1, rcgui_i18n::f("已恢复内置插件「{}」", &[&(name)]));
                         // 与卸载对称：先立刻把顶部那条提示去掉，再重扫把卡片加回来。
                         let rid = id.clone();
                         let _ = ui.upgrade_in_event_loop(move |ui| {
@@ -8353,7 +8336,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         });
                         rescan_plugins(ctx, ui).await;
                     }
-                    Err(e) => toast(ui, 2, format!("恢复失败: {e:#}")),
+                    Err(e) => toast(ui, 2, rcgui_i18n::f("恢复失败: {}", &[&(format!("{:#}", e))])),
                 }
             }
             false
@@ -8366,14 +8349,14 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 .unwrap_or_else(|| id.clone());
             match plugins::restore_builtin(ctx, &id) {
                 Ok(()) => {
-                    toast(ui, 1, format!("已恢复内置插件「{name}」"));
+                    toast(ui, 1, rcgui_i18n::f("已恢复内置插件「{}」", &[&(name)]));
                     let rid = id.clone();
                     let _ = ui.upgrade_in_event_loop(move |ui| {
                         remove_removed_builtin(&ui, &rid);
                     });
                     rescan_plugins(ctx, ui).await;
                 }
-                Err(e) => toast(ui, 2, format!("恢复失败: {e:#}")),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("恢复失败: {}", &[&(format!("{:#}", e))])),
             }
             false
         }
@@ -8402,6 +8385,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     cfg.rclone.connect_on_start = s.get_connect_on_start();
                     cfg.theme_mode = s.get_theme_idx() as u8;
                     cfg.accent_idx = s.get_accent_idx() as u8;
+                    cfg.language = lang_idx_to_tag(s.get_language_idx()).to_string();
                     cfg.autostart = s.get_autostart();
                     cfg.silent_start = s.get_silent();
                     // 用户在设置页动过「关闭到托盘」复选框 = 已经做过选择，
@@ -8422,9 +8406,30 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 }
             })
             .await;
+            // 语言改动立即生效（不重建窗口）：先切语言，后面所有提示与刷新都用新语言。
+            // 接着重发一遍各页面的刷新命令——已经由 Rust 写进界面属性的动态文案
+            // 不会随 `@tr` 重算而更新。
+            let want_lang = {
+                let tag = ctx.cfg.lock().unwrap().language.clone();
+                resolve_lang(&tag)
+            };
+            if want_lang != rcgui_i18n::lang() {
+                rcgui_i18n::set_lang(want_lang);
+                apply_slint_language(want_lang);
+                for cmd in [
+                    Cmd::RefreshDashboard,
+                    Cmd::RemotesRefresh,
+                    Cmd::MountsRefresh,
+                    Cmd::ServesRefresh,
+                    Cmd::TransfersEnter,
+                    Cmd::OptionsLoad,
+                ] {
+                    let _ = Box::pin(handle_cmd(ctx, ui, cmd)).await;
+                }
+            }
             match save_result {
-                Some(Ok(())) => toast(ui, 1, "设置已保存（连接相关改动重启后生效）"),
-                Some(Err(e)) => toast(ui, 2, format!("配置保存失败: {e}")),
+                Some(Ok(())) => toast(ui, 1, rcgui_i18n::t("设置已保存（连接相关改动重启后生效）")),
+                Some(Err(e)) => toast(ui, 2, rcgui_i18n::f("配置保存失败: {}", &[&(e)])),
                 None => {}
             }
             // 仅当内嵌 HTTP 的启用状态或端口真正变化时才重启服务
@@ -8462,7 +8467,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             })
             .await;
             if let Some(Err(e)) = saved {
-                toast(ui, 2, format!("保存连接设置失败: {e}"));
+                toast(ui, 2, rcgui_i18n::f("保存连接设置失败: {}", &[&(e)]));
                 return false;
             }
             conn_action(ctx, ui, ConnAction::Connect).await;
@@ -8494,16 +8499,16 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         g.set_conf_pending(true);
                         g.set_conf_info(info2.into());
                     });
-                    toast(ui, 1, format!("预览完成（尚未写入）：{info}"));
+                    toast(ui, 1, rcgui_i18n::f("预览完成（尚未写入）：{}", &[&(info)]));
                 }
                 Err(e) => {
                     *ctx.pending_import.lock().unwrap() = None;
                     let _ = ui.upgrade_in_event_loop(|ui| {
                         let g = ui.global::<SettingsG>();
                         g.set_conf_pending(false);
-                        g.set_conf_info("导入预览失败，详见提示".into());
+                        g.set_conf_info(rcgui_i18n::t("导入预览失败，详见提示").into());
                     });
-                    toast(ui, 2, format!("导入预览失败: {e}"));
+                    toast(ui, 2, rcgui_i18n::f("导入预览失败: {}", &[&(e)]));
                 }
             }
             false
@@ -8519,9 +8524,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         g.set_script_path(p.into());
                         g.set_script_preview(b.into());
                     });
-                    toast(ui, 1, format!("已生成恢复脚本（未执行）：{}", path.display()));
+                    toast(ui, 1, rcgui_i18n::f("已生成恢复脚本（未执行）：{}", &[&(path.display())]));
                 }
-                Err(e) => toast(ui, 2, format!("生成恢复脚本失败: {e}")),
+                Err(e) => toast(ui, 2, rcgui_i18n::f("生成恢复脚本失败: {}", &[&(e)])),
             }
             false
         }
@@ -8532,10 +8537,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             .await
             .unwrap_or_default();
             if text.is_empty() {
-                toast(ui, 0, "还没有可复制的脚本，请先「生成恢复脚本」");
+                toast(ui, 0, rcgui_i18n::t("还没有可复制的脚本，请先「生成恢复脚本」"));
             } else {
                 clipboard_copy(&text);
-                toast(ui, 1, "脚本已复制到剪贴板");
+                toast(ui, 1, rcgui_i18n::t("脚本已复制到剪贴板"));
             }
             false
         }
@@ -8548,13 +8553,13 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let _ = ui.upgrade_in_event_loop(move |ui| {
                     ui.global::<SettingsG>().set_run_as_admin(current)
                 });
-                toast(ui, 0, "当前已是该权限，无需重启");
+                toast(ui, 0, rcgui_i18n::t("当前已是该权限，无需重启"));
                 return false;
             }
             let msg = if target {
-                "软件将重启，并以管理员身份运行。若弹出 UAC 提示，请选择「是」。"
+                rcgui_i18n::t("软件将重启，并以管理员身份运行。若弹出 UAC 提示，请选择「是」。")
             } else {
-                "软件将重启，并以普通权限运行。"
+                rcgui_i18n::t("软件将重启，并以普通权限运行。")
             };
             let _ = ui.upgrade_in_event_loop(move |ui| {
                 let g = ui.global::<SettingsG>();
@@ -8601,7 +8606,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 g.set_admin_confirm_show(false);
                 g.set_run_as_admin(current);
             });
-            toast(ui, 0, "已取消，保持当前权限");
+            toast(ui, 0, rcgui_i18n::t("已取消，保持当前权限"));
             false
         }
         Cmd::TrayFailed(msg) => {
@@ -8611,7 +8616,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         }
         Cmd::ConfApply => {
             let Some(conf) = ctx.pending_import.lock().unwrap().take() else {
-                toast(ui, 0, "请先「导入预览」，确认无误后再应用");
+                toast(ui, 0, rcgui_i18n::t("请先「导入预览」，确认无误后再应用"));
                 return false;
             };
             let mut cfg = ctx.cfg.lock().unwrap().clone();
@@ -8628,12 +8633,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::RemotesRefresh)).await;
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ServesRefresh)).await;
-                    let mut info = format!(
-                        "已应用到本地 rclone：远程 {ok_r} / 挂载 {ok_m} / 服务 {ok_s}；原档案备份在 {}",
-                        bak.display()
-                    );
+                    let mut info = rcgui_i18n::f("已应用到本地 rclone：远程 {} / 挂载 {} / 服务 {}；原档案备份在 {}", &[&(ok_r), &(ok_m), &(ok_s), &(bak.display())]);
                     if !errs.is_empty() {
-                        info.push_str(&format!("；失败 {} 项：{}", errs.len(), errs.join("；")));
+                        info.push_str(&rcgui_i18n::f("；失败 {} 项：{}", &[&(errs.len()), &(errs.join("；"))]));
                     }
                     let info2 = info.clone();
                     let _ = ui.upgrade_in_event_loop(move |ui| {
@@ -8646,7 +8648,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 Err(e) => {
                     // 失败时放回待应用状态，允许用户处理后重试
                     *ctx.pending_import.lock().unwrap() = Some(conf);
-                    toast(ui, 2, format!("应用导入失败（数据未改动）: {e}"));
+                    toast(ui, 2, rcgui_i18n::f("应用导入失败（数据未改动）: {}", &[&(e)]));
                 }
             }
             false
@@ -8729,8 +8731,8 @@ fn read_plugin_json_lenient(dir: &Path) -> Option<plugin_host::package::PluginJs
 /// 已存在则校验完整性，版本更高才替换，否则不替换 → 最后刷新界面。
 async fn plugin_add_from_file(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let Some(path) = rfd::FileDialog::new()
-        .set_title("选择插件包（.zip）")
-        .add_filter("插件包", &["zip"])
+        .set_title(rcgui_i18n::t("选择插件包（.zip）"))
+        .add_filter(rcgui_i18n::t("插件包"), &["zip"])
         .pick_file()
     else {
         return;
@@ -8740,7 +8742,7 @@ async fn plugin_add_from_file(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let size = match std::fs::metadata(&path) {
         Ok(m) => m.len(),
         Err(e) => {
-            toast(ui, 2, format!("无法读取文件信息: {e}"));
+            toast(ui, 2, rcgui_i18n::f("无法读取文件信息: {}", &[&(e)]));
             return;
         }
     };
@@ -8752,7 +8754,7 @@ async fn plugin_add_from_file(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let data = match std::fs::read(&path) {
         Ok(d) => d,
         Err(e) => {
-            toast(ui, 2, format!("读取文件失败: {e}"));
+            toast(ui, 2, rcgui_i18n::f("读取文件失败: {}", &[&(e)]));
             return;
         }
     };
@@ -8778,15 +8780,15 @@ async fn plugin_add_from_file(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             toast(ui, 1, outcome.message());
             rescan_plugins(ctx, ui).await;
         }
-        Ok(Err(e)) => toast(ui, 2, format!("添加插件失败: {e:#}")),
-        Err(e) => toast(ui, 2, format!("安装线程异常: {e}")),
+        Ok(Err(e)) => toast(ui, 2, rcgui_i18n::f("添加插件失败: {}", &[&(format!("{:#}", e))])),
+        Err(e) => toast(ui, 2, rcgui_i18n::f("安装线程异常: {}", &[&(e)])),
     }
 }
 
 /// 选择一个**已解压**的插件文件夹并安装。
 async fn plugin_add_from_dir(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let Some(dir) = rfd::FileDialog::new()
-        .set_title("选择已解压的插件文件夹")
+        .set_title(rcgui_i18n::t("选择已解压的插件文件夹"))
         .pick_folder()
     else {
         return;
@@ -8810,8 +8812,8 @@ async fn plugin_add_from_dir(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             toast(ui, 1, outcome.message());
             rescan_plugins(ctx, ui).await;
         }
-        Ok(Err(e)) => toast(ui, 2, format!("添加插件失败: {e:#}")),
-        Err(e) => toast(ui, 2, format!("安装线程异常: {e}")),
+        Ok(Err(e)) => toast(ui, 2, rcgui_i18n::f("添加插件失败: {}", &[&(format!("{:#}", e))])),
+        Err(e) => toast(ui, 2, rcgui_i18n::f("安装线程异常: {}", &[&(e)])),
     }
 }
 
@@ -8901,7 +8903,7 @@ fn wire_callbacks(
                 }
             } else if let Some(local) = rfd::FileDialog::new()
                 .set_file_name(&row.name)
-                .set_title("保存文件到…")
+                .set_title(rcgui_i18n::t("保存文件到…"))
                 .save_file()
             {
                 let _ = tx.send(Cmd::FilesDownload {
@@ -8983,7 +8985,7 @@ fn wire_callbacks(
         move || {
             // 打开资源管理器选文件（rfd 的系统文件选择器）。多选是默认支持的。
             let paths = rfd::FileDialog::new()
-                .set_title("选择要上传的文件")
+                .set_title(rcgui_i18n::t("选择要上传的文件"))
                 .pick_files()
                 .unwrap_or_default();
             if paths.is_empty() {
@@ -9032,7 +9034,7 @@ fn wire_callbacks(
                 return;
             }
             // 与单行「下载到…」一致：选目录，不选文件名
-            if let Some(dir) = rfd::FileDialog::new().set_title("选择下载目录").pick_folder() {
+            if let Some(dir) = rfd::FileDialog::new().set_title(rcgui_i18n::t("选择下载目录")).pick_folder() {
                 let _ = tx.send(Cmd::FilesDownloadMany { items, dir });
             }
         }
@@ -9099,7 +9101,8 @@ fn wire_callbacks(
             let _ = tx.send(Cmd::LocalUpload { name, is_dir });
         }
     });
-    ui.on_files_crumb_nav({        let tx = tx.clone();
+    ui.on_files_crumb_nav({
+        let tx = tx.clone();
         let ui = ui.as_weak();
         move |path| {
             let Some(ui) = ui.upgrade() else { return };
@@ -9154,7 +9157,7 @@ fn wire_callbacks(
                 .map(|r| (r.name.to_string(), r.is_dir));
             let Some((name, is_dir)) = row else { return };
             if let Some(dir) = rfd::FileDialog::new()
-                .set_title("选择下载目录")
+                .set_title(rcgui_i18n::t("选择下载目录"))
                 .pick_folder()
             {
                 let _ = tx.send(Cmd::FilesDownloadToDir { name, dir, is_dir });
@@ -9232,7 +9235,7 @@ fn wire_callbacks(
             let lg = ui.global::<LocalG>();
             let dir = PathBuf::from(lg.get_path().to_string());
             if dir.as_os_str().is_empty() {
-                toast_ui(&ui, 2, "左侧本机目录还是空的，请先选择目录");
+                toast_ui(&ui, 2, rcgui_i18n::t("左侧本机目录还是空的，请先选择目录"));
                 return;
             }
             // 右键点的是已勾选的一行 → 下整组；否则只下这一行（修「多选只下一个」的 bug）
@@ -9432,7 +9435,7 @@ fn wire_callbacks(
             let lg = ui.global::<LocalG>();
             let dir = PathBuf::from(lg.get_path().to_string());
             if dir.as_os_str().is_empty() {
-                toast_ui(&ui, 2, "左侧本机目录还是空的，请先选择目录");
+                toast_ui(&ui, 2, rcgui_i18n::t("左侧本机目录还是空的，请先选择目录"));
                 return;
             }
             // 拖的是已勾选的行 → 整组；否则只拖这一行
@@ -9477,7 +9480,7 @@ fn wire_callbacks(
             let lg = ui.global::<LocalG>();
             let cur = PathBuf::from(lg.get_path().to_string());
             if cur.as_os_str().is_empty() {
-                toast_ui(&ui, 2, "请先在左侧选择一个本机目录");
+                toast_ui(&ui, 2, rcgui_i18n::t("请先在左侧选择一个本机目录"));
                 return;
             }
             // 拖的是已勾选的行 → 整组；否则只拖这一行
@@ -9955,9 +9958,9 @@ fn wire_callbacks(
                 .add_filter("rcgui.conf", &["conf"])
                 .set_file_name("rcgui.conf")
                 .set_title(if include_secrets {
-                    "导出 rcgui.conf（含凭据）"
+                    rcgui_i18n::t("导出 rcgui.conf（含凭据）")
                 } else {
-                    "导出 rcgui.conf（不含凭据）"
+                    rcgui_i18n::t("导出 rcgui.conf（不含凭据）")
                 })
                 .save_file()
             {
@@ -9970,7 +9973,7 @@ fn wire_callbacks(
         move || {
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter("rcgui.conf", &["conf", "json"])
-                .set_title("选择要导入的 rcgui.conf")
+                .set_title(rcgui_i18n::t("选择要导入的 rcgui.conf"))
                 .pick_file()
             {
                 let _ = tx.send(Cmd::ConfPreview { path });
@@ -9990,7 +9993,7 @@ fn wire_callbacks(
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter("rcgui.conf", &["conf"])
                 .set_file_name("rcgui.conf")
-                .set_title("导出 rcgui.conf（含凭据）")
+                .set_title(rcgui_i18n::t("导出 rcgui.conf（含凭据）"))
                 .save_file()
             {
                 let _ = tx.send(Cmd::ConfExport { path, include_secrets: true });
@@ -10096,8 +10099,8 @@ fn spawn_tray(ui: Weak<MainWindow>, tx: mpsc::UnboundedSender<Cmd>) {
 
             // 菜单：主界面 / 退出
             let menu = Menu::new();
-            let open_item = MenuItem::with_id("open", "主界面", true, None);
-            let quit_item = MenuItem::with_id("quit", "退出", true, None);
+            let open_item = MenuItem::with_id("open", rcgui_i18n::t("主界面"), true, None);
+            let quit_item = MenuItem::with_id("quit", rcgui_i18n::t("退出"), true, None);
             let _ = menu.append_items(&[&open_item, &quit_item]);
 
             // 关键：`_tray` 必须活到线程结束。写成 `let _tray` 会在作用域结束时
@@ -10125,12 +10128,10 @@ fn spawn_tray(ui: Weak<MainWindow>, tx: mpsc::UnboundedSender<Cmd>) {
                     // 放在 Low 目录下必失败；进程自身 IL 也随之是 0x1000。
                     // 注意 `Shell_NotifyIconW` 失败时并不保证刷新 last error，
                     // 所以 `os error 5` 只是「最可能」而非「必然」的取值。
-                    let msg = format!(
-                        "托盘图标注册失败（{e}）。若系统托盘里没有 RCGUI：\
+                    let msg = rcgui_i18n::f("托盘图标注册失败（{}）。若系统托盘里没有 RCGUI：\
                          通常是程序所在文件/目录被标记为低完整性（Low），\
                          或程序以受限权限运行。已尝试把文件与目录完整性调回普通级别，\
-                         若提示里出现「成功」，请**退出并重新启动本程序**后托盘才会出现。"
-                    );
+                         若提示里出现「成功」，请**退出并重新启动本程序**后托盘才会出现。", &[&(e)]);
                     tray_log(&format!("tray: build FAILED: {e}"));
                     // 自愈：exe 与目录都调回 Medium。
                     //

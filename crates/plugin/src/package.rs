@@ -71,33 +71,33 @@ impl PluginJson {
     /// 校验必需字段与取值合法性。
     pub fn validate(&self) -> Result<()> {
         if self.id.trim().is_empty() {
-            bail!("plugin.json 缺少 id");
+            bail!("{}", rcgui_i18n::t("plugin.json 缺少 id"));
         }
         // id 必须像反向域名，避免与 WASM 插件或其它包混淆
         if !self.id.contains('.') || self.id.contains(char::is_whitespace) {
-            bail!("plugin.json 的 id 格式不合法（应类似 com.example.plugin）：{}", self.id);
+            bail!("{}", rcgui_i18n::f("plugin.json 的 id 格式不合法（应类似 com.example.plugin）：{}", &[&(self.id)]));
         }
         if self.name.trim().is_empty() {
-            bail!("plugin.json 缺少 name");
+            bail!("{}", rcgui_i18n::t("plugin.json 缺少 name"));
         }
         if self.version.trim().is_empty() {
-            bail!("plugin.json 缺少 version");
+            bail!("{}", rcgui_i18n::t("plugin.json 缺少 version"));
         }
         Version::parse(self.version.trim())
-            .with_context(|| format!("plugin.json 的 version 不是合法语义化版本：{}", self.version))?;
+            .with_context(|| rcgui_i18n::f("plugin.json 的 version 不是合法语义化版本：{}", &[&(self.version)]))?;
         if !self.min_gui_version.trim().is_empty() {
             Version::parse(self.min_gui_version.trim()).with_context(|| {
-                format!("plugin.json 的 min_gui_version 不是合法语义化版本：{}", self.min_gui_version)
+                rcgui_i18n::f("plugin.json 的 min_gui_version 不是合法语义化版本：{}", &[&(self.min_gui_version)])
             })?;
         }
         if self.entry_file.trim().is_empty() {
-            bail!("plugin.json 缺少 entry_file");
+            bail!("{}", rcgui_i18n::t("plugin.json 缺少 entry_file"));
         }
         // 与 [`crate::config::PluginConfig::validate`] 一致：WASI 插件不挑平台，
         // `any`（或不填）与 `windows` 都放行，其余拒绝。
         let platform = self.platform.trim();
         if !platform.is_empty() && platform != "windows" && platform != "any" {
-            bail!("插件声明的平台不受支持：{platform}（仅支持 windows / any）");
+            bail!("{}", rcgui_i18n::f("插件声明的平台不受支持：{}（仅支持 windows / any）", &[&(platform)]));
         }
         Ok(())
     }
@@ -109,13 +109,9 @@ impl PluginJson {
         }
         let need = Version::parse(self.min_gui_version.trim())?;
         let have = Version::parse(gui_version.trim())
-            .with_context(|| format!("宿主版本号无法解析：{gui_version}"))?;
+            .with_context(|| rcgui_i18n::f("宿主版本号无法解析：{}", &[&(gui_version)]))?;
         if have < need {
-            bail!(
-                "插件需要宿主版本 >= {}，当前为 {}",
-                self.min_gui_version,
-                gui_version
-            );
+            bail!("{}", rcgui_i18n::f("插件需要宿主版本 >= {}，当前为 {}", &[&(self.min_gui_version), &(gui_version)]));
         }
         Ok(())
     }
@@ -146,13 +142,10 @@ pub fn parse_manifest(text: &str) -> Result<Vec<HashEntry>> {
         // 去掉 sha256sum 的二进制标记 "*"
         let path = rest.strip_prefix('*').unwrap_or(rest).trim();
         if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            bail!(
-                "manifest.sha256 第 {} 行的哈希不合法（应为 64 位十六进制）",
-                lineno + 1
-            );
+            bail!("{}", rcgui_i18n::f("manifest.sha256 第 {} 行的哈希不合法（应为 64 位十六进制）", &[&(lineno + 1)]));
         }
         if path.is_empty() {
-            bail!("manifest.sha256 第 {} 行缺少文件路径", lineno + 1);
+            bail!("{}", rcgui_i18n::f("manifest.sha256 第 {} 行缺少文件路径", &[&(lineno + 1)]));
         }
         out.push(HashEntry {
             sha256: hash.to_ascii_lowercase(),
@@ -160,7 +153,7 @@ pub fn parse_manifest(text: &str) -> Result<Vec<HashEntry>> {
         });
     }
     if out.is_empty() {
-        bail!("manifest.sha256 为空，无法校验插件完整性");
+        bail!("{}", rcgui_i18n::t("manifest.sha256 为空，无法校验插件完整性"));
     }
     Ok(out)
 }
@@ -181,29 +174,24 @@ pub struct VerifyReport {
 pub fn verify_dir(dir: &Path, pj: &PluginJson) -> Result<VerifyReport> {
     let mf = dir.join("manifest.sha256");
     let text = std::fs::read_to_string(&mf)
-        .with_context(|| format!("读取 manifest.sha256 失败: {}", mf.display()))?;
+        .with_context(|| rcgui_i18n::f("读取 manifest.sha256 失败: {}", &[&(mf.display())]))?;
     let entries = parse_manifest(&text)?;
 
     let entry_rel = pj.entry_file.replace('\\', "/");
     if !entries.iter().any(|e| e.path == entry_rel) {
-        bail!("manifest.sha256 未包含入口文件 {entry_rel}，拒绝加载");
+        bail!("{}", rcgui_i18n::f("manifest.sha256 未包含入口文件 {}，拒绝加载", &[&(entry_rel)]));
     }
 
     let mut verified = Vec::new();
     for e in &entries {
         let p = zip::safe_join(dir, &e.path)
-            .with_context(|| format!("manifest.sha256 中的路径不合法: {}", e.path))?;
+            .with_context(|| rcgui_i18n::f("manifest.sha256 中的路径不合法: {}", &[&(e.path)]))?;
         if !p.is_file() {
-            bail!("插件缺少清单中声明的文件: {}", e.path);
+            bail!("{}", rcgui_i18n::f("插件缺少清单中声明的文件: {}", &[&(e.path)]));
         }
         let got = zip::sha256_file(&p)?;
         if got != e.sha256 {
-            bail!(
-                "插件文件校验失败: {}\n  期望 {}\n  实际 {}",
-                e.path,
-                e.sha256,
-                got
-            );
+            bail!("{}", rcgui_i18n::f("插件文件校验失败: {}\n  期望 {}\n  实际 {}", &[&(e.path), &(e.sha256), &(got)]));
         }
         verified.push(e.path.clone());
     }
@@ -217,9 +205,9 @@ pub fn verify_dir(dir: &Path, pj: &PluginJson) -> Result<VerifyReport> {
 pub fn load_from_dir(dir: &Path, gui_version: &str) -> Result<(PluginJson, VerifyReport)> {
     let pj_path = dir.join("plugin.json");
     let text = std::fs::read_to_string(&pj_path)
-        .with_context(|| format!("读取 plugin.json 失败: {}", pj_path.display()))?;
+        .with_context(|| rcgui_i18n::f("读取 plugin.json 失败: {}", &[&(pj_path.display())]))?;
     let pj: PluginJson = serde_json::from_str(&text)
-        .with_context(|| format!("解析 plugin.json 失败: {}", pj_path.display()))?;
+        .with_context(|| rcgui_i18n::f("解析 plugin.json 失败: {}", &[&(pj_path.display())]))?;
     pj.validate()?;
     pj.compatible_with(gui_version)?;
     let report = verify_dir(dir, &pj)?;
@@ -278,8 +266,8 @@ pub fn scan_dir(root: &Path, gui_version: &str) -> (Vec<InstalledPlugin>, Vec<(P
 /// 从 zip 字节流读取插件元数据（不落盘）。
 pub fn peek_zip_meta(data: &[u8]) -> Result<PluginJson> {
     let (_name, content) = zip::find_plugin_json(data)?
-        .ok_or_else(|| anyhow!("压缩包内未找到 plugin.json，这不是一个插件包"))?;
-    let pj: PluginJson = serde_json::from_slice(&content).context("解析 plugin.json 失败")?;
+        .ok_or_else(|| anyhow!("{}", rcgui_i18n::t("压缩包内未找到 plugin.json，这不是一个插件包")))?;
+    let pj: PluginJson = serde_json::from_slice(&content).context(rcgui_i18n::t("解析 plugin.json 失败"))?;
     pj.validate()?;
     Ok(pj)
 }
@@ -317,15 +305,15 @@ pub enum InstallOutcome {
 impl InstallOutcome {
     pub fn message(&self) -> String {
         match self {
-            InstallOutcome::Added { id, version } => format!("已添加插件 {id} v{version}"),
+            InstallOutcome::Added { id, version } => rcgui_i18n::f("已添加插件 {} v{}", &[&(id), &(version)]),
             InstallOutcome::Upgraded { id, from, to } => {
-                format!("已更新插件 {id}：v{from} → v{to}")
+                rcgui_i18n::f("已更新插件 {}：v{} → v{}", &[&(id), &(from), &(to)])
             }
             InstallOutcome::Kept {
                 id,
                 installed,
                 offered,
-            } => format!("插件 {id} 已安装 v{installed}，来源版本 v{offered} 不更高，未替换"),
+            } => rcgui_i18n::f("插件 {} 已安装 v{}，来源版本 v{} 不更高，未替换", &[&(id), &(installed), &(offered)]),
         }
     }
 }
@@ -333,16 +321,10 @@ impl InstallOutcome {
 /// 检查来源文件大小是否合理。
 pub fn check_source_size(bytes: u64) -> Result<()> {
     if bytes < MIN_PACKAGE_BYTES {
-        bail!(
-            "文件太小（{bytes} 字节），不像是一个插件包（至少 {MIN_PACKAGE_BYTES} 字节）"
-        );
+        bail!("{}", rcgui_i18n::f("文件太小（{} 字节），不像是一个插件包（至少 {} 字节）", &[&(bytes), &(MIN_PACKAGE_BYTES)]));
     }
     if bytes > MAX_PACKAGE_BYTES {
-        bail!(
-            "文件太大（{} MB），超过上限 {} MB，拒绝处理",
-            bytes / 1024 / 1024,
-            MAX_PACKAGE_BYTES / 1024 / 1024
-        );
+        bail!("{}", rcgui_i18n::f("文件太大（{} MB），超过上限 {} MB，拒绝处理", &[&(bytes / 1024 / 1024), &(MAX_PACKAGE_BYTES / 1024 / 1024)]));
     }
     Ok(())
 }
@@ -381,7 +363,7 @@ pub fn install_verified_dir(
             let backup = plugins_root.join(format!("{}.old-{}", sanitize_dir_name(&meta.id), std::process::id()));
             let _ = std::fs::remove_dir_all(&backup);
             std::fs::rename(&dest, &backup)
-                .with_context(|| format!("备份旧版本失败: {}", dest.display()))?;
+                .with_context(|| rcgui_i18n::f("备份旧版本失败: {}", &[&(dest.display())]))?;
             match copy_dir(src_dir, &dest) {
                 Ok(()) => {
                     let _ = std::fs::remove_dir_all(&backup);
@@ -395,7 +377,7 @@ pub fn install_verified_dir(
                     // 回滚，保证用户原有的插件不被破坏
                     let _ = std::fs::remove_dir_all(&dest);
                     let _ = std::fs::rename(&backup, &dest);
-                    Err(e.context("替换插件失败，已回滚到旧版本"))
+                    Err(e.context(rcgui_i18n::t("替换插件失败，已回滚到旧版本")))
                 }
             }
         }
@@ -460,7 +442,7 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
             copy_dir(&from, &to)?;
         } else {
             std::fs::copy(&from, &to)
-                .with_context(|| format!("复制失败: {}", from.display()))?;
+                .with_context(|| rcgui_i18n::f("复制失败: {}", &[&(from.display())]))?;
         }
     }
     Ok(())
@@ -491,7 +473,7 @@ pub fn sanitize_dir_name(id: &str) -> String {
 pub fn run_entry_file(pkg_dir: &Path, meta: &PluginJson) -> Result<i32> {
     let entry = zip::safe_join(pkg_dir, &meta.entry_file)?;
     if !entry.is_file() {
-        bail!("入口文件不存在: {}", entry.display());
+        bail!("{}", rcgui_i18n::f("入口文件不存在: {}", &[&(entry.display())]));
     }
     let ext = entry
         .extension()
@@ -522,9 +504,7 @@ pub fn run_entry_file(pkg_dir: &Path, meta: &PluginJson) -> Result<i32> {
                 .arg(&entry);
             c
         }
-        other => bail!(
-            "不支持的入口文件类型: .{other}（支持 msi / exe / bat / cmd / ps1）"
-        ),
+        other => bail!("{}", rcgui_i18n::f("不支持的入口文件类型: .{}（支持 msi / exe / bat / cmd / ps1）", &[&(other)])),
     };
 
     cmd.args(&meta.entry_args);
@@ -538,7 +518,7 @@ pub fn run_entry_file(pkg_dir: &Path, meta: &PluginJson) -> Result<i32> {
     }
     let status = cmd
         .status()
-        .with_context(|| format!("启动入口文件失败: {}", entry.display()))?;
+        .with_context(|| rcgui_i18n::f("启动入口文件失败: {}", &[&(entry.display())]))?;
     Ok(status.code().unwrap_or(-1))
 }
 

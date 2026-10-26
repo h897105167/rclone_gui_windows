@@ -17,7 +17,7 @@ fn main() {
     });
     let gui_version = args.next().unwrap_or_else(|| "0.1.0".to_string());
 
-    let data = std::fs::read(&zip_path).expect("读取 zip 失败");
+    let data = std::fs::read(&zip_path).expect(rcgui_i18n::t("读取 zip 失败"));
     println!("zip 大小: {} 字节", data.len());
 
     // 1) 大小检查
