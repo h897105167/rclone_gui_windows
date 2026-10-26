@@ -54,7 +54,7 @@ impl CapProvider for StubCaps {
             "fs.read_b64" => Ok(json!({ "b64": "", "bytes": 0 })),
             "rclone.cat" => Ok(json!({ "b64": "", "content_type": "image/png" })),
             "ui.copy" => Ok(json!({ "ok": true })),
-            other => Ok(json!({ "ok": false, "error": format!("桩未实现 {other}") })),
+            other => Ok(json!({ "ok": false, "error": rcgui_i18n::f("桩未实现 {}", &[&(other)]) })),
         }
     }
 }
@@ -69,11 +69,7 @@ fn assets_dir() -> PathBuf {
 #[tokio::test]
 async fn shipped_plugins_answer_state_with_panel_body() {
     let root = assets_dir();
-    assert!(
-        root.is_dir(),
-        "随包插件目录不存在: {}（先跑 scripts/fetch_plugins.ps1）",
-        root.display()
-    );
+    assert!(root.is_dir(), "{}", rcgui_i18n::f("随包插件目录不存在: {}（先跑 scripts/fetch_plugins.ps1）", &[&(root.display())]));
 
     let mut checked = 0usize;
     let mut entries: Vec<_> = std::fs::read_dir(&root)
@@ -101,11 +97,7 @@ async fn shipped_plugins_answer_state_with_panel_body() {
 
         // 1) manifest 能取回来，且 id 与 config.json 一致
         let manifest = host.load_manifest(&wasm).await.unwrap();
-        assert_eq!(
-            manifest.id, cfg.id,
-            "{}: manifest.id 与 config.json 的 id 不一致",
-            cfg.id
-        );
+        assert_eq!(manifest.id, cfg.id, "{}", rcgui_i18n::f("{}: manifest.id 与 config.json 的 id 不一致", &[&(cfg.id)]));
 
         // 2) 面板 `state` 动作回了一个可渲染的 body
         let out = host
@@ -118,20 +110,16 @@ async fn shipped_plugins_answer_state_with_panel_body() {
                 &allowed,
             )
             .await
-            .unwrap_or_else(|e| panic!("{}: state 调用失败: {e}", cfg.id));
+            .unwrap_or_else(|e| panic("{}", rcgui_i18n::f("{}: state 调用失败: {}", &[&(cfg.id), &(e)])));
 
         let body = out
             .get("body")
-            .unwrap_or_else(|| panic!("{}: state 没有 result.body，实际: {out}", cfg.id));
+            .unwrap_or_else(|| panic("{}", rcgui_i18n::f("{}: state 没有 result.body，实际: {}", &[&(cfg.id), &(out)])));
 
         // 面板渲染只认这几样；至少 status 或 checks 之一要出现，否则用户看到空面板
         let has_status = body.get("status").and_then(|v| v.as_str()).is_some();
         let has_checks = body.get("checks").and_then(|v| v.as_array()).is_some();
-        assert!(
-            has_status || has_checks,
-            "{}: 面板 body 既没有 status 也没有 checks: {body}",
-            cfg.id
-        );
+        assert!(has_status || has_checks, "{}", rcgui_i18n::f("{}: 面板 body 既没有 status 也没有 checks: {}", &[&(cfg.id), &(body)]));
 
         // 3) 未知动作不许 panic，要回错误（面板可能把 error 放在 body 里，也可能给 4xx 状态）
         let bad = host
@@ -153,11 +141,7 @@ async fn shipped_plugins_answer_state_with_panel_body() {
                     .and_then(|l| l.as_str())
                     .is_some_and(|l| l == "err");
                 let text = v.to_string();
-                assert!(
-                    status_bad || bad_lamp || text.contains("\"error\""),
-                    "{}: 未知动作应当明确报错，实际: {v}",
-                    cfg.id
-                );
+                assert!(status_bad || bad_lamp || text.contains("\"error\""), "{}", rcgui_i18n::f("{}: 未知动作应当明确报错，实际: {}", &[&(cfg.id), &(v)]));
             }
             Err(_) => { /* 宿主层报错也算拒绝，可接受 */ }
         }
@@ -165,5 +149,5 @@ async fn shipped_plugins_answer_state_with_panel_body() {
         checked += 1;
     }
 
-    assert!(checked > 0, "随包插件目录里一个可加载的插件都没有");
+    assert!(checked > 0, "{}", rcgui_i18n::t("随包插件目录里一个可加载的插件都没有"));
 }

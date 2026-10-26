@@ -99,7 +99,7 @@ pub trait CapProvider: Send + Sync {
     ///
     /// 默认实现返回错误：让不关心新能力的旧实现（以及测试桩）继续可用。
     async fn cap_call(&self, op: &str, params: Value) -> Result<Value> {
-        Err(anyhow!("宿主未实现能力: {op}（参数 {params}）"))
+        Err(anyhow!("{}", rcgui_i18n::f("宿主未实现能力: {}（参数 {}）", &[&(op), &(params)])))
     }
 
     /// 让宿主弹一个通知（插件主动推送，不需要返回值）。
@@ -144,14 +144,12 @@ impl Allowed {
             Allowed::Unrestricted => None,
             Allowed::Groups(groups) => {
                 let Some(g) = group else {
-                    return Some(format!("宿主不认识的能力: {op}"));
+                    return Some(rcgui_i18n::f("宿主不认识的能力: {}", &[&(op)]));
                 };
                 if groups.iter().any(|c| c == g) {
                     None
                 } else {
-                    Some(format!(
-                        "插件未在 config.json 的 capabilities 里声明「{g}」，拒绝执行 {op}"
-                    ))
+                    Some(rcgui_i18n::f("插件未在 config.json 的 capabilities 里声明「{}」，拒绝执行 {}", &[&(g), &(op)]))
                 }
             }
         }
@@ -193,7 +191,7 @@ impl PluginHost {
     async fn module_for(&self, path: &Path) -> Result<Module> {
         let meta = tokio::fs::metadata(path)
             .await
-            .map_err(|e| anyhow!("读取插件失败 {}: {e}", path.display()))?;
+            .map_err(|e| anyhow!("{}", rcgui_i18n::f("读取插件失败 {}: {}", &[&(path.display()), &(e)])))?;
         let mtime = meta.modified()?;
         let cached = {
             let guard = self.cache.lock().unwrap();
@@ -209,7 +207,7 @@ impl PluginHost {
         let engine = self.engine.clone();
         let module = tokio::task::spawn_blocking(move || Module::from_file(&engine, &p))
             .await
-            .map_err(|e| anyhow!("wasm 编译线程异常: {e}"))??;
+            .map_err(|e| anyhow!("{}", rcgui_i18n::f("wasm 编译线程异常: {}", &[&(e)])))??;
         self.cache
             .lock()
             .unwrap()
@@ -223,7 +221,7 @@ impl PluginHost {
         let m = out.get("manifest").cloned().unwrap_or(Value::Null);
         let manifest: PluginManifest = serde_json::from_value(m)?;
         if manifest.id.is_empty() {
-            bail!("插件 manifest 缺少 id");
+            bail!("{}", rcgui_i18n::t("插件 manifest 缺少 id"));
         }
         Ok(manifest)
     }
@@ -269,9 +267,9 @@ impl PluginHost {
             let module = self.module_for(wasm).await?;
             let out = run_module(&self.engine, &module, serde_json::to_vec(&req)?).await?;
             let raw: Value = serde_json::from_slice(&out)
-                .map_err(|e| anyhow!("插件输出解析失败: {e}；输出片段: {}", String::from_utf8_lossy(&out).chars().take(300).collect::<String>()))?;
+                .map_err(|e| anyhow!("{}", rcgui_i18n::f("插件输出解析失败: {}；输出片段: {}", &[&(e), &(String::from_utf8_lossy(&out).chars().take(300).collect::<String>())])))?;
             if let Some(err) = raw.get("error") {
-                bail!("插件错误: {}", err.get("message").and_then(|m| m.as_str()).unwrap_or("未知"));
+                bail!("{}", rcgui_i18n::f("插件错误: {}", &[&(err.get("message").and_then(|m| m.as_str()).unwrap_or(rcgui_i18n::t("未知")))]));
             }
             // manifest 响应不走 result 协议，原样返回
             if method == "manifest" {
@@ -279,7 +277,7 @@ impl PluginHost {
             }
             let resp: PluginResponse = serde_json::from_value(raw)?;
             if !resp.need.is_empty() {
-                let caps = caps.as_ref().ok_or_else(|| anyhow!("插件请求能力但没有提供者"))?;
+                let caps = caps.as_ref().ok_or_else(|| anyhow!("{}", rcgui_i18n::t("插件请求能力但没有提供者")))?;
                 let mut prov = serde_json::Map::new();
                 for n in resp.need {
                     let key = if n.key.is_empty() { n.cap.clone() } else { n.key };
@@ -315,15 +313,15 @@ impl PluginHost {
                 continue;
             }
             if !resp.ops.is_empty() {
-                let caps = caps.as_ref().ok_or_else(|| anyhow!("插件返回 ops 但没有能力提供者"))?;
+                let caps = caps.as_ref().ok_or_else(|| anyhow!("{}", rcgui_i18n::t("插件返回 ops 但没有能力提供者")))?;
                 exec_ops(&resp.ops, caps, plugin_id, allowed).await?;
             }
             if let Some(result) = resp.result {
                 return Ok(result);
             }
-            bail!("插件未返回 result");
+            bail!("{}", rcgui_i18n::t("插件未返回 result"));
         }
-        bail!("插件能力协商轮次超限（{MAX_ROUNDS}）")
+        bail!("{}", rcgui_i18n::f("插件能力协商轮次超限（{}）", &[&(MAX_ROUNDS)]))
     }
 }
 
@@ -394,8 +392,8 @@ async fn run_module(engine: &Engine, module: &Module, stdin: Vec<u8>) -> Result<
         .spawn(move || {
             let _ = tx.send(run_module_sync(&engine, &module, stdin));
         })
-        .map_err(|e| anyhow!("无法启动插件执行线程: {e}"))?;
-    rx.await.map_err(|e| anyhow!("插件执行线程异常退出: {e}"))?
+        .map_err(|e| anyhow!("{}", rcgui_i18n::f("无法启动插件执行线程: {}", &[&(e)])))?;
+    rx.await.map_err(|e| anyhow!("{}", rcgui_i18n::f("插件执行线程异常退出: {}", &[&(e)])))?
 }
 
 fn run_module_sync(engine: &Engine, module: &Module, stdin: Vec<u8>) -> Result<Vec<u8>> {
@@ -423,15 +421,15 @@ fn run_module_sync(engine: &Engine, module: &Module, stdin: Vec<u8>) -> Result<V
     let instance = linker.instantiate(&mut store, module)?;
     let start = instance
         .get_typed_func::<(), ()>(&mut store, "_start")
-        .map_err(|e| anyhow!("插件缺少 _start 导出: {e}"))?;
+        .map_err(|e| anyhow!("{}", rcgui_i18n::f("插件缺少 _start 导出: {}", &[&(e)])))?;
     if let Err(e) = start.call(&mut store, ()) {
         let err_bytes = stderr.contents();
         let err_text = String::from_utf8_lossy(&err_bytes);
         // fuel 耗尽时 wasmtime 报 "all fuel consumed"；给出更可读的提示
         if format!("{e}").contains("fuel") {
-            bail!("插件执行超出资源上限，已中止（可能存在死循环或过度计算）\n插件 stderr: {err_text}");
+            bail!("{}", rcgui_i18n::f("插件执行超出资源上限，已中止（可能存在死循环或过度计算）\n插件 stderr: {}", &[&(err_text)]));
         }
-        bail!("插件运行失败: {e}\n插件 stderr: {err_text}");
+        bail!("{}", rcgui_i18n::f("插件运行失败: {}\n插件 stderr: {}", &[&(e), &(err_text)]));
     }
     Ok(stdout.contents().to_vec())
 }

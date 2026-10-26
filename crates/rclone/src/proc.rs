@@ -71,7 +71,7 @@ pub fn discover_exe(custom: Option<&str>) -> anyhow::Result<PathBuf> {
             return Ok(p);
         }
     }
-    Err(anyhow!("未找到 rclone.exe，请确认已安装并加入 PATH"))
+    Err(anyhow!("{}", rcgui_i18n::t("未找到 rclone.exe，请确认已安装并加入 PATH")))
 }
 
 /// 连接发布器：只负责「把可用的客户端放到共享连接状态里」。
@@ -105,7 +105,7 @@ impl RcloneManager {
             Ok(v) => v,
             Err(e) => {
                 self.rc.set_disconnected(Some(e.describe())).await;
-                return Err(anyhow!("连接已有 rclone 失败: {e}"));
+                return Err(anyhow!("{}", rcgui_i18n::f("连接已有 rclone 失败: {}", &[&(e)])));
             }
         };
         self.rc.set_connected(client).await;

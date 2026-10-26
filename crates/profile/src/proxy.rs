@@ -140,11 +140,13 @@ impl ProxyKey {
     }
 
     /// 面向用户的键名。**不携带值**，避免把凭据带进提示。
-    pub const fn label(self) -> &'static str {
+    ///
+    /// 不是 `const fn`：文案要经过翻译表查表，无法在编译期求值。
+    pub fn label(self) -> &'static str {
         match self {
             Self::Override => "override.http_proxy",
-            Self::NativeHttp => "原生 http_proxy",
-            Self::NativeSocks => "原生 socks_proxy",
+            Self::NativeHttp => rcgui_i18n::t("原生 http_proxy"),
+            Self::NativeSocks => rcgui_i18n::t("原生 socks_proxy"),
         }
     }
 
@@ -276,20 +278,20 @@ impl ProxyProfile {
     /// 以为存进去的是他写的值，而实际落盘的是另一样东西。
     pub fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
-            return Err("代理配置名称不能为空".into());
+            return Err(rcgui_i18n::t("代理配置名称不能为空").into());
         }
         let host = self.host.trim();
         if host.is_empty() {
-            return Err("代理地址不能为空".into());
+            return Err(rcgui_i18n::t("代理地址不能为空").into());
         }
         if host.contains(' ') {
-            return Err("代理地址不能包含空格".into());
+            return Err(rcgui_i18n::t("代理地址不能包含空格").into());
         }
         if host.contains("://") {
-            return Err("代理地址只填主机名或 IP，不要带 http:// 之类的前缀".into());
+            return Err(rcgui_i18n::t("代理地址只填主机名或 IP，不要带 http:// 之类的前缀").into());
         }
         if host.contains('[') || host.contains(']') {
-            return Err("IPv6 地址请直接填写，不要带方括号".into());
+            return Err(rcgui_i18n::t("IPv6 地址请直接填写，不要带方括号").into());
         }
         // 域名/主机名/点分 IPv4 可以用字母数字与 . - _ 以及 IPv6 的冒号
         let looks_v6 = host.contains(':');
@@ -298,18 +300,18 @@ impl ProxyProfile {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
         {
-            return Err("代理地址包含非法字符".into());
+            return Err(rcgui_i18n::t("代理地址包含非法字符").into());
         }
         if looks_v6 && host.parse::<std::net::Ipv6Addr>().is_err() {
-            return Err("IPv6 地址格式不正确".into());
+            return Err(rcgui_i18n::t("IPv6 地址格式不正确").into());
         }
         if self.port == 0 {
-            return Err("端口必须在 1–65535 之间".into());
+            return Err(rcgui_i18n::t("端口必须在 1–65535 之间").into());
         }
         // 用户名和密码：只要有一个非空就当作「要认证」，
         // 但不允许密码里有裸的换行（会破坏 conf 文件的行结构）
         if self.pass.contains(['\n', '\r']) || self.user.contains(['\n', '\r']) {
-            return Err("代理账号/密码不能包含换行".into());
+            return Err(rcgui_i18n::t("代理账号/密码不能包含换行").into());
         }
         Ok(())
     }
@@ -387,13 +389,13 @@ impl ProxyProfile {
         self.validate()?;
         if self.user.contains('@') || self.pass.contains('@') {
             return Err(
-                "ftp / sftp 的原生 socks_proxy 不支持账号或密码里的「@」：rclone 会在第一个 @ 处切分，且不做 URL 解码"
+                rcgui_i18n::t("ftp / sftp 的原生 socks_proxy 不支持账号或密码里的「@」：rclone 会在第一个 @ 处切分，且不做 URL 解码")
                     .into(),
             );
         }
         if self.user.contains(':') {
             return Err(
-                "ftp / sftp 的原生 socks_proxy 不支持用户名里的「:」：rclone 用它分隔用户名与密码"
+                rcgui_i18n::t("ftp / sftp 的原生 socks_proxy 不支持用户名里的「:」：rclone 用它分隔用户名与密码")
                     .into(),
             );
         }

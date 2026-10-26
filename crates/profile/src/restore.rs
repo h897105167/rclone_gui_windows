@@ -13,22 +13,22 @@ use crate::ProfileDoc;
 /// 生成脚本正文。`endpoint_hint` 只用于注释与参数默认值，凭据一律不写入。
 pub fn generate(doc: &ProfileDoc, endpoint_hint: &str) -> String {
     let name = if doc.meta.name.is_empty() {
-        "默认档案".to_string()
+        rcgui_i18n::t("默认档案").to_string()
     } else {
         doc.meta.name.clone()
     };
     let mut s = String::new();
-    s.push_str("# RCGUI 恢复脚本（由 RCGUI 自动生成，请勿手工修改）\n");
-    s.push_str(&format!("# 档案：{name}\n"));
-    s.push_str(&format!("# 生成时间：{}\n", crate::now_iso()));
+    s.push_str(rcgui_i18n::t("# RCGUI 恢复脚本（由 RCGUI 自动生成，请勿手工修改）\n"));
+    s.push_str(&rcgui_i18n::f("# 档案：{}\n", &[&(name)]));
+    s.push_str(&rcgui_i18n::f("# 生成时间：{}\n", &[&(crate::now_iso())]));
     s.push_str("#\n");
-    s.push_str("# 本脚本只连接**已经在运行**且启用了 RC 的 rclone：\n");
-    s.push_str("#   * 不会启动、停止或重启 rclone；\n");
-    s.push_str("#   * 不会创建开机启动项或计划任务；\n");
-    s.push_str("#   * 不内置 RC 密码（用 -RcUser / -RcPass 或环境变量 RCGUI_RC_USER / RCGUI_RC_PASS）；\n");
-    s.push_str("#   * serve 密码不内置（用 -ServePasses 传入，缺失则跳过该项并告警）。\n");
+    s.push_str(rcgui_i18n::t("# 本脚本只连接**已经在运行**且启用了 RC 的 rclone：\n"));
+    s.push_str(rcgui_i18n::t("#   * 不会启动、停止或重启 rclone；\n"));
+    s.push_str(rcgui_i18n::t("#   * 不会创建开机启动项或计划任务；\n"));
+    s.push_str(rcgui_i18n::t("#   * 不内置 RC 密码（用 -RcUser / -RcPass 或环境变量 RCGUI_RC_USER / RCGUI_RC_PASS）；\n"));
+    s.push_str(rcgui_i18n::t("#   * serve 密码不内置（用 -ServePasses 传入，缺失则跳过该项并告警）。\n"));
     s.push_str("#\n");
-    s.push_str("# 用法示例：\n");
+    s.push_str(rcgui_i18n::t("# 用法示例：\n"));
     s.push_str(&format!(
         "#   .\\restore.ps1 -Endpoint {} -RcUser <user>\n",
         ps_quote(endpoint_hint)
@@ -47,61 +47,37 @@ pub fn generate(doc: &ProfileDoc, endpoint_hint: &str) -> String {
     s.push_str(HEADER_FUNCS);
 
     // ---- 挂载（保持保存顺序）----
-    s.push_str("\n# ---------------- 挂载（按保存顺序） ----------------\n");
+    s.push_str(rcgui_i18n::t("\n# ---------------- 挂载（按保存顺序） ----------------\n"));
     let mut any_mount = false;
     for m in &doc.mounts {
         if !m.enabled {
-            s.push_str(&format!(
-                "# 跳过（已停用）：{} -> {}\n",
-                ps_comment(&compose_fs(&m.remote, &m.sub_path)),
-                ps_comment(&m.point)
-            ));
+            s.push_str(&rcgui_i18n::f("# 跳过（已停用）：{} -> {}\n", &[&(ps_comment(&compose_fs(&m.remote, &m.sub_path))), &(ps_comment(&m.point))]));
             continue;
         }
         any_mount = true;
-        s.push_str(&format!(
-            "# 挂载 {}\n$p = @{{ fs = {}; mountPoint = {}; vfs_cache_mode = {}; read_only = ${} }}\nInvoke-Rc -Method 'mount/mount' -Params $p\n",
-            ps_comment(&compose_fs(&m.remote, &m.sub_path)),
-            ps_quote(&compose_fs(&m.remote, &m.sub_path)),
-            ps_quote(&m.point),
-            ps_quote(if m.cache.is_empty() { "writes" } else { &m.cache }),
-            if m.ro { "true" } else { "false" }
-        ));
+        s.push_str(&rcgui_i18n::f("# 挂载 {}\n$p = @{{ fs = {}; mountPoint = {}; vfs_cache_mode = {}; read_only = ${} }}\nInvoke-Rc -Method 'mount/mount' -Params $p\n", &[&(ps_comment(&compose_fs(&m.remote, &m.sub_path))), &(ps_quote(&compose_fs(&m.remote, &m.sub_path))), &(ps_quote(&m.point)), &(ps_quote(if m.cache.is_empty() { "writes" } else { &m.cache })), &(if m.ro { "true" } else { "false" })]));
     }
     if !any_mount {
-        s.push_str("# （本档案没有启用的挂载）\n");
+        s.push_str(rcgui_i18n::t("# （本档案没有启用的挂载）\n"));
     }
 
     // ---- 服务 ----
-    s.push_str("\n# ---------------- 服务（按保存顺序） ----------------\n");
+    s.push_str(rcgui_i18n::t("\n# ---------------- 服务（按保存顺序） ----------------\n"));
     let mut any_serve = false;
     for sv in &doc.serves {
         if !sv.enabled {
-            s.push_str(&format!(
-                "# 跳过（已停用）：{} {}\n",
-                ps_comment(&sv.stype),
-                ps_comment(&sv.addr)
-            ));
+            s.push_str(&rcgui_i18n::f("# 跳过（已停用）：{} {}\n", &[&(ps_comment(&sv.stype)), &(ps_comment(&sv.addr))]));
             continue;
         }
         any_serve = true;
         let key = format!("{}@{}", sv.stype, sv.addr);
-        s.push_str(&format!(
-            "# 启动 {} 服务于 {}（密码从 -ServePasses 取，缺失则跳过）\n$key = {}\nif ($ServePasses.ContainsKey($key)) {{\n    $p = @{{ type = {}; fs = {}; addr = {}; user = {}; pass = $ServePasses[$key] }}\n}} else {{\n    Write-Warning (\"缺少 serve 密码，已跳过：\" + $key)\n    $p = $null\n}}\nif ($null -ne $p) {{ Invoke-Rc -Method 'serve/start' -Params $p }}\n",
-            ps_comment(&sv.stype),
-            ps_comment(&sv.addr),
-            ps_quote(&key),
-            ps_quote(&sv.stype),
-            ps_quote(&compose_fs(&sv.remote, &sv.sub_path)),
-            ps_quote(&sv.addr),
-            ps_quote(&sv.user)
-        ));
+        s.push_str(&rcgui_i18n::f("# 启动 {} 服务于 {}（密码从 -ServePasses 取，缺失则跳过）\n$key = {}\nif ($ServePasses.ContainsKey($key)) {{\n    $p = @{{ type = {}; fs = {}; addr = {}; user = {}; pass = $ServePasses[$key] }}\n}} else {{\n    Write-Warning (\"缺少 serve 密码，已跳过：\" + $key)\n    $p = $null\n}}\nif ($null -ne $p) {{ Invoke-Rc -Method 'serve/start' -Params $p }}\n", &[&(ps_comment(&sv.stype)), &(ps_comment(&sv.addr)), &(ps_quote(&key)), &(ps_quote(&sv.stype)), &(ps_quote(&compose_fs(&sv.remote, &sv.sub_path))), &(ps_quote(&sv.addr)), &(ps_quote(&sv.user))]));
     }
     if !any_serve {
-        s.push_str("# （本档案没有启用的服务）\n");
+        s.push_str(rcgui_i18n::t("# （本档案没有启用的服务）\n"));
     }
 
-    s.push_str("\nWrite-Host 'RCGUI 恢复完成（未启动/停止任何 rclone 进程）'\n");
+    s.push_str(rcgui_i18n::t("\nWrite-Host 'RCGUI 恢复完成（未启动/停止任何 rclone 进程）'\n"));
     s
 }
 

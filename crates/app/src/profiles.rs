@@ -85,17 +85,14 @@ pub fn load_doc(legacy: &AppConfig) -> Option<ProfileDoc> {
                 && doc.proxies.is_empty();
             if !empty {
                 match s.save(&doc) {
-                    Ok(()) => notice(format!(
-                        "已把挂载/服务预设迁移到档案：{}",
-                        s.path().display()
-                    )),
-                    Err(e) => notice(format!("档案初始化失败（{e}），本次改动仅保存在内存")),
+                    Ok(()) => notice(rcgui_i18n::f("已把挂载/服务预设迁移到档案：{}", &[&(s.path().display())])),
+                    Err(e) => notice(rcgui_i18n::f("档案初始化失败（{}），本次改动仅保存在内存", &[&(e)])),
                 }
             }
             Some(doc)
         }
         Err(e) => {
-            notice(format!("{e}；本次不会写回档案，请处理后重启"));
+            notice(rcgui_i18n::f("{}；本次不会写回档案，请处理后重启", &[&(e)]));
             None
         }
     }
@@ -301,7 +298,7 @@ fn connections_from_cfg(cfg: &AppConfig, doc: &ProfileDoc) -> Vec<ConnectionProf
             .connections
             .first()
             .map(|x| x.name.clone())
-            .unwrap_or_else(|| "本机".to_string()),
+            .unwrap_or_else(|| rcgui_i18n::t("本机").to_string()),
         // 新模型没有「托管模式」：一律按「连接已有实例」记录
         mode: 1,
         url: cfg.rclone.url.clone(),

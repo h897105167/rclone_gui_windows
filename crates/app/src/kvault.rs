@@ -223,11 +223,11 @@ impl KvCfg {
     /// 上传是否具备最小条件（有站点地址 + 令牌）。返回 `Err` 时是给用户看的中文原因。
     pub fn upload_ready(&self) -> Result<(), String> {
         if self.base.trim().is_empty() {
-            return Err("K-Vault 远程没有站点地址".into());
+            return Err(rcgui_i18n::t("K-Vault 远程没有站点地址").into());
         }
         if self.token.trim().is_empty() {
             return Err(
-                "K-Vault 上传需要 API 访问令牌（WebDAV 通道只读）。请编辑该远程填入令牌。".into(),
+                rcgui_i18n::t("K-Vault 上传需要 API 访问令牌（WebDAV 通道只读）。请编辑该远程填入令牌。").into(),
             );
         }
         Ok(())
@@ -240,7 +240,7 @@ fn http_client(timeout: Duration) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(timeout)
         .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))
+        .map_err(|e| rcgui_i18n::f("创建 HTTP 客户端失败: {}", &[&(e)]))
 }
 
 /// 探活 + 读令牌信息：`GET /api/health` 判站点是否在，`GET /api/v1/me` 判令牌与策略。
@@ -250,10 +250,10 @@ fn http_client(timeout: Duration) -> Result<reqwest::Client, String> {
 pub async fn probe(base: &str, token: &str) -> Result<Probe, String> {
     let base = normalize_base(base);
     if base.is_empty() {
-        return Err("站点地址不能为空".into());
+        return Err(rcgui_i18n::t("站点地址不能为空").into());
     }
     if !(base.starts_with("http://") || base.starts_with("https://")) {
-        return Err("站点地址要以 http:// 或 https:// 开头".into());
+        return Err(rcgui_i18n::t("站点地址要以 http:// 或 https:// 开头").into());
     }
     let http = http_client(Duration::from_secs(15))?;
 
@@ -261,11 +261,11 @@ pub async fn probe(base: &str, token: &str) -> Result<Probe, String> {
         .get(format!("{base}/api/health"))
         .send()
         .await
-        .map_err(|e| format!("站点不可达: {e}"))?;
+        .map_err(|e| rcgui_i18n::f("站点不可达: {}", &[&(e)]))?;
     let status = health.status().as_u16();
     let body = health.text().await.unwrap_or_default();
     if status >= 400 {
-        return Err(format!("健康检查失败 · {}", api_error(status, &body)));
+        return Err(rcgui_i18n::f("健康检查失败 · {}", &[&(api_error(status, &body))]));
     }
 
     if token.trim().is_empty() {
@@ -277,14 +277,14 @@ pub async fn probe(base: &str, token: &str) -> Result<Probe, String> {
         .bearer_auth(token.trim())
         .send()
         .await
-        .map_err(|e| format!("读取令牌信息失败: {e}"))?;
+        .map_err(|e| rcgui_i18n::f("读取令牌信息失败: {}", &[&(e)]))?;
     let status = me.status().as_u16();
     let body = me.text().await.unwrap_or_default();
     if status >= 400 {
-        return Err(format!("令牌不可用 · {}", api_error(status, &body)));
+        return Err(rcgui_i18n::f("令牌不可用 · {}", &[&(api_error(status, &body))]));
     }
     let v: Value = serde_json::from_str(&body)
-        .map_err(|e| format!("令牌信息不是 JSON（HTTP {status}）: {e}"))?;
+        .map_err(|e| rcgui_i18n::f("令牌信息不是 JSON（HTTP {}）: {}", &[&(status), &(e)]))?;
     Ok(parse_me(&v))
 }
 
@@ -348,13 +348,9 @@ fn parse_me(v: &Value) -> Probe {
 /// 另一个目录」不会误命中上一次的响应。
 pub async fn upload(cfg: &KvCfg, path: &Path, name: &str, folder: &str) -> Result<Uploaded, String> {
     cfg.upload_ready()?;
-    let meta = std::fs::metadata(path).map_err(|e| format!("读取文件失败: {e}"))?;
+    let meta = std::fs::metadata(path).map_err(|e| rcgui_i18n::f("读取文件失败: {}", &[&(e)]))?;
     if meta.len() > MAX_UPLOAD {
-        return Err(format!(
-            "文件 {:.1} MB 超过站点单文件上限 {:.0} MB",
-            meta.len() as f64 / 1048576.0,
-            MAX_UPLOAD as f64 / 1048576.0
-        ));
+        return Err(rcgui_i18n::f("文件 {} MB 超过站点单文件上限 {} MB", &[&(format!("{:.1}", meta.len() as f64 / 1048576.0)), &(format!("{:.0}", MAX_UPLOAD as f64 / 1048576.0))]));
     }
     let folder = folder.trim().trim_matches('/').to_string();
     let mtime = meta
@@ -371,7 +367,7 @@ pub async fn upload(cfg: &KvCfg, path: &Path, name: &str, folder: &str) -> Resul
     for attempt in 0..2 {
         let bytes = tokio::fs::read(path)
             .await
-            .map_err(|e| format!("读取文件失败: {e}"))?;
+            .map_err(|e| rcgui_i18n::f("读取文件失败: {}", &[&(e)]))?;
         match post_upload(cfg, bytes, name, &folder, &idem).await {
             Ok(u) => return Ok(u),
             Err((retry, msg)) => {
@@ -413,7 +409,7 @@ async fn post_upload(
     let part = reqwest::multipart::Part::bytes(bytes)
         .file_name(name.to_string())
         .mime_str(mime_for(name))
-        .map_err(|e| (false, format!("构造上传请求失败: {e}")))?;
+        .map_err(|e| (false, rcgui_i18n::f("构造上传请求失败: {}", &[&(e)])))?;
     let mut form = reqwest::multipart::Form::new().part("file", part);
     // storage 必须显式给：该部署的令牌策略是 fail-closed 的，缺了直接
     // `403 POLICY_STORAGE_DENIED`，不会替你挑默认后端。
@@ -442,7 +438,7 @@ async fn post_upload(
         // 连接层面的失败才值得重试；`is_body`/`is_decode` 这类是确定性的。
         Err(e) => {
             let retry = e.is_timeout() || e.is_connect() || e.is_request();
-            return Err((retry, format!("上传请求失败: {e}")));
+            return Err((retry, rcgui_i18n::f("上传请求失败: {}", &[&(e)])));
         }
     };
     let status = resp.status().as_u16();
@@ -453,7 +449,7 @@ async fn post_upload(
         return Err((retry, api_error(status, &body)));
     }
     let v: Value = serde_json::from_str(&body)
-        .map_err(|e| (false, format!("上传响应不是 JSON: {e}")))?;
+        .map_err(|e| (false, rcgui_i18n::f("上传响应不是 JSON: {}", &[&(e)])))?;
     // 站点的成功信封是 `{success, file, links, deduplicated?}`；老文档写过
     // 平铺形式，`data` 里也照看一眼。
     let root = v.get("data").filter(|d| d.is_object()).unwrap_or(&v);
@@ -489,10 +485,10 @@ const LIST_MAX_PAGES: usize = 25;
 pub async fn list_files(base: &str, token: &str) -> Result<Vec<RemoteFile>, String> {
     let base = normalize_base(base);
     if base.is_empty() {
-        return Err("站点地址不能为空".into());
+        return Err(rcgui_i18n::t("站点地址不能为空").into());
     }
     if token.trim().is_empty() {
-        return Err("读取站点文件列表需要 API 令牌（令牌要有 read 权限）".into());
+        return Err(rcgui_i18n::t("读取站点文件列表需要 API 令牌（令牌要有 read 权限）").into());
     }
     let http = http_client(Duration::from_secs(30))?;
     let mut out: Vec<RemoteFile> = Vec::new();
@@ -508,17 +504,14 @@ pub async fn list_files(base: &str, token: &str) -> Result<Vec<RemoteFile>, Stri
         let resp = req
             .send()
             .await
-            .map_err(|e| format!("读取站点文件列表失败: {e}"))?;
+            .map_err(|e| rcgui_i18n::f("读取站点文件列表失败: {}", &[&(e)]))?;
         let status = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();
         if status >= 400 {
-            return Err(format!(
-                "读取站点文件列表失败 · {}",
-                api_error(status, &body)
-            ));
+            return Err(rcgui_i18n::f("读取站点文件列表失败 · {}", &[&(api_error(status, &body))]));
         }
         let v: Value = serde_json::from_str(&body)
-            .map_err(|e| format!("文件列表不是 JSON（HTTP {status}）: {e}"))?;
+            .map_err(|e| rcgui_i18n::f("文件列表不是 JSON（HTTP {}）: {}", &[&(status), &(e)]))?;
         let (page, next) = parse_files(&v);
         out.extend(page);
         match next {
@@ -583,10 +576,10 @@ fn parse_files(v: &Value) -> (Vec<RemoteFile>, Option<String>) {
 pub async fn delete_file(base: &str, token: &str, id: &str) -> Result<(), String> {
     let base = normalize_base(base);
     if base.is_empty() {
-        return Err("站点地址不能为空".into());
+        return Err(rcgui_i18n::t("站点地址不能为空").into());
     }
     if token.trim().is_empty() {
-        return Err("删除站点文件需要 API 令牌（令牌要有 delete 权限）".into());
+        return Err(rcgui_i18n::t("删除站点文件需要 API 令牌（令牌要有 delete 权限）").into());
     }
     let http = http_client(Duration::from_secs(60))?;
     let resp = http
@@ -594,7 +587,7 @@ pub async fn delete_file(base: &str, token: &str, id: &str) -> Result<(), String
         .bearer_auth(token.trim())
         .send()
         .await
-        .map_err(|e| format!("删除请求失败: {e}"))?;
+        .map_err(|e| rcgui_i18n::f("删除请求失败: {}", &[&(e)]))?;
     let status = resp.status().as_u16();
     let body = resp.text().await.unwrap_or_default();
     if status >= 400 {

@@ -42,7 +42,7 @@ async fn read_config(
     let map = client
         .config_get(remote)
         .await
-        .map_err(|e| format!("读取 {remote} 的配置失败：{e}"))?;
+        .map_err(|e| rcgui_i18n::f("读取 {} 的配置失败：{}", &[&(remote), &(e)]))?;
     Ok((
         ProxyConfigValues::backend_type(&map),
         ProxyConfigValues::from_config_map(&map),
@@ -90,20 +90,13 @@ impl ApplyOutcome {
     /// 面向用户的一句话说明（不含密码）。
     pub fn describe(&self, remote: &str) -> String {
         match self {
-            Self::Unchanged => format!("{remote} 的代理已是最新，无需改动"),
-            Self::Applied => format!("{remote} 的代理已生效"),
-            Self::Removed => format!("{remote} 的代理已移除（原本没有代理）"),
-            Self::Restored(_) => format!("{remote} 的代理已恢复为你原来设置的值"),
-            Self::RespectExisting { key } => format!(
-                "{remote}：你在 rclone 里已经设置了 {}，本程序只补空缺、不会覆盖；如需使用这里的代理，请先在远程配置里清空它",
-                key.label()
-            ),
-            Self::Conflict { key, current, .. } => format!(
-                "{remote}：rclone 里的 {} 已被其他方式修改（当前 {}），为避免覆盖你的改动已跳过",
-                key.label(),
-                redact_proxy_value(current)
-            ),
-            Self::LeftAlone => format!("{remote} 未由本程序管理，保持原样"),
+            Self::Unchanged => rcgui_i18n::f("{} 的代理已是最新，无需改动", &[&(remote)]),
+            Self::Applied => rcgui_i18n::f("{} 的代理已生效", &[&(remote)]),
+            Self::Removed => rcgui_i18n::f("{} 的代理已移除（原本没有代理）", &[&(remote)]),
+            Self::Restored(_) => rcgui_i18n::f("{} 的代理已恢复为你原来设置的值", &[&(remote)]),
+            Self::RespectExisting { key } => rcgui_i18n::f("{}：你在 rclone 里已经设置了 {}，本程序只补空缺、不会覆盖；如需使用这里的代理，请先在远程配置里清空它", &[&(remote), &(key.label())]),
+            Self::Conflict { key, current, .. } => rcgui_i18n::f("{}：rclone 里的 {} 已被其他方式修改（当前 {}），为避免覆盖你的改动已跳过", &[&(remote), &(key.label()), &(redact_proxy_value(current))]),
+            Self::LeftAlone => rcgui_i18n::f("{} 未由本程序管理，保持原样", &[&(remote)]),
         }
     }
 }
@@ -114,7 +107,7 @@ impl ApplyOutcome {
 /// 历史记录，也可能被截图 —— 不能原样透出。
 pub fn redact_proxy_value(v: &str) -> String {
     if v.is_empty() {
-        return "（空）".into();
+        return rcgui_i18n::t("（空）").into();
     }
     let (prefix, rest) = match v.find("://") {
         Some(i) => (&v[..i + 3], &v[i + 3..]),
@@ -136,13 +129,13 @@ async fn run_step(client: &RcClient, name: &str, step: &ProxyStep) -> Result<(),
             client
                 .config_update(name, serde_json::Value::Object(params))
                 .await
-                .map_err(|e| format!("写入 {name} 的 {key} 失败：{e}"))
+                .map_err(|e| rcgui_i18n::f("写入 {} 的 {} 失败：{}", &[&(name), &(key), &(e)]))
         }
         ProxyStep::Unset { .. } => client
             .config_unset(name, &[key])
             .await
             .map(|_| ())
-            .map_err(|e| format!("移除 {name} 的 {key} 失败：{e}")),
+            .map_err(|e| rcgui_i18n::f("移除 {} 的 {} 失败：{}", &[&(name), &(key), &(e)])),
     }
 }
 
@@ -234,26 +227,34 @@ pub fn remotes_using(cfg: &AppConfig, proxy_id: &str) -> Vec<String> {
 }
 
 /// 代理改完后必须提示的说明（实测结论：后端实例在创建时读配置）。
-pub const RESTART_HINT: &str = "代理只在远程建立连接时生效：该远程若有正在运行的挂载或服务，需要重新挂载/重新启动才会使用新代理。";
+pub fn restart_hint() -> &'static str {
+    rcgui_i18n::t("代理只在远程建立连接时生效：该远程若有正在运行的挂载或服务，需要重新挂载/重新启动才会使用新代理。")
+}
 
 /// 「不代理」的准确措辞。
 ///
 /// **不能**写成「强制直连」：rclone 仍可能继承系统 `HTTP_PROXY` / `HTTPS_PROXY`
 /// 环境变量（本机实测发现默认就带全局代理变量）。
-pub const DIRECT_HINT: &str = "「不代理」= 不设置 RCGUI 的 remote 级代理。rclone 仍可能继承系统的 HTTP_PROXY / HTTPS_PROXY 环境变量，因此不等于强制直连。";
+pub fn direct_hint() -> &'static str {
+    rcgui_i18n::t("「不代理」= 不设置 RCGUI 的 remote 级代理。rclone 仍可能继承系统的 HTTP_PROXY / HTTPS_PROXY 环境变量，因此不等于强制直连。")
+}
 
 /// 凭据存储形式的说明（实测：百分号编码明文，连 obscure 都不是）。
-pub const CREDENTIAL_HINT: &str = "代理账号密码会以明文（百分号编码）写入 rclone.conf，不是加密，请勿在共享环境使用敏感凭据。";
+pub fn credential_hint() -> &'static str {
+    rcgui_i18n::t("代理账号密码会以明文（百分号编码）写入 rclone.conf，不是加密，请勿在共享环境使用敏感凭据。")
+}
 
 /// ftp / sftp 的代理键与限制说明（绑定时提示）。
 ///
 /// 三条都是实测/上游源码确认的，不能省略：用原生键而不是 `override.http_proxy`、
 /// `socks_proxy` 只认裸 `host:port`、写入后正在运行的挂载/服务不会热生效。
-pub const NATIVE_KEY_HINT: &str = "ftp / sftp 使用 rclone 原生 http_proxy / socks_proxy 键；若该远程自己已设了代理，本程序只补空缺、不会覆盖（rclone 优先使用 socks_proxy）。SOCKS5 与 SOCKS5H 在这两类后端上等价（都由代理解析域名）；账号密码以明文写入 rclone.conf，密码不能包含「@」、用户名不能包含「:」。";
+pub fn native_key_hint() -> &'static str {
+    rcgui_i18n::t("ftp / sftp 使用 rclone 原生 http_proxy / socks_proxy 键；若该远程自己已设了代理，本程序只补空缺、不会覆盖（rclone 优先使用 socks_proxy）。SOCKS5 与 SOCKS5H 在这两类后端上等价（都由代理解析域名）；账号密码以明文写入 rclone.conf，密码不能包含「@」、用户名不能包含「:」。")
+}
 
 /// ftp / sftp 的绑定提示；其它类型返回 `None`。
 pub fn native_note(rtype: &str) -> Option<&'static str> {
-    uses_native_keys(rtype).then_some(NATIVE_KEY_HINT)
+    uses_native_keys(rtype).then_some(native_key_hint())
 }
 
 
@@ -290,10 +291,10 @@ impl ProxyFailure {
     /// 简短标签，用作提示开头。
     pub fn label(self) -> &'static str {
         match self {
-            Self::Refused => "代理拒绝连接",
-            Self::AuthRequired => "代理要求认证",
-            Self::BadGateway => "代理上游不可达",
-            Self::SchemeMismatch => "代理协议不匹配",
+            Self::Refused => rcgui_i18n::t("代理拒绝连接"),
+            Self::AuthRequired => rcgui_i18n::t("代理要求认证"),
+            Self::BadGateway => rcgui_i18n::t("代理上游不可达"),
+            Self::SchemeMismatch => rcgui_i18n::t("代理协议不匹配"),
         }
     }
 
@@ -301,23 +302,25 @@ impl ProxyFailure {
     pub fn hint(self) -> &'static str {
         match self {
             Self::Refused => {
-                "代理端口上没有服务在监听：请确认代理软件已启动，并核对代理配置里的地址与端口。"
+                rcgui_i18n::t("代理端口上没有服务在监听：请确认代理软件已启动，并核对代理配置里的地址与端口。")
             }
             Self::AuthRequired => {
-                "代理要求用户名/密码（HTTP 407）：请在代理配置里填写账号密码，或改用免认证的代理。"
+                rcgui_i18n::t("代理要求用户名/密码（HTTP 407）：请在代理配置里填写账号密码，或改用免认证的代理。")
             }
             Self::BadGateway => {
-                "代理返回 502：它连不上自己的上游或目标站点，请检查代理软件内部的上游设置。"
+                rcgui_i18n::t("代理返回 502：它连不上自己的上游或目标站点，请检查代理软件内部的上游设置。")
             }
             Self::SchemeMismatch => {
-                "代理协议填错：https:// 只能用于支持 TLS 的代理；本机常见的 Clash / v2ray 等要用 http:// 或 socks5://。"
+                rcgui_i18n::t("代理协议填错：https:// 只能用于支持 TLS 的代理；本机常见的 Clash / v2ray 等要用 http:// 或 socks5://。")
             }
         }
     }
 }
 
 /// 注解里标记「已经补过提示」的固定片段，用于避免重复包装。
-const ANNOTATED_MARK: &str = "（rclone 原文：";
+fn annotated_mark() -> &'static str {
+    rcgui_i18n::t("（rclone 原文：")
+}
 
 /// 从 rclone 原文判断代理故障；没有明确证据就返回 `None`。
 pub fn classify_proxy_failure(raw: &str) -> Option<ProxyFailure> {
@@ -370,17 +373,15 @@ fn looks_like_network_failure(raw: &str) -> bool {
 ///
 /// 已带注解的文本直接原样返回，因此可以安全地在多个层重复调用。
 pub fn annotate_error(raw: &str, proxy_endpoint: Option<&str>) -> String {
-    if raw.contains(ANNOTATED_MARK) {
+    if raw.contains(annotated_mark()) {
         return raw.to_string();
     }
     if let Some(f) = classify_proxy_failure(raw) {
-        return format!("【代理】{}：{}{ANNOTATED_MARK}{raw}）", f.label(), f.hint());
+        return rcgui_i18n::f("【代理】{}：{}{}{}）", &[&(f.label()), &(f.hint()), &(annotated_mark()), &(raw)]);
     }
     if let Some(ep) = proxy_endpoint {
         if looks_like_network_failure(raw) {
-            return format!(
-                "该远程绑定了代理 {ep}，本次失败可能与代理有关；若代理正常，请再查远程自身配置。{ANNOTATED_MARK}{raw}）"
-            );
+            return rcgui_i18n::f("该远程绑定了代理 {}，本次失败可能与代理有关；若代理正常，请再查远程自身配置。{}{}）", &[&(ep), &(annotated_mark()), &(raw)]);
         }
     }
     raw.to_string()
@@ -480,20 +481,20 @@ mod tests {
     #[test]
     fn hints_do_not_overpromise() {
         // 「不代理」的文案不得出现「强制直连」这类误导说法
-        assert!(DIRECT_HINT.contains("不等于强制直连"));
-        assert!(DIRECT_HINT.contains("HTTP_PROXY"));
+        assert!(direct_hint().contains("不等于强制直连"));
+        assert!(direct_hint().contains("HTTP_PROXY"));
         // 凭据说明必须点明是明文、不是加密
-        assert!(CREDENTIAL_HINT.contains("明文"));
-        assert!(CREDENTIAL_HINT.contains("不是加密"));
-        assert!(!CREDENTIAL_HINT.contains("obscure 加密"));
+        assert!(credential_hint().contains("明文"));
+        assert!(credential_hint().contains("不是加密"));
+        assert!(!credential_hint().contains("obscure 加密"));
         // 重启提示必须说清「需要重新挂载/启动」
-        assert!(RESTART_HINT.contains("重新挂载"));
-        assert!(RESTART_HINT.contains("重新启动"));
+        assert!(restart_hint().contains("重新挂载"));
+        assert!(restart_hint().contains("重新启动"));
         // ftp/sftp 的说明必须点明原生键、只补空缺、凭据限制
-        assert!(NATIVE_KEY_HINT.contains("原生 http_proxy"));
-        assert!(NATIVE_KEY_HINT.contains("只补空缺"));
-        assert!(NATIVE_KEY_HINT.contains("socks_proxy"));
-        assert!(NATIVE_KEY_HINT.contains("「@」"));
+        assert!(native_key_hint().contains("原生 http_proxy"));
+        assert!(native_key_hint().contains("只补空缺"));
+        assert!(native_key_hint().contains("socks_proxy"));
+        assert!(native_key_hint().contains("「@」"));
     }
 
     /// 只有 ftp / sftp 需要原生键说明；其它类型不能误导用户。

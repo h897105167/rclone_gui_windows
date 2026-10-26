@@ -183,8 +183,8 @@ pub fn build_bundle(
     }
     if live {
         conf.warnings.push(
-            "挂载/服务由当前运行中的 rclone 状态还原：serve 密码未包含（rclone 不返回），\
-             挂载的只读与缓存模式优先沿用 RCGUI 记录、否则取默认值（只读=否、缓存=writes）"
+            rcgui_i18n::t("挂载/服务由当前运行中的 rclone 状态还原：serve 密码未包含（rclone 不返回），\
+             挂载的只读与缓存模式优先沿用 RCGUI 记录、否则取默认值（只读=否、缓存=writes）")
                 .to_string(),
         );
     }
@@ -215,7 +215,7 @@ pub fn build_bundle(
             conf.remotes.sort_by(|a, b| a.name.cmp(&b.name));
         }
         None => conf.warnings.push(
-            "导出时未连接 rclone：文件不含任何远程参数，导入后需要重新连接并手工补齐"
+            rcgui_i18n::t("导出时未连接 rclone：文件不含任何远程参数，导入后需要重新连接并手工补齐")
                 .to_string(),
         ),
     }
@@ -227,24 +227,24 @@ pub fn build_bundle(
 
 /// 原子写入导出文件。
 pub fn write_bundle(path: &Path, conf: &RcguiConf) -> Result<()> {
-    let text = serde_json::to_vec_pretty(conf).context("序列化 rcgui.conf 失败")?;
+    let text = serde_json::to_vec_pretty(conf).context(rcgui_i18n::t("序列化 rcgui.conf 失败"))?;
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(dir).with_context(|| format!("创建目录 {} 失败", dir.display()))?;
+            std::fs::create_dir_all(dir).with_context(|| rcgui_i18n::f("创建目录 {} 失败", &[&(dir.display())]))?;
         }
     }
     let tmp = path.with_extension("tmp-export");
-    std::fs::write(&tmp, &text).with_context(|| format!("写入 {} 失败", tmp.display()))?;
+    std::fs::write(&tmp, &text).with_context(|| rcgui_i18n::f("写入 {} 失败", &[&(tmp.display())]))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        anyhow!("保存 {} 失败: {e}", path.display())
+        anyhow!("{}", rcgui_i18n::f("保存 {} 失败: {}", &[&(path.display()), &(e)]))
     })?;
     Ok(())
 }
 
 /// 解析 + 校验 + 生成摘要/差异。**不写任何文件。**
 pub fn preview_file(path: &Path, current: &ProfileDoc) -> Result<(RcguiConf, Preview)> {
-    let raw = std::fs::read(path).with_context(|| format!("读取 {} 失败", path.display()))?;
+    let raw = std::fs::read(path).with_context(|| rcgui_i18n::f("读取 {} 失败", &[&(path.display())]))?;
     // 容忍 BOM（外部编辑器可能加）
     let raw: &[u8] = if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
         &raw[3..]
@@ -254,24 +254,18 @@ pub fn preview_file(path: &Path, current: &ProfileDoc) -> Result<(RcguiConf, Pre
     // 先做「是不是 rcgui.conf」的硬校验：RcguiConf 用了容器级 serde(default)，
     // 任意 JSON 都能被填成默认包，必须在反序列化前看原始 kind。
     let probe: serde_json::Value =
-        serde_json::from_slice(raw).map_err(|e| anyhow!("不是合法的 JSON: {e}"))?;
+        serde_json::from_slice(raw).map_err(|e| anyhow!("{}", rcgui_i18n::f("不是合法的 JSON: {}", &[&(e)])))?;
     match probe.get("kind").and_then(|k| k.as_str()) {
         Some(rgui) if rgui == rcgui_profile::BUNDLE_KIND => {}
         Some(other) => {
-            return Err(anyhow!(
-                "不是 rcgui.conf 文件（kind = \"{other}\"，应为 \"{}\"）",
-                rcgui_profile::BUNDLE_KIND
-            ))
+            return Err(anyhow!("{}", rcgui_i18n::f("不是 rcgui.conf 文件（kind = \"{}\"，应为 \"{}\"）", &[&(other), &(rcgui_profile::BUNDLE_KIND)])))
         }
         None => {
-            return Err(anyhow!(
-                "不是 rcgui.conf 文件（缺少 kind 字段，应为 \"{}\"）",
-                rcgui_profile::BUNDLE_KIND
-            ))
+            return Err(anyhow!("{}", rcgui_i18n::f("不是 rcgui.conf 文件（缺少 kind 字段，应为 \"{}\"）", &[&(rcgui_profile::BUNDLE_KIND)])))
         }
     }
     let mut conf: RcguiConf = serde_json::from_slice(raw)
-        .map_err(|e| anyhow!("不是合法的 rcgui.conf（JSON 解析失败）: {e}"))?;
+        .map_err(|e| anyhow!("{}", rcgui_i18n::f("不是合法的 rcgui.conf（JSON 解析失败）: {}", &[&(e)])))?;
     conf.validate().map_err(|e| anyhow!("{e}"))?;
     // 兼容早期导出：serves 为空但 serve_names 有内容时，用映射还原出服务条目，
     // 否则预览会错误地显示「服务 0」。
@@ -294,14 +288,14 @@ pub fn backup_profile() -> Result<Option<PathBuf>> {
     }
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let bak = p.with_file_name(format!("default.json.bak-{stamp}"));
-    std::fs::copy(&p, &bak).with_context(|| format!("备份档案到 {} 失败", bak.display()))?;
+    std::fs::copy(&p, &bak).with_context(|| rcgui_i18n::f("备份档案到 {} 失败", &[&(bak.display())]))?;
     Ok(Some(bak))
 }
 
 /// 把导入文件应用到本地档案（含备份 + 回滚点）。**不写 rclone.conf。**
 pub fn apply(conf: &RcguiConf, cfg: &mut AppConfig) -> Result<PathBuf> {
     let bak = backup_profile()?
-        .ok_or_else(|| anyhow!("找不到当前档案文件；为避免覆盖未知数据，已中止导入"))?;
+        .ok_or_else(|| anyhow!("{}", rcgui_i18n::t("找不到当前档案文件；为避免覆盖未知数据，已中止导入")))?;
     // apply_doc + 远程元信息合并都在 profiles 里完成，保证只有一个写入口
     profiles::replace_from_bundle(conf, cfg)?;
     Ok(bak)
@@ -315,21 +309,14 @@ pub fn describe(p: &Preview) -> String {
         .file_name()
         .and_then(|x| x.to_str())
         .unwrap_or("rcgui.conf");
-    let mut out = format!(
-        "{} → 档案「{}」：远程 {} · 挂载 {} · 服务 {}",
-        fname,
-        if s.profile_name.is_empty() {
-            "（未命名）"
+    let mut out = rcgui_i18n::f("{} → 档案「{}」：远程 {} · 挂载 {} · 服务 {}", &[&(fname), &(if s.profile_name.is_empty() {
+            rcgui_i18n::t("（未命名）")
         } else {
             &s.profile_name
-        },
-        s.remote_count,
-        s.mount_count,
-        s.serve_count
-    );
+        }), &(s.remote_count), &(s.mount_count), &(s.serve_count)]);
     out.push_str(&format!("；{}", p.diff.one_line()));
     if s.sensitive {
-        out.push_str(&format!("；⚠ 含敏感数据；{} 个远程的凭据未随包导出（可能需要重新认证）", s.needs_auth));
+        out.push_str(&rcgui_i18n::f("；⚠ 含敏感数据；{} 个远程的凭据未随包导出（可能需要重新认证）", &[&(s.needs_auth)]));
     }
     out
 }

@@ -428,7 +428,7 @@ async fn spawn_usage(
                     let used = v.get("used").and_then(|x| x.as_f64());
                     match (total, used) {
                         (Some(t), Some(u)) => format!("{} / {}", fmt_bytes(u), fmt_bytes(t)),
-                        (None, Some(u)) => format!("已用 {}", fmt_bytes(u)),
+                        (None, Some(u)) => rcgui_i18n::f("已用 {}", &[&(fmt_bytes(u))]),
                         _ => "—".into(),
                     }
                 }

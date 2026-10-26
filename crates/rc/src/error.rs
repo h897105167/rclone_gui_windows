@@ -27,24 +27,24 @@ impl RcErrorKind {
     /// 简短中文标签，可直接进 toast / 状态栏。
     pub fn label(self) -> &'static str {
         match self {
-            Self::Connect => "无法连接",
-            Self::Auth => "鉴权失败",
-            Self::Unsupported => "rclone 不支持该接口",
-            Self::Api => "rclone 返回错误",
-            Self::Decode => "响应无法解析",
-            Self::Timeout => "请求超时",
+            Self::Connect => rcgui_i18n::t("无法连接"),
+            Self::Auth => rcgui_i18n::t("鉴权失败"),
+            Self::Unsupported => rcgui_i18n::t("rclone 不支持该接口"),
+            Self::Api => rcgui_i18n::t("rclone 返回错误"),
+            Self::Decode => rcgui_i18n::t("响应无法解析"),
+            Self::Timeout => rcgui_i18n::t("请求超时"),
         }
     }
 
     /// 给用户的下一步建议（不要与 WinFsp/盘符等无关原因混用）。
     pub fn hint(self) -> &'static str {
         match self {
-            Self::Connect => "请确认 rclone 已用 --rc 启动，并检查地址与端口",
-            Self::Auth => "请检查 RC 用户名与密码（--rc-user / --rc-pass）",
-            Self::Unsupported => "请升级 rclone，或改用兼容模式",
-            Self::Api => "请查看 rclone 日志并检查该远程的配置",
-            Self::Decode => "可能是 rclone 版本不兼容或代理返回了异常内容",
-            Self::Timeout => "端点无响应：远程后端可能较慢或已卡住",
+            Self::Connect => rcgui_i18n::t("请确认 rclone 已用 --rc 启动，并检查地址与端口"),
+            Self::Auth => rcgui_i18n::t("请检查 RC 用户名与密码（--rc-user / --rc-pass）"),
+            Self::Unsupported => rcgui_i18n::t("请升级 rclone，或改用兼容模式"),
+            Self::Api => rcgui_i18n::t("请查看 rclone 日志并检查该远程的配置"),
+            Self::Decode => rcgui_i18n::t("可能是 rclone 版本不兼容或代理返回了异常内容"),
+            Self::Timeout => rcgui_i18n::t("端点无响应：远程后端可能较慢或已卡住"),
         }
     }
 

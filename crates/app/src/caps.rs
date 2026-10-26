@@ -297,14 +297,12 @@ async fn kv_write_op(
     };
     if refuses {
         let what = match method {
-            "operations/mkdir" => "新建目录",
-            "operations/rmdir" => "删除目录",
-            _ => "改名/移动/复制",
+            "operations/mkdir" => rcgui_i18n::t("新建目录"),
+            "operations/rmdir" => rcgui_i18n::t("删除目录"),
+            _ => rcgui_i18n::t("改名/移动/复制"),
         };
-        return Err(anyhow!(
-            "K-Vault 远程不支持{what}：站点的 DAV 只读，API 也只开放上传、列表、删除。\
-             要在站点上调整目录，请到站点网页端操作。"
-        ));
+        return Err(anyhow!("{}", rcgui_i18n::f("K-Vault 远程不支持{}：站点的 DAV 只读，API 也只开放上传、列表、删除。\
+             要在站点上调整目录，请到站点网页端操作。", &[&(what)])));
     }
     let path = params
         .get("remote")
@@ -319,19 +317,15 @@ async fn kv_write_op(
     let folder = kv_join(&[sub, parent]);
     let files = crate::kvault::list_files(&cfg.base, &cfg.token)
         .await
-        .map_err(|e| anyhow!("站点索引读取失败: {e}"))?;
+        .map_err(|e| anyhow!("{}", rcgui_i18n::f("站点索引读取失败: {}", &[&(e)])))?;
     let ids = crate::kvault::pick_targets(&files, &folder, name, is_dir);
     if ids.is_empty() {
-        return Err(anyhow!(
-            "站点索引里没有 {}/{}（可能已经被删掉了）",
-            folder.trim_matches('/'),
-            name
-        ));
+        return Err(anyhow!("{}", rcgui_i18n::f("站点索引里没有 {}/{}（可能已经被删掉了）", &[&(folder.trim_matches('/')), &(name)])));
     }
     for id in &ids {
         crate::kvault::delete_file(&cfg.base, &cfg.token, id)
             .await
-            .map_err(|e| anyhow!("站点删除失败: {e}"))?;
+            .map_err(|e| anyhow!("{}", rcgui_i18n::f("站点删除失败: {}", &[&(e)])))?;
     }
     Ok(Some(json!({ "deleted": ids.len() })))
 }
@@ -414,7 +408,7 @@ impl CapProvider for HostCaps {
     ) -> Result<Value> {
         let data = base64::engine::general_purpose::STANDARD
             .decode(data_b64.as_bytes())
-            .map_err(|e| anyhow!("base64 解码失败: {e}"))?;
+            .map_err(|e| anyhow!("{}", rcgui_i18n::f("base64 解码失败: {}", &[&(e)])))?;
         let tmp_dir = config::data_dir().join("tmp");
         std::fs::create_dir_all(&tmp_dir)?;
         let name = format!("up-{}-{}", std::process::id(), chrono_ts());
@@ -443,7 +437,7 @@ impl CapProvider for HostCaps {
                 };
                 let r = crate::kvault::upload(&cfg, &tmp, &shown, &folder).await;
                 let _ = std::fs::remove_file(&tmp);
-                let up = r.map_err(|e| anyhow!("站点上传失败: {e}"))?;
+                let up = r.map_err(|e| anyhow!("{}", rcgui_i18n::f("站点上传失败: {}", &[&(e)])))?;
                 return Ok(json!({
                     "link": up.link,
                     "name": up.name,
@@ -511,7 +505,7 @@ impl CapProvider for HostCaps {
                 spawn_blocking(move || {
                     let p = PathBuf::from(&path);
                     if !p.is_file() {
-                        bail!("文件不存在: {path}");
+                        bail!("{}", rcgui_i18n::f("文件不存在: {}", &[&(path)]));
                     }
                     let sha = plugin_host::zip::sha256_file(&p)?;
                     let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
@@ -523,7 +517,7 @@ impl CapProvider for HostCaps {
                 let path = Self::p_str(&params, "path");
                 let max = Self::p_u64(&params, "max_bytes").max(1) as usize;
                 spawn_blocking(move || {
-                    let raw = std::fs::read(&path).with_context(|| format!("读取 {path} 失败"))?;
+                    let raw = std::fs::read(&path).with_context(|| rcgui_i18n::f("读取 {} 失败", &[&(path)]))?;
                     let cut = raw.len().min(max);
                     Ok(json!({ "text": String::from_utf8_lossy(&raw[..cut]).to_string(), "size": raw.len() }))
                 })
@@ -538,14 +532,14 @@ impl CapProvider for HostCaps {
                 } as usize;
                 spawn_blocking(move || {
                     let md = std::fs::metadata(&path)
-                        .with_context(|| format!("读取 {path} 失败"))?;
+                        .with_context(|| rcgui_i18n::f("读取 {} 失败", &[&(path)]))?;
                     if !md.is_file() {
-                        bail!("不是文件: {path}");
+                        bail!("{}", rcgui_i18n::f("不是文件: {}", &[&(path)]));
                     }
                     if md.len() as usize > max {
-                        bail!("文件超过 {} MB 上限: {path}", max / 1024 / 1024);
+                        bail!("{}", rcgui_i18n::f("文件超过 {} MB 上限: {}", &[&(max / 1024 / 1024), &(path)]));
                     }
-                    let raw = std::fs::read(&path).with_context(|| format!("读取 {path} 失败"))?;
+                    let raw = std::fs::read(&path).with_context(|| rcgui_i18n::f("读取 {} 失败", &[&(path)]))?;
                     Ok(json!({
                         "data_b64": base64::engine::general_purpose::STANDARD.encode(&raw),
                         "size": raw.len(),
@@ -568,7 +562,7 @@ impl CapProvider for HostCaps {
                     } else {
                         opt.truncate(true);
                     }
-                    let mut f = opt.open(&path).with_context(|| format!("写入 {path} 失败"))?;
+                    let mut f = opt.open(&path).with_context(|| rcgui_i18n::f("写入 {} 失败", &[&(path)]))?;
                     std::io::Write::write_all(&mut f, text.as_bytes())?;
                     Ok(json!({ "ok": true }))
                 })
@@ -580,10 +574,10 @@ impl CapProvider for HostCaps {
                 spawn_blocking(move || {
                     if let Some(d) = Path::new(&to).parent() {
                         std::fs::create_dir_all(d)
-                            .with_context(|| format!("创建目录失败: {}", d.display()))?;
+                            .with_context(|| rcgui_i18n::f("创建目录失败: {}", &[&(d.display())]))?;
                     }
                     std::fs::copy(&from, &to)
-                        .with_context(|| format!("复制 {from} → {to} 失败（可能被占用或权限不足）"))?;
+                        .with_context(|| rcgui_i18n::f("复制 {} → {} 失败（可能被占用或权限不足）", &[&(from), &(to)]))?;
                     Ok(json!({ "ok": true, "to": to }))
                 })
                 .await
@@ -602,9 +596,9 @@ impl CapProvider for HostCaps {
                     let p = Path::new(&path);
                     if p.is_dir() {
                         std::fs::remove_dir_all(p)
-                            .with_context(|| format!("删除目录失败: {path}"))?;
+                            .with_context(|| rcgui_i18n::f("删除目录失败: {}", &[&(path)]))?;
                     } else if p.exists() {
-                        std::fs::remove_file(p).with_context(|| format!("删除文件失败: {path}"))?;
+                        std::fs::remove_file(p).with_context(|| rcgui_i18n::f("删除文件失败: {}", &[&(path)]))?;
                     }
                     Ok(json!({ "ok": true }))
                 })
@@ -614,7 +608,7 @@ impl CapProvider for HostCaps {
                 let path = Self::p_str(&params, "path");
                 spawn_blocking(move || {
                     let mut out = Vec::new();
-                    for e in std::fs::read_dir(&path).with_context(|| format!("读取目录失败: {path}"))?.flatten() {
+                    for e in std::fs::read_dir(&path).with_context(|| rcgui_i18n::f("读取目录失败: {}", &[&(path)]))?.flatten() {
                         let p = e.path();
                         let is_dir = p.is_dir();
                         let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
@@ -660,7 +654,7 @@ impl CapProvider for HostCaps {
                     if d == 0 { 8000 } else { d.min(30000) }
                 };
                 let hub = self.progress.clone();
-                hub.begin("正在搜索本机程序…");
+                hub.begin(rcgui_i18n::t("正在搜索本机程序…"));
                 // 用**专用大栈线程**而不是 tokio 的 blocking 池：
                 // 后者默认栈只有 2MB，而搜索要遍历深层目录、每层都留一份
                 // read_dir 迭代器与 PathBuf；实测在 `C:\` 上会直接把 worker 栈撑爆
@@ -674,11 +668,11 @@ impl CapProvider for HostCaps {
                         let found = search_exe(&name2, depth, Duration::from_millis(budget_ms));
                         let _ = tx.send(Ok(json!({ "paths": found, "count": found.len() })));
                     })
-                    .map_err(|e| anyhow!("无法启动搜索线程: {e}"))?;
+                    .map_err(|e| anyhow!("{}", rcgui_i18n::f("无法启动搜索线程: {}", &[&(e)])))?;
                 let r = tokio::task::spawn_blocking(move || rx.recv())
                     .await
-                    .map_err(|e| anyhow!("等待搜索结果失败: {e}"))
-                    .and_then(|inner| inner.map_err(|e| anyhow!("搜索结果丢失: {e}")));
+                    .map_err(|e| anyhow!("{}", rcgui_i18n::f("等待搜索结果失败: {}", &[&(e)])))
+                    .and_then(|inner| inner.map_err(|e| anyhow!("{}", rcgui_i18n::f("搜索结果丢失: {}", &[&(e)]))));
                 hub.finish();
                 r?
             }
@@ -691,12 +685,12 @@ impl CapProvider for HostCaps {
                     Self::p_u64(&params, "max_bytes")
                 };
                 let hub = self.progress.clone();
-                hub.begin("正在解压…");
+                hub.begin(rcgui_i18n::t("正在解压…"));
                 let r = spawn_blocking(move || -> Result<Value> {
                     let data = std::fs::read(&zip_path)
-                        .with_context(|| format!("读取压缩包失败: {zip_path}"))?;
+                        .with_context(|| rcgui_i18n::f("读取压缩包失败: {}", &[&(zip_path)]))?;
                     if data.len() < 4 || &data[0..2] != b"PK" {
-                        bail!("不是 zip 文件（可能下载到了错误页面）");
+                        bail!("{}", rcgui_i18n::t("不是 zip 文件（可能下载到了错误页面）"));
                     }
                     std::fs::create_dir_all(&dest)?;
                     let n = plugin_host::zip::extract_all(&data, Path::new(&dest), max)?;
@@ -726,7 +720,7 @@ impl CapProvider for HostCaps {
                     }
                     if !filters.is_empty() {
                         let refs: Vec<&str> = filters.iter().map(|s| s.as_str()).collect();
-                        d = d.add_filter("允许的文件", &refs);
+                        d = d.add_filter(rcgui_i18n::t("允许的文件"), &refs);
                     }
                     if !start.is_empty() {
                         d = d.set_directory(&start);
@@ -777,12 +771,12 @@ impl CapProvider for HostCaps {
                     .get(&url)
                     .send()
                     .await
-                    .with_context(|| format!("请求 {url} 失败"))?;
+                    .with_context(|| rcgui_i18n::f("请求 {} 失败", &[&(url)]))?;
                 let status = resp.status().as_u16();
                 let body = resp
                     .text()
                     .await
-                    .with_context(|| format!("读取 {url} 响应失败"))?;
+                    .with_context(|| rcgui_i18n::f("读取 {} 响应失败", &[&(url)]))?;
                 Ok(json!({ "status": status, "body": body }))
             }
             "http.request" => {
@@ -815,7 +809,7 @@ impl CapProvider for HostCaps {
                     "PATCH" => client.patch(&url),
                     "DELETE" => client.delete(&url),
                     "HEAD" => client.head(&url),
-                    other => bail!("http.request 不支持的方法: {other}"),
+                    other => bail!("{}", rcgui_i18n::f("http.request 不支持的方法: {}", &[&(other)])),
                 };
                 if let Some(h) = params.get("headers").and_then(|v| v.as_object()) {
                     for (k, v) in h {
@@ -829,7 +823,7 @@ impl CapProvider for HostCaps {
                 let resp = req
                     .send()
                     .await
-                    .with_context(|| format!("请求 {url} 失败"))?;
+                    .with_context(|| rcgui_i18n::f("请求 {} 失败", &[&(url)]))?;
                 let status = resp.status().as_u16();
                 let content_type = resp
                     .headers()
@@ -840,9 +834,9 @@ impl CapProvider for HostCaps {
                 let bytes = resp
                     .bytes()
                     .await
-                    .with_context(|| format!("读取 {url} 响应失败"))?;
+                    .with_context(|| rcgui_i18n::f("读取 {} 响应失败", &[&(url)]))?;
                 if bytes.len() > max {
-                    bail!("响应超过 {} MB 上限: {url}", max / 1024 / 1024);
+                    bail!("{}", rcgui_i18n::f("响应超过 {} MB 上限: {}", &[&(max / 1024 / 1024), &(url)]));
                 }
                 Ok(json!({
                     "status": status,
@@ -860,7 +854,7 @@ impl CapProvider for HostCaps {
                     Self::p_u64(&params, "max_bytes")
                 };
                 let hub = self.progress.clone();
-                hub.begin(format!("正在下载 {}", short_host(&url)));
+                hub.begin(rcgui_i18n::f("正在下载 {}", &[&(short_host(&url))]));
                 let client = reqwest::Client::builder()
                     .connect_timeout(Duration::from_secs(20))
                     .timeout(Duration::from_secs(1800))
@@ -870,11 +864,11 @@ impl CapProvider for HostCaps {
                     .get(&url)
                     .send()
                     .await
-                    .with_context(|| format!("下载 {url} 失败"))?;
+                    .with_context(|| rcgui_i18n::f("下载 {} 失败", &[&(url)]))?;
                 if !r.status().is_success() {
                     let code = r.status().as_u16();
                     hub.finish();
-                    bail!("下载失败：{url} 返回 HTTP {code}");
+                    bail!("{}", rcgui_i18n::f("下载失败：{} 返回 HTTP {}", &[&(url), &(code)]));
                 }
                 let total = r.content_length();
                 hub.update(0, total);
@@ -882,7 +876,7 @@ impl CapProvider for HostCaps {
                     std::fs::create_dir_all(d)?;
                 }
                 let mut file = std::fs::File::create(&dest)
-                    .with_context(|| format!("创建 {dest} 失败"))?;
+                    .with_context(|| rcgui_i18n::f("创建 {} 失败", &[&(dest)]))?;
                 let mut done = 0u64;
                 let mut last = Instant::now();
                 loop {
@@ -893,7 +887,7 @@ impl CapProvider for HostCaps {
                                 drop(file);
                                 let _ = std::fs::remove_file(&dest);
                                 hub.finish();
-                                bail!("下载体积异常（超过 {} MB），已中止", max / 1024 / 1024);
+                                bail!("{}", rcgui_i18n::f("下载体积异常（超过 {} MB），已中止", &[&(max / 1024 / 1024)]));
                             }
                             std::io::Write::write_all(&mut file, &chunk)?;
                             if last.elapsed() >= Duration::from_millis(120) {
@@ -906,7 +900,7 @@ impl CapProvider for HostCaps {
                             drop(file);
                             let _ = std::fs::remove_file(&dest);
                             hub.finish();
-                            return Err(anyhow!("下载中断: {e}"));
+                            return Err(anyhow!("{}", rcgui_i18n::f("下载中断: {}", &[&(e)])));
                         }
                     }
                 }
@@ -915,7 +909,7 @@ impl CapProvider for HostCaps {
                 hub.finish();
                 if done == 0 {
                     let _ = std::fs::remove_file(&dest);
-                    bail!("下载内容为空：{url}");
+                    bail!("{}", rcgui_i18n::f("下载内容为空：{}", &[&(url)]));
                 }
                 let sha = plugin_host::zip::sha256_file(Path::new(&dest))?;
                 Ok(json!({ "path": dest, "bytes": done, "sha256": sha }))
@@ -998,9 +992,9 @@ impl CapProvider for HostCaps {
                 let text = Self::p_str(&params, "text");
                 spawn_blocking(move || {
                     let mut cb = arboard::Clipboard::new()
-                        .map_err(|e| anyhow!("无法访问剪贴板: {e}"))?;
+                        .map_err(|e| anyhow!("{}", rcgui_i18n::f("无法访问剪贴板: {}", &[&(e)])))?;
                     cb.set_text(text)
-                        .map_err(|e| anyhow!("写入剪贴板失败: {e}"))?;
+                        .map_err(|e| anyhow!("{}", rcgui_i18n::f("写入剪贴板失败: {}", &[&(e)])))?;
                     Ok(json!({ "ok": true }))
                 })
                 .await
@@ -1010,7 +1004,7 @@ impl CapProvider for HostCaps {
                 let message = Self::p_str(&params, "message");
                 spawn_blocking(move || {
                     let ok = rfd::MessageDialog::new()
-                        .set_title(if title.is_empty() { "请确认" } else { &title })
+                        .set_title(if title.is_empty() { rcgui_i18n::t("请确认") } else { &title })
                         .set_description(&message)
                         .set_buttons(rfd::MessageButtons::YesNo)
                         .set_level(rfd::MessageLevel::Warning)
@@ -1056,7 +1050,7 @@ impl CapProvider for HostCaps {
                     Self::p_u64(&params, "max_bytes")
                 } as usize;
                 if remote.trim().is_empty() || path.trim().is_empty() {
-                    bail!("rclone.cat 需要 remote 与 path");
+                    bail!("{}", rcgui_i18n::t("rclone.cat 需要 remote 与 path"));
                 }
                 // 该 rclone 版本没有 operations/cat（实测 404），
                 // 因此走 copyfile 到唯一临时目录再读回来，和图片直链同一路径。
@@ -1066,13 +1060,10 @@ impl CapProvider for HostCaps {
                 let client = self.rc.client().await;
                 let bytes = rcgui_rc::fetch_to_temp(&client, &remote, &path, &dir)
                     .await
-                    .map_err(|e| anyhow!("读取远程文件失败（{}）: {}", e.kind.label(), e))?;
+                    .map_err(|e| anyhow!("{}", rcgui_i18n::f("读取远程文件失败（{}）: {}", &[&(e.kind.label()), &(e)])))?;
                 let _ = std::fs::remove_dir_all(&dir);
                 if bytes.len() > max {
-                    bail!(
-                        "远程文件超过 {} MB 上限: {remote}:{path}",
-                        max / 1024 / 1024
-                    );
+                    bail!("{}", rcgui_i18n::f("远程文件超过 {} MB 上限: {}:{}", &[&(max / 1024 / 1024), &(remote), &(path)]));
                 }
                 Ok(json!({
                     "data_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
@@ -1080,7 +1071,7 @@ impl CapProvider for HostCaps {
                     "content_type": content_type_of(&path),
                 }))
             }
-            other => bail!("宿主不认识的能力: {other}"),
+            other => bail!("{}", rcgui_i18n::f("宿主不认识的能力: {}", &[&(other)])),
         }
     }
 }
@@ -1119,7 +1110,7 @@ where
 {
     tokio::task::spawn_blocking(f)
         .await
-        .map_err(|e| anyhow!("后台线程异常: {e}"))?
+        .map_err(|e| anyhow!("{}", rcgui_i18n::f("后台线程异常: {}", &[&(e)])))?
 }
 
 fn meta_of(path: &str) -> Result<Value> {
@@ -1156,7 +1147,7 @@ fn start_proc(
     log_to: &str,
 ) -> Result<Value> {
     if !Path::new(program).is_file() {
-        bail!("找不到可执行文件：{program}");
+        bail!("{}", rcgui_i18n::f("找不到可执行文件：{}", &[&(program)]));
     }
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
@@ -1192,7 +1183,7 @@ fn start_proc(
     }
     let child = cmd
         .spawn()
-        .with_context(|| format!("无法启动 {program}"))?;
+        .with_context(|| rcgui_i18n::f("无法启动 {}", &[&(program)]))?;
     let pid = child.id();
     let handle = format!("{}#{}", plugin, PROC_SEQ.fetch_add(1, Ordering::Relaxed));
     {
@@ -1218,9 +1209,9 @@ fn start_proc(
         };
         let code = st.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(-1);
         if tail.is_empty() {
-            bail!("进程启动后立刻退出（退出码 {code}），没有日志");
+            bail!("{}", rcgui_i18n::f("进程启动后立刻退出（退出码 {}），没有日志", &[&(code)]));
         }
-        bail!("进程启动后立刻退出（退出码 {code}）：{tail}");
+        bail!("{}", rcgui_i18n::f("进程启动后立刻退出（退出码 {}）：{}", &[&(code), &(tail)]));
     }
     Ok(json!({ "handle": handle, "pid": pid }))
 }
@@ -1476,7 +1467,7 @@ fn run_capture(mut cmd: std::process::Command, timeout: Duration) -> Result<Valu
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     no_window(&mut cmd);
-    let mut child = cmd.spawn().with_context(|| "无法启动子进程")?;
+    let mut child = cmd.spawn().with_context(|| rcgui_i18n::t("无法启动子进程"))?;
     let start = Instant::now();
     let mut timed_out = false;
     loop {
@@ -1491,13 +1482,13 @@ fn run_capture(mut cmd: std::process::Command, timeout: Duration) -> Result<Valu
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(e) => bail!("等待子进程失败: {e}"),
+            Err(e) => bail!("{}", rcgui_i18n::f("等待子进程失败: {}", &[&(e)])),
         }
     }
     if timed_out {
-        bail!("执行超时（{}s）", timeout.as_secs());
+        bail!("{}", rcgui_i18n::f("执行超时（{}s）", &[&(timeout.as_secs())]));
     }
-    let out = child.wait_with_output().with_context(|| "读取子进程输出失败")?;
+    let out = child.wait_with_output().with_context(|| rcgui_i18n::t("读取子进程输出失败"))?;
     Ok(json!({
         "code": out.status.code().unwrap_or(-1),
         "stdout": String::from_utf8_lossy(&out.stdout).to_string(),
@@ -1521,29 +1512,29 @@ fn pe_info_json(path: &str) -> Value {
 
 fn pe_info(p: &Path) -> Result<(String, String, String, String)> {
     use std::io::Read;
-    let mut f = std::fs::File::open(p).with_context(|| "打开文件失败")?;
+    let mut f = std::fs::File::open(p).with_context(|| rcgui_i18n::t("打开文件失败"))?;
     let mut head = [0u8; 64];
     let mut read = 0usize;
     while read < head.len() {
-        let n = f.read(&mut head[read..]).with_context(|| "读取文件头失败")?;
+        let n = f.read(&mut head[read..]).with_context(|| rcgui_i18n::t("读取文件头失败"))?;
         if n == 0 {
             break;
         }
         read += n;
     }
     if read < 64 || &head[0..2] != b"MZ" {
-        bail!("缺少 MZ 头");
+        bail!("{}", rcgui_i18n::t("缺少 MZ 头"));
     }
     let e_lfanew = u32::from_le_bytes([head[0x3C], head[0x3D], head[0x3E], head[0x3F]]) as u64;
     if e_lfanew < 64 || e_lfanew > 64 * 1024 * 1024 {
-        bail!("PE 头偏移异常");
+        bail!("{}", rcgui_i18n::t("PE 头偏移异常"));
     }
     use std::io::Seek;
     f.seek(std::io::SeekFrom::Start(e_lfanew))?;
     let mut sig = [0u8; 4];
-    f.read_exact(&mut sig).with_context(|| "读取 PE 签名失败")?;
+    f.read_exact(&mut sig).with_context(|| rcgui_i18n::t("读取 PE 签名失败"))?;
     if &sig != b"PE\0\0" {
-        bail!("缺少 PE 签名");
+        bail!("{}", rcgui_i18n::t("缺少 PE 签名"));
     }
     let mut coff = [0u8; 20];
     f.read_exact(&mut coff)?;

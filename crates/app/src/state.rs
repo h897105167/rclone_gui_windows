@@ -480,16 +480,12 @@ pub fn hint_text(endpoint_url: &str, listed: &[MountState], drives: &[String]) -
     if !listed.is_empty() || drives.is_empty() {
         return String::new();
     }
-    format!(
-        "本机存在 rclone 挂载盘 {}，但当前连接的 {} 报告没有挂载。该盘属于另一个 rclone 实例；\
-         界面只反映当前端点的状态。",
-        drives.join("、"),
-        if endpoint_url.is_empty() {
-            "端点"
+    rcgui_i18n::f("本机存在 rclone 挂载盘 {}，但当前连接的 {} 报告没有挂载。该盘属于另一个 rclone 实例；\
+         界面只反映当前端点的状态。", &[&(drives.join("、")), &(if endpoint_url.is_empty() {
+            rcgui_i18n::t("端点")
         } else {
             endpoint_url
-        }
-    )
+        })])
 }
 
 #[cfg(test)]

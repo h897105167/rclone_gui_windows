@@ -5,6 +5,7 @@ edition.workspace = true
 description = "RCGUI 档案模型与持久化：版本化单文档，区分「用户保存的期望配置」与「rclone 运行态」"
 
 [dependencies]
+rcgui-i18n = { path = "../i18n" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

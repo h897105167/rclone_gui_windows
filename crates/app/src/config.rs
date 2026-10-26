@@ -118,6 +118,11 @@ pub struct AppConfig {
     /// 强调色：0 蓝 / 1 绿 / 2 紫 / 3 橙
     #[serde(default)]
     pub accent_idx: u8,
+    /// 界面语言：`"system"` 跟随系统 / `"zh"` 简体中文 / `"en"` English。
+    ///
+    /// 空串（老配置没有这个字段）与 `"system"` 等价。
+    #[serde(default)]
+    pub language: String,
     #[serde(default)]
     pub autostart: bool,
     #[serde(default)]
@@ -353,9 +358,9 @@ fn ensure_user_can_write(dir: &std::path::Path, quiet: bool) -> bool {
             let stdout = String::from_utf8_lossy(&o.stdout);
             let stderr = String::from_utf8_lossy(&o.stderr);
             let combined = format!("{stdout}{stderr}");
-            !(combined.contains("拒绝访问")
+            !(combined.contains(rcgui_i18n::t("拒绝访问"))
                 || combined.contains("Access is denied")
-                || combined.contains("失败")
+                || combined.contains(rcgui_i18n::t("失败"))
                 || combined.contains("Failed processing"))
         }
         Err(_) => false,
@@ -391,17 +396,12 @@ fn resolve_data_dir(new_dir: PathBuf, legacy_dir: PathBuf) -> PathBuf {
                 "bytes": bytes,
                 "skipped": skipped,
                 // 回滚 = 删除新目录即可，旧目录从未被修改
-                "rollback": "删除该 RCGUI 目录后重启，程序会回到旧目录 %APPDATA%\\rclone-gui"
+                "rollback": rcgui_i18n::t("删除该 RCGUI 目录后重启，程序会回到旧目录 %APPDATA%\\rclone-gui")
             });
             let _ = write_atomic(&new_dir.join("migration.json"), marker.to_string().as_bytes());
-            let mut msg = format!(
-                "数据已从旧目录迁移到 {}（{} 个文件 / {:.1} MB；旧目录保留，可回滚）",
-                new_dir.display(),
-                files,
-                bytes as f64 / 1024.0 / 1024.0
-            );
+            let mut msg = rcgui_i18n::f("数据已从旧目录迁移到 {}（{} 个文件 / {} MB；旧目录保留，可回滚）", &[&(new_dir.display()), &(files), &(format!("{:.1}", bytes as f64 / 1024.0 / 1024.0))]);
             if !skipped.is_empty() {
-                msg.push_str(&format!("；{} 个条目被跳过（详见 migration.json）", skipped.len()));
+                msg.push_str(&rcgui_i18n::f("；{} 个条目被跳过（详见 migration.json）", &[&(skipped.len())]));
             }
             crate::profiles::push_notice(msg);
             new_dir
@@ -409,10 +409,7 @@ fn resolve_data_dir(new_dir: PathBuf, legacy_dir: PathBuf) -> PathBuf {
         Err(e) => {
             // 只清理本次自己创建的不完整副本（进入本函数时 new_dir 尚不存在）
             let _ = std::fs::remove_dir_all(&new_dir);
-            crate::profiles::push_notice(format!(
-                "数据目录迁移失败（{e}），本次继续使用旧目录 {}",
-                legacy_dir.display()
-            ));
+            crate::profiles::push_notice(rcgui_i18n::f("数据目录迁移失败（{}），本次继续使用旧目录 {}", &[&(e), &(legacy_dir.display())]));
             legacy_dir
         }
     }
@@ -446,7 +443,7 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(u64, u64, Vec<String>)> {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    skipped.push(format!("{} 内部条目（{e}）", src.display()));
+                    skipped.push(rcgui_i18n::f("{} 内部条目（{}）", &[&(src.display()), &(e)]));
                     continue;
                 }
             };
@@ -461,7 +458,7 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(u64, u64, Vec<String>)> {
                 }
             };
             if meta.file_type().is_symlink() {
-                skipped.push(format!("{}（符号链接）", path.display()));
+                skipped.push(rcgui_i18n::f("{}（符号链接）", &[&(path.display())]));
             } else if meta.is_dir() {
                 walk(&path, &to, files, bytes, skipped);
             } else if meta.is_file() {
@@ -473,7 +470,7 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(u64, u64, Vec<String>)> {
                     Err(e) => skipped.push(format!("{}（{e}）", path.display())),
                 }
             } else {
-                skipped.push(format!("{}（特殊文件）", path.display()));
+                skipped.push(rcgui_i18n::f("{}（特殊文件）", &[&(path.display())]));
             }
         }
     }
@@ -482,7 +479,7 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(u64, u64, Vec<String>)> {
     let mut skipped: Vec<String> = Vec::new();
     // 只有「连根目录都建不出来」才算致命错误
     std::fs::create_dir_all(dst)
-        .map_err(|e| anyhow::anyhow!("创建 {} 失败: {e}", dst.display()))?;
+        .map_err(|e| anyhow::anyhow!("{}", rcgui_i18n::f("创建 {} 失败: {}", &[&(dst.display()), &(e)])))?;
     walk(src, dst, &mut files, &mut bytes, &mut skipped);
     Ok((files, bytes, skipped))
 }
@@ -515,7 +512,7 @@ pub fn config_path() -> PathBuf {
 pub fn repair_data_dir_permissions() -> Result<(), String> {
     let dir = data_dir();
     if !dir.exists() {
-        return Err(format!("数据目录不存在：{}", dir.display()));
+        return Err(rcgui_i18n::f("数据目录不存在：{}", &[&(dir.display())]));
     }
     if ensure_user_can_write(&dir, false) {
         Ok(())
@@ -523,12 +520,9 @@ pub fn repair_data_dir_permissions() -> Result<(), String> {
         let account = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
             (Ok(d), Ok(u)) if !d.is_empty() && !u.is_empty() => format!("{d}\\{u}"),
             (_, Ok(u)) => u,
-            _ => "<你的用户名>".to_string(),
+            _ => rcgui_i18n::t("<你的用户名>").to_string(),
         };
-        Err(format!(
-            "自动修复数据目录权限失败。可手动执行：icacls \"{}\" /grant \"{account}:(OI)(CI)F\" /T",
-            dir.display()
-        ))
+        Err(rcgui_i18n::f("自动修复数据目录权限失败。可手动执行：icacls \"{}\" /grant \"{}:(OI)(CI)F\" /T", &[&(dir.display()), &(account)]))
     }
 }
 
@@ -558,10 +552,7 @@ pub fn write_atomic(file: &PathBuf, data: &[u8]) -> Result<()> {
         Ok(()) => Ok(()),
         Err(e) if is_permission_error(&e) => {
             repair_data_dir_permissions().map_err(|re| {
-                anyhow::anyhow!(
-                    "{e}；自动修复权限也失败了：{re}",
-                    e = e
-                )
+                anyhow::anyhow!("{}", rcgui_i18n::f("{}；自动修复权限也失败了：{}", &[&(e), &(re)]))
             })?;
             // 修完重试一次；这次仍失败就把原始错误抛出去
             write_atomic_once(file, data)

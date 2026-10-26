@@ -46,14 +46,14 @@ pub fn check_text(dir: &Path) -> Result<String> {
         }
         let abs = zip::safe_join(dir, &rel)?;
         let hash = zip::sha256_file(&abs)
-            .with_context(|| format!("计算哈希失败: {}", abs.display()))?;
+            .with_context(|| rcgui_i18n::f("计算哈希失败: {}", &[&(abs.display())]))?;
         out.push_str(&hash);
         out.push_str("  ");
         out.push_str(&rel);
         out.push('\n');
     }
     if out.is_empty() {
-        bail!("插件目录为空，无法生成 {}", config::CHECK_SHA256);
+        bail!("{}", rcgui_i18n::f("插件目录为空，无法生成 {}", &[&(config::CHECK_SHA256)]));
     }
     Ok(out)
 }
@@ -83,7 +83,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
 pub fn write_check(dir: &Path) -> Result<usize> {
     let text = check_text(dir)?;
     std::fs::write(dir.join(config::CHECK_SHA256), text.as_bytes())
-        .with_context(|| format!("写入 {} 失败", config::CHECK_SHA256))?;
+        .with_context(|| rcgui_i18n::f("写入 {} 失败", &[&(config::CHECK_SHA256)]))?;
     Ok(text.lines().count())
 }
 
@@ -94,25 +94,25 @@ pub fn write_check(dir: &Path) -> Result<usize> {
 pub fn verify_dir(dir: &Path, names: ConfigFileNames, cfg: &PluginConfig) -> Result<VerifyReport> {
     let check_path = dir.join(names.check);
     let text = std::fs::read_to_string(&check_path)
-        .with_context(|| format!("读取 {} 失败: {}", names.check, check_path.display()))?;
+        .with_context(|| rcgui_i18n::f("读取 {} 失败: {}", &[&(names.check), &(check_path.display())]))?;
     let entries = crate::package::parse_manifest(&text)
-        .with_context(|| format!("解析 {} 失败", names.check))?;
+        .with_context(|| rcgui_i18n::f("解析 {} 失败", &[&(names.check)]))?;
 
     let entry_rel = cfg.entry.replace('\\', "/");
     if !entries.iter().any(|e| e.path == entry_rel) {
-        bail!("{} 未包含入口文件 {entry_rel}，拒绝加载", names.check);
+        bail!("{}", rcgui_i18n::f("{} 未包含入口文件 {}，拒绝加载", &[&(names.check), &(entry_rel)]));
     }
 
     let mut files = Vec::new();
     for e in &entries {
         let p = zip::safe_join(dir, &e.path)
-            .with_context(|| format!("{} 中的路径不合法: {}", names.check, e.path))?;
+            .with_context(|| rcgui_i18n::f("{} 中的路径不合法: {}", &[&(names.check), &(e.path)]))?;
         if !p.is_file() {
-            bail!("插件缺少清单中声明的文件: {}", e.path);
+            bail!("{}", rcgui_i18n::f("插件缺少清单中声明的文件: {}", &[&(e.path)]));
         }
         let got = zip::sha256_file(&p)?;
         if got != e.sha256 {
-            bail!("插件文件校验失败: {}\n  期望 {}\n  实际 {}", e.path, e.sha256, got);
+            bail!("{}", rcgui_i18n::f("插件文件校验失败: {}\n  期望 {}\n  实际 {}", &[&(e.path), &(e.sha256), &(got)]));
         }
         files.push(e.path.clone());
     }
@@ -125,25 +125,20 @@ pub fn verify_dir(dir: &Path, names: ConfigFileNames, cfg: &PluginConfig) -> Res
 /// 读取并校验一个插件目录（新一代格式）。
 pub fn load_from_dir(dir: &Path, gui_version: &str) -> Result<(PluginConfig, VerifyReport)> {
     let names = ConfigFileNames::detect(dir).ok_or_else(|| {
-        anyhow!(
-            "目录里没有 {}（也不是旧格式 {}）: {}",
-            config::CONFIG_JSON,
-            config::LEGACY_PLUGIN_JSON,
-            dir.display()
-        )
+        anyhow!("{}", rcgui_i18n::f("目录里没有 {}（也不是旧格式 {}）: {}", &[&(config::CONFIG_JSON), &(config::LEGACY_PLUGIN_JSON), &(dir.display())]))
     })?;
     let path = dir.join(names.config);
     let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("读取 {} 失败: {}", names.config, path.display()))?;
+        .with_context(|| rcgui_i18n::f("读取 {} 失败: {}", &[&(names.config), &(path.display())]))?;
     let cfg: PluginConfig = serde_json::from_str(&text)
-        .with_context(|| format!("解析 {} 失败: {}", names.config, path.display()))?;
+        .with_context(|| rcgui_i18n::f("解析 {} 失败: {}", &[&(names.config), &(path.display())]))?;
     cfg.validate()?;
     cfg.compatible_with(gui_version)?;
     let report = verify_dir(dir, names, &cfg)?;
     // 入口文件必须真实存在（清单里已保证，这里再确认可读）
     let entry = zip::safe_join(dir, &cfg.entry)?;
     if !entry.is_file() {
-        bail!("入口文件不存在: {}", entry.display());
+        bail!("{}", rcgui_i18n::f("入口文件不存在: {}", &[&(entry.display())]));
     }
     Ok((cfg, report))
 }
@@ -232,7 +227,7 @@ pub fn install_dir(
             ));
             let _ = std::fs::remove_dir_all(&backup);
             std::fs::rename(&dest, &backup)
-                .with_context(|| format!("备份旧版本失败: {}", dest.display()))?;
+                .with_context(|| rcgui_i18n::f("备份旧版本失败: {}", &[&(dest.display())]))?;
             match copy_dir(src_dir, &dest) {
                 Ok(()) => {
                     let _ = std::fs::remove_dir_all(&backup);
@@ -245,7 +240,7 @@ pub fn install_dir(
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&dest);
                     let _ = std::fs::rename(&backup, &dest);
-                    Err(e.context("替换插件失败，已回滚到旧版本"))
+                    Err(e.context(rcgui_i18n::t("替换插件失败，已回滚到旧版本")))
                 }
             }
         }
@@ -288,9 +283,9 @@ pub fn install_zip(
 /// 从 zip 里读出 `config.json`（不落盘）。
 pub fn peek_zip_config(data: &[u8]) -> Result<PluginConfig> {
     let content = find_zip_config(data)?
-        .ok_or_else(|| anyhow!("压缩包里没有 {}，这不是插件包", config::CONFIG_JSON))?;
+        .ok_or_else(|| anyhow!("{}", rcgui_i18n::f("压缩包里没有 {}，这不是插件包", &[&(config::CONFIG_JSON)])))?;
     let cfg: PluginConfig = serde_json::from_slice(&content)
-        .with_context(|| format!("解析 {} 失败", config::CONFIG_JSON))?;
+        .with_context(|| rcgui_i18n::f("解析 {} 失败", &[&(config::CONFIG_JSON)]))?;
     cfg.validate()?;
     Ok(cfg)
 }
@@ -333,7 +328,7 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
             copy_dir(&from, &to)?;
         } else {
             std::fs::copy(&from, &to)
-                .with_context(|| format!("复制失败: {}", from.display()))?;
+                .with_context(|| rcgui_i18n::f("复制失败: {}", &[&(from.display())]))?;
         }
     }
     Ok(())
@@ -350,9 +345,9 @@ pub fn uninstall(dir: &Path) -> Result<PathBuf> {
     }
     // 只允许删插件根目录下的一级子目录，杜绝误传路径造成的批量删除
     if dir.parent().is_none() {
-        bail!("拒绝删除根目录: {}", dir.display());
+        bail!("{}", rcgui_i18n::f("拒绝删除根目录: {}", &[&(dir.display())]));
     }
-    std::fs::remove_dir_all(dir).with_context(|| format!("删除插件目录失败: {}", dir.display()))?;
+    std::fs::remove_dir_all(dir).with_context(|| rcgui_i18n::f("删除插件目录失败: {}", &[&(dir.display())]))?;
     Ok(dir.to_path_buf())
 }
 

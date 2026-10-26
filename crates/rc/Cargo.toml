@@ -5,6 +5,7 @@ edition.workspace = true
 description = "rclone RC 客户端与连接状态：只管端点/鉴权/方法调用，不含任何进程启动或终止逻辑"
 
 [dependencies]
+rcgui-i18n = { path = "../i18n" }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

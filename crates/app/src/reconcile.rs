@@ -75,7 +75,7 @@ pub fn desired_from(cfg: &AppConfig) -> (Desired, Vec<String>) {
                 Some(p) => Some(p.clone()),
                 // 悬空引用：期望「不代理」，但要让用户知道这不是他的选择
                 None => {
-                    errors.push(format!("{} 引用的代理配置已不存在", b.remote));
+                    errors.push(rcgui_i18n::f("{} 引用的代理配置已不存在", &[&(b.remote)]));
                     None
                 }
             }
@@ -191,12 +191,12 @@ pub enum Action {
 impl Action {
     pub fn describe(&self) -> String {
         match self {
-            Self::SetProxy { remote } => format!("设置 {remote} 的代理"),
-            Self::UnsetProxy { remote } => format!("移除 {remote} 的代理"),
-            Self::Mount { fs, point } => format!("挂载 {fs} → {point}"),
-            Self::Unmount { point } => format!("卸载 {point}"),
-            Self::StartServe { stype, addr, .. } => format!("启动 {stype} 服务 {addr}"),
-            Self::StopServe { addr, .. } => format!("停止服务 {addr}"),
+            Self::SetProxy { remote } => rcgui_i18n::f("设置 {} 的代理", &[&(remote)]),
+            Self::UnsetProxy { remote } => rcgui_i18n::f("移除 {} 的代理", &[&(remote)]),
+            Self::Mount { fs, point } => rcgui_i18n::f("挂载 {} → {}", &[&(fs), &(point)]),
+            Self::Unmount { point } => rcgui_i18n::f("卸载 {}", &[&(point)]),
+            Self::StartServe { stype, addr, .. } => rcgui_i18n::f("启动 {} 服务 {}", &[&(stype), &(addr)]),
+            Self::StopServe { addr, .. } => rcgui_i18n::f("停止服务 {}", &[&(addr)]),
         }
     }
 }
@@ -235,7 +235,7 @@ pub fn plan(
         ) {
             Ok(p) => p,
             Err(e) => {
-                errors.push(format!("{} 的代理配置无效：{e}", d.remote));
+                errors.push(rcgui_i18n::f("{} 的代理配置无效：{}", &[&(d.remote), &(e)]));
                 continue;
             }
         };
@@ -336,14 +336,14 @@ impl ReconcileReport {
 
     pub fn summary(&self) -> String {
         if self.changed == 0 && self.failed.is_empty() && self.skipped.is_empty() {
-            return "运行状态已与配置一致，无需重载".into();
+            return rcgui_i18n::t("运行状态已与配置一致，无需重载").into();
         }
-        let mut s = format!("已重载 {} 项", self.changed);
+        let mut s = rcgui_i18n::f("已重载 {} 项", &[&(self.changed)]);
         if !self.skipped.is_empty() {
-            s.push_str(&format!("，{} 项跳过", self.skipped.len()));
+            s.push_str(&rcgui_i18n::f("，{} 项跳过", &[&(self.skipped.len())]));
         }
         if !self.failed.is_empty() {
-            s.push_str(&format!("，{} 项失败", self.failed.len()));
+            s.push_str(&rcgui_i18n::f("，{} 项失败", &[&(self.failed.len())]));
         }
         s
     }
@@ -387,7 +387,7 @@ pub async fn collect_proxy_actual(
                 backend_type: ProxyConfigValues::backend_type(&map),
                 values: ProxyConfigValues::from_config_map(&map),
             }),
-            Err(e) => errors.push(format!("读取 {r} 的代理状态失败：{e}（本次跳过该远程）")),
+            Err(e) => errors.push(rcgui_i18n::f("读取 {} 的代理状态失败：{}（本次跳过该远程）", &[&(r), &(e)])),
         }
     }
     (out, errors)
@@ -457,7 +457,7 @@ pub async fn execute(
                         rep.changed += 1;
                     }
                     Ok(Err(e)) => rep.failed.push(format!("{}：{e}", a.describe())),
-                    Err(_) => rep.failed.push(format!("{}：超时", a.describe())),
+                    Err(_) => rep.failed.push(rcgui_i18n::f("{}：超时", &[&(a.describe())])),
                 }
             }
             Action::Unmount { point } => match client.unmount(point).await {

@@ -36,7 +36,7 @@ pub fn remember_mount(
         Some(i) => cfg.auto_mounts[i] = item,
         None => cfg.auto_mounts.push(item),
     }
-    config::save(cfg).map_err(|e| anyhow!("记住挂载失败: {e}"))
+    config::save(cfg).map_err(|e| anyhow!("{}", rcgui_i18n::f("记住挂载失败: {}", &[&(e)])))
 }
 
 /// 忘掉某个挂载点（用户主动卸载时调用）。
@@ -67,7 +67,7 @@ pub fn remember_serve(
     cfg.auto_serves
         .retain(|s| !(s.stype == item.stype && s.addr == item.addr));
     cfg.auto_serves.push(item);
-    config::save(cfg).map_err(|e| anyhow!("记住服务失败: {e}"))
+    config::save(cfg).map_err(|e| anyhow!("{}", rcgui_i18n::f("记住服务失败: {}", &[&(e)])))
 }
 
 /// 忘掉一个服务（用户停止，或该服务已不存在时调用）。
@@ -192,11 +192,11 @@ pub async fn replay(ctx: &Arc<Ctx>, ui: &slint::Weak<crate::MainWindow>) {
         match tokio::time::timeout(crate::MOUNT_RC_TIMEOUT, client.mount(&fs, &point, opts)).await {
             Ok(Ok(_)) => ok_m += 1,
             Ok(Err(e)) => {
-                errs.push(format!("挂载 {fs} → {point}: {e}"));
+                errs.push(rcgui_i18n::f("挂载 {} → {}: {}", &[&(fs), &(point), &(e)]));
                 stale.push(point);
             }
             Err(_) => {
-                errs.push(format!("挂载 {fs} → {point}: 超时"));
+                errs.push(rcgui_i18n::f("挂载 {} → {}: 超时", &[&(fs), &(point)]));
                 stale.push(point);
             }
         }
@@ -214,8 +214,8 @@ pub async fn replay(ctx: &Arc<Ctx>, ui: &slint::Weak<crate::MainWindow>) {
         .await
         {
             Ok(Ok(_)) => ok_s += 1,
-            Ok(Err(e)) => errs.push(format!("服务 {} {}: {e}", s.stype, s.addr)),
-            Err(_) => errs.push(format!("服务 {} {}: 超时", s.stype, s.addr)),
+            Ok(Err(e)) => errs.push(rcgui_i18n::f("服务 {} {}: {}", &[&(s.stype), &(s.addr), &(e)])),
+            Err(_) => errs.push(rcgui_i18n::f("服务 {} {}: 超时", &[&(s.stype), &(s.addr)])),
         }
     }
 
@@ -225,14 +225,14 @@ pub async fn replay(ctx: &Arc<Ctx>, ui: &slint::Weak<crate::MainWindow>) {
         crate::toast(
             ui,
             1,
-            format!("已恢复上次的挂载 {ok_m} 项 / 服务 {ok_s} 项"),
+            rcgui_i18n::f("已恢复上次的挂载 {} 项 / 服务 {} 项", &[&(ok_m), &(ok_s)]),
         );
     }
     if !errs.is_empty() {
         crate::toast(
             ui,
             2,
-            format!("自动恢复有 {} 项失败：{}", errs.len(), errs.join("；")),
+            rcgui_i18n::f("自动恢复有 {} 项失败：{}", &[&(errs.len()), &(errs.join("；"))]),
         );
     }
     let _ = stale;

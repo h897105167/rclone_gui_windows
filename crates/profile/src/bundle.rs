@@ -157,24 +157,20 @@ impl RcguiConf {
                     .proxies
                     .iter()
                     .any(|p| !p.user.is_empty() || !p.pass.is_empty()));
-        self.warnings.retain(|w| !w.contains("已排除"));
+        self.warnings.retain(|w| !w.contains(rcgui_i18n::t("已排除")));
         if include_secrets && self.sensitive {
             self.warnings.push(
-                "该文件包含远程凭据（OAuth token / 密码）与代理账号。rclone 的 obscure 只是可逆混淆、\
-                 并非加密；代理密码更是以明文（百分号编码）保存，请存放在受控位置"
+                rcgui_i18n::t("该文件包含远程凭据（OAuth token / 密码）与代理账号。rclone 的 obscure 只是可逆混淆、\
+                 并非加密；代理密码更是以明文（百分号编码）保存，请存放在受控位置")
                     .to_string(),
             );
         }
         if stripped_any > 0 {
-            self.warnings.push(format!(
-                "已排除 {stripped_any} 个远程的凭据字段；这些远程在导入后标记为「凭据未随包导出」（可能需要重新认证）\
-                 （表示凭据未随包导出，不代表其认证状态已被验证）"
-            ));
+            self.warnings.push(rcgui_i18n::f("已排除 {} 个远程的凭据字段；这些远程在导入后标记为「凭据未随包导出」（可能需要重新认证）\
+                 （表示凭据未随包导出，不代表其认证状态已被验证）", &[&(stripped_any)]));
         }
         if stripped_proxies > 0 {
-            self.warnings.push(format!(
-                "已排除 {stripped_proxies} 条代理配置的账号密码；导入后需要重新填写才能连接代理"
-            ));
+            self.warnings.push(rcgui_i18n::f("已排除 {} 条代理配置的账号密码；导入后需要重新填写才能连接代理", &[&(stripped_proxies)]));
         }
     }
 }
@@ -242,15 +238,9 @@ pub enum BundleError {
 impl std::fmt::Display for BundleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotBundle { found } => write!(
-                f,
-                "不是 rcgui.conf 文件（kind = \"{found}\"，应为 \"{KIND}\"）"
-            ),
-            Self::VersionTooNew { found, supported } => write!(
-                f,
-                "文件格式版本 {found} 高于本程序支持的 {supported}，请升级 RCGUI"
-            ),
-            Self::Invalid(m) => write!(f, "文件内容不合法: {m}"),
+            Self::NotBundle { found } => write!(f, "{}", rcgui_i18n::f("不是 rcgui.conf 文件（kind = \"{}\"，应为 \"{}\"）", &[&(found), &(KIND)])),
+            Self::VersionTooNew { found, supported } => write!(f, "{}", rcgui_i18n::f("文件格式版本 {} 高于本程序支持的 {}，请升级 RCGUI", &[&(found), &(supported)])),
+            Self::Invalid(m) => write!(f, "{}", rcgui_i18n::f("文件内容不合法: {}", &[&(m)])),
         }
     }
 }
@@ -286,18 +276,9 @@ pub struct Diff {
 
 impl Diff {
     pub fn one_line(&self) -> String {
-        let mut s = format!(
-            "远程 +{} / -{} / 保留 {}；挂载 {}→{}，服务 {}→{}",
-            self.remotes_added.len(),
-            self.remotes_removed.len(),
-            self.remotes_kept,
-            self.mounts_before,
-            self.mounts_after,
-            self.serves_before,
-            self.serves_after
-        );
+        let mut s = rcgui_i18n::f("远程 +{} / -{} / 保留 {}；挂载 {}→{}，服务 {}→{}", &[&(self.remotes_added.len()), &(self.remotes_removed.len()), &(self.remotes_kept), &(self.mounts_before), &(self.mounts_after), &(self.serves_before), &(self.serves_after)]);
         if !self.remotes_removed.is_empty() {
-            s.push_str(&format!("；将被移除的远程：{}", self.remotes_removed.join("、")));
+            s.push_str(&rcgui_i18n::f("；将被移除的远程：{}", &[&(self.remotes_removed.join("、"))]));
         }
         s
     }
@@ -326,33 +307,29 @@ impl RcguiConf {
         // 数量上限：防止畸形/恶意文件把 UI 撑爆
         if self.mounts_len() > 500 || self.serves_len() > 500 || self.remotes.len() > 200 {
             return Err(BundleError::Invalid(
-                "条目数量超出上限（远程 ≤200，挂载/服务各 ≤500）".to_string(),
+                rcgui_i18n::t("条目数量超出上限（远程 ≤200，挂载/服务各 ≤500）").to_string(),
             ));
         }
         let mut seen = std::collections::HashSet::new();
         for r in &self.remotes {
             let name = r.name.trim();
             if name.is_empty() {
-                return Err(BundleError::Invalid("存在空远程名".to_string()));
+                return Err(BundleError::Invalid(rcgui_i18n::t("存在空远程名").to_string()));
             }
             if name.contains(':') || name.contains(' ') {
-                return Err(BundleError::Invalid(format!(
-                    "远程名 \"{name}\" 不能包含冒号或空格"
-                )));
+                return Err(BundleError::Invalid(rcgui_i18n::f("远程名 \"{}\" 不能包含冒号或空格", &[&(name)])));
             }
             if !seen.insert(name.to_ascii_lowercase()) {
-                return Err(BundleError::Invalid(format!("远程名 \"{name}\" 重复")));
+                return Err(BundleError::Invalid(rcgui_i18n::f("远程名 \"{}\" 重复", &[&(name)])));
             }
             if r.rtype.trim().is_empty() {
-                return Err(BundleError::Invalid(format!(
-                    "远程 \"{name}\" 缺少后端类型"
-                )));
+                return Err(BundleError::Invalid(rcgui_i18n::f("远程 \"{}\" 缺少后端类型", &[&(name)])));
             }
         }
         // 脚本清单：只做路径安全检查。导入阶段不会执行也不会写盘。
         for s in &self.script_manifest {
             if s.path.is_empty() {
-                return Err(BundleError::Invalid("脚本清单存在空路径".to_string()));
+                return Err(BundleError::Invalid(rcgui_i18n::t("脚本清单存在空路径").to_string()));
             }
             let p = std::path::Path::new(&s.path);
             if p.is_absolute()
@@ -360,10 +337,7 @@ impl RcguiConf {
                 || s.path.starts_with('\\')
                 || p.components().any(|c| matches!(c, std::path::Component::ParentDir))
             {
-                return Err(BundleError::Invalid(format!(
-                    "脚本路径 \"{}\" 不允许绝对路径或 ..",
-                    s.path
-                )));
+                return Err(BundleError::Invalid(rcgui_i18n::f("脚本路径 \"{}\" 不允许绝对路径或 ..", &[&(s.path)])));
             }
         }
         Ok(())
@@ -404,13 +378,10 @@ impl RcguiConf {
         if !self
             .warnings
             .iter()
-            .any(|w| w.contains("由服务名称映射还原"))
+            .any(|w| w.contains(rcgui_i18n::t("由服务名称映射还原")))
         {
-            self.warnings.push(format!(
-                "该文件未记录服务参数，已按服务名称映射还原 {} 个服务（地址/协议/远程取自映射）；\
-                 用户名与密码需在导入后重新填写",
-                self.profile.serves.len()
-            ));
+            self.warnings.push(rcgui_i18n::f("该文件未记录服务参数，已按服务名称映射还原 {} 个服务（地址/协议/远程取自映射）；\
+                 用户名与密码需在导入后重新填写", &[&(self.profile.serves.len())]));
         }
     }
 

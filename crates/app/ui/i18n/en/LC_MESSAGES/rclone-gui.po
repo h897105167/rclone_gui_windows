@@ -1,0 +1,836 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: rclone-gui\n"
+"Language: en\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgid " · 含错误"
+msgstr " · has errors"
+
+msgid "127.0.0.1 或 proxy.corp.local"
+msgstr "127.0.0.1 or proxy.corp.local"
+
+msgid "API 令牌（上传必填；留空 = 不修改已保存的令牌）"
+msgstr "API token (required for uploads; leave empty to keep the saved token)"
+
+msgid "RC 地址"
+msgstr "RC address"
+
+msgid "RC 密码"
+msgstr "RC password"
+
+msgid "RC 用户"
+msgstr "RC user"
+
+msgid "RCGUI 不启动、不停止、不重启 rclone"
+msgstr "RCGUI never starts, stops, or restarts rclone"
+
+msgid "rclone RC 不支持暂停单个任务；可先取消，或用「网速与限速」整体降速"
+msgstr "rclone RC cannot pause a single transfer; cancel it instead, or throttle everything under \"Speed & limits\""
+
+msgid "rclone 状态"
+msgstr "rclone status"
+
+msgid "rclone 运行参数（立即生效）"
+msgstr "rclone arguments (applied immediately)"
+
+msgid "rclone 连接"
+msgstr "rclone connection"
+
+msgid "{} 个插件"
+msgstr "Plugins: {}"
+
+msgid "{} 远程"
+msgstr "Remotes: {}"
+
+msgid "{}。这些远程的代理会被恢复成原状（我们不会删除你原本设置的值）。"
+msgstr "{} Proxies for these remotes are restored to their original state (values you set yourself are never deleted)."
+
+msgid "· 配置文件 {}"
+msgstr "· config file {}"
+
+msgid "↑ 上级"
+msgstr "↑ Parent"
+
+msgid "▸ 显示高级选项"
+msgstr "▸ Show advanced options"
+
+msgid "▾ 隐藏高级选项"
+msgstr "▾ Hide advanced options"
+
+msgid "「{}」已卸载"
+msgstr "\"{}\" uninstalled"
+
+msgid "上传"
+msgstr "Upload"
+
+msgid "上传 {} 项到远程："
+msgstr "Upload {} item(s) to remote:"
+
+msgid "上传 ↑ {}"
+msgstr "Upload ↑ {}"
+
+msgid "上传到右侧远程的当前目录"
+msgstr "Upload to the remote's current directory on the right"
+
+msgid "上传到当前远程目录"
+msgstr "Upload to current remote directory"
+
+msgid "上传到此处"
+msgstr "Upload here"
+
+msgid "上传文件"
+msgstr "Upload files"
+
+msgid "上传文件到此处…"
+msgstr "Upload files here…"
+
+msgid "上传此文件到…"
+msgstr "Upload this file to…"
+
+msgid "上传此文件夹到…"
+msgstr "Upload this folder to…"
+
+msgid "上传目录（相对站点根；留空 = 令牌策略里的目录前缀）"
+msgstr "Upload directory (relative to the site root; empty = the directory prefix from the token policy)"
+
+msgid "上传限速"
+msgstr "Upload limit"
+
+msgid "上次刷新 {}"
+msgstr "Last refresh {}"
+
+msgid "下载"
+msgstr "Download"
+
+msgid "下载 ↓ {}"
+msgstr "Download ↓ {}"
+
+msgid "下载到…"
+msgstr "Download to…"
+
+msgid "下载到当前本地目录"
+msgstr "Download to current local directory"
+
+msgid "下载到本机"
+msgstr "Download to this computer"
+
+msgid "下载限速"
+msgstr "Download limit"
+
+msgid "不代理"
+msgstr "No proxy"
+
+msgid "不限"
+msgstr "Unlimited"
+
+msgid "主题"
+msgstr "Theme"
+
+msgid "从文件夹添加"
+msgstr "Add from folder"
+
+msgid "从文件添加"
+msgstr "Add from file"
+
+msgid "仓库内子路径（留空 = 仓库根目录）"
+msgstr "Path inside the repository (empty = repository root)"
+
+msgid "仓库（远程）"
+msgstr "Repository (remote)"
+
+msgid "代理"
+msgstr "Proxy"
+
+msgid "代理配置（{}）"
+msgstr "Proxy profiles ({})"
+
+msgid "以管理员身份运行"
+msgstr "Run as administrator"
+
+msgid "仪表盘"
+msgstr "Dashboard"
+
+msgid "任务 #{}"
+msgstr "Job #{}"
+
+msgid "任务 {} 个"
+msgstr "Transfers: {}"
+
+msgid "传输"
+msgstr "Transfers"
+
+msgid "传输 {}"
+msgstr "Transfers {}"
+
+msgid "传输速度"
+msgstr "Transfer speed"
+
+msgid "位置"
+msgstr "Location"
+
+msgid "作者"
+msgstr "Author"
+
+msgid "你希望关闭窗口时隐藏到托盘区（程序继续在后台运行），还是直接退出程序？选「取消」不做任何操作，下次关闭还会再问。"
+msgstr "Should closing the window hide it to the tray (the program keeps running in the background), or exit the program? Choosing \"Cancel\" does nothing and you will be asked again next time."
+
+msgid "使用中的远程"
+msgstr "Remotes in use"
+
+msgid "例如 movies/2024，留空为根"
+msgstr "e.g. movies/2024, leave empty for root"
+
+msgid "保存"
+msgstr "Save"
+
+msgid "保存位置: {}"
+msgstr "Save location: {}"
+
+msgid "保存设置"
+msgstr "Save settings"
+
+msgid "保存运行参数"
+msgstr "Save arguments"
+
+msgid "修改时间"
+msgstr "Modified"
+
+msgid "停止"
+msgstr "Stop"
+
+msgid "入口文件"
+msgstr "Entry file"
+
+msgid "全选"
+msgstr "Select all"
+
+msgid "共 {} 条"
+msgstr "Total: {}"
+
+msgid "关闭"
+msgstr "Close"
+
+msgid "关闭窗口"
+msgstr "Close window"
+
+msgid "关闭窗口时隐藏到托盘区"
+msgstr "Hide to tray when closing the window"
+
+msgid "内容去重（同一份文件只存一次，返回已有直链）"
+msgstr "Deduplicate content (each file is stored once and the existing direct link is returned)"
+
+msgid "内嵌 HTTP 服务（图床 / 直链 / Obsidian）"
+msgstr "Embedded HTTP service (image hosting / direct links / Obsidian)"
+
+msgid "内置"
+msgstr "Built-in"
+
+msgid "凭据"
+msgstr "Credentials"
+
+msgid "凭据会以明文（百分号编码）写入 rclone.conf，不是加密；导出 rcgui.conf 时默认不包含，导入后需要重新填写。"
+msgstr "Credentials are written to rclone.conf in plain text (percent-encoded), not encrypted; they are excluded from rcgui.conf exports by default, so they must be re-entered after an import."
+
+msgid "凭据未随包导出"
+msgstr "Credentials were not included in the export"
+
+msgid "切换到原始模式"
+msgstr "Switch to raw mode"
+
+msgid "切换到表单模式"
+msgstr "Switch to form mode"
+
+msgid "切换权限会重启软件（当前窗口先关闭）"
+msgstr "Changing privileges restarts the app (the current window closes first)"
+
+msgid "删除"
+msgstr "Delete"
+
+msgid "删除代理配置「{}」？"
+msgstr "Delete proxy profile \"{}\"?"
+
+msgid "删除远程"
+msgstr "Remove remote"
+
+msgid "刷新"
+msgstr "Refresh"
+
+msgid "加载中…"
+msgstr "Loading…"
+
+msgid "协议"
+msgstr "Protocol"
+
+msgid "卸载"
+msgstr "Uninstall"
+
+msgid "卸载插件"
+msgstr "Uninstall plugin"
+
+msgid "历史记录"
+msgstr "History"
+
+msgid "参数（每行一个 key=value，保存时将覆盖已有同名参数）"
+msgstr "Arguments (one key=value per line; saving overrides existing entries with the same key)"
+
+msgid "反选"
+msgstr "Invert selection"
+
+msgid "取消"
+msgstr "Cancel"
+
+msgid "取消更改"
+msgstr "Discard changes"
+
+msgid "只读"
+msgstr "Read-only"
+
+msgid "只连接已运行且启用 RC 的 rclone：先健康检查，连不上就明确退出；不启动、不停止 rclone，不注册开机项，不内置 RC 密码。生成后不会自动执行。"
+msgstr "Connects only to an rclone that is already running with RC enabled: it health-checks first and exits with a clear error if unreachable; it never starts or stops rclone, registers no startup entry, and embeds no RC password. Generated scripts are not executed automatically."
+
+msgid "可能需要重新认证"
+msgstr "Re-authentication may be required"
+
+msgid "名称"
+msgstr "Name"
+
+msgid "名称（英文，不含空格或冒号）"
+msgstr "Name (English, no spaces or colons)"
+
+msgid "后台任务（{}）"
+msgstr "Background jobs ({})"
+
+msgid "启动"
+msgstr "Start"
+
+msgid "启动时连接该地址（只连 API，不启动 rclone）"
+msgstr "Connect to this address at startup (API only, never starts rclone)"
+
+msgid "启动是即时操作：只在点击「启动」时通过 rclone RC 执行，不会在下次启动时自动执行。"
+msgstr "Starting is a one-off action: it runs over rclone RC only when you click \"Start\" and is never repeated at the next launch."
+
+msgid "启用"
+msgstr "Enable"
+
+msgid "启用 = 执行上面的入口文件（.msi 会以静默方式安装）。停用不会卸载已安装的程序。"
+msgstr "Enable = runs the entry file above (.msi installs silently). Disabling does not uninstall the program."
+
+msgid "在线"
+msgstr "Online"
+
+msgid "地址"
+msgstr "Address"
+
+msgid "地址（主机名或 IP，IPv6 不要加方括号）"
+msgstr "Address (host name or IP; do not add brackets for IPv6)"
+
+msgid "处理中…"
+msgstr "Working…"
+
+msgid "复制一份"
+msgstr "Duplicate"
+
+msgid "复制直链"
+msgstr "Copy direct link"
+
+msgid "复制脚本"
+msgstr "Copy script"
+
+msgid "外观与启动"
+msgstr "Appearance & startup"
+
+msgid "外部 · {}"
+msgstr "External · {}"
+
+msgid "多选"
+msgstr "Multi-select"
+
+msgid "大→小"
+msgstr "Largest first"
+
+msgid "大小"
+msgstr "Size"
+
+msgid "失败"
+msgstr "Failed"
+
+msgid "子路径（留空 = 根）"
+msgstr "Subpath (empty = root)"
+
+msgid "存储位置"
+msgstr "Storage location"
+
+msgid "完整性"
+msgstr "Integrity"
+
+msgid "密码（可选）"
+msgstr "Password (optional)"
+
+msgid "密码（可选；留空 = 不修改）"
+msgstr "Password (optional; empty = unchanged)"
+
+msgid "导入预览"
+msgstr "Import preview"
+
+msgid "导出 rcgui.conf"
+msgstr "Export rcgui.conf"
+
+msgid "导出包含凭据？"
+msgstr "Export credentials?"
+
+msgid "导出时包含凭据"
+msgstr "Include credentials in export"
+
+msgid "小→大"
+msgstr "Smallest first"
+
+msgid "已停用"
+msgstr "Disabled"
+
+msgid "已启用"
+msgstr "Enabled"
+
+msgid "已安装插件（点击插件栏展开 / 收起）"
+msgstr "Installed plugins (click a plugin row to expand / collapse)"
+
+msgid "已断开"
+msgstr "Disconnected"
+
+msgid "已设置（留空不修改）"
+msgstr "Set (leave empty to keep)"
+
+msgid "已选 {} 项"
+msgstr "Selected: {}"
+
+msgid "已预览，可应用"
+msgstr "Previewed, ready to apply"
+
+msgid "平台"
+msgstr "Platform"
+
+msgid "应用导入"
+msgstr "Apply import"
+
+msgid "应用限速"
+msgstr "Apply limits"
+
+msgid "开机恢复脚本（PowerShell）"
+msgstr "Startup recovery script (PowerShell)"
+
+msgid "开机自启"
+msgstr "Start with Windows"
+
+msgid "强调色"
+msgstr "Accent color"
+
+msgid "当前没有进行中的传输"
+msgstr "No transfers in progress"
+
+msgid "当前生效的全局限速：{}"
+msgstr "Effective global limits: {}"
+
+msgid "待修复"
+msgstr "Needs fixing"
+
+msgid "待应用"
+msgstr "Pending"
+
+msgid "恢复内置"
+msgstr "Restore built-in"
+
+msgid "打开目录"
+msgstr "Open folder"
+
+msgid "托管 · {}"
+msgstr "Managed · {}"
+
+msgid "把远程仓库挂载为本地磁盘（需要 WinFsp）"
+msgstr "Mount a remote repository as a local disk (requires WinFsp)"
+
+msgid "挂载"
+msgstr "Mount"
+
+msgid "挂载 {}"
+msgstr "Mounts {}"
+
+msgid "挂载 {} 个 · 服务 {} 个"
+msgstr "Mounts: {} · Services: {}"
+
+msgid "挂载是即时操作：只在点击「挂载」时通过 rclone RC 执行，不会在下次启动时自动执行。"
+msgstr "Mounting is a one-off action: it runs over rclone RC only when you click \"Mount\" and is never repeated at the next launch."
+
+msgid "挂载点（盘符 / * 自动）"
+msgstr "Mount point (drive letter / * for auto)"
+
+msgid "按名称、ID 或标签检索插件…"
+msgstr "Search plugins by name, ID, or tag…"
+
+msgid "按远程分配代理。「不代理」= 不设置 RCGUI 的远程级代理，rclone 仍可能继承系统的 HTTP_PROXY / HTTPS_PROXY 环境变量，不等于强制直连。代理只在远程建立连接时生效：正在运行的挂载/服务需要重新挂载或重启才会使用新代理。ftp / sftp 使用 rclone 原生 http_proxy / socks_proxy 键；若该远程自己已设了代理，本程序只补空缺、不会覆盖（rclone 优先使用 socks_proxy）。SOCKS 的账号密码以明文写入 rclone.conf，且密码不能包含「@」、用户名不能包含「:」。"
+msgstr "Assign a proxy per remote. \"No proxy\" means no RCGUI remote-level proxy; rclone may still inherit the system HTTP_PROXY / HTTPS_PROXY environment variables, so it is not a forced direct connection. A proxy only takes effect when the remote connects: running mounts/services must be remounted or restarted to use the new proxy. ftp / sftp use rclone's native http_proxy / socks_proxy keys; if the remote already sets a proxy, RCGUI only fills the gaps and never overrides it (rclone prefers socks_proxy). SOCKS credentials are written to rclone.conf in plain text, the password must not contain \"@\", and the user name must not contain \":\"."
+
+msgid "排序"
+msgstr "Sort"
+
+msgid "提示"
+msgstr "Notice"
+
+msgid "插件"
+msgstr "Plugins"
+
+msgid "插件包"
+msgstr "Plugin package"
+
+msgid "插件目录：{}"
+msgstr "Plugin directory: {}"
+
+msgid "搜索 ID / 服务名称"
+msgstr "Search ID / service name"
+
+msgid "搜索任务"
+msgstr "Search transfers"
+
+msgid "搜索本地/远程路径"
+msgstr "Search local/remote path"
+
+msgid "搜索远程名称"
+msgstr "Search remote name"
+
+msgid "操作"
+msgstr "Actions"
+
+msgid "支持 .zip 插件包或已解压的插件文件夹；放入插件目录后点「刷新」即可识别。新插件默认未启用，需手动勾选才会运行其入口文件。"
+msgstr "Supports .zip plugin packages or an already extracted plugin folder; place it in the plugin directory and click \"Refresh\" to detect it. New plugins start disabled and only run their entry file after you enable them."
+
+msgid "文件"
+msgstr "File"
+
+msgid "文件将以明文包含远程凭据（OAuth token / 密码）。rclone 的 obscure 只是可逆混淆，不是加密。确认导出？"
+msgstr "The file will contain remote credentials in plain text (OAuth token / password). rclone's obscure is only reversible obfuscation, not encryption. Export anyway?"
+
+msgid "断开"
+msgstr "Disconnect"
+
+msgid "新→旧"
+msgstr "Newest first"
+
+msgid "新建挂载"
+msgstr "New mount"
+
+msgid "新建文件夹"
+msgstr "New folder"
+
+msgid "新建服务"
+msgstr "New service"
+
+msgid "新建远程存储"
+msgstr "New remote"
+
+msgid "旧→新"
+msgstr "Oldest first"
+
+msgid "显示上次快照 · {}"
+msgstr "Showing last snapshot · {}"
+
+msgid "暂停"
+msgstr "Pause"
+
+msgid "暂无活动挂载"
+msgstr "No active mounts"
+
+msgid "暂无记录"
+msgstr "No records"
+
+msgid "暂无错误记录"
+msgstr "No error records"
+
+msgid "更改密码"
+msgstr "Change password"
+
+msgid "服务"
+msgstr "Services"
+
+msgid "服务名称"
+msgstr "Service name"
+
+msgid "未发现插件"
+msgstr "No plugins found"
+
+msgid "未连接"
+msgstr "Not connected"
+
+msgid "本地路径"
+msgstr "Local path"
+
+msgid "本机"
+msgstr "This computer"
+
+msgid "标签"
+msgstr "Tags"
+
+msgid "校验失败"
+msgstr "Verification failed"
+
+msgid "校验通过"
+msgstr "Verification passed"
+
+msgid "根目录"
+msgstr "Root"
+
+msgid "档案导入 / 导出（rcgui.conf）"
+msgstr "Profile import / export (rcgui.conf)"
+
+msgid "橙色"
+msgstr "Orange"
+
+msgid "正在传输"
+msgstr "Active transfers"
+
+msgid "正在握手…"
+msgstr "Handshaking…"
+
+msgid "正在读取插件状态…"
+msgstr "Reading plugin status…"
+
+msgid "活动挂载（{}）"
+msgstr "Active mounts ({})"
+
+msgid "浅色"
+msgstr "Light"
+
+msgid "测试中…"
+msgstr "Testing…"
+
+msgid "测试连接"
+msgstr "Test connection"
+
+msgid "浏览远程路径"
+msgstr "Browse remote path"
+
+msgid "深色"
+msgstr "Dark"
+
+msgid "清空"
+msgstr "Clear"
+
+msgid "版本"
+msgstr "Version"
+
+msgid "版本 {}"
+msgstr "Version {}"
+
+msgid "状态"
+msgstr "Status"
+
+msgid "生成恢复脚本"
+msgstr "Generate recovery script"
+
+msgid "用户名（可选）"
+msgstr "User name (optional)"
+
+msgid "用户名（可选，只影响浏览/下载）"
+msgstr "User name (optional; browsing/download only)"
+
+msgid "用户（可选）"
+msgstr "User (optional)"
+
+msgid "用量"
+msgstr "Usage"
+
+msgid "监听地址"
+msgstr "Listen address"
+
+msgid "目标"
+msgstr "Target"
+
+msgid "直接关闭"
+msgstr "Exit directly"
+
+msgid "确定"
+msgstr "OK"
+
+msgid "确认"
+msgstr "Confirm"
+
+msgid "确认删除"
+msgstr "Confirm deletion"
+
+msgid "确认删除 {}（文件夹将整体删除）？"
+msgstr "Delete {}? (the folder and everything in it will be removed)"
+
+msgid "确认删除 {}？"
+msgstr "Delete {}?"
+
+msgid "确认删除远程存储 {}？"
+msgstr "Delete remote {}?"
+
+msgid "确认删除选中的 {} 项？（文件夹将整体删除）"
+msgstr "Delete the {} selected item(s)? (folders are removed entirely)"
+
+msgid "确认卸载「{}」？插件目录与该插件的设置会一并删除。"
+msgstr "Uninstall \"{}\"? Its plugin directory and settings will be deleted as well."
+
+msgid "确认导出"
+msgstr "Confirm export"
+
+msgid "确认操作"
+msgstr "Confirm action"
+
+msgid "离线"
+msgstr "Offline"
+
+msgid "移动到此处"
+msgstr "Move here"
+
+msgid "移动文件…"
+msgstr "Move file…"
+
+msgid "移动文件「{}」到："
+msgstr "Move file \"{}\" to:"
+
+msgid "移动文件夹…"
+msgstr "Move folder…"
+
+msgid "移动文件夹「{}」到："
+msgstr "Move folder \"{}\" to:"
+
+msgid "站点地址（根地址，不要带 /dav）"
+msgstr "Site address (root URL, without /dav)"
+
+msgid "端口"
+msgstr "Port"
+
+msgid "类型"
+msgstr "Type"
+
+msgid "系统信息"
+msgstr "System information"
+
+msgid "紫色"
+msgstr "Purple"
+
+msgid "累计流量"
+msgstr "Total traffic"
+
+msgid "绿色"
+msgstr "Green"
+
+msgid "缓存模式"
+msgstr "Cache mode"
+
+msgid "编辑"
+msgstr "Edit"
+
+msgid "编辑远程存储：{}"
+msgstr "Edit remote: {}"
+
+msgid "网络服务（将远程以 WebDAV/SFTP 等方式共享到局域网）"
+msgstr "Network services (share a remote on the LAN via WebDAV/SFTP and similar)"
+
+msgid "网速与限速"
+msgstr "Speed & limits"
+
+msgid "耗时"
+msgstr "Elapsed"
+
+msgid "若该远程有正在运行的挂载或服务，需要重新挂载/重启才会丢掉旧代理。"
+msgstr "If a mount or service is running for this remote, remount or restart it to drop the old proxy."
+
+msgid "蓝色"
+msgstr "Blue"
+
+msgid "设置"
+msgstr "Settings"
+
+msgid "资源总览"
+msgstr "Resources"
+
+msgid "语言"
+msgstr "Language"
+
+msgid "跟随系统"
+msgstr "Follow system"
+
+msgid "软件将重启"
+msgstr "The app will restart"
+
+msgid "输入密码"
+msgstr "Enter password"
+
+msgid "输入新密码（留空不修改）"
+msgstr "Enter a new password (leave empty to keep the current one)"
+
+msgid "运行中"
+msgstr "Running"
+
+msgid "运行中服务（{}）"
+msgstr "Running services ({})"
+
+msgid "远程"
+msgstr "Remotes"
+
+msgid "远程存储（{}）"
+msgstr "Remotes ({})"
+
+msgid "远程路径"
+msgstr "Remote path"
+
+msgid "连接 / 握手"
+msgstr "Connect / handshake"
+
+msgid "退出多选"
+msgstr "Exit multi-select"
+
+msgid "选择…"
+msgstr "Choose…"
+
+msgid "速度"
+msgstr "Speed"
+
+msgid "配置文件: {}"
+msgstr "Config file: {}"
+
+msgid "重命名"
+msgstr "Rename"
+
+msgid "重命名 {}"
+msgstr "Rename {}"
+
+msgid "重新握手"
+msgstr "Re-handshake"
+
+msgid "错误 {}"
+msgstr "Errors {}"
+
+msgid "错误 {} 次"
+msgstr "Errors: {}"
+
+msgid "错误记录"
+msgstr "Error log"
+
+msgid "隐藏已完成任务"
+msgstr "Hide finished transfers"
+
+msgid "静默启动（仅托盘）"
+msgstr "Start silently (tray only)"
+
+msgid "默认不含凭据（勾选后才写入）；导入需先预览，应用前自动备份当前档案。"
+msgstr "Excludes credentials by default (they are written only once you tick the box); an import must be previewed first, and the current profile is backed up automatically before applying."
+
+msgid "（当前 {} 条错误记录）"
+msgstr " ({} error records)"
+
+msgid "（没有子文件夹）"
+msgstr " (no subfolders)"
+
+msgid "（空）"
+msgstr " (empty)"
+
+msgid "＋ 新建代理配置"
+msgstr "＋ New proxy profile"
+
+msgid "＋ 新建远程"
+msgstr "＋ New remote"

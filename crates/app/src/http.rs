@@ -101,7 +101,7 @@ async fn dispatch(
     if !plugin_enabled(&st, &id) {
         return fail(
             StatusCode::FORBIDDEN,
-            format!("插件 {id} 已停用，请先在「插件」页启用"),
+            rcgui_i18n::f("插件 {} 已停用，请先在「插件」页启用", &[&(id)]),
         );
     }
 
@@ -167,7 +167,7 @@ async fn dispatch(
                 }
             },
             Err(e) => {
-                return fail(StatusCode::BAD_REQUEST, format!("multipart 解析失败: {e}"));
+                return fail(StatusCode::BAD_REQUEST, rcgui_i18n::f("multipart 解析失败: {}", &[&(e)]));
             }
         }
         (Some(json!({"fields": fields, "files": files})), String::new())
@@ -175,7 +175,7 @@ async fn dispatch(
         let bytes = match axum::body::to_bytes(req.into_body(), BODY_LIMIT).await {
             Ok(b) => b,
             Err(e) => {
-                return fail(StatusCode::BAD_REQUEST, format!("读取请求体失败: {e}"));
+                return fail(StatusCode::BAD_REQUEST, rcgui_i18n::f("读取请求体失败: {}", &[&(e)]));
             }
         };
         (
@@ -251,7 +251,7 @@ fn render(v: Value) -> axum::response::Response {
             Err(e) => {
                 return fail(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("插件返回的 body_b64 不是合法 base64: {e}"),
+                    rcgui_i18n::f("插件返回的 body_b64 不是合法 base64: {}", &[&(e)]),
                 );
             }
         }

@@ -2,9 +2,22 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     // 1) Slint UI 编译
+    //
+    // 多语言：原始语言就是中文（`@tr("中文")` 里的中文即 msgid），`ui/i18n/<lang>/
+    // LC_MESSAGES/<domain>.po` 里放其它语言的翻译，域名默认取 `CARGO_PKG_NAME`
+    // （即 `rclone-gui`）。运行期用 `slint::select_bundled_translation("en")`
+    // 切到英文、传空串切回中文。
+    //
+    // `with_default_translation_context(None)` 关掉「默认上下文 = 组件名」：
+    // 否则同一个中文串在不同组件里会生成不同 msgid，翻译文件得写多份，漏一份
+    // 就回落成中文。统一不带上下文，一个串只对应一条翻译。
     let ui = PathBuf::from("ui/main.slint");
     if ui.exists() {
-        slint_build::compile(&ui).expect("Slint UI 编译失败");
+        let config = slint_build::CompilerConfiguration::new()
+            .with_bundled_translations("ui/i18n")
+            .with_default_translation_context(slint_build::DefaultTranslationContext::None);
+        println!("cargo:rerun-if-changed=ui/i18n");
+        slint_build::compile_with_config(&ui, config).expect("Slint UI 编译失败");
     }
 
     // 2) 插件**不再**编进 exe

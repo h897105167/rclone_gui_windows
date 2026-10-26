@@ -465,7 +465,7 @@ export global RemotesG {
     callback kv-test();
     // ---------------- 代理配置 ----------------
     /// 第 0 项固定是「不代理」，之后是已保存的配置
-    in-out property <[string]> proxy-options: ["不代理"];
+    in-out property <[string]> proxy-options: [@tr("不代理")];
     /// 与 proxy-options 一一对应的说明（悬停提示）
     in-out property <[string]> proxy-option-hints: [];
     in-out property <[ProxyRow]> proxy-rows: [];
@@ -526,10 +526,14 @@ export global SettingsG {
     in-out property <bool> connect-on-start: true;
     in-out property <string> rc-pass: "";
     in-out property <string> rc-url: "http://127.0.0.1:5572";
-    in-out property <[string]> themes: ["跟随系统", "浅色", "深色"];
+    in-out property <[string]> themes: [@tr("跟随系统"), @tr("浅色"), @tr("深色")];
     in-out property <int> theme-idx: 0;
-    in-out property <[string]> accents: ["蓝色", "绿色", "紫色", "橙色"];
+    in-out property <[string]> accents: [@tr("蓝色"), @tr("绿色"), @tr("紫色"), @tr("橙色")];
     in-out property <int> accent-idx: 0;
+    /// 界面语言：只有中文和英文两种。「简体中文」「English」是语言自身的名字，
+    /// 按惯例用各自语言书写，不进翻译表。
+    in-out property <[string]> languages: [@tr("跟随系统"), "简体中文", "English"];
+    in-out property <int> language-idx: 0;
     in-out property <bool> autostart: false;
     in-out property <bool> silent: false;
     /// 关闭窗口时隐藏到托盘（而非退出）。首次关闭时由弹层询问，之后按此值执行。
@@ -553,7 +557,7 @@ export global SettingsG {
 
     // ---------- 连接状态区（阶段 3） ----------
     // status 文案由 Rust 侧按 ConnStatus 给出：未连接 / 已连接 / 已断开（显示的是上次快照）
-    in-out property <string> conn-status: "未连接";
+    in-out property <string> conn-status: @tr("未连接");
     in-out property <bool> conn-live: false;
     in-out property <bool> conn-stale: false;
     in-out property <bool> conn-busy: false;
@@ -575,7 +579,7 @@ export global SettingsG {
     in-out property <string> script-preview: "";
     in-out property <string> script-path: "";
     /// 最近一次预览/应用的摘要文本（不含任何凭据内容）
-    in-out property <string> conf-info: "默认不含凭据（勾选后才写入）；导入需先预览，应用前自动备份当前档案。";
+    in-out property <string> conf-info: @tr("默认不含凭据（勾选后才写入）；导入需先预览，应用前自动备份当前档案。");
 }
 
 // ---------------- 通用组件 ----------------
@@ -735,9 +739,9 @@ component FieldLabel inherits Text {
 
 // 应用内确认弹窗：风格与整体 UI 一致、无系统提示音，锚定在触发元素（鼠标）附近
 component ConfirmPop inherits PopupWindow {
-    in property <string> title: "确认操作";
+    in property <string> title: @tr("确认操作");
     in property <string> msg;
-    in property <string> ok-label: "删除";
+    in property <string> ok-label: @tr("删除");
     callback confirmed;
     callback cancelled;
     close-policy: PopupClosePolicy.close-on-click-outside;
@@ -778,7 +782,7 @@ component ConfirmPop inherits PopupWindow {
             HorizontalLayout {
                 spacing: 8px;
                 alignment: end;
-                PillBtn { label: "取消"; clicked => { root.close(); root.cancelled(); } }
+                PillBtn { label: @tr("取消"); clicked => { root.close(); root.cancelled(); } }
                 PillBtn { label: root.ok-label; danger: true; clicked => { root.close(); root.confirmed(); } }
             }
         }
@@ -870,20 +874,20 @@ component SortSubmenu inherits Rectangle {
         spacing: 2px;
         MenuItemBtn {
             glyph: root.key == "name" ? "\u{E73E}" : "";
-            label: "名称";
+            label: @tr("名称");
             hint: root.key == "name" ? (root.desc ? "Z→A" : "A→Z") : "";
             clicked => { root.pick("name"); }
         }
         MenuItemBtn {
             glyph: root.key == "size" ? "\u{E73E}" : "";
-            label: "大小";
-            hint: root.key == "size" ? (root.desc ? "大→小" : "小→大") : "";
+            label: @tr("大小");
+            hint: root.key == "size" ? (root.desc ? @tr("大→小") : @tr("小→大")) : "";
             clicked => { root.pick("size"); }
         }
         MenuItemBtn {
             glyph: root.key == "mtime" ? "\u{E73E}" : "";
-            label: "修改时间";
-            hint: root.key == "mtime" ? (root.desc ? "新→旧" : "旧→新") : "";
+            label: @tr("修改时间");
+            hint: root.key == "mtime" ? (root.desc ? @tr("新→旧") : @tr("旧→新")) : "";
             clicked => { root.pick("mtime"); }
         }
     }
@@ -978,38 +982,38 @@ component DashboardView inherits Rectangle {
                 spacing: 14px;
                 height: 96px;
                 StatTile {
-                    label: "rclone 状态";
-                    value: DashboardG.running ? "运行中" : (DashboardG.stale ? "已断开" : "未连接");
-                    sub: DashboardG.running ? (DashboardG.managed ? "托管 · " + DashboardG.url : "外部 · " + DashboardG.url) : (DashboardG.stale ? "显示上次快照 · " + DashboardG.url : "未连接");
+                    label: @tr("rclone 状态");
+                    value: DashboardG.running ? @tr("运行中") : (DashboardG.stale ? @tr("已断开") : @tr("未连接"));
+                    sub: DashboardG.running ? (DashboardG.managed ? @tr("托管 · {}", DashboardG.url) : @tr("外部 · {}", DashboardG.url)) : (DashboardG.stale ? @tr("显示上次快照 · {}", DashboardG.url) : @tr("未连接"));
                     tint: DashboardG.running ? ThemeG.ok : (DashboardG.stale ? ThemeG.warn : ThemeG.err);
                 }
                 StatTile {
-                    label: "传输速度";
+                    label: @tr("传输速度");
                     value: DashboardG.speed;
-                    sub: "任务 " + DashboardG.transfers + " 个";
+                    sub: @tr("任务 {} 个", DashboardG.transfers);
                 }
                 StatTile {
-                    label: "累计流量";
+                    label: @tr("累计流量");
                     value: DashboardG.total-bytes;
-                    sub: "错误 " + DashboardG.errors + " 次";
+                    sub: @tr("错误 {} 次", DashboardG.errors);
                     tint: ThemeG.warn;
                 }
                 StatTile {
-                    label: "资源总览";
-                    value: DashboardG.remotes + " 远程";
-                    sub: "挂载 " + DashboardG.mounts + " 个 · 服务 " + DashboardG.serves + " 个";
+                    label: @tr("资源总览");
+                    value: @tr("{} 远程", DashboardG.remotes);
+                    sub: @tr("挂载 {} 个 · 服务 {} 个", DashboardG.mounts, DashboardG.serves);
                     tint: ThemeG.ok;
                 }
             }
             HorizontalLayout {
                 spacing: 14px;
                 Card {
-                    title: "正在传输";
+                    title: @tr("正在传输");
                     horizontal-stretch: 2;
                     VerticalLayout {
                         spacing: 2px;
                         if DashboardG.xfers.length == 0 : Text {
-                            text: "当前没有进行中的传输";
+                            text: @tr("当前没有进行中的传输");
                             font-size: 13px;
                             color: ThemeG.text-dim;
                         }
@@ -1017,23 +1021,23 @@ component DashboardView inherits Rectangle {
                     }
                 }
                 Card {
-                    title: "系统信息";
+                    title: @tr("系统信息");
                     horizontal-stretch: 1;
                     VerticalLayout {
                         spacing: 8px;
                         HorizontalLayout {
                             height: 20px;
-                            Text { text: "版本"; font-size: 12px; color: ThemeG.text-dim; width: 64px; vertical-alignment: center; }
+                            Text { text: @tr("版本"); font-size: 12px; color: ThemeG.text-dim; width: 64px; vertical-alignment: center; }
                             Text { text: DashboardG.version; font-size: 13px; color: ThemeG.text; vertical-alignment: center; }
                         }
                         HorizontalLayout {
                             height: 20px;
-                            Text { text: "平台"; font-size: 12px; color: ThemeG.text-dim; width: 64px; vertical-alignment: center; }
+                            Text { text: @tr("平台"); font-size: 12px; color: ThemeG.text-dim; width: 64px; vertical-alignment: center; }
                             Text { text: DashboardG.os-info; font-size: 13px; color: ThemeG.text; vertical-alignment: center; }
                         }
                         HorizontalLayout {
                             height: 20px;
-                            Text { text: "RC 地址"; font-size: 12px; color: ThemeG.text-dim; width: 64px; vertical-alignment: center; }
+                            Text { text: @tr("RC 地址"); font-size: 12px; color: ThemeG.text-dim; width: 64px; vertical-alignment: center; }
                             // 没连过 rclone 时不显示地址：那只是「将要连的」配置值，
                             // 摆在「系统信息」里会被误读成当前连接目标（会话 11 用户指出）。
                             // 连上过、现在断了（stale）仍显示，因为上面已标「显示上次快照」。
@@ -1051,7 +1055,7 @@ component DashboardView inherits Rectangle {
             // 历史记录：把每一次 toast（成功/失败/提示）留档。
             // toast 只显示 2.6 秒，操作失败时经常来不及看清；这里可回看、可清空。
             Card {
-                title: "历史记录";
+                title: @tr("历史记录");
                 VerticalLayout {
                     spacing: 8px;
                     HorizontalLayout {
@@ -1059,9 +1063,9 @@ component DashboardView inherits Rectangle {
                         height: 26px;
                         Text {
                             text: ToastG.history.length == 0
-                                ? "暂无记录"
-                                : "共 " + ToastG.history.length + " 条"
-                                  + (ToastG.has-errors ? " · 含错误" : "");
+                                ? @tr("暂无记录")
+                                : @tr("共 {} 条", ToastG.history.length)
+                                  + (ToastG.has-errors ? @tr(" · 含错误") : "");
                             font-size: 12px;
                             color: ToastG.has-errors ? ThemeG.err : ThemeG.text-dim;
                             vertical-alignment: center;
@@ -1069,7 +1073,7 @@ component DashboardView inherits Rectangle {
                         Rectangle {}
                         // 右上角：清空。PillBtn 用自定义 disabled 属性（不是标准 enabled）
                         PillBtn {
-                            label: "清空";
+                            label: @tr("清空");
                             compact: true;
                             disabled: ToastG.history.length == 0;
                             clicked => {
@@ -1191,7 +1195,7 @@ component LocalPane inherits Rectangle {
         HorizontalLayout {
             height: 36px;
             spacing: 6px;
-            Text { text: "本机"; font-size: 14px; font-weight: 600; color: ThemeG.text; vertical-alignment: center; }
+            Text { text: @tr("本机"); font-size: 14px; font-weight: 600; color: ThemeG.text; vertical-alignment: center; }
             IconBtn { label: "\u{E74A}"; clicked => { root.go-up(); } }
             Rectangle {
                 horizontal-stretch: 1;
@@ -1212,9 +1216,9 @@ component LocalPane inherits Rectangle {
                     overflow: elide;
                 }
             }
-            PillBtn { label: "选择…"; compact: true; disabled: LocalG.busy; clicked => { root.choose-dir(); } }
+            PillBtn { label: @tr("选择…"); compact: true; disabled: LocalG.busy; clicked => { root.choose-dir(); } }
             if !LocalG.multi : PillBtn {
-                label: "多选";
+                label: @tr("多选");
                 compact: true;
                 clicked => { root.multi-toggle(); }
             }
@@ -1230,22 +1234,22 @@ component LocalPane inherits Rectangle {
                 padding-right: 8px;
                 spacing: 8px;
                 Text {
-                    text: "已选 " + LocalG.checked-count + " 项";
+                    text: @tr("已选 {} 项", LocalG.checked-count);
                     font-size: 12px;
                     color: ThemeG.text;
                     vertical-alignment: center;
                 }
                 Rectangle { horizontal-stretch: 1; }
-                PillBtn { label: "全选"; compact: true; clicked => { root.select-all(); } }
-                PillBtn { label: "反选"; compact: true; clicked => { root.select-invert(); } }
+                PillBtn { label: @tr("全选"); compact: true; clicked => { root.select-all(); } }
+                PillBtn { label: @tr("反选"); compact: true; clicked => { root.select-invert(); } }
                 PillBtn {
-                    label: "上传";
+                    label: @tr("上传");
                     compact: true;
                     primary: true;
                     disabled: LocalG.busy || LocalG.checked-count == 0;
                     clicked => { root.upload-many(); }
                 }
-                PillBtn { label: "退出多选"; compact: true; clicked => { root.multi-toggle(); } }
+                PillBtn { label: @tr("退出多选"); compact: true; clicked => { root.multi-toggle(); } }
             }
         }
         Card {
@@ -1261,9 +1265,9 @@ component LocalPane inherits Rectangle {
                         padding-right: 12px;
                         Rectangle {
                             horizontal-stretch: 1;
-                            Text { text: "名称"; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            Text { text: @tr("名称"); font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                         }
-                        Text { text: "大小"; font-size: 12px; color: ThemeG.text-dim; width: 62px; vertical-alignment: center; }
+                        Text { text: @tr("大小"); font-size: 12px; color: ThemeG.text-dim; width: 62px; vertical-alignment: center; }
                         Rectangle { width: 38px; }
                     }
                     // 表头右键同样给出刷新 / 排序
@@ -1388,7 +1392,7 @@ component LocalPane inherits Rectangle {
                                         label: "\u{E898}";
                                         clicked => { root.upload-row(i); }
                                     }
-                                    Tooltip { text: @markdown("上传到右侧远程的当前目录"); }
+                                    Tooltip { text: @markdown("\{@tr("上传到右侧远程的当前目录")}"); }
                                 }
                             }
                         }
@@ -1475,7 +1479,7 @@ component LocalPane inherits Rectangle {
                             spacing: 2px;
                             MenuItemBtn {
                                 glyph: "\u{E72C}";
-                                label: "刷新";
+                                label: @tr("刷新");
                                 // 不要在其它项上收起子菜单：鼠标从「排序」斜向滑进子面板时
                                 // 必然会扫过相邻行，一旦在那里收起，子面板会在指针到达前消失，
                                 // 用户永远点不中它（实测复现）。
@@ -1483,7 +1487,7 @@ component LocalPane inherits Rectangle {
                             }
                             MenuItemBtn {
                                 glyph: "\u{E8CB}";
-                                label: "排序";
+                                label: @tr("排序");
                                 has-submenu: true;
                                 entered => { root.sub-open = true; }
                                 clicked => { root.sub-open = !root.sub-open; }
@@ -1523,13 +1527,13 @@ component LocalPane inherits Rectangle {
                 spacing: 2px;
                 MenuItemBtn {
                     glyph: "\u{E898}";
-                    label: root.op-is-dir ? "上传此文件夹到…" : "上传此文件到…";
+                    label: root.op-is-dir ? @tr("上传此文件夹到…") : @tr("上传此文件到…");
                     // 弹窗由 Slint 自己 show：Rust 侧只能填数据，无法打开组件内弹层
                     clicked => { lcm.close(); upmp.show(); root.upload-to(root.op-idx); }
                 }
                 MenuItemBtn {
                     glyph: "\u{E898}";
-                    label: "上传到当前远程目录";
+                    label: @tr("上传到当前远程目录");
                     clicked => { lcm.close(); root.upload-row(root.op-idx); }
                 }
             }
@@ -1552,7 +1556,7 @@ component LocalPane inherits Rectangle {
                 padding: 14px;
                 spacing: 10px;
                 Text {
-                    text: "上传 " + LocalG.up-count + " 项到远程：";
+                    text: @tr("上传 {} 项到远程：", LocalG.up-count);
                     font-size: 13px;
                     color: ThemeG.text;
                     overflow: elide;
@@ -1560,8 +1564,8 @@ component LocalPane inherits Rectangle {
                 HorizontalLayout {
                     spacing: 8px;
                     height: 30px;
-                    PillBtn { label: "↑ 上级"; compact: true; clicked => { root.upload-to-up(); } }
-                    PillBtn { label: "根目录"; compact: true; clicked => { root.upload-to-root(); } }
+                    PillBtn { label: @tr("↑ 上级"); compact: true; clicked => { root.upload-to-up(); } }
+                    PillBtn { label: @tr("根目录"); compact: true; clicked => { root.upload-to-root(); } }
                     Rectangle { horizontal-stretch: 1; }
                 }
                 Rectangle {
@@ -1590,7 +1594,7 @@ component LocalPane inherits Rectangle {
                     border-color: ThemeG.border;
                     VerticalLayout {
                         if LocalG.up-dirs.length == 0 : Text {
-                            text: LocalG.up-busy ? "加载中…" : "（没有子文件夹）";
+                            text: LocalG.up-busy ? @tr("加载中…") : @tr("（没有子文件夹）");
                             font-size: 12px;
                             color: ThemeG.text-dim;
                             horizontal-alignment: center;
@@ -1625,9 +1629,9 @@ component LocalPane inherits Rectangle {
                 HorizontalLayout {
                     spacing: 8px;
                     Rectangle { horizontal-stretch: 1; }
-                    PillBtn { label: "取消"; clicked => { upmp.close(); } }
+                    PillBtn { label: @tr("取消"); clicked => { upmp.close(); } }
                     PillBtn {
-                        label: "上传到此处";
+                        label: @tr("上传到此处");
                         primary: true;
                         disabled: LocalG.up-busy;
                         clicked => { upmp.close(); root.upload-to-confirm(); }
@@ -1714,7 +1718,7 @@ component FilesView inherits Rectangle {
             }
             // 远程名右侧：上传按钮（资源管理器选文件 → 传到当前目录）
             PillBtn {
-                label: "上传文件";
+                label: @tr("上传文件");
                 disabled: FilesG.busy;
                 clicked => { root.upload-pick(); }
             }
@@ -1835,8 +1839,8 @@ component FilesView inherits Rectangle {
             // 让路径框吃满中间剩余宽度（唯一 stretch 项，宽度不随面包屑内容变化）
             Rectangle { horizontal-stretch: 0; }
             // 多选入口；进入后动作按钮出现在下面单独一行（宽度不够时不至于挤爆工具条）
-            if !FilesG.multi : PillBtn { label: "多选"; clicked => { root.multi-toggle(); } }
-            PillBtn { label: "新建文件夹"; clicked => { root.mkdir(); } }
+            if !FilesG.multi : PillBtn { label: @tr("多选"); clicked => { root.multi-toggle(); } }
+            PillBtn { label: @tr("新建文件夹"); clicked => { root.mkdir(); } }
             IconBtn { label: "\u{E72C}"; clicked => { root.refresh(); } }
         }
         // 多选动作条：只在多选模式出现，独占一行，宽度不参与主工具条的挤压计算
@@ -1849,28 +1853,28 @@ component FilesView inherits Rectangle {
                 padding-right: 12px;
                 spacing: 8px;
                 Text {
-                    text: "已选 " + FilesG.checked-count + " 项";
+                    text: @tr("已选 {} 项", FilesG.checked-count);
                     font-size: 13px;
                     color: ThemeG.accent;
                     vertical-alignment: center;
                 }
                 Rectangle { horizontal-stretch: 1; }
-                PillBtn { label: "全选"; compact: true; clicked => { root.select-all(); } }
-                PillBtn { label: "反选"; compact: true; clicked => { root.select-invert(); } }
+                PillBtn { label: @tr("全选"); compact: true; clicked => { root.select-all(); } }
+                PillBtn { label: @tr("反选"); compact: true; clicked => { root.select-invert(); } }
                 PillBtn {
-                    label: "下载到本机";
+                    label: @tr("下载到本机");
                     compact: true;
                     disabled: FilesG.busy;
                     clicked => { root.download-many(); }
                 }
                 PillBtn {
-                    label: "删除";
+                    label: @tr("删除");
                     compact: true;
                     danger: true;
                     disabled: FilesG.busy || FilesG.checked-count == 0;
                     clicked => { delmp.show(); }
                 }
-                PillBtn { label: "退出多选"; compact: true; clicked => { root.multi-toggle(); } }
+                PillBtn { label: @tr("退出多选"); compact: true; clicked => { root.multi-toggle(); } }
             }
         }
         Card {
@@ -1897,10 +1901,10 @@ component FilesView inherits Rectangle {
                         padding-right: 14px;
                         Rectangle {
                             horizontal-stretch: 1;
-                            Text { text: "名称"; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                            Text { text: @tr("名称"); font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                         }
-                        Text { text: "大小"; font-size: 12px; color: ThemeG.text-dim; width: 100px; vertical-alignment: center; }
-                        Text { text: "修改时间"; font-size: 12px; color: ThemeG.text-dim; width: 170px; vertical-alignment: center; }
+                        Text { text: @tr("大小"); font-size: 12px; color: ThemeG.text-dim; width: 100px; vertical-alignment: center; }
+                        Text { text: @tr("修改时间"); font-size: 12px; color: ThemeG.text-dim; width: 170px; vertical-alignment: center; }
                     }
                 }
                 Rectangle {
@@ -2043,7 +2047,7 @@ component FilesView inherits Rectangle {
                             alignment: center;
                             spacing: 8px;
                             Spinner { running: true; }
-                            Text { text: "加载中…"; font-size: 12px; color: ThemeG.text; vertical-alignment: center; }
+                            Text { text: @tr("加载中…"); font-size: 12px; color: ThemeG.text; vertical-alignment: center; }
                         }
                     }
                 }
@@ -2080,17 +2084,17 @@ component FilesView inherits Rectangle {
                 spacing: 2px;
                 MenuItemBtn {
                     glyph: "\u{E896}";
-                    label: "下载到当前本地目录";
+                    label: @tr("下载到当前本地目录");
                     clicked => { ctx.close(); root.download-here(); }
                 }
                 MenuItemBtn {
                     glyph: "\u{E896}";
-                    label: "下载到…";
+                    label: @tr("下载到…");
                     clicked => { ctx.close(); root.download-row(root.op-idx); }
                 }
                 MenuItemBtn {
                     glyph: "\u{E8B7}";
-                    label: root.op-is-dir ? "移动文件夹…" : "移动文件…";
+                    label: root.op-is-dir ? @tr("移动文件夹…") : @tr("移动文件…");
                     clicked => {
                         ctx.close();
                         FilesG.move-name = root.op-name;
@@ -2104,22 +2108,22 @@ component FilesView inherits Rectangle {
                 }
                 MenuItemBtn {
                     glyph: "\u{E8AC}";
-                    label: "重命名";
+                    label: @tr("重命名");
                     clicked => { ctx.close(); rnp.show(); }
                 }
                 MenuItemBtn {
                     glyph: "\u{E8C8}";
-                    label: "复制一份";
+                    label: @tr("复制一份");
                     clicked => { ctx.close(); root.copy-row(root.op-idx); }
                 }
                 if !root.op-is-dir : MenuItemBtn {
                     glyph: "\u{E71B}";
-                    label: "复制直链";
+                    label: @tr("复制直链");
                     clicked => { ctx.close(); root.copy-link(root.op-idx); }
                 }
                 MenuItemBtn {
                     glyph: "\u{E74D}";
-                    label: "删除";
+                    label: @tr("删除");
                     danger: true;
                     clicked => { ctx.close(); delp.show(); }
                 }
@@ -2166,7 +2170,7 @@ component FilesView inherits Rectangle {
             VerticalLayout {
                 padding: 14px;
                 spacing: 10px;
-                FieldLabel { text: "重命名 " + root.op-name; }
+                FieldLabel { text: @tr("重命名 {}", root.op-name); }
                 HorizontalLayout {
                     spacing: 8px;
                     LineEdit {
@@ -2174,8 +2178,8 @@ component FilesView inherits Rectangle {
                         text <=> FilesG.rename-name;
                         accepted(t) => { rnp.close(); root.rename-row(root.op-idx); }
                     }
-                    PillBtn { label: "确定"; primary: true; clicked => { rnp.close(); root.rename-row(root.op-idx); } }
-                    PillBtn { label: "取消"; clicked => { rnp.close(); } }
+                    PillBtn { label: @tr("确定"); primary: true; clicked => { rnp.close(); root.rename-row(root.op-idx); } }
+                    PillBtn { label: @tr("取消"); clicked => { rnp.close(); } }
                 }
             }
         }
@@ -2200,7 +2204,7 @@ component FilesView inherits Rectangle {
                 padding: 14px;
                 spacing: 10px;
                 Text {
-                    text: (FilesG.move-is-dir ? "移动文件夹「" : "移动文件「") + FilesG.move-name + "」到：";
+                    text: FilesG.move-is-dir ? @tr("移动文件夹「{}」到：", FilesG.move-name) : @tr("移动文件「{}」到：", FilesG.move-name);
                     font-size: 13px;
                     color: ThemeG.text;
                     overflow: elide;
@@ -2208,8 +2212,8 @@ component FilesView inherits Rectangle {
                 HorizontalLayout {
                     spacing: 8px;
                     height: 30px;
-                    PillBtn { label: "↑ 上级"; compact: true; clicked => { root.move-up(); } }
-                    PillBtn { label: "根目录"; compact: true; clicked => { root.move-root(); } }
+                    PillBtn { label: @tr("↑ 上级"); compact: true; clicked => { root.move-up(); } }
+                    PillBtn { label: @tr("根目录"); compact: true; clicked => { root.move-root(); } }
                     Rectangle { horizontal-stretch: 1; }
                 }
                 // 当前浏览到的目标目录
@@ -2241,7 +2245,7 @@ component FilesView inherits Rectangle {
                     border-color: ThemeG.border;
                     VerticalLayout {
                         if FilesG.move-dirs.length == 0 : Text {
-                            text: FilesG.move-busy ? "加载中…" : "（没有子文件夹）";
+                            text: FilesG.move-busy ? @tr("加载中…") : @tr("（没有子文件夹）");
                             font-size: 12px;
                             color: ThemeG.text-dim;
                             horizontal-alignment: center;
@@ -2276,9 +2280,9 @@ component FilesView inherits Rectangle {
                 HorizontalLayout {
                     spacing: 8px;
                     Rectangle { horizontal-stretch: 1; }
-                    PillBtn { label: "取消"; clicked => { mvp.close(); } }
+                    PillBtn { label: @tr("取消"); clicked => { mvp.close(); } }
                     PillBtn {
-                        label: "移动到此处";
+                        label: @tr("移动到此处");
                         primary: true;
                         disabled: FilesG.move-busy;
                         clicked => { mvp.close(); root.move-confirm(); }
@@ -2289,8 +2293,8 @@ component FilesView inherits Rectangle {
     }
     // 删除确认弹窗
     delp := ConfirmPop {
-        title: "删除";
-        msg: "确认删除 " + root.op-name + (root.op-is-dir ? "（文件夹将整体删除）？" : "？");
+        title: @tr("删除");
+        msg: root.op-is-dir ? @tr("确认删除 {}（文件夹将整体删除）？", root.op-name) : @tr("确认删除 {}？", root.op-name);
         x: root.menu-ax;
         y: root.menu-ay;
         confirmed => { root.del-row(root.op-idx); }
@@ -2354,19 +2358,19 @@ component FilesView inherits Rectangle {
                             spacing: 2px;
                             MenuItemBtn {
                                 glyph: "\u{E72C}";
-                                label: "刷新";
+                                label: @tr("刷新");
                                 clicked => { bmp.close(); root.refresh(); }
                             }
                             MenuItemBtn {
                                 glyph: "\u{E8CB}";
-                                label: "排序";
+                                label: @tr("排序");
                                 has-submenu: true;
                                 entered => { root.sub-open = true; }
                                 clicked => { root.sub-open = !root.sub-open; }
                             }
                             MenuItemBtn {
                                 glyph: "\u{E898}";
-                                label: "上传文件到此处…";
+                                label: @tr("上传文件到此处…");
                                 clicked => { bmp.close(); root.upload-pick(); }
                             }
                         }
@@ -2390,8 +2394,8 @@ component FilesView inherits Rectangle {
     }
     // 批量删除确认（多选模式）
     delmp := ConfirmPop {
-        title: "删除";
-        msg: "确认删除选中的 " + FilesG.checked-count + " 项？（文件夹将整体删除）";
+        title: @tr("删除");
+        msg: @tr("确认删除选中的 {} 项？（文件夹将整体删除）", FilesG.checked-count);
         x: Math.max(0px, (root.width - 360px) / 2);
         y: 120px;
         confirmed => { root.del-many(); }
@@ -2443,10 +2447,10 @@ component RemotesView inherits Rectangle {
             LineEdit {
                 width: 220px;
                 text <=> RemotesG.filter;
-                placeholder-text: "搜索远程名称";
+                placeholder-text: @tr("搜索远程名称");
                 edited(t) => { root.filter-changed(t); }
             }
-            PillBtn { label: "刷新"; clicked => { root.refresh(); } }
+            PillBtn { label: @tr("刷新"); clicked => { root.refresh(); } }
             // 忙碌指示：任何异步操作（刷新 / 应用导入 / 下发代理）期间可见，
             // 让用户知道「正在做什么」，而不是点完没反应。
             if RemotesG.loading : HorizontalLayout {
@@ -2456,18 +2460,18 @@ component RemotesView inherits Rectangle {
                     Spinner { width: 18px; height: 18px; running: true; }
                 }
                 Text {
-                    text: "处理中…";
+                    text: @tr("处理中…");
                     font-size: 12px;
                     color: ThemeG.text-dim;
                     vertical-alignment: center;
                 }
             }
             Rectangle {}
-            PillBtn { label: "＋ 新建远程"; primary: true; clicked => { root.add(); } }
+            PillBtn { label: @tr("＋ 新建远程"); primary: true; clicked => { root.add(); } }
         }
         // 编辑器
         if RemotesG.show-editor : Card {
-            title: RemotesG.edit-is-new ? "新建远程存储" : "编辑远程存储：" + RemotesG.edit-name;
+            title: RemotesG.edit-is-new ? @tr("新建远程存储") : @tr("编辑远程存储：{}", RemotesG.edit-name);
             VerticalLayout {
                 spacing: 10px;
                 // 名称 + 类型
@@ -2477,13 +2481,13 @@ component RemotesView inherits Rectangle {
                     VerticalLayout {
                         spacing: 3px;
                         horizontal-stretch: 1;
-                        FieldLabel { text: "名称（英文，不含空格或冒号）"; }
+                        FieldLabel { text: @tr("名称（英文，不含空格或冒号）"); }
                         LineEdit { text <=> RemotesG.edit-name; enabled: RemotesG.edit-is-new; }
                     }
                     VerticalLayout {
                         spacing: 3px;
                         width: 180px;
-                        FieldLabel { text: "类型"; }
+                        FieldLabel { text: @tr("类型"); }
                         ComboBox {
                             model: RemotesG.types;
                             current-index <=> RemotesG.type-idx;
@@ -2509,7 +2513,7 @@ component RemotesView inherits Rectangle {
                     spacing: 10px;
                     VerticalLayout {
                         spacing: 3px;
-                        FieldLabel { text: "站点地址（根地址，不要带 /dav）"; }
+                        FieldLabel { text: @tr("站点地址（根地址，不要带 /dav）"); }
                         LineEdit {
                             text <=> RemotesG.kv-base;
                             placeholder-text: "https://kvault.example.com";
@@ -2517,11 +2521,11 @@ component RemotesView inherits Rectangle {
                     }
                     VerticalLayout {
                         spacing: 3px;
-                        FieldLabel { text: "API 令牌（上传必填；留空 = 不修改已保存的令牌）"; }
+                        FieldLabel { text: @tr("API 令牌（上传必填；留空 = 不修改已保存的令牌）"); }
                         LineEdit {
                             text <=> RemotesG.kv-token;
                             input-type: InputType.password;
-                            placeholder-text: RemotesG.kv-token-set ? "已设置（留空不修改）" : "kvault_xxxxxxxxxx_…";
+                            placeholder-text: RemotesG.kv-token-set ? @tr("已设置（留空不修改）") : "kvault_xxxxxxxxxx_…";
                         }
                     }
                     HorizontalLayout {
@@ -2529,13 +2533,13 @@ component RemotesView inherits Rectangle {
                         VerticalLayout {
                             spacing: 3px;
                             horizontal-stretch: 1;
-                            FieldLabel { text: "上传目录（相对站点根；留空 = 令牌策略里的目录前缀）"; }
+                            FieldLabel { text: @tr("上传目录（相对站点根；留空 = 令牌策略里的目录前缀）"); }
                             LineEdit { text <=> RemotesG.kv-folder; }
                         }
                         VerticalLayout {
                             spacing: 3px;
                             width: 170px;
-                            FieldLabel { text: "存储位置"; }
+                            FieldLabel { text: @tr("存储位置"); }
                             ComboBox {
                                 model: RemotesG.kv-storages;
                                 current-index <=> RemotesG.kv-storage-idx;
@@ -2547,13 +2551,13 @@ component RemotesView inherits Rectangle {
                         VerticalLayout {
                             spacing: 3px;
                             horizontal-stretch: 1;
-                            FieldLabel { text: "用户名（可选，只影响浏览/下载）"; }
+                            FieldLabel { text: @tr("用户名（可选，只影响浏览/下载）"); }
                             LineEdit { text <=> RemotesG.kv-user; }
                         }
                         VerticalLayout {
                             spacing: 3px;
                             horizontal-stretch: 1;
-                            FieldLabel { text: "密码（可选；留空 = 不修改）"; }
+                            FieldLabel { text: @tr("密码（可选；留空 = 不修改）"); }
                             LineEdit { text <=> RemotesG.kv-pass; input-type: InputType.password; }
                         }
                     }
@@ -2561,12 +2565,12 @@ component RemotesView inherits Rectangle {
                         spacing: 12px;
                         height: 30px;
                         CheckBox {
-                            text: "内容去重（同一份文件只存一次，返回已有直链）";
+                            text: @tr("内容去重（同一份文件只存一次，返回已有直链）");
                             checked <=> RemotesG.kv-dedup;
                         }
                         Rectangle {}
                         PillBtn {
-                            label: RemotesG.kv-testing ? "测试中…" : "测试连接";
+                            label: RemotesG.kv-testing ? @tr("测试中…") : @tr("测试连接");
                             disabled: RemotesG.kv-testing;
                             clicked => { RemotesG.kv-test(); }
                         }
@@ -2624,7 +2628,7 @@ component RemotesView inherits Rectangle {
                                         // 原样写回。默认锁住，只显示「已设置」。
                                         if f.kind == "password" && f.secret-set && !f.secret-editing : Text {
                                             horizontal-stretch: 1;
-                                            text: "已设置（留空不修改）";
+                                            text: @tr("已设置（留空不修改）");
                                             font-size: 12px;
                                             color: ThemeG.text-dim;
                                             vertical-alignment: center;
@@ -2635,15 +2639,15 @@ component RemotesView inherits Rectangle {
                                             text: f.value;
                                             input-type: f.kind == "password" ? InputType.password : InputType.text;
                                             placeholder-text: f.kind != "password" ? ""
-                                                : f.secret-set ? "输入新密码（留空不修改）"
-                                                : "输入密码";
+                                                : f.secret-set ? @tr("输入新密码（留空不修改）")
+                                                : @tr("输入密码");
                                             edited(t) => {
                                                 RemotesG.edit-fields[i].value = t;
                                             }
                                         }
                                         if f.kind == "password" && f.secret-set : PillBtn {
                                             compact: true;
-                                            label: f.secret-editing ? "取消更改" : "更改密码";
+                                            label: f.secret-editing ? @tr("取消更改") : @tr("更改密码");
                                             clicked => {
                                                 RemotesG.edit-fields[i].secret-editing = !RemotesG.edit-fields[i].secret-editing;
                                                 RemotesG.edit-fields[i].value = "";
@@ -2678,7 +2682,7 @@ component RemotesView inherits Rectangle {
                         mouse-cursor: pointer;
                         clicked => { RemotesG.show-advanced = !RemotesG.show-advanced; }
                         Text {
-                            text: RemotesG.show-advanced ? "▾ 隐藏高级选项" : "▸ 显示高级选项";
+                            text: RemotesG.show-advanced ? @tr("▾ 隐藏高级选项") : @tr("▸ 显示高级选项");
                             font-size: 12px;
                             color: ThemeG.accent;
                             vertical-alignment: center;
@@ -2689,7 +2693,7 @@ component RemotesView inherits Rectangle {
                         mouse-cursor: pointer;
                         clicked => { RemotesG.show-raw = !RemotesG.show-raw; }
                         Text {
-                            text: RemotesG.show-raw ? "切换到表单模式" : "切换到原始模式";
+                            text: RemotesG.show-raw ? @tr("切换到表单模式") : @tr("切换到原始模式");
                             font-size: 12px;
                             color: ThemeG.accent;
                             vertical-alignment: center;
@@ -2699,7 +2703,7 @@ component RemotesView inherits Rectangle {
                 // 原始 key=value 编辑器（保留给高级用户）
                 if (RemotesG.show-raw || RemotesG.edit-fields.length == 0) && !RemotesG.kv-editor : VerticalLayout {
                     spacing: 3px;
-                    FieldLabel { text: "参数（每行一个 key=value，保存时将覆盖已有同名参数）"; }
+                    FieldLabel { text: @tr("参数（每行一个 key=value，保存时将覆盖已有同名参数）"); }
                     Rectangle {
                         height: 140px;
                         background: ThemeG.panel-2;
@@ -2712,8 +2716,8 @@ component RemotesView inherits Rectangle {
                 // 按钮
                 HorizontalLayout {
                     spacing: 8px;
-                    PillBtn { label: "保存"; primary: true; clicked => { root.editor-save(); } }
-                    PillBtn { label: "取消"; clicked => { root.editor-cancel(); } }
+                    PillBtn { label: @tr("保存"); primary: true; clicked => { root.editor-save(); } }
+                    PillBtn { label: @tr("取消"); clicked => { root.editor-cancel(); } }
                     Rectangle {}
                 }
             }
@@ -2730,7 +2734,7 @@ component RemotesView inherits Rectangle {
         // 而且因为 ListView 视口只有一行高，滚轮也滚不动。
         // 因此这里**两个高度都必须由 rows.length 推导**，不依赖布局结果。
         Card {
-            title: "远程存储（" + RemotesG.rows.length + "）";
+            title: @tr("远程存储（{}）", RemotesG.rows.length);
             pad: 0px;
             // 高度 = 卡片标题行 36 + 表头行 36 + 每行 40 + 2（上下边框）。
             // 标题行是 Card 内建的，容易被漏掉：只算一个 36 会让最后一行被裁。
@@ -2745,12 +2749,12 @@ component RemotesView inherits Rectangle {
                         padding-right: 14px;
                         Rectangle {
                             horizontal-stretch: 1;
-                            Text { text: "名称"; width: 100%; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
+                            Text { text: @tr("名称"); width: 100%; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
                         }
-                        Text { text: "类型"; font-size: 12px; color: ThemeG.text-dim; width: 110px; vertical-alignment: center; }
-                        Text { text: "用量"; font-size: 12px; color: ThemeG.text-dim; width: 140px; vertical-alignment: center; }
-                        Text { text: "代理"; font-size: 12px; color: ThemeG.text-dim; width: 240px; vertical-alignment: center; }
-                        Text { text: "操作"; font-size: 12px; color: ThemeG.text-dim; width: 150px; vertical-alignment: center; }
+                        Text { text: @tr("类型"); font-size: 12px; color: ThemeG.text-dim; width: 110px; vertical-alignment: center; }
+                        Text { text: @tr("用量"); font-size: 12px; color: ThemeG.text-dim; width: 140px; vertical-alignment: center; }
+                        Text { text: @tr("代理"); font-size: 12px; color: ThemeG.text-dim; width: 240px; vertical-alignment: center; }
+                        Text { text: @tr("操作"); font-size: 12px; color: ThemeG.text-dim; width: 150px; vertical-alignment: center; }
                     }
                 }
                 Rectangle {
@@ -2790,7 +2794,7 @@ component RemotesView inherits Rectangle {
                                                 HorizontalLayout {
                                                     alignment: center;
                                                     Text {
-                                                        text: bah.has-hover ? "可能需要重新认证" : "凭据未随包导出";
+                                                        text: bah.has-hover ? @tr("可能需要重新认证") : @tr("凭据未随包导出");
                                                         font-size: 11px;
                                                         color: ThemeG.warn;
                                                         vertical-alignment: center;
@@ -2817,7 +2821,7 @@ component RemotesView inherits Rectangle {
                                         border-width: 1px;
                                         border-color: ThemeG.warn;
                                         Text {
-                                            text: "待修复";
+                                            text: @tr("待修复");
                                             font-size: 10px;
                                             color: ThemeG.warn;
                                             horizontal-alignment: center;
@@ -2832,7 +2836,7 @@ component RemotesView inherits Rectangle {
                                         border-width: 1px;
                                         border-color: ThemeG.border;
                                         Text {
-                                            text: "待应用";
+                                            text: @tr("待应用");
                                             font-size: 10px;
                                             color: ThemeG.text-dim;
                                             horizontal-alignment: center;
@@ -2856,12 +2860,12 @@ component RemotesView inherits Rectangle {
                                     alignment: start;
                                     VerticalLayout {
                                         alignment: center;
-                                        PillBtn { label: "编辑"; compact: true; clicked => { root.edit-row(i); } }
+                                        PillBtn { label: @tr("编辑"); compact: true; clicked => { root.edit-row(i); } }
                                     }
                                     VerticalLayout {
                                         alignment: center;
                                         PillBtn {
-                                            label: "删除";
+                                            label: @tr("删除");
                                             compact: true;
                                             danger: true;
                                             clicked => {
@@ -2896,12 +2900,12 @@ component RemotesView inherits Rectangle {
         // - 之前给它限高 + 内部 ScrollView，结果卡片参与外层高度分配被压扁，
         //   ScrollView 拿不到高度，底部按钮直接被裁掉、完全点不到。
         Card {
-            title: "代理配置（" + RemotesG.proxy-rows.length + "）";
+            title: @tr("代理配置（{}）", RemotesG.proxy-rows.length);
             VerticalLayout {
                 spacing: 8px;
                 // 说明：必须写清四件事，否则用户会误判功能边界
                 Text {
-                    text: "按远程分配代理。「不代理」= 不设置 RCGUI 的远程级代理，rclone 仍可能继承系统的 HTTP_PROXY / HTTPS_PROXY 环境变量，不等于强制直连。代理只在远程建立连接时生效：正在运行的挂载/服务需要重新挂载或重启才会使用新代理。ftp / sftp 使用 rclone 原生 http_proxy / socks_proxy 键；若该远程自己已设了代理，本程序只补空缺、不会覆盖（rclone 优先使用 socks_proxy）。SOCKS 的账号密码以明文写入 rclone.conf，且密码不能包含「@」、用户名不能包含「:」。";
+                    text: @tr("按远程分配代理。「不代理」= 不设置 RCGUI 的远程级代理，rclone 仍可能继承系统的 HTTP_PROXY / HTTPS_PROXY 环境变量，不等于强制直连。代理只在远程建立连接时生效：正在运行的挂载/服务需要重新挂载或重启才会使用新代理。ftp / sftp 使用 rclone 原生 http_proxy / socks_proxy 键；若该远程自己已设了代理，本程序只补空缺、不会覆盖（rclone 优先使用 socks_proxy）。SOCKS 的账号密码以明文写入 rclone.conf，且密码不能包含「@」、用户名不能包含「:」。");
                     font-size: 11px;
                     color: ThemeG.text-dim;
                     wrap: word-wrap;
@@ -2909,8 +2913,8 @@ component RemotesView inherits Rectangle {
                 HorizontalLayout {
                     spacing: 8px;
                     height: 30px;
-                    PillBtn { label: "＋ 新建代理配置"; primary: true; clicked => { root.proxy-add(); } }
-                    PillBtn { label: "刷新"; clicked => { root.proxy-refresh(); } }
+                    PillBtn { label: @tr("＋ 新建代理配置"); primary: true; clicked => { root.proxy-add(); } }
+                    PillBtn { label: @tr("刷新"); clicked => { root.proxy-refresh(); } }
                     Rectangle {}
                 }
                 // 编辑表单：分三行，避免控件在同一行争宽度。
@@ -2929,13 +2933,13 @@ component RemotesView inherits Rectangle {
                             spacing: 4px;
                             horizontal-stretch: 1;
                             min-width: 180px;
-                            FieldLabel { text: "名称"; }
+                            FieldLabel { text: @tr("名称"); }
                             LineEdit { text <=> RemotesG.proxy-edit-name; }
                         }
                         VerticalLayout {
                             spacing: 4px;
                             width: 170px;
-                            FieldLabel { text: "协议"; }
+                            FieldLabel { text: @tr("协议"); }
                             ComboBox {
                                 model: RemotesG.proxy-protocols;
                                 current-index <=> RemotesG.proxy-edit-proto;
@@ -2950,13 +2954,13 @@ component RemotesView inherits Rectangle {
                             spacing: 4px;
                             horizontal-stretch: 1;
                             min-width: 220px;
-                            FieldLabel { text: "地址（主机名或 IP，IPv6 不要加方括号）"; }
-                            LineEdit { text <=> RemotesG.proxy-edit-host; placeholder-text: "127.0.0.1 或 proxy.corp.local"; }
+                            FieldLabel { text: @tr("地址（主机名或 IP，IPv6 不要加方括号）"); }
+                            LineEdit { text <=> RemotesG.proxy-edit-host; placeholder-text: @tr("127.0.0.1 或 proxy.corp.local"); }
                         }
                         VerticalLayout {
                             spacing: 4px;
                             width: 170px;
-                            FieldLabel { text: "端口"; }
+                            FieldLabel { text: @tr("端口"); }
                             LineEdit { text <=> RemotesG.proxy-edit-port; input-type: InputType.number; }
                         }
                     }
@@ -2968,19 +2972,19 @@ component RemotesView inherits Rectangle {
                             spacing: 4px;
                             horizontal-stretch: 1;
                             min-width: 170px;
-                            FieldLabel { text: "用户名（可选）"; }
+                            FieldLabel { text: @tr("用户名（可选）"); }
                             LineEdit { text <=> RemotesG.proxy-edit-user; }
                         }
                         VerticalLayout {
                             spacing: 4px;
                             horizontal-stretch: 1;
                             min-width: 170px;
-                            FieldLabel { text: "密码（可选）"; }
+                            FieldLabel { text: @tr("密码（可选）"); }
                             LineEdit { text <=> RemotesG.proxy-edit-pass; input-type: InputType.password; }
                         }
                     }
                     Text {
-                        text: "凭据会以明文（百分号编码）写入 rclone.conf，不是加密；导出 rcgui.conf 时默认不包含，导入后需要重新填写。";
+                        text: @tr("凭据会以明文（百分号编码）写入 rclone.conf，不是加密；导出 rcgui.conf 时默认不包含，导入后需要重新填写。");
                         font-size: 11px;
                         color: ThemeG.warn;
                         wrap: word-wrap;
@@ -2988,8 +2992,8 @@ component RemotesView inherits Rectangle {
                     HorizontalLayout {
                         spacing: 8px;
                         height: 32px;
-                        PillBtn { label: "保存"; primary: true; clicked => { root.proxy-save(); } }
-                        PillBtn { label: "取消"; clicked => { root.proxy-cancel(); } }
+                        PillBtn { label: @tr("保存"); primary: true; clicked => { root.proxy-save(); } }
+                        PillBtn { label: @tr("取消"); clicked => { root.proxy-cancel(); } }
                         Rectangle {}
                     }
                 }
@@ -3004,12 +3008,12 @@ component RemotesView inherits Rectangle {
                         padding-left: 12px;
                         padding-right: 12px;
                         spacing: 4px;
-                        Text { text: "名称"; width: 140px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                        Text { text: "协议"; width: 76px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                        Text { text: "目标"; horizontal-stretch: 1; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
-                        Text { text: "凭据"; width: 64px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                        Text { text: "使用中的远程"; width: 160px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
-                        Text { text: "操作"; width: 130px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: @tr("名称"); width: 140px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: @tr("协议"); width: 76px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: @tr("目标"); horizontal-stretch: 1; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
+                        Text { text: @tr("凭据"); width: 64px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: @tr("使用中的远程"); width: 160px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
+                        Text { text: @tr("操作"); width: 130px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                     }
                 }
                 if RemotesG.proxy-rows.length > 0 : VerticalLayout {
@@ -3028,8 +3032,8 @@ component RemotesView inherits Rectangle {
                                 width: 130px;
                                 spacing: 6px;
                                 alignment: start;
-                                PillBtn { label: "编辑"; compact: true; clicked => { root.proxy-edit(p.id); } }
-                                PillBtn { label: "删除"; compact: true; danger: true; clicked => { root.proxy-del(p.id); } }
+                                PillBtn { label: @tr("编辑"); compact: true; clicked => { root.proxy-edit(p.id); } }
+                                PillBtn { label: @tr("删除"); compact: true; danger: true; clicked => { root.proxy-del(p.id); } }
                             }
                         }
                     }
@@ -3044,19 +3048,19 @@ component RemotesView inherits Rectangle {
                         padding: 12px;
                         spacing: 8px;
                         Text {
-                            text: "删除代理配置「" + RemotesG.proxy-del-name + "」？";
+                            text: @tr("删除代理配置「{}」？", RemotesG.proxy-del-name);
                             font-size: 13px;
                             color: ThemeG.text;
                             wrap: word-wrap;
                         }
                         if RemotesG.proxy-del-affected != "" : Text {
-                            text: RemotesG.proxy-del-affected + "。这些远程的代理会被恢复成原状（我们不会删除你原本设置的值）。";
+                            text: @tr("{}。这些远程的代理会被恢复成原状（我们不会删除你原本设置的值）。", RemotesG.proxy-del-affected);
                             font-size: 12px;
                             color: ThemeG.warn;
                             wrap: word-wrap;
                         }
                         Text {
-                            text: "若该远程有正在运行的挂载或服务，需要重新挂载/重启才会丢掉旧代理。";
+                            text: @tr("若该远程有正在运行的挂载或服务，需要重新挂载/重启才会丢掉旧代理。");
                             font-size: 11px;
                             color: ThemeG.text-dim;
                             wrap: word-wrap;
@@ -3064,8 +3068,8 @@ component RemotesView inherits Rectangle {
                         HorizontalLayout {
                             spacing: 8px;
                             height: 30px;
-                            PillBtn { label: "确认删除"; danger: true; clicked => { RemotesG.proxy-del-show = false; root.proxy-del-confirm(RemotesG.proxy-del-id); } }
-                            PillBtn { label: "取消"; clicked => { RemotesG.proxy-del-show = false; } }
+                            PillBtn { label: @tr("确认删除"); danger: true; clicked => { RemotesG.proxy-del-show = false; root.proxy-del-confirm(RemotesG.proxy-del-id); } }
+                            PillBtn { label: @tr("取消"); clicked => { RemotesG.proxy-del-show = false; } }
                             Rectangle {}
                         }
                     }
@@ -3076,8 +3080,8 @@ component RemotesView inherits Rectangle {
     }                       // ScrollView（整页滚动）
     // 删除确认弹窗（锚定在删除按钮附近）
     delp := ConfirmPop {
-        title: "删除远程";
-        msg: "确认删除远程存储 " + root.del-name + "？";
+        title: @tr("删除远程");
+        msg: @tr("确认删除远程存储 {}？", root.del-name);
         x: root.pop-ax;
         y: root.pop-ay;
         confirmed => { root.del-row(root.del-idx); }
@@ -3100,12 +3104,12 @@ component MountsView inherits Rectangle {
         HorizontalLayout {
             height: 36px;
             spacing: 8px;
-            Text { text: "把远程仓库挂载为本地磁盘（需要 WinFsp）"; font-size: 13px; color: ThemeG.text-dim; vertical-alignment: center; }
+            Text { text: @tr("把远程仓库挂载为本地磁盘（需要 WinFsp）"); font-size: 13px; color: ThemeG.text-dim; vertical-alignment: center; }
             Rectangle {}
             LineEdit {
                 width: 220px;
                 text <=> MountsG.search;
-                placeholder-text: "搜索本地/远程路径";
+                placeholder-text: @tr("搜索本地/远程路径");
                 edited(t) => { root.search-changed(t); }
             }
             IconBtn { label: "\u{E72C}"; clicked => { root.refresh(); } }
@@ -3136,12 +3140,12 @@ component MountsView inherits Rectangle {
                 padding-left: 14px;
                 padding-right: 14px;
                 spacing: 10px;
-                Text { text: "提示"; font-size: 12px; font-weight: 700; color: ThemeG.accent; vertical-alignment: center; }
+                Text { text: @tr("提示"); font-size: 12px; font-weight: 700; color: ThemeG.accent; vertical-alignment: center; }
                 Text { text: MountsG.instance-hint; font-size: 12px; color: ThemeG.text; wrap: word-wrap; vertical-alignment: center; }
             }
         }
         Card {
-            title: "新建挂载";
+            title: @tr("新建挂载");
             VerticalLayout {
                 spacing: 10px;
                 // 第一行：仓库 + 子路径 + 挂载点
@@ -3151,7 +3155,7 @@ component MountsView inherits Rectangle {
                     VerticalLayout {
                         spacing: 3px;
                         width: 180px;
-                        FieldLabel { text: "仓库（远程）"; }
+                        FieldLabel { text: @tr("仓库（远程）"); }
                         ComboBox {
                             model: MountsG.remotes;
                             current-index <=> MountsG.remote-idx;
@@ -3160,10 +3164,10 @@ component MountsView inherits Rectangle {
                     VerticalLayout {
                         spacing: 3px;
                         horizontal-stretch: 1;
-                        FieldLabel { text: "仓库内子路径（留空 = 仓库根目录）"; }
+                        FieldLabel { text: @tr("仓库内子路径（留空 = 仓库根目录）"); }
                         HorizontalLayout {
                             spacing: 4px;
-                            LineEdit { text <=> MountsG.sub-path; placeholder-text: "例如 movies/2024，留空为根"; horizontal-stretch: 1; }
+                            LineEdit { text <=> MountsG.sub-path; placeholder-text: @tr("例如 movies/2024，留空为根"); horizontal-stretch: 1; }
                             IconBtn {
                                 label: "\u{E838}";
                                 clicked => { root.browse(); }
@@ -3173,7 +3177,7 @@ component MountsView inherits Rectangle {
                     VerticalLayout {
                         spacing: 3px;
                         width: 180px;
-                        FieldLabel { text: "挂载点（盘符 / * 自动）"; }
+                        FieldLabel { text: @tr("挂载点（盘符 / * 自动）"); }
                         LineEdit { text <=> MountsG.new-point; }
                     }
                 }
@@ -3184,7 +3188,7 @@ component MountsView inherits Rectangle {
                     VerticalLayout {
                         spacing: 3px;
                         width: 160px;
-                        FieldLabel { text: "缓存模式"; }
+                        FieldLabel { text: @tr("缓存模式"); }
                         ComboBox {
                             model: MountsG.caches;
                             current-index <=> MountsG.cache-idx;
@@ -3193,7 +3197,7 @@ component MountsView inherits Rectangle {
                     VerticalLayout {
                         spacing: 3px;
                         width: 100px;
-                        FieldLabel { text: "只读"; }
+                        FieldLabel { text: @tr("只读"); }
                         HorizontalLayout {
                             spacing: 6px;
                             alignment: start;
@@ -3206,19 +3210,19 @@ component MountsView inherits Rectangle {
                         spacing: 3px;
                         width: 96px;
                         FieldLabel { text: " "; }
-                        PillBtn { label: "挂载"; primary: true; disabled: MountsG.busy; clicked => { root.add(); } }
+                        PillBtn { label: @tr("挂载"); primary: true; disabled: MountsG.busy; clicked => { root.add(); } }
                     }
                 }
-                FieldLabel { text: "挂载是即时操作：只在点击「挂载」时通过 rclone RC 执行，不会在下次启动时自动执行。"; }
+                FieldLabel { text: @tr("挂载是即时操作：只在点击「挂载」时通过 rclone RC 执行，不会在下次启动时自动执行。"); }
             }
         }
         // 挂载预设列表已移除：挂载是即时操作，配置通过 rcgui.conf 导入后直接应用到本地 rclone
         Card {
-            title: "活动挂载（" + MountsG.mounts.length + "）";
+            title: @tr("活动挂载（{}）", MountsG.mounts.length);
             VerticalLayout {
                 spacing: 2px;
                 if MountsG.mounts.length == 0 : Text {
-                    text: "暂无活动挂载";
+                    text: @tr("暂无活动挂载");
                     font-size: 13px;
                     color: ThemeG.text-dim;
                 }
@@ -3229,9 +3233,9 @@ component MountsView inherits Rectangle {
                         padding-left: 12px;
                         padding-right: 12px;
                         spacing: 10px;
-                        Text { text: "本地路径"; width: 90px; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
-                        Text { text: "远程路径"; horizontal-stretch: 1; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
-                        Text { text: "操作"; width: 140px; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
+                        Text { text: @tr("本地路径"); width: 90px; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
+                        Text { text: @tr("远程路径"); horizontal-stretch: 1; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
+                        Text { text: @tr("操作"); width: 140px; font-size: 12px; color: ThemeG.text-dim; horizontal-alignment: left; vertical-alignment: center; }
                     }
                 }
                 for m[i] in MountsG.mounts : Rectangle {
@@ -3252,7 +3256,7 @@ component MountsView inherits Rectangle {
                             alignment: start;
                             // 用 if 而非 visible：visible:false 仍占布局空间，会把按钮挤出列宽
                             if m.pending : VerticalLayout { alignment: center; Spinner { running: true; } }
-                            VerticalLayout { alignment: center; PillBtn { label: "卸载"; compact: true; danger: true; disabled: m.pending; clicked => { root.remove(m.mount-point); } } }
+                            VerticalLayout { alignment: center; PillBtn { label: @tr("卸载"); compact: true; danger: true; disabled: m.pending; clicked => { root.remove(m.mount-point); } } }
                         }
                     }
                 }
@@ -3278,18 +3282,18 @@ component ServesView inherits Rectangle {
         HorizontalLayout {
             height: 36px;
             spacing: 8px;
-            Text { text: "网络服务（将远程以 WebDAV/SFTP 等方式共享到局域网）"; font-size: 13px; color: ThemeG.text-dim; vertical-alignment: center; }
+            Text { text: @tr("网络服务（将远程以 WebDAV/SFTP 等方式共享到局域网）"); font-size: 13px; color: ThemeG.text-dim; vertical-alignment: center; }
             Rectangle {}
             LineEdit {
                 width: 220px;
                 text <=> ServesG.search;
-                placeholder-text: "搜索 ID / 服务名称";
+                placeholder-text: @tr("搜索 ID / 服务名称");
                 edited(t) => { root.search-changed(t); }
             }
             IconBtn { label: "\u{E72C}"; clicked => { root.refresh(); } }
         }
         Card {
-            title: "新建服务";
+            title: @tr("新建服务");
             VerticalLayout {
                 spacing: 10px;
                 // 第一行：服务名称 + 协议 + 仓库
@@ -3301,13 +3305,13 @@ component ServesView inherits Rectangle {
                     VerticalLayout {
                         spacing: 3px;
                         width: 180px;
-                        FieldLabel { text: "服务名称"; }
+                        FieldLabel { text: @tr("服务名称"); }
                         LineEdit { text <=> ServesG.svc-name; placeholder-text: "Serve_01"; }
                     }
                     VerticalLayout {
                         spacing: 3px;
                         width: 180px;
-                        FieldLabel { text: "协议"; }
+                        FieldLabel { text: @tr("协议"); }
                         ComboBox {
                             model: ServesG.types;
                             current-index <=> ServesG.type-idx;
@@ -3316,7 +3320,7 @@ component ServesView inherits Rectangle {
                     VerticalLayout {
                         spacing: 3px;
                         width: 200px;
-                        FieldLabel { text: "仓库（远程）"; }
+                        FieldLabel { text: @tr("仓库（远程）"); }
                         ComboBox {
                             model: ServesG.remotes;
                             current-index <=> ServesG.remote-idx;
@@ -3331,7 +3335,7 @@ component ServesView inherits Rectangle {
                     VerticalLayout {
                         spacing: 3px;
                         horizontal-stretch: 1;
-                        FieldLabel { text: "子路径（留空 = 根）"; }
+                        FieldLabel { text: @tr("子路径（留空 = 根）"); }
                         HorizontalLayout {
                             spacing: 4px;
                             LineEdit { text <=> ServesG.sub-path; placeholder-text: "share/docs"; horizontal-stretch: 1; }
@@ -3344,7 +3348,7 @@ component ServesView inherits Rectangle {
                     VerticalLayout {
                         spacing: 3px;
                         width: 220px;
-                        FieldLabel { text: "监听地址"; }
+                        FieldLabel { text: @tr("监听地址"); }
                         LineEdit { text <=> ServesG.addr; }
                     }
                 }
@@ -3355,13 +3359,13 @@ component ServesView inherits Rectangle {
                     VerticalLayout {
                         spacing: 3px;
                         width: 160px;
-                        FieldLabel { text: "用户（可选）"; }
+                        FieldLabel { text: @tr("用户（可选）"); }
                         LineEdit { text <=> ServesG.user; }
                     }
                     VerticalLayout {
                         spacing: 3px;
                         width: 160px;
-                        FieldLabel { text: "密码（可选）"; }
+                        FieldLabel { text: @tr("密码（可选）"); }
                         LineEdit { text <=> ServesG.pass; input-type: InputType.password; }
                     }
                     Rectangle {}
@@ -3370,15 +3374,15 @@ component ServesView inherits Rectangle {
                         spacing: 3px;
                         width: 96px;
                         FieldLabel { text: " "; }
-                        PillBtn { label: "启动"; primary: true; disabled: ServesG.busy; clicked => { root.start(); } }
+                        PillBtn { label: @tr("启动"); primary: true; disabled: ServesG.busy; clicked => { root.start(); } }
                     }
                 }
-                FieldLabel { text: "启动是即时操作：只在点击「启动」时通过 rclone RC 执行，不会在下次启动时自动执行。"; }
+                FieldLabel { text: @tr("启动是即时操作：只在点击「启动」时通过 rclone RC 执行，不会在下次启动时自动执行。"); }
             }
         }
         // 服务预设列表已移除：服务是即时操作，配置通过 rcgui.conf 导入后直接应用到本地 rclone
         Card {
-            title: "运行中服务（" + ServesG.rows.length + "）";
+            title: @tr("运行中服务（{}）", ServesG.rows.length);
             pad: 0px;
             fill: true;
             vertical-stretch: 1;
@@ -3391,13 +3395,13 @@ component ServesView inherits Rectangle {
                         padding-right: 14px;
                         Rectangle {
                             horizontal-stretch: 1;
-                            Text { text: "服务名称"; font-size: 12px; color: ThemeG.text-dim; width: parent.width; horizontal-alignment: left; vertical-alignment: center; overflow: elide; }
+                            Text { text: @tr("服务名称"); font-size: 12px; color: ThemeG.text-dim; width: parent.width; horizontal-alignment: left; vertical-alignment: center; overflow: elide; }
                         }
                         Text { text: "ID"; font-size: 12px; color: ThemeG.text-dim; width: 190px; horizontal-alignment: left; vertical-alignment: center; }
-                        Text { text: "协议"; font-size: 12px; color: ThemeG.text-dim; width: 90px; horizontal-alignment: left; vertical-alignment: center; }
-                        Text { text: "远程"; font-size: 12px; color: ThemeG.text-dim; width: 170px; horizontal-alignment: left; vertical-alignment: center; }
-                        Text { text: "地址"; font-size: 12px; color: ThemeG.text-dim; width: 150px; horizontal-alignment: left; vertical-alignment: center; }
-                        Text { text: "操作"; font-size: 12px; color: ThemeG.text-dim; width: 90px; horizontal-alignment: left; vertical-alignment: center; }
+                        Text { text: @tr("协议"); font-size: 12px; color: ThemeG.text-dim; width: 90px; horizontal-alignment: left; vertical-alignment: center; }
+                        Text { text: @tr("远程"); font-size: 12px; color: ThemeG.text-dim; width: 170px; horizontal-alignment: left; vertical-alignment: center; }
+                        Text { text: @tr("地址"); font-size: 12px; color: ThemeG.text-dim; width: 150px; horizontal-alignment: left; vertical-alignment: center; }
+                        Text { text: @tr("操作"); font-size: 12px; color: ThemeG.text-dim; width: 90px; horizontal-alignment: left; vertical-alignment: center; }
                     }
                 }
                 Rectangle {
@@ -3420,7 +3424,7 @@ component ServesView inherits Rectangle {
                                 Text { text: s.addr; font-size: 12px; color: ThemeG.ok; width: 150px; horizontal-alignment: left; vertical-alignment: center; }
                                 HorizontalLayout {
                                     width: 90px;
-                                    VerticalLayout { alignment: center; PillBtn { label: "停止"; compact: true; danger: true; clicked => { root.stop(s.id); } } }
+                                    VerticalLayout { alignment: center; PillBtn { label: @tr("停止"); compact: true; danger: true; clicked => { root.stop(s.id); } } }
                                 }
                             }
                             Rectangle {
@@ -3474,47 +3478,47 @@ component TransfersView inherits Rectangle {
         HorizontalLayout {
             spacing: 8px;
             height: 34px;
-            Text { text: "传输"; font-size: 16px; font-weight: 700; color: ThemeG.text; vertical-alignment: center; }
+            Text { text: @tr("传输"); font-size: 16px; font-weight: 700; color: ThemeG.text; vertical-alignment: center; }
             Rectangle { horizontal-stretch: 1; }
             LineEdit {
                 width: 200px;
                 text <=> TransfersG.task-search;
-                placeholder-text: "搜索任务";
+                placeholder-text: @tr("搜索任务");
                 edited(t) => { root.task-search(t); }
             }
             CheckBox {
-                text: "隐藏已完成任务";
+                text: @tr("隐藏已完成任务");
                 checked <=> TransfersG.hide-done;
                 toggled => { root.hide-done-changed(); }
             }
             IconBtn { label: "\u{E72C}"; clicked => { root.refresh(); } }
         }
         if TransfersG.effective != "" : Text {
-            text: "当前生效的全局限速：" + TransfersG.effective;
+            text: @tr("当前生效的全局限速：{}", TransfersG.effective);
             font-size: 12px;
             color: ThemeG.text-dim;
         }
 
         // ---------- 网速监控 + 全局限速（rclone 仅支持全局 tx:rx） ----------
         Card {
-            title: "网速与限速";
+            title: @tr("网速与限速");
             fill: false;
             VerticalLayout {
                 spacing: 10px;
                 HorizontalLayout {
                     spacing: 24px;
-                    Text { text: "上传 ↑ " + TransfersG.up-speed; font-size: 13px; color: ThemeG.accent; vertical-alignment: center; }
-                    Text { text: "下载 ↓ " + TransfersG.down-speed; font-size: 13px; color: ThemeG.ok; vertical-alignment: center; }
+                    Text { text: @tr("上传 ↑ {}", TransfersG.up-speed); font-size: 13px; color: ThemeG.accent; vertical-alignment: center; }
+                    Text { text: @tr("下载 ↓ {}", TransfersG.down-speed); font-size: 13px; color: ThemeG.ok; vertical-alignment: center; }
                     Rectangle { horizontal-stretch: 1; }
                 }
                 // 限速：分两行，避免与内置控件 min-width:160px 冲突导致挤压
                 HorizontalLayout {
                     spacing: 8px;
-                    Text { text: "上传限速"; width: 64px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                    Text { text: @tr("上传限速"); width: 64px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                     LineEdit {
                         width: 180px;
                         text <=> TransfersG.up-limit;
-                        placeholder-text: "不限";
+                        placeholder-text: @tr("不限");
                     }
                     ComboBox {
                         width: 160px;
@@ -3525,18 +3529,18 @@ component TransfersView inherits Rectangle {
                 }
                 HorizontalLayout {
                     spacing: 8px;
-                    Text { text: "下载限速"; width: 64px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                    Text { text: @tr("下载限速"); width: 64px; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                     LineEdit {
                         width: 180px;
                         text <=> TransfersG.down-limit;
-                        placeholder-text: "不限";
+                        placeholder-text: @tr("不限");
                     }
                     ComboBox {
                         width: 160px;
                         model: TransfersG.units;
                         current-index <=> TransfersG.down-unit;
                     }
-                    PillBtn { label: "应用限速"; primary: true; compact: true; clicked => { root.limit-apply(); } }
+                    PillBtn { label: @tr("应用限速"); primary: true; compact: true; clicked => { root.limit-apply(); } }
                     Rectangle { horizontal-stretch: 1; }
                 }
             }
@@ -3544,7 +3548,7 @@ component TransfersView inherits Rectangle {
 
         // ---------- 后台任务 ----------
         Card {
-            title: "后台任务（" + TransfersG.tasks.length + "）";
+            title: @tr("后台任务（{}）", TransfersG.tasks.length);
             pad: 0px;
             fill: true;
             vertical-stretch: 1;
@@ -3556,12 +3560,12 @@ component TransfersView inherits Rectangle {
                         padding-left: 14px;
                         padding-right: 14px;
                         spacing: 8px;
-                        Text { text: "文件"; width: 220px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                        Text { text: "标签"; horizontal-stretch: 1; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                        Text { text: "状态"; width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                        Text { text: "耗时"; width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                        Text { text: "速度"; width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                        Text { text: "操作"; width: 150px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: @tr("文件"); width: 220px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: @tr("标签"); horizontal-stretch: 1; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: @tr("状态"); width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: @tr("耗时"); width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: @tr("速度"); width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: @tr("操作"); width: 150px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                     }
                 }
                 Rectangle {
@@ -3589,7 +3593,7 @@ component TransfersView inherits Rectangle {
                                         vertical-alignment: center;
                                         overflow: elide;
                                     }
-                                    Tooltip { text: @markdown("任务 #\{t.id}\n\{t.path}"); }
+                                    Tooltip { text: @markdown("\{@tr("任务 #{}", t.id)}\n\{t.path}"); }
                                 }
                                 Rectangle {
                                     horizontal-stretch: 1;
@@ -3600,9 +3604,9 @@ component TransfersView inherits Rectangle {
                                     // 标签配色：绿=上传、蓝=下载、橙=改名/移动（不搬数据）、红=删除
                                     if t.op != "" : TagPill {
                                         label: t.op;
-                                        tint: t.op == "上传" ? ThemeG.ok
-                                            : t.op == "下载" ? ThemeG.accent
-                                            : t.op == "删除" ? ThemeG.err
+                                        tint: t.op == @tr("上传") ? ThemeG.ok
+                                            : t.op == @tr("下载") ? ThemeG.accent
+                                            : t.op == @tr("删除") ? ThemeG.err
                                             : ThemeG.warn;
                                     }
                                     if t.remote != "" : TagPill {
@@ -3614,7 +3618,7 @@ component TransfersView inherits Rectangle {
                                         }
                                     }
                                 }
-                                Text { text: t.status; width: 90px; horizontal-alignment: left; font-size: 12px; color: t.status == "运行中" ? ThemeG.accent : (t.status == "失败" ? ThemeG.err : ThemeG.text-dim); vertical-alignment: center; }
+                                Text { text: t.status; width: 90px; horizontal-alignment: left; font-size: 12px; color: t.status == @tr("运行中") ? ThemeG.accent : (t.status == @tr("失败") ? ThemeG.err : ThemeG.text-dim); vertical-alignment: center; }
                                 Text { text: t.duration; width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                                 Text { text: t.speed; width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.accent; vertical-alignment: center; }
                                 HorizontalLayout {
@@ -3625,13 +3629,13 @@ component TransfersView inherits Rectangle {
                                         HorizontalLayout {
                                             spacing: 6px;
                                             // 取消 = RC 的 job/stop（rclone 侧会中断该任务的传输）
-                                            if !t.done : PillBtn { label: "取消"; compact: true; danger: true; clicked => { root.job-stop(t.id); } }
+                                            if !t.done : PillBtn { label: @tr("取消"); compact: true; danger: true; clicked => { root.job-stop(t.id); } }
                                             // 暂停：rclone RC 没有「暂停单个任务」的接口，置灰并说明原因
                                             if !t.done : Rectangle {
                                                 width: 58px;
                                                 height: 26px;
-                                                PillBtn { label: "暂停"; compact: true; disabled: true; width: 58px; height: 26px; }
-                                                Tooltip { text: @markdown("rclone RC 不支持暂停单个任务；可先取消，或用「网速与限速」整体降速"); }
+                                                PillBtn { label: @tr("暂停"); compact: true; disabled: true; width: 58px; height: 26px; }
+                                                Tooltip { text: @markdown("\{@tr("rclone RC 不支持暂停单个任务；可先取消，或用「网速与限速」整体降速")}"); }
                                             }
                                         }
                                     }
@@ -3705,20 +3709,20 @@ component PluginsView inherits Rectangle {
                         height: 32px;
                         spacing: 10px;
                         Text {
-                            text: "插件目录：" + PluginsG.dir;
+                            text: @tr("插件目录：{}", PluginsG.dir);
                             font-size: 12px;
                             color: ThemeG.text-dim;
                             vertical-alignment: center;
                             overflow: elide;
                         }
                         Rectangle {}
-                        PillBtn { label: "从文件添加"; primary: true; compact: true; clicked => { root.add-from-file(); } }
-                        PillBtn { label: "从文件夹添加"; compact: true; clicked => { root.add-from-dir(); } }
-                        PillBtn { label: "打开目录"; compact: true; clicked => { root.open-dir(); } }
-                        PillBtn { label: "刷新"; compact: true; clicked => { root.rescan(); } }
+                        PillBtn { label: @tr("从文件添加"); primary: true; compact: true; clicked => { root.add-from-file(); } }
+                        PillBtn { label: @tr("从文件夹添加"); compact: true; clicked => { root.add-from-dir(); } }
+                        PillBtn { label: @tr("打开目录"); compact: true; clicked => { root.open-dir(); } }
+                        PillBtn { label: @tr("刷新"); compact: true; clicked => { root.rescan(); } }
                     }
                     Text {
-                        text: "支持 .zip 插件包或已解压的插件文件夹；放入插件目录后点「刷新」即可识别。新插件默认未启用，需手动勾选才会运行其入口文件。";
+                        text: @tr("支持 .zip 插件包或已解压的插件文件夹；放入插件目录后点「刷新」即可识别。新插件默认未启用，需手动勾选才会运行其入口文件。");
                         font-size: 11px;
                         color: ThemeG.text-dim;
                         wrap: word-wrap;
@@ -3732,7 +3736,7 @@ component PluginsView inherits Rectangle {
                             height: 26px;
                             spacing: 8px;
                             Text {
-                                text: "「" + rb.name + "」已卸载";
+                                text: @tr("「{}」已卸载", rb.name);
                                 font-size: 12px;
                                 color: ThemeG.text-dim;
                                 vertical-alignment: center;
@@ -3740,7 +3744,7 @@ component PluginsView inherits Rectangle {
                             // 弹簧：不给它，PillBtn（Rectangle）会把整行剩余宽度吃掉
                             Rectangle {}
                             PillBtn {
-                                label: "恢复内置";
+                                label: @tr("恢复内置");
                                 compact: true;
                                 clicked => { root.plugin-restore-by-id(rb.id); }
                             }
@@ -3786,7 +3790,7 @@ component PluginsView inherits Rectangle {
             }
             HorizontalLayout {
                 height: 24px;
-                Text { text: "已安装插件（点击插件栏展开 / 收起）"; font-size: 13px; color: ThemeG.text-dim; vertical-alignment: center; }
+                Text { text: @tr("已安装插件（点击插件栏展开 / 收起）"); font-size: 13px; color: ThemeG.text-dim; vertical-alignment: center; }
                 Rectangle {}
                 IconBtn { label: "\u{E72C}"; clicked => { root.rescan(); } }
             }
@@ -3796,18 +3800,18 @@ component PluginsView inherits Rectangle {
                 spacing: 8px;
                 LineEdit {
                     horizontal-stretch: 1;
-                    placeholder-text: "按名称、ID 或标签检索插件…";
+                    placeholder-text: @tr("按名称、ID 或标签检索插件…");
                     text <=> PluginsG.search;
                 }
                 Text {
-                    text: PluginsG.rows.length + " 个插件";
+                    text: @tr("{} 个插件", PluginsG.rows.length);
                     font-size: 12px;
                     color: ThemeG.text-dim;
                     vertical-alignment: center;
                 }
             }
             if PluginsG.rows.length == 0 : Card {
-                Text { text: "未发现插件"; font-size: 13px; color: ThemeG.text-dim; }
+                Text { text: @tr("未发现插件"); font-size: 13px; color: ThemeG.text-dim; }
             }
             // 注意：外层容器（VerticalLayout）承担拉伸，卡片本身保持自然高度。
             // 否则行高不足时 Slint 会把卡片拉伸成一整块，视觉上很难看。
@@ -3849,7 +3853,7 @@ component PluginsView inherits Rectangle {
                                     border-radius: 10px;
                                     background: p.kind == "package" ? ThemeG.panel-2 : ThemeG.accent-soft;
                                     Text {
-                                        text: p.kind == "package" ? "插件包" : "WASM";
+                                        text: p.kind == "package" ? @tr("插件包") : "WASM";
                                         font-size: 10px;
                                         color: p.kind == "package" ? ThemeG.text-dim : ThemeG.accent;
                                         horizontal-alignment: center;
@@ -3863,7 +3867,7 @@ component PluginsView inherits Rectangle {
                                     border-radius: 10px;
                                     background: ThemeG.accent-soft;
                                     Text {
-                                        text: "内置";
+                                        text: @tr("内置");
                                         font-size: 10px;
                                         color: ThemeG.accent;
                                         horizontal-alignment: center;
@@ -3875,7 +3879,7 @@ component PluginsView inherits Rectangle {
                                     width: 52px;
                                     border-radius: 10px;
                                     background: ThemeG.err;
-                                    Text { text: "校验失败"; font-size: 10px; color: white; horizontal-alignment: center; vertical-alignment: center; }
+                                    Text { text: @tr("校验失败"); font-size: 10px; color: white; horizontal-alignment: center; vertical-alignment: center; }
                                 }
                                 Rectangle {
                                     horizontal-stretch: 1;
@@ -3888,7 +3892,7 @@ component PluginsView inherits Rectangle {
                                     border-radius: 5px;
                                     background: p.lamp == "ok" ? ThemeG.ok : (p.lamp == "err" ? ThemeG.err : ThemeG.warn);
                                 }
-                                Text { text: p.enabled ? "已启用" : "已停用"; font-size: 12px; color: p.enabled ? ThemeG.ok : ThemeG.text-dim; vertical-alignment: center; }
+                                Text { text: p.enabled ? @tr("已启用") : @tr("已停用"); font-size: 12px; color: p.enabled ? ThemeG.ok : ThemeG.text-dim; vertical-alignment: center; }
                                 MdlIcon {
                                     glyph: PluginsG.expanded == i ? "\u{E70E}" : "\u{E70D}";
                                     width: 20px;
@@ -3918,17 +3922,17 @@ component PluginsView inherits Rectangle {
                                 }
                                 if p.author != "" : HorizontalLayout {
                                     spacing: 8px;
-                                    Text { text: "作者"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
+                                    Text { text: @tr("作者"); font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
                                     Text { text: p.author; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
                                 }
                                 if p.entry != "" : HorizontalLayout {
                                     spacing: 8px;
-                                    Text { text: "入口文件"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
+                                    Text { text: @tr("入口文件"); font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
                                     Text { text: p.entry; font-size: 12px; color: ThemeG.text; vertical-alignment: center; overflow: elide; }
                                 }
                                 if p.tags.length > 0 : HorizontalLayout {
                                     spacing: 8px;
-                                    Text { text: "标签"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
+                                    Text { text: @tr("标签"); font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
                                     HorizontalLayout {
                                         spacing: 6px;
                                         for tg[ti] in p.tags : TagPill { label: tg; tint: ThemeG.accent; }
@@ -3937,9 +3941,9 @@ component PluginsView inherits Rectangle {
                                 }
                                 HorizontalLayout {
                                     spacing: 8px;
-                                    Text { text: "完整性"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
+                                    Text { text: @tr("完整性"); font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
                                     Text {
-                                        text: p.verified ? "校验通过" : "校验失败";
+                                        text: p.verified ? @tr("校验通过") : @tr("校验失败");
                                         font-size: 12px;
                                         color: p.verified ? ThemeG.ok : ThemeG.err;
                                         vertical-alignment: center;
@@ -3961,13 +3965,13 @@ component PluginsView inherits Rectangle {
                                 }
                                 HorizontalLayout {
                                     spacing: 8px;
-                                    Text { text: "位置"; font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
+                                    Text { text: @tr("位置"); font-size: 12px; color: ThemeG.text-dim; width: 76px; vertical-alignment: center; }
                                     Text { text: p.path; font-size: 11px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; }
                                     Rectangle {}
-                                    PillBtn { label: "打开目录"; compact: true; clicked => { root.open-dir(); } }
+                                    PillBtn { label: @tr("打开目录"); compact: true; clicked => { root.open-dir(); } }
                                 }
                                 if p.kind == "package" && !p.has-panel : Text {
-                                    text: "启用 = 执行上面的入口文件（.msi 会以静默方式安装）。停用不会卸载已安装的程序。";
+                                    text: @tr("启用 = 执行上面的入口文件（.msi 会以静默方式安装）。停用不会卸载已安装的程序。");
                                     font-size: 11px;
                                     color: ThemeG.text-dim;
                                     wrap: word-wrap;
@@ -3978,7 +3982,7 @@ component PluginsView inherits Rectangle {
                             if p.has-panel : VerticalLayout {
                                 spacing: 12px;
                                 if PluginsG.panel-loading : Text {
-                                    text: "正在读取插件状态…";
+                                    text: @tr("正在读取插件状态…");
                                     font-size: 11px;
                                     color: ThemeG.text-dim;
                                 }
@@ -4208,7 +4212,7 @@ component PluginsView inherits Rectangle {
                                 spacing: 8px;
                                 Rectangle {}
                                 PillBtn {
-                                    label: "卸载插件";
+                                    label: @tr("卸载插件");
                                     compact: true;
                                     danger: true;
                                     clicked => {
@@ -4234,9 +4238,9 @@ component PluginsView inherits Rectangle {
     // 浮层会跟着内容一起滚走，弹窗才有稳定的居中位置。
     // 卸载插件确认弹窗：卸载会删掉插件目录与该插件的 kv 数据，删了要重新添加
     up := ConfirmPop {
-        title: "卸载插件";
-        msg: "确认卸载「" + root.cb-name + "」？插件目录与该插件的设置会一并删除。";
-        ok-label: "卸载";
+        title: @tr("卸载插件");
+        msg: @tr("确认卸载「{}」？插件目录与该插件的设置会一并删除。", root.cb-name);
+        ok-label: @tr("卸载");
         x: root.pop-ax;
         y: root.pop-ay;
         confirmed => { root.plugin-uninstall(root.cb-idx); }
@@ -4270,17 +4274,17 @@ component SettingsView inherits Rectangle {
             padding: 24px;
             spacing: 12px;
             Card {
-                title: "rclone 连接";
+                title: @tr("rclone 连接");
                 VerticalLayout {
                     spacing: 10px;
                     HorizontalLayout {
                         spacing: 8px;
                         height: 32px;
-                        FieldLabel { text: "RC 地址"; width: 70px; vertical-alignment: center; }
+                        FieldLabel { text: @tr("RC 地址"); width: 70px; vertical-alignment: center; }
                         LineEdit { width: 300px; text <=> SettingsG.rc-url; placeholder-text: "http://127.0.0.1:5572"; }
-                        FieldLabel { text: "RC 用户"; width: 56px; vertical-alignment: center; }
+                        FieldLabel { text: @tr("RC 用户"); width: 56px; vertical-alignment: center; }
                         LineEdit { width: 150px; text <=> SettingsG.rc-user; }
-                        FieldLabel { text: "RC 密码"; width: 56px; vertical-alignment: center; }
+                        FieldLabel { text: @tr("RC 密码"); width: 56px; vertical-alignment: center; }
                         LineEdit { width: 150px; text <=> SettingsG.rc-pass; input-type: InputType.password; }
                     }
                     HorizontalLayout {
@@ -4288,11 +4292,11 @@ component SettingsView inherits Rectangle {
                         height: 26px;
                         CheckBox {
                             checked <=> SettingsG.connect-on-start;
-                            text: "启动时连接该地址（只连 API，不启动 rclone）";
+                            text: @tr("启动时连接该地址（只连 API，不启动 rclone）");
                             toggled => { root.save(); }
                         }
                         Text {
-                            text: "RCGUI 不启动、不停止、不重启 rclone";
+                            text: @tr("RCGUI 不启动、不停止、不重启 rclone");
                             font-size: 12px;
                             color: ThemeG.text-dim;
                             vertical-alignment: center;
@@ -4308,7 +4312,7 @@ component SettingsView inherits Rectangle {
                         // - `cross-axis-alignment` = 交叉轴（垂直）对齐，用它做垂直居中。
                         // 8px 的小圆点在默认（stretch）下会被拉伸、贴顶，所以取 center。
                         cross-axis-alignment: center;
-                        FieldLabel { text: "状态"; width: 46px; vertical-alignment: center; }
+                        FieldLabel { text: @tr("状态"); width: 46px; vertical-alignment: center; }
                         // 圆点用固定尺寸，避免被交叉轴拉伸成竖条
                         Rectangle {
                             width: 8px;
@@ -4338,11 +4342,11 @@ component SettingsView inherits Rectangle {
                     HorizontalLayout {
                         spacing: 8px;
                         height: 20px;
-                        Text { text: "版本 " + SettingsG.conn-version; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                        Text { text: "· 配置文件 " + SettingsG.conn-config-path; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                        Text { text: @tr("版本 {}", SettingsG.conn-version); font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: @tr("· 配置文件 {}", SettingsG.conn-config-path); font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
                     }
                     Text {
-                        text: "上次刷新 " + SettingsG.conn-last-refresh;
+                        text: @tr("上次刷新 {}", SettingsG.conn-last-refresh);
                         font-size: 12px;
                         color: ThemeG.text-dim;
                         vertical-alignment: center;
@@ -4356,15 +4360,15 @@ component SettingsView inherits Rectangle {
                     HorizontalLayout {
                         spacing: 8px;
                         height: 32px;
-                        PillBtn { label: "连接 / 握手"; primary: true; disabled: SettingsG.conn-busy; clicked => { root.conn-connect(); } }
-                        PillBtn { label: "断开"; disabled: SettingsG.conn-busy || !SettingsG.conn-live; clicked => { root.conn-disconnect(); } }
-                        PillBtn { label: "重新握手"; disabled: SettingsG.conn-busy; clicked => { root.conn-reconnect(); } }
-                        Text { text: SettingsG.conn-busy ? "正在握手…" : ""; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        PillBtn { label: @tr("连接 / 握手"); primary: true; disabled: SettingsG.conn-busy; clicked => { root.conn-connect(); } }
+                        PillBtn { label: @tr("断开"); disabled: SettingsG.conn-busy || !SettingsG.conn-live; clicked => { root.conn-disconnect(); } }
+                        PillBtn { label: @tr("重新握手"); disabled: SettingsG.conn-busy; clicked => { root.conn-reconnect(); } }
+                        Text { text: SettingsG.conn-busy ? @tr("正在握手…") : ""; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                     }
                 }
             }
             Card {
-                title: "档案导入 / 导出（rcgui.conf）";
+                title: @tr("档案导入 / 导出（rcgui.conf）");
                 VerticalLayout {
                     spacing: 8px;
                     Text {
@@ -4377,12 +4381,12 @@ component SettingsView inherits Rectangle {
                         spacing: 8px;
                         height: 32px;
                         PillBtn {
-                            label: "导出 rcgui.conf";
+                            label: @tr("导出 rcgui.conf");
                             primary: true;
                             clicked => {
                                 // 勾选「包含凭据」时先要一次明确确认；未勾选直接导出
                                 if (SettingsG.conf-include-secrets) {
-                                    SettingsG.conf-confirm-msg = "文件将以明文包含远程凭据（OAuth token / 密码）。rclone 的 obscure 只是可逆混淆，不是加密。确认导出？";
+                                    SettingsG.conf-confirm-msg = @tr("文件将以明文包含远程凭据（OAuth token / 密码）。rclone 的 obscure 只是可逆混淆，不是加密。确认导出？");
                                     cexp.show();
                                 } else {
                                     root.conf-export();
@@ -4391,12 +4395,12 @@ component SettingsView inherits Rectangle {
                         }
                         CheckBox {
                             checked <=> SettingsG.conf-include-secrets;
-                            text: "导出时包含凭据";
+                            text: @tr("导出时包含凭据");
                         }
-                        PillBtn { label: "导入预览"; clicked => { root.conf-import-preview(); } }
-                        PillBtn { label: "应用导入"; disabled: !SettingsG.conf-pending; clicked => { root.conf-import-apply(); } }
+                        PillBtn { label: @tr("导入预览"); clicked => { root.conf-import-preview(); } }
+                        PillBtn { label: @tr("应用导入"); disabled: !SettingsG.conf-pending; clicked => { root.conf-import-apply(); } }
                         Text {
-                            text: SettingsG.conf-pending ? "已预览，可应用" : "";
+                            text: SettingsG.conf-pending ? @tr("已预览，可应用") : "";
                             font-size: 12px;
                             color: ThemeG.warn;
                             vertical-alignment: center;
@@ -4405,11 +4409,11 @@ component SettingsView inherits Rectangle {
                 }
             }
             Card {
-                title: "开机恢复脚本（PowerShell）";
+                title: @tr("开机恢复脚本（PowerShell）");
                 VerticalLayout {
                     spacing: 8px;
                     Text {
-                        text: "只连接已运行且启用 RC 的 rclone：先健康检查，连不上就明确退出；不启动、不停止 rclone，不注册开机项，不内置 RC 密码。生成后不会自动执行。";
+                        text: @tr("只连接已运行且启用 RC 的 rclone：先健康检查，连不上就明确退出；不启动、不停止 rclone，不注册开机项，不内置 RC 密码。生成后不会自动执行。");
                         font-size: 12px;
                         color: ThemeG.text-dim;
                         wrap: word-wrap;
@@ -4417,10 +4421,10 @@ component SettingsView inherits Rectangle {
                     HorizontalLayout {
                         spacing: 8px;
                         height: 32px;
-                        PillBtn { label: "生成恢复脚本"; primary: true; clicked => { root.script-generate(); } }
-                        PillBtn { label: "复制脚本"; disabled: SettingsG.script-preview == ""; clicked => { root.script-copy(); } }
+                        PillBtn { label: @tr("生成恢复脚本"); primary: true; clicked => { root.script-generate(); } }
+                        PillBtn { label: @tr("复制脚本"); disabled: SettingsG.script-preview == ""; clicked => { root.script-copy(); } }
                         Text {
-                            text: "保存位置: " + SettingsG.script-path;
+                            text: @tr("保存位置: {}", SettingsG.script-path);
                             font-size: 12px;
                             color: ThemeG.text-dim;
                             vertical-alignment: center;
@@ -4446,14 +4450,14 @@ component SettingsView inherits Rectangle {
             HorizontalLayout {
                 spacing: 12px;
                 Card {
-                    title: "外观与启动";
+                    title: @tr("外观与启动");
                     horizontal-stretch: 1;
                     VerticalLayout {
                         spacing: 10px;
                         HorizontalLayout {
                             spacing: 8px;
                             height: 32px;
-                            FieldLabel { text: "主题"; width: 46px; vertical-alignment: center; }
+                            FieldLabel { text: @tr("主题"); width: 46px; vertical-alignment: center; }
                             ComboBox {
                                 width: 160px;
                                 model: SettingsG.themes;
@@ -4463,8 +4467,19 @@ component SettingsView inherits Rectangle {
                         }
                         HorizontalLayout {
                             spacing: 8px;
+                            height: 32px;
+                            FieldLabel { text: @tr("语言"); width: 46px; vertical-alignment: center; }
+                            ComboBox {
+                                width: 160px;
+                                model: SettingsG.languages;
+                                current-index <=> SettingsG.language-idx;
+                                changed current-index => { root.save(); }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
                             height: 26px;
-                            FieldLabel { text: "强调色"; width: 46px; vertical-alignment: center; }
+                            FieldLabel { text: @tr("强调色"); width: 46px; vertical-alignment: center; }
                             for c[i] in [#1f6feb, #238636, #8957e5, #d4760a] : Rectangle {
                                 width: 22px;
                                 height: 22px;
@@ -4482,11 +4497,11 @@ component SettingsView inherits Rectangle {
                         HorizontalLayout {
                             spacing: 20px;
                             height: 28px;
-                            CheckBox { checked <=> SettingsG.autostart; text: "开机自启"; toggled => { root.save(); } }
-                            CheckBox { checked <=> SettingsG.silent; text: "静默启动（仅托盘）"; toggled => { root.save(); } }
+                            CheckBox { checked <=> SettingsG.autostart; text: @tr("开机自启"); toggled => { root.save(); } }
+                            CheckBox { checked <=> SettingsG.silent; text: @tr("静默启动（仅托盘）"); toggled => { root.save(); } }
                             CheckBox {
                                 checked <=> SettingsG.close-to-tray;
-                                text: "关闭窗口时隐藏到托盘区";
+                                text: @tr("关闭窗口时隐藏到托盘区");
                                 toggled => { root.save(); }
                             }
                         }
@@ -4496,11 +4511,11 @@ component SettingsView inherits Rectangle {
                             height: 28px;
                             CheckBox {
                                 checked <=> SettingsG.run-as-admin;
-                                text: "以管理员身份运行";
+                                text: @tr("以管理员身份运行");
                                 toggled => { root.admin-toggle(); }
                             }
                             Text {
-                                text: "切换权限会重启软件（当前窗口先关闭）";
+                                text: @tr("切换权限会重启软件（当前窗口先关闭）");
                                 font-size: 11px;
                                 color: ThemeG.text-dim;
                                 vertical-alignment: center;
@@ -4509,21 +4524,21 @@ component SettingsView inherits Rectangle {
                     }
                 }
                 Card {
-                    title: "内嵌 HTTP 服务（图床 / 直链 / Obsidian）";
+                    title: @tr("内嵌 HTTP 服务（图床 / 直链 / Obsidian）");
                     horizontal-stretch: 1;
                     VerticalLayout {
                         spacing: 10px;
                         HorizontalLayout {
                             spacing: 12px;
                             height: 32px;
-                            CheckBox { checked <=> SettingsG.http-enabled; text: "启用"; toggled => { root.save(); } }
-                            FieldLabel { text: "端口"; width: 34px; vertical-alignment: center; }
+                            CheckBox { checked <=> SettingsG.http-enabled; text: @tr("启用"); toggled => { root.save(); } }
+                            FieldLabel { text: @tr("端口"); width: 34px; vertical-alignment: center; }
                             LineEdit { width: 160px; text <=> SettingsG.http-port; }
                         }
                     }
                 }
                 Card {
-                    title: "rclone 运行参数（立即生效）";
+                    title: @tr("rclone 运行参数（立即生效）");
                     horizontal-stretch: 1;
                     VerticalLayout {
                         spacing: 10px;
@@ -4545,7 +4560,7 @@ component SettingsView inherits Rectangle {
                         }
                         HorizontalLayout {
                             spacing: 8px;
-                            PillBtn { label: "保存运行参数"; primary: true; compact: true; clicked => { root.options-save(); } }
+                            PillBtn { label: @tr("保存运行参数"); primary: true; compact: true; clicked => { root.options-save(); } }
                             Rectangle {}
                         }
                     }
@@ -4554,18 +4569,18 @@ component SettingsView inherits Rectangle {
             HorizontalLayout {
                 spacing: 8px;
                 height: 36px;
-                PillBtn { label: "保存设置"; primary: true; clicked => { root.save(); } }
-                PillBtn { label: "测试连接"; clicked => { root.test(); } }
+                PillBtn { label: @tr("保存设置"); primary: true; clicked => { root.save(); } }
+                PillBtn { label: @tr("测试连接"); clicked => { root.test(); } }
                 Rectangle {}
-                FieldLabel { text: "配置文件: " + SettingsG.cfg-path; vertical-alignment: center; }
+                FieldLabel { text: @tr("配置文件: {}", SettingsG.cfg-path); vertical-alignment: center; }
             }
         }
     }
     // 导出含凭据时的二次确认：Rust 置 conf-confirm-show=true 触发；取消/确认先 close() 再回调 Rust 清理状态。
     cexp := ConfirmPop {
-        title: "导出包含凭据？";
+        title: @tr("导出包含凭据？");
         msg: SettingsG.conf-confirm-msg;
-        ok-label: "确认导出";
+        ok-label: @tr("确认导出");
         confirmed => { root.conf-export-confirmed(); }
         cancelled => { root.conf-export-cancelled(); }
     }
@@ -4592,7 +4607,7 @@ component SettingsView inherits Rectangle {
             VerticalLayout {
                 padding: 18px;
                 spacing: 12px;
-                Text { text: "软件将重启"; font-size: 15px; font-weight: 700; color: ThemeG.text; }
+                Text { text: @tr("软件将重启"); font-size: 15px; font-weight: 700; color: ThemeG.text; }
                 Text {
                     text: SettingsG.admin-confirm-msg;
                     font-size: 13px;
@@ -4604,14 +4619,14 @@ component SettingsView inherits Rectangle {
                     spacing: 8px;
                     alignment: end;
                     PillBtn {
-                        label: "取消";
+                        label: @tr("取消");
                         clicked => {
                             SettingsG.admin-confirm-show = false;
                             root.admin-cancel();
                         }
                     }
                     PillBtn {
-                        label: "确定";
+                        label: @tr("确定");
                         primary: true;
                         clicked => {
                             SettingsG.admin-confirm-show = false;
@@ -4786,7 +4801,7 @@ export component MainWindow inherits Window {
     min-height: 600px;
     background: ThemeG.bg;
 
-    property <[string]> page-names: ["仪表盘", "文件", "远程", "挂载", "服务", "传输", "插件", "设置"];
+    property <[string]> page-names: [@tr("仪表盘"), @tr("文件"), @tr("远程"), @tr("挂载"), @tr("服务"), @tr("传输"), @tr("插件"), @tr("设置")];
     property <[string]> nav-icons: ["\u{E80F}", "\u{E8B7}", "\u{E753}", "\u{E8CE}", "\u{E909}", "\u{E895}", "\u{EA86}", "\u{E713}"];
     // 侧栏「传输」呼吸灯相位：没有后台任务时恒为 0（不读 animation-tick，静止不重绘）
     property <float> nav-pulse: DashboardG.transfers > 0 ? (mod(animation-tick(), 1.6s) / 1.6s) : 0;
@@ -5034,7 +5049,7 @@ export component MainWindow inherits Window {
                                 background: DashboardG.running ? ThemeG.ok : ThemeG.err;
                             }
                         }
-                        Text { text: DashboardG.running ? "在线" : "离线"; font-size: 9px; color: ThemeG.text-dim; horizontal-alignment: center; }
+                        Text { text: DashboardG.running ? @tr("在线") : @tr("离线"); font-size: 9px; color: ThemeG.text-dim; horizontal-alignment: center; }
                     }
                 }
             }
@@ -5244,7 +5259,7 @@ export component MainWindow inherits Window {
                     // 同样只在真正连上（或显示上次快照）时才露出 RC 地址，
                     // 否则状态栏会显示一个「将要连的」地址，看起来像已连上。
                     Text {
-                        text: (DashboardG.running || DashboardG.stale) ? DashboardG.url : "未连接";
+                        text: (DashboardG.running || DashboardG.stale) ? DashboardG.url : @tr("未连接");
                         font-size: 11px;
                         color: ThemeG.text-dim;
                         vertical-alignment: center;
@@ -5260,21 +5275,21 @@ export component MainWindow inherits Window {
                         width: 68px;
                         height: 22px;
                         clicked => { NavG.idx = 5; }   // 传输
-                        Text { text: "传输 " + DashboardG.transfers; font-size: 11px; color: ThemeG.text-dim; horizontal-alignment: center; vertical-alignment: center; }
+                        Text { text: @tr("传输 {}", DashboardG.transfers); font-size: 11px; color: ThemeG.text-dim; horizontal-alignment: center; vertical-alignment: center; }
                     }
                     TouchArea {
                         mouse-cursor: pointer;
                         width: 68px;
                         height: 22px;
                         clicked => { NavG.idx = 3; }   // 挂载
-                        Text { text: "挂载 " + DashboardG.mounts; font-size: 11px; color: ThemeG.text-dim; horizontal-alignment: center; vertical-alignment: center; }
+                        Text { text: @tr("挂载 {}", DashboardG.mounts); font-size: 11px; color: ThemeG.text-dim; horizontal-alignment: center; vertical-alignment: center; }
                     }
                     TouchArea {
                         mouse-cursor: pointer;
                         width: 68px;
                         height: 22px;
                         clicked => { ToastG.error-panel = !ToastG.error-panel; }
-                        Text { text: "错误 " + (ToastG.error-count + DashboardG.errors); font-size: 11px; color: (ToastG.error-count + DashboardG.errors) > 0 ? ThemeG.err : ThemeG.text-dim; horizontal-alignment: center; vertical-alignment: center; }
+                        Text { text: @tr("错误 {}", (ToastG.error-count + DashboardG.errors)); font-size: 11px; color: (ToastG.error-count + DashboardG.errors) > 0 ? ThemeG.err : ThemeG.text-dim; horizontal-alignment: center; vertical-alignment: center; }
                     }
                 }
                 Rectangle {
@@ -5306,21 +5321,21 @@ export component MainWindow inherits Window {
                 spacing: 8px;
                 height: 26px;
                 Text {
-                    text: "错误记录";
+                    text: @tr("错误记录");
                     font-size: 14px;
                     font-weight: 700;
                     color: ThemeG.err;
                     vertical-alignment: center;
                 }
                 Text {
-                    text: "（当前 " + ToastG.error-count + " 条错误记录）";
+                    text: @tr("（当前 {} 条错误记录）", ToastG.error-count);
                     font-size: 11px;
                     color: ThemeG.text-dim;
                     vertical-alignment: center;
                 }
                 Rectangle {}
                 PillBtn {
-                    label: "清空";
+                    label: @tr("清空");
                     compact: true;
                     clicked => {
                         ToastG.history = [];
@@ -5330,7 +5345,7 @@ export component MainWindow inherits Window {
                     }
                 }
                 PillBtn {
-                    label: "关闭";
+                    label: @tr("关闭");
                     compact: true;
                     clicked => { ToastG.error-panel = false; }
                 }
@@ -5360,7 +5375,7 @@ export component MainWindow inherits Window {
                         // 现在行高交给内容：Text 自动换行 → HorizontalLayout 自动变高；
                         // 非错误项用 visible=false 排除（Slint 不会为它保留布局空间）。
                         if ToastG.error-count == 0 : Text {
-                            text: "暂无错误记录";
+                            text: @tr("暂无错误记录");
                             font-size: 12px;
                             color: ThemeG.text-dim;
                         }
@@ -5424,14 +5439,13 @@ export component MainWindow inherits Window {
                 padding: 20px;
                 spacing: 12px;
                 Text {
-                    text: "关闭窗口";
+                    text: @tr("关闭窗口");
                     font-size: 15px;
                     font-weight: 700;
                     color: ThemeG.text;
                 }
                 Text {
-                    text: "你希望关闭窗口时隐藏到托盘区（程序继续在后台运行），还是直接退出程序？"
-                        + "选「取消」不做任何操作，下次关闭还会再问。";
+                    text: @tr("你希望关闭窗口时隐藏到托盘区（程序继续在后台运行），还是直接退出程序？选「取消」不做任何操作，下次关闭还会再问。");
                     // 必须定宽：只写 wrap 不约束宽度时 preferred-height 会按单行估算，
                     // 长文案换行后会把按钮挤出卡片。
                     width: 376px;
@@ -5444,18 +5458,18 @@ export component MainWindow inherits Window {
                     spacing: 8px;
                     alignment: end;
                     PillBtn {
-                        label: "取消";
+                        label: @tr("取消");
                         compact: true;
                         clicked => { root.close-prompt-cancel(); }
                     }
                     PillBtn {
-                        label: "直接关闭";
+                        label: @tr("直接关闭");
                         compact: true;
                         danger: true;
                         clicked => { root.close-prompt-quit(); }
                     }
                     PillBtn {
-                        label: "确认";
+                        label: @tr("确认");
                         compact: true;
                         primary: true;
                         clicked => { root.close-prompt-confirm(); }
@@ -5511,7 +5525,7 @@ export component MainWindow inherits Window {
                 HorizontalLayout {
                     spacing: 8px;
                     height: 32px;
-                    Text { text: "浏览远程路径"; font-size: 14px; font-weight: 700; color: ThemeG.text; vertical-alignment: center; }
+                    Text { text: @tr("浏览远程路径"); font-size: 14px; font-weight: 700; color: ThemeG.text; vertical-alignment: center; }
                     Rectangle {}
                     IconBtn {
                         label: "\u{E72B}";  // 上级
@@ -5535,7 +5549,7 @@ export component MainWindow inherits Window {
                     border-color: ThemeG.border;
                     clip: true;
                     if BrowseG.entries.length == 0 : Text {
-                        text: "（空）";
+                        text: @tr("（空）");
                         font-size: 13px;
                         color: ThemeG.text-dim;
                         horizontal-alignment: center;
@@ -5574,8 +5588,8 @@ export component MainWindow inherits Window {
                     height: 36px;
                     spacing: 8px;
                     alignment: end;
-                    PillBtn { label: "取消"; clicked => { BrowseG.show = false; } }
-                    PillBtn { label: "确定"; primary: true; clicked => { root.browse-ok(); } }
+                    PillBtn { label: @tr("取消"); clicked => { BrowseG.show = false; } }
+                    PillBtn { label: @tr("确定"); primary: true; clicked => { root.browse-ok(); } }
                 }
             }
         }

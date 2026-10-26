@@ -62,14 +62,14 @@ impl RcClient {
             return RcError::new(
                 RcErrorKind::Timeout,
                 method,
-                format!("{} 无响应（超时）", self.base_url),
+                rcgui_i18n::f("{} 无响应（超时）", &[&(self.base_url)]),
             );
         }
         if e.is_connect() {
             return RcError::new(
                 RcErrorKind::Connect,
                 method,
-                format!("无法连接 {}（{e}）", self.base_url),
+                rcgui_i18n::f("无法连接 {}（{}）", &[&(self.base_url), &(e)]),
             );
         }
         RcError::new(RcErrorKind::Connect, method, e.to_string())
@@ -97,7 +97,7 @@ impl RcClient {
             return Ok(Value::Null);
         }
         serde_json::from_str(&text)
-            .map_err(|e| RcError::new(RcErrorKind::Decode, method, format!("响应解析失败: {e}")))
+            .map_err(|e| RcError::new(RcErrorKind::Decode, method, rcgui_i18n::f("响应解析失败: {}", &[&(e)])))
     }
 
     /// 依次尝试多个方法名（新旧版本改名兼容），**仅**在「方法不存在」时回退。
@@ -116,7 +116,7 @@ impl RcClient {
             }
         }
         Err(last_err.unwrap_or_else(|| {
-            RcError::new(RcErrorKind::Unsupported, methods.join("|"), "无可用 RC 方法")
+            RcError::new(RcErrorKind::Unsupported, methods.join("|"), rcgui_i18n::t("无可用 RC 方法"))
         }))
     }
 

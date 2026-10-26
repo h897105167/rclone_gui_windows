@@ -90,7 +90,7 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {    std::fs::create_dir_all(d
             copy_dir(&from, &to)?;
         } else {
             std::fs::copy(&from, &to)
-                .with_context(|| format!("复制失败: {}", from.display()))?;
+                .with_context(|| rcgui_i18n::f("复制失败: {}", &[&(from.display())]))?;
         }
     }
     Ok(())
@@ -173,7 +173,7 @@ pub fn restore_builtin(ctx: &Arc<Ctx>, id: &str) -> Result<()> {
         cfg.plugin_enabled.insert(id.to_string(), true);
         let _ = config::save(&cfg);
     }
-    let root = builtin_root().ok_or_else(|| anyhow!("找不到内置插件目录（assets/plugins）"))?;
+    let root = builtin_root().ok_or_else(|| anyhow!("{}", rcgui_i18n::t("找不到内置插件目录（assets/plugins）")))?;
     let mut found = None;
     if let Ok(rd) = std::fs::read_dir(&root) {
         for entry in rd.flatten() {
@@ -186,7 +186,7 @@ pub fn restore_builtin(ctx: &Arc<Ctx>, id: &str) -> Result<()> {
             }
         }
     }
-    let src = found.ok_or_else(|| anyhow!("内置插件 {id} 不在安装包里"))?;
+    let src = found.ok_or_else(|| anyhow!("{}", rcgui_i18n::f("内置插件 {} 不在安装包里", &[&(id)])))?;
     let dest = plugins_dir().join(plugin_host::config::sanitize_dir_name(id));
     if dest.exists() {
         std::fs::remove_dir_all(&dest).ok();
@@ -222,7 +222,7 @@ fn remove_plugin_files(path: &Path, plugins_root: &Path, id: &str) -> Result<Pat
     let removed = if path.is_dir() {
         plugin_host::bundle::uninstall(path)?
     } else if path.is_file() {
-        std::fs::remove_file(path).map_err(|e| anyhow!("删除 {} 失败: {e}", path.display()))?;
+        std::fs::remove_file(path).map_err(|e| anyhow!("{}", rcgui_i18n::f("删除 {} 失败: {}", &[&(path.display()), &(e)])))?;
         path.to_path_buf()
     } else {
         // 路径已不存在：按目录再试一次，仍不行就报错（不要静默成功）
@@ -539,7 +539,7 @@ pub fn open_path(p: &str) -> Result<()> {
     if ok {
         Ok(())
     } else {
-        bail!("无法打开 {p}")
+        bail!("{}", rcgui_i18n::f("无法打开 {}", &[&(p)]))
     }
 }
 
@@ -644,9 +644,9 @@ pub fn now_json() -> Value {
 /// `body_b64` 用 base64 而不是字符串：上传的可能是任意二进制（图片），
 /// JSON 字符串装不下非 UTF-8 字节。
 pub async fn dispatch_http(ctx: &Arc<Ctx>, id: &str, req: Value) -> Result<Value> {
-    let (dir, cfg) = loaded_config(id).ok_or_else(|| anyhow!("找不到插件 {id}"))?;
+    let (dir, cfg) = loaded_config(id).ok_or_else(|| anyhow!("{}", rcgui_i18n::f("找不到插件 {}", &[&(id)])))?;
     if !cfg.http_entry {
-        bail!("插件 {id} 没有声明 HTTP 入口");
+        bail!("{}", rcgui_i18n::f("插件 {} 没有声明 HTTP 入口", &[&(id)]));
     }
     let mut params = json!({
         "action": "http",
@@ -667,7 +667,7 @@ async fn call_plugin(
     action: &str,
     extra: Value,
 ) -> Result<Value> {
-    let (dir, cfg) = loaded_config(id).ok_or_else(|| anyhow!("找不到插件 {id}"))?;
+    let (dir, cfg) = loaded_config(id).ok_or_else(|| anyhow!("{}", rcgui_i18n::f("找不到插件 {}", &[&(id)])))?;
     let mut params = json!({
         "action": action,
         // 必须是合并过声明式默认值的有效表单：插件看到的要和界面显示的一致，
@@ -698,11 +698,11 @@ async fn call_entry(
     params: Value,
 ) -> Result<Value> {
     if !cfg.entry_is_wasm() {
-        bail!("插件 {id} 的入口不是 WASM，无法执行");
+        bail!("{}", rcgui_i18n::f("插件 {} 的入口不是 WASM，无法执行", &[&(id)]));
     }
     let entry = dir.join(&cfg.entry);
     if !entry.is_file() {
-        bail!("入口文件不存在: {}", entry.display());
+        bail!("{}", rcgui_i18n::f("入口文件不存在: {}", &[&(entry.display())]));
     }
     let allowed = Allowed::from_groups(&cfg.capabilities);
     ctx.host
@@ -1051,7 +1051,7 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, id:
                     .unwrap_or_default();
                 if checks.is_empty() {
                     let text = if c.text.is_empty() {
-                        "尚未校验".to_string()
+                        rcgui_i18n::t("尚未校验").to_string()
                     } else {
                         c.text.clone()
                     };
@@ -1162,7 +1162,7 @@ fn simple_row(kind: &str, key: &str, text: &str) -> PanelData {
 /// 拉取并合成某个插件的面板（`action` 默认 "state"）。
 pub async fn build_panel(ctx: &Arc<Ctx>, id: &str) -> Result<Vec<PanelData>> {
     let Some((_dir, cfg)) = loaded_config(id) else {
-        bail!("找不到插件 {id} 的 config.json");
+        bail!("{}", rcgui_i18n::f("找不到插件 {} 的 config.json", &[&(id)]));
     };
     if cfg.plugin_setting.controls.is_empty() {
         return Ok(Vec::new());
@@ -1194,7 +1194,7 @@ pub async fn run_action(
         .map(|c| c.plugin_enabled.get(id).copied().unwrap_or(false))
         .unwrap_or(false);
     if !enabled {
-        bail!("插件 {id} 已停用，请先启用再操作");
+        bail!("{}", rcgui_i18n::f("插件 {} 已停用，请先启用再操作", &[&(id)]));
     }
     let body = call_plugin(ctx, id, action, Value::Null).await?;
     if let Some((kind, msg)) = apply_body(ctx, id, &body) {

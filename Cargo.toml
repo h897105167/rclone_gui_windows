@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/app",
+    "crates/i18n",
     "crates/profile",
     "crates/rc",
     "crates/rclone",
