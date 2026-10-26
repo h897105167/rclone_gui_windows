@@ -1,191 +1,160 @@
 # RCGUI
 
-Windows 上的 rclone 图形管理工具（RCGUI）。Rust + [Slint](https://slint.dev) 构建，
-插件系统基于 WASM。插件与本体彻底分离：**每个插件一个独立仓库**，本体只保留一份
-锁文件 [plugins/manifest.json](plugins/manifest.json)，构建时按锁文件从各插件仓库的
-Release 下载并校验。
+English | [简体中文](README.zh-CN.md)
 
-> **RCGUI 不拥有 rclone 的进程生命周期**：它不启动、不停止、不重启 rclone。你需要自己安装并运行 rclone，RCGUI 只连接你指定的 RC endpoint。
+RCGUI is a Windows desktop front end for [rclone](https://rclone.org/), written in Rust with a [Slint](https://slint.dev) UI.
 
-> **注意**：本仓库不是旧的 Node.js + Vue 3 网页版（`rcdeck`）。旧版已放弃，仅可作为设计参考。
+It is a front end and nothing more: RCGUI never embeds rclone, never starts it, and never stops it. You run `rclone rcd` yourself — or let the bundled *one-click rclone* plugin start it for you — and RCGUI connects to that RC endpoint over HTTP. Everything the window shows is a projection of rclone's own state, so a change made from the command line appears here too. Mounts additionally need [WinFsp](https://winfsp.dev), which RCGUI can install for you with one click.
 
-## 功能概览
+The interface ships in Chinese and English and switches at runtime.
 
-| 模块 | 说明 |
-|---|---|
-| 仪表盘 | 运行版本、传输速度、挂载/传输计数 |
-| 文件 | 远程目录浏览、新建/重命名/删除/复制/复制直链 |
-| 远程 | 基于 rclone `config/providers` 的动态参数表单（非硬编码类型列表） |
-| 挂载 | 把远程挂载为本地盘符（需要 WinFsp），支持自动挂载预设 |
-| 服务 | WebDAV / SFTP / HTTP / FTP 等 serve 端点，支持自动启动预设 |
-| 传输 | 活动传输与后台任务、全局限速 |
-| 插件 | 运行时加载的 WASM 插件包；界面由插件 `config.json` 的声明式控件渲染，本体不认识任何插件 id |
-| 设置 | 主题（跟随系统/浅色/深色）、强调色、开机自启、静默启动、内嵌 HTTP |
-| 语言 | 中文 / English 两套界面。跟随系统或手动切换，**切换后立即生效、无需重启**；插件面板的文案由插件自己按宿主传来的 `params.lang` 给出（见 [PLUGIN.md](docs/PLUGIN.md) §2.1.1） |
+> RCGUI is not the old *rcdeck* (the Node + Vue rewrite of the rclone web UI). It is a ground-up Rust/Slint application, and it does not ship a web front end at all — it only serves the plugin HTTP endpoints described below.
 
-内置插件（各自独立仓库，发布在自己的 Release 上）：
+## Features
 
-| 插件 | 仓库 | 说明 |
-|---|---|---|
-| 图床 | <https://github.com/h897105167/rcgui-plugin-imagehost> | 上传、SHA-1 去重、索引、直链、短链 |
-| 一键 rclone | <https://github.com/h897105167/rcgui-plugin-oneclick> | 环境自检、下载安装 rclone、创建远程、常用操作 |
+| Page | What you can do |
+| --- | --- |
+| **Dashboard** | Connection state and the RC endpoint actually in use, live counters for remotes / mounts / services / transfers, and a history of what the app just did |
+| **Files** | Two-pane browser — local disk on the left, remote on the right — with a sort menu (name / size / modified), multi-select, upload to or download into a chosen folder, and drag-and-drop between the two panes |
+| **Remotes** | Create, edit and delete remotes (name, backend type, `key=value` parameters), fill in a dedicated **K-Vault** form, keep a list of proxies and bind one per remote — re-applied on every start |
+| **Mounts** | Mount any remote to a drive letter with cache mode and read-only flags, see whether the drive letter actually appeared, install WinFsp from the official or a mirror source — and have a mount you created re-created after the next successful connect |
+| **Services** | Serve a remote over HTTP, WebDAV, FTP, SFTP or DLNA with per-service credentials, start and stop them, see what is running right now, and get remembered services re-created on reconnect |
+| **Transfers** | Live and finished transfers with progress, speed and totals, and every background job labelled by kind (copy, move, rename, delete) |
+| **Plugins** | Install, enable, disable and uninstall plugins, drive their declarative settings panel, restore a built-in plugin you removed, and open the plugin directory |
+| **Settings** | RC endpoint and credentials, theme, accent colour, UI language, the embedded HTTP server port, the winget mirror source, the config file path, and `rcgui.conf` import/export |
 
-## 环境要求
+## Bundled plugins
 
-- **Rust 工具链**（MSVC）：<https://rustup.rs>
-- **WinFsp**：仅在「挂载为本地盘符」时需要 <https://winfsp.dev>
-- **wasm32-wasip1 目标**：只在**开发插件**时需要（`rustup target add wasm32-wasip1`）；
-  构建本体不需要，插件是现成的 Release 资产。
+Plugins live in their own repositories; this repository only keeps the lock file `plugins/manifest.json` that pins a version, an asset name and a SHA-256 for each of them.
 
-## 快速开始
+| Plugin | Version | What it does |
+| --- | --- | --- |
+| [imagehost](https://github.com/h897105167/rcgui-plugin-imagehost) | 0.6.1 | Uploads local images to an rclone remote, hands back a direct link (and an optional short link), and exposes an HTTP upload service that other apps can post to |
+| [oneclick](https://github.com/h897105167/rcgui-plugin-oneclick) | 0.3.3 | Finds, verifies, downloads and starts a local rclone, then keeps it running for as long as RCGUI is open (Windows only) |
+
+![The one-click rclone plugin panel](docs/oneclick-plugin-panel.png)
+
+## Requirements
+
+| Item | Notes |
+| --- | --- |
+| Windows 10 / 11 (x64) | The only supported target today |
+| [Rust](https://rustup.rs/) with the MSVC toolchain | Needed to build from source |
+| `wasm32-wasip1` target | `rustup target add wasm32-wasip1` — plugins are WASI modules |
+| [WinFsp](https://winfsp.dev) | Optional; only needed for the **Mounts** page, and installable from inside the app |
+| A running `rclone rcd` | Optional at build time; required at runtime unless a plugin starts one for you |
+
+## Quick start
 
 ```powershell
 git clone https://github.com/h897105167/rclone_gui_windows.git
 cd rclone_gui_windows
-
-# 构建（会先按 plugins/manifest.json 拉取插件资产，再构建应用）
 .\scripts\build.ps1
-
-# 运行
-.\target\debug\rclone-gui.exe
 ```
 
-或者一步构建并运行：
+`build.ps1` fetches the pinned plugin archives, verifies their SHA-256, builds the workspace and leaves the executable in `target\release\rclone-gui.exe`.
+
+| Parameter | Effect |
+| --- | --- |
+| `-Release` | Build the release profile (the default is debug) |
+| `-Run` | Launch the app as soon as the build succeeds |
+| `-SkipPlugins` | Do not fetch or refresh plugin archives |
+| `-ForcePlugins` | Re-download the plugin archives even when the cached copies match the lock file |
+
+## Building by hand
+
+The plugin archives have to be in place before `cargo build`, because they are embedded into the binary:
 
 ```powershell
-.\scripts\build.ps1 -Run
-```
-
-Release 构建：
-
-```powershell
-.\scripts\build.ps1 -Release
-.\target\release\rclone-gui.exe
-```
-
-常用参数：
-
-| 参数 | 作用 |
-|---|---|
-| `-Release` | release 构建 |
-| `-Run` | 构建后直接启动 |
-| `-SkipPlugins` | 不检查/不下载插件资产（只改本体时用；资产缺失会有警告） |
-| `-ForcePlugins` | 无视本地已就绪状态，强制重新下载 |
-
-> 若提示脚本被执行策略阻止，可在当前会话临时放开：
-> `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`
-
-## 手动构建（不用脚本）
-
-本体**不含插件源码**，所以第一步是拿插件资产，顺序不能反：
-
-```powershell
-# 1) 按锁文件下载并校验插件资产 → crates/app/assets/plugins/<id>/
 .\scripts\fetch_plugins.ps1
-
-# 2) 构建应用（build.rs 会把 assets/plugins 复制到 exe 同级目录）
 cargo build -p rclone-gui
-
-# 运行
-.\target\debug\rclone-gui.exe
 ```
 
-某个插件仓库发了新版本时，改 `plugins/manifest.json` 里的 `tag` 与 `sha256`，
-再 `.\scripts\fetch_plugins.ps1 -Force` 即可。插件的完整打包/发布流程见
-[docs/PLUGIN.md](docs/PLUGIN.md)。
+`fetch_plugins.ps1` reads `plugins/manifest.json`, downloads each release archive from the plugin repository, verifies its SHA-256 against the lock file and unpacks it into `crates/app/assets/plugins/`.
 
-## 插件机制（一句话版）
+## Connecting to rclone
 
-插件是运行时加载的 WASI 包（目录形态：`config.json` + 入口 wasm + `check.sha256`）。
-宿主与插件之间只有一条 JSON 通道：插件通过 `need` 申请能力（`kv` / `fs` / `http` /
-`proc` / `rclone` / `ui` …），宿主校验 `capabilities` 白名单后执行；插件页的界面
-完全由 `config.json` 的 `plugin_setting` 控件描述驱动。**新增插件不需要改本体源码。**
-
-框架、命名、接入规则、能力清单、发布流程都在
-**[docs/PLUGIN.md](docs/PLUGIN.md)**。
-
-## 关于 rclone（外部进程）
-
-RCGUI **不自带、不解压、不启动** rclone。使用前请自行安装 rclone 并让它提供 RC 接口，例如：
+RCGUI talks to rclone's RC API, so `rclone` has to be listening somewhere. A typical session:
 
 ```powershell
-rclone rcd --rc-addr 127.0.0.1:5574 --rc-user gui --rc-pass <你的密码>
-# 或者在你的挂载命令上加 --rc：
-rclone mount teldrive: T: --rc --rc-addr 127.0.0.1:5574 --rc-user gui --rc-pass <密码>
+rclone rcd --rc-addr 127.0.0.1:5574 --rc-user gui --rc-pass <your-password>
 ```
 
-然后在 RCGUI「设置 → rclone 连接」里填该地址/端口/用户名/密码，点「连接 / 握手」。
-连不上时 RCGUI 进入离线模式（可继续编辑/导入导出本地档案），**不会**回退成替你启动 rclone。
+Then put the same address and credentials into **Settings** and press **Connect / handshake**. If rclone was started with `--rc-no-auth`, tick *no authentication* instead — otherwise every endpoint except `core/version` answers 403.
 
-关闭 RCGUI 只停止轮询、释放连接：**不会**调用 `core/quit`、不会杀进程、不会卸载挂载或停止 serve。
+Mounts and services have no persistence of their own in rclone: `rclone mount` and `rclone serve` live only as long as the process that started them. RCGUI therefore remembers the ones you created and re-applies them through the RC API after every successful connect, skipping whatever is already mounted or already listening, and reporting per-item failures without blocking the rest. Unmounting or stopping an item forgets it. If the RC endpoint has no authentication configured at all, the replay is skipped — the connection status already says so.
 
-## 内嵌 HTTP 服务
+## Embedded HTTP server
 
-默认监听 `127.0.0.1:5273`（可在设置中修改）。路由是通用的，本体不认识任何插件的业务路径：
+RCGUI can expose a small HTTP server (default port **5273**, configurable in Settings) so external tools and plugins can reach it:
 
-| 端点 | 说明 |
-|---|---|
-| `GET /api/health` | 健康检查 |
-| `ANY /plugin/{id}` | 交给 `id` 对应的插件（需其 `config.json` 声明 `"http_entry": true`） |
-| `ANY /plugin/{id}/{*rest}` | 同上，路径/查询串/请求头/原始 body 原样转交 |
+| Route | Purpose |
+| --- | --- |
+| `GET /api/health` | Liveness probe for the app itself |
+| `ANY /plugin/{id}` | Dispatch to the plugin whose id is `{id}` |
+| `ANY /plugin/{id}/{*rest}` | Same, with an arbitrary sub-path |
+| `ANY /api/plugin/{id}/{*rest}` | Legacy alias of the route above, kept for older clients |
 
-路径表、鉴权、响应格式都由插件自己决定。图床插件的上传与直链端点就在它自己的
-仓库里（`POST /plugin/imagehost/upload`、`GET /plugin/imagehost/i/{root}/{path}` …）。
+A plugin opts into HTTP handling with `"http_entry": true` in its `config.json`; requests are then negotiated through the plugin's `http` capability, one JSON round per invocation.
 
-`rclone rcd` 默认监听 `127.0.0.1:5572`；本机若用 `--rc-addr 127.0.0.1:5574` 启动，就在设置里填这个地址。
+## How plugins work
 
-## 数据目录
+A plugin is a directory with a `config.json` (identity, version, capabilities, entry point) and a `main.wasm` compiled for `wasm32-wasip1`. There is no plugin API in the host UI: the panel is described **declaratively** by `plugin_setting.controls` in `config.json`, and the host renders whatever the plugin declares without knowing any specific plugin.
 
-配置与插件数据位于 `%APPDATA%\\RCGUI`（首次启动时从旧的 `%APPDATA%\\rclone-gui` **复制**迁移，旧目录保留可回滚）：
+- **Capabilities.** A plugin must declare and then request each capability it uses: `kv`, `ui`, `fs`, `http`, `proc`, `net`, `rclone`, `env`. Dependencies are checked by the host, and every call is a JSON request/response round over stdin/stdout.
+- **Localisation.** Display strings — labels, hints, option labels, `tags` — may be written as `{"zh": "…", "en": "…"}`. The host passes the active language to the plugin on every call (`params.lang`), and stores the value the user picked rather than the display string.
+- **Lifecycle.** A plugin may declare `on_start` / `on_exit` hooks, may be disabled, and may be uninstalled — a built-in plugin leaves a tombstone behind so it can be restored from the Plugins page instead of disappearing for good.
+- **Integrity.** The build-time archives are verified once when fetching and again when the app unpacks them into `%APPDATA%\RCGUI\plugins\<id>\`.
 
-- `config.json` — 应用配置（连接地址、主题、内嵌 HTTP 等）
-- `profiles\default.json` — 档案：远程元信息、**记住的挂载/服务**（连接成功后自动恢复）
-- `plugins\<id>\` — 插件包与各插件的 `kv.json`（内置插件首次运行时从 exe 同级
-  `assets\plugins\` 释放到这里，之后与用户自己装的插件完全同构）
-- `cache\` — 插件申请的缓存（例如图床直链缓存）
+The full contract — manifest schema, capability signatures, action protocol — is in [`docs/PLUGIN.md`](docs/PLUGIN.md).
 
-**便携模式**：在 `rclone-gui.exe` 同目录放一个名为 `portable` 的空文件，
-数据目录会改为 `exe目录\data`。
+## Data directory
 
-## 开发
+Configuration and runtime state are separated:
+
+- `%APPDATA%\RCGUI\` — `config.json` (RC endpoint, server port, UI language, per-remote proxy bindings, the mounts and services you asked for), profiles, plugin copies and kv stores.
+- On first start RCGUI copies an existing `%APPDATA%\rclone-gui\` directory over, so upgrading from the old name keeps your settings.
+- **Portable mode:** drop an empty file named `portable` next to `rclone-gui.exe` and everything moves to `data\` beside the executable.
+
+`rcgui.conf` is the versioned import/export format for a profile (remotes, mounts, services). Credentials are stripped by default, so an exported file is safe to carry around.
+
+## Development
 
 ```powershell
-cargo build --workspace          # 构建全部 crate
-cargo test --workspace           # 运行单元测试
-cargo run -p plugin_host --example protocol_test    # 插件协议测试
+cargo build --workspace
+cargo test --workspace
+cargo run -p plugin_host --example protocol_test
 ```
 
-### 项目结构
+## Project layout
 
-```text
+```
 crates/
-  app/       # Slint UI、主程序、配置、托盘、启动项、内嵌 HTTP
-  rc/        # RC 客户端、连接状态、握手与能力探测
-  profile/   # 版本化档案、rcgui.conf 导入导出、恢复脚本生成
-  rclone/    # legacy：rclone 进程管理残留（不再启动进程）
-  plugin/    # 插件宿主（wasmtime + WASI）与能力 API、config.json 校验
+  app/       the Slint UI, the RC client wiring and the HTTP server
+  i18n/      Chinese/English dictionaries and the `t` / `f` helpers
+  profile/   the versioned `rcgui.conf` import/export format
+  rc/        a typed client for rclone's RC API
+  rclone/    legacy process helpers (exe discovery, a managed `rcd` child, `cat`
+             streaming); the RC client has moved to rc/ and this crate is slated
+             for removal
+  plugin/    the WASI plugin host, capability broker and manifest handling
 plugins/
-  manifest.json  # 插件锁文件（id / repo / tag / sha256），本仓库唯一的插件相关文件
-scripts/     # build.ps1 / fetch_plugins.ps1 等构建脚本
-docs/
-  PLUGIN.md  # 插件框架与接入规则（写插件先看这个）
-  CHANGELOG.md  # 按日期记录的阶段性变更
+  manifest.json   pinned plugin versions plus their SHA-256
+scripts/     build.ps1, fetch_plugins.ps1, packaging helpers
+docs/        PLUGIN.md, CHANGELOG.md, verification notes
 ```
 
-插件源码不在本仓库，见上面的内置插件表。
+## Documentation
 
-## 变更记录
+| File | Contents |
+| --- | --- |
+| [`docs/CHANGELOG.md`](docs/CHANGELOG.md) | Everything that changed, newest first |
+| [`docs/PLUGIN.md`](docs/PLUGIN.md) | Plugin manifest, capability groups, action protocol, HTTP entry points |
+| [`docs/proxy-verification.md`](docs/proxy-verification.md) | What each rclone backend actually accepts for a proxy, measured |
 
-按日期记录每个阶段做了什么，不维护语义化版本号：[docs/CHANGELOG.md](docs/CHANGELOG.md)。
+## Security notes
 
-## 安全提示
-
-- RC 密码保存在 `%APPDATA%\RCGUI\config.json`（明文，属用户目录，不入库）。
-- 插件在 WASI 沙箱内运行（无文件系统/网络预开放），只能发起 `config.json.capabilities`
-  里声明过的能力组，未声明的一律被宿主拒绝；另有 fuel、栈、轮数与超时上限。
-- 插件包有双重校验：包内 `check.sha256` 校验入口文件，`plugins/manifest.json` 的
-  `sha256` 校验下载到的 zip。
-- `fs.*` / `proc.*` / `http.*` 是高危能力（前者能读写文件、后者能执行外部程序）。
-  装插件前先看它声明了什么，以及它的仓库是否可信。
-- 导出 `rcgui.conf` 默认剥离凭据；勾选「包含凭据」会二次确认，且 rclone 的
-  `obscure` 只是可逆混淆、并非加密。
+- The RC password is stored in cleartext in `config.json`. Use a dedicated `--rc-user/--rc-pass` pair, and keep the RC port on loopback.
+- Plugins run inside a WASI sandbox and reach the system only through declared capabilities. `fs.`, `proc.` and `http.` are the dangerous ones — read a plugin's `config.json` before you trust it.
+- The embedded HTTP server binds to loopback and has no authentication of its own; treat anything you expose through a plugin's `http_entry` as reachable by any local process.
+- `rclone obscure` obfuscates configuration values, it does not encrypt them: an obscured password in `rclone.conf` is recoverable.
