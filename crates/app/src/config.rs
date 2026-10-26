@@ -177,6 +177,13 @@ pub struct AppConfig {
     pub bw_down: String,
     #[serde(default = "d_unit")]
     pub bw_down_unit: i32,
+    /// winget 镜像源名（只存名字，源地址由用户自己 `winget source add` 注册）。
+    ///
+    /// 挂载页「一键安装 WinFsp」选镜像源时，命令里带上 `--source <这个名字>`；
+    /// 留空则镜像源不可用。这里刻意不内置任何镜像地址：程序不该替用户改 winget 配置，
+    /// 也不该在代码里固化第三方源。
+    #[serde(default)]
+    pub winget_mirror_source: String,
 }
 
 impl Default for AppConfig {

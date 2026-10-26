@@ -370,6 +370,14 @@ export global MountsG {
     in-out property <int> cache-idx: 2;
     in-out property <bool> winfsp-ok: false;
     in-out property <string> winfsp-msg: "";
+    // ---- 一键安装 WinFsp（winget）----
+    // 安装中：整行置灰 + 转圈，防重复点击（winget 同时跑两个会互相抢锁）
+    in-out property <bool> winfsp-busy: false;
+    // 本次会话里刚装成功、但进程还没重启（WinFsp 的驱动要重启才加载）。
+    // 单独一个状态是为了「已装但还没重启」也能把入口禁掉，而不是让用户重复安装。
+    in-out property <bool> winfsp-done: false;
+    // 源选择：0 = 官方源（winget 默认源），1 = 镜像源（源名在设置页配置）
+    in-out property <int> winget-src: 0;
     in-out property <bool> busy: false;
     in-out property <string> search: "";
 }
@@ -404,6 +412,12 @@ export global PluginsG {
     in-out property <bool> panel-loading: false;
     /// 面板最近一次错误（插件抛错 / 校验失败）
     in-out property <string> panel-error: "";
+    /// 正在执行的面板动作名（空 = 空闲）。一个插件调用可能跨好几轮能力协商
+    /// （例如启动 rclone 要先探测端口再等进程起来），期间面板必须显示进度，
+    /// 否则用户会以为点了没反应而反复点击。
+    in-out property <string> panel-busy-action: "";
+    /// 正在执行的面板动作的按钮文案（用于把按钮换成「启动中…」这类进行时文案）
+    in-out property <string> panel-busy-label: "";
     /// 检索框（按名称 / id / tags 过滤）
     in-out property <string> search: "";
     /// 已被卸载、可一键恢复的内置插件
@@ -544,6 +558,9 @@ export global SettingsG {
     in-out property <bool> admin-confirm-show: false;
     in-out property <bool> http-enabled: true;
     in-out property <string> http-port: "5273";
+    /// winget 镜像源名（挂载页「一键安装 WinFsp」选镜像源时用 `--source <这个名字>`）。
+    /// 只存名字，源地址由用户自己用 `winget source add` 注册，程序不碰网络配置。
+    in-out property <string> winget-mirror-source: "";
     in-out property <string> cfg-path: "";
     in-out property <string> opt-transfers: "";
     in-out property <string> opt-checkers: "";
@@ -613,74 +630,12 @@ component IconBtn inherits Rectangle {
     }
 }
 
-component PillBtn inherits Rectangle {
-    in property <string> label;
-    in property <bool> primary: false;
-    in property <bool> danger: false;
-    in property <bool> disabled: false;
-    in property <bool> compact: false;
-    callback clicked;
-    height: root.compact ? 26px : 32px;
-    min-width: root.compact ? 0px : 76px;
-    border-radius: ThemeG.radius-s;
-    background: root.disabled ? ThemeG.panel-2
-        : root.primary ? (ta.pressed ? ThemeG.pressed : (ta.has-hover ? ThemeG.primary-hover : ThemeG.primary))
-        : (ta.pressed ? ThemeG.pressed : (ta.has-hover ? ThemeG.hover : ThemeG.panel-2));
-    border-width: root.primary ? 0px : 1px;
-    border-color: ThemeG.border;
-    opacity: root.disabled ? 0.55 : 1.0;
-    HorizontalLayout {
-        padding-left: root.compact ? 10px : 14px;
-        padding-right: root.compact ? 10px : 14px;
-        alignment: center;
-        Text {
-            text: root.label;
-            font-size: root.compact ? 12px : 13px;
-            font-weight: 500;
-            color: root.primary ? white : (root.danger ? ThemeG.err : ThemeG.text);
-            vertical-alignment: center;
-        }
-    }
-    ta := TouchArea {
-        mouse-cursor: pointer;
-        enabled: !root.disabled;
-        clicked => { root.clicked(); }
-    }
-}
-
-component Card inherits Rectangle {
-    in property <string> title: "";
-    in property <length> pad: 16px;
-    // fill=true 时子元素可拉伸占满卡片（用于列表类卡片）
-    in property <bool> fill: false;
-    background: ThemeG.panel;
-    border-radius: ThemeG.radius;
-    border-width: 1px;
-    border-color: ThemeG.border;
-    vertical-layout := VerticalLayout {
-        padding: root.pad;
-        alignment: root.fill ? LayoutAlignment.stretch : LayoutAlignment.start;
-        if root.title != "": Rectangle {
-            height: 36px;
-            HorizontalLayout {
-                padding-left: root.pad < 14px ? 14px : root.pad;
-                padding-right: root.pad < 14px ? 14px : root.pad;
-                Text {
-                    text: root.title;
-                    font-size: 14px;
-                    font-weight: 700;
-                    color: ThemeG.text;
-                    vertical-alignment: center;
-                }
-            }
-        }
-        if root.title != "" && root.pad > 0px : Rectangle { height: 8px; }
-        @children
-    }
-}
-
 // 忙碌指示器：由 Slint 内建动画时钟 animation-tick() 驱动，无需外部定时器推进。
 // 旋转的缺口圆弧，比单帧字符更像"正在旋转"的指示器。
+// 位置说明：必须声明在 PillBtn 之前——Slint 要求同文件内「先声明后使用」，
+// 会话 27 之前把它写在 PillBtn 之后，只好在按钮里手抄一份 Path，结果是
+// 裸 Path 放进 HorizontalLayout 时垂直方向贴到行顶（真机截图看到转圈浮在文字上方），
+// 复用它（Rectangle 包 Path）才能被布局垂直居中。
 component Spinner inherits Rectangle {
     in property <bool> running: false;
     // 允许调用方通过 width/height 覆盖尺寸
@@ -725,6 +680,90 @@ component Spinner inherits Rectangle {
             sweep: true;
             large-arc: false;
         }
+    }
+}
+
+component PillBtn inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary: false;
+    in property <bool> danger: false;
+    in property <bool> disabled: false;
+    in property <bool> compact: false;
+    // busy：这个按钮对应的动作正在执行（例如「启动 rclone」等握手）。
+    // 只做视觉反馈，真正的防重入由宿主把整排按钮置灰来做。
+    in property <bool> busy: false;
+    callback clicked;
+    height: root.compact ? 26px : 32px;
+    min-width: root.compact ? 0px : 76px;
+    border-radius: ThemeG.radius-s;
+    background: root.disabled ? ThemeG.panel-2
+        : root.primary ? (ta.pressed ? ThemeG.pressed : (ta.has-hover ? ThemeG.primary-hover : ThemeG.primary))
+        : (ta.pressed ? ThemeG.pressed : (ta.has-hover ? ThemeG.hover : ThemeG.panel-2));
+    border-width: root.primary ? 0px : 1px;
+    border-color: ThemeG.border;
+    opacity: root.disabled ? 0.55 : 1.0;
+    HorizontalLayout {
+        padding-left: root.compact ? 10px : 14px;
+        padding-right: root.compact ? 10px : 14px;
+        spacing: root.busy ? 7px : 0px;
+        alignment: center;
+        // 转圈复用 Spinner（已声明在 PillBtn 之前）。
+        // 外面必须再包一层满高的 Rectangle：布局里定高的子元素在交叉轴上是贴顶摆放的
+        // （文字之所以看着居中，是因为 Text 撑满整行、再由 vertical-alignment 居中），
+        // 所以裸 Spinner 会浮到按钮顶部。包一层 height:100% 的容器再手动 y 居中才正。
+        if root.busy : Rectangle {
+            width: 13px;
+            height: 100%;
+            Spinner {
+                width: 13px;
+                height: 13px;
+                y: (parent.height - self.height) / 2;
+                running: true;
+            }
+        }
+        Text {
+            text: root.label;
+            font-size: root.compact ? 12px : 13px;
+            font-weight: 500;
+            color: root.primary ? white : (root.danger ? ThemeG.err : ThemeG.text);
+            vertical-alignment: center;
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        enabled: !root.disabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Card inherits Rectangle {
+    in property <string> title: "";
+    in property <length> pad: 16px;
+    // fill=true 时子元素可拉伸占满卡片（用于列表类卡片）
+    in property <bool> fill: false;
+    background: ThemeG.panel;
+    border-radius: ThemeG.radius;
+    border-width: 1px;
+    border-color: ThemeG.border;
+    vertical-layout := VerticalLayout {
+        padding: root.pad;
+        alignment: root.fill ? LayoutAlignment.stretch : LayoutAlignment.start;
+        if root.title != "": Rectangle {
+            height: 36px;
+            HorizontalLayout {
+                padding-left: root.pad < 14px ? 14px : root.pad;
+                padding-right: root.pad < 14px ? 14px : root.pad;
+                Text {
+                    text: root.title;
+                    font-size: 14px;
+                    font-weight: 700;
+                    color: ThemeG.text;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        if root.title != "" && root.pad > 0px : Rectangle { height: 8px; }
+        @children
     }
 }
 
@@ -3088,6 +3127,9 @@ component MountsView inherits Rectangle {
     background: transparent;
     callback refresh;
     callback add;
+    // 一键安装 WinFsp（走 winget；具体命令由宿主拼，UI 只说「用户点了」）。
+    // 参数是源选择：0 官方源 / 1 镜像源。
+    callback install-winfsp(int);
     callback remove(string);
     callback browse;
     callback path-nav(string);
@@ -3110,18 +3152,82 @@ component MountsView inherits Rectangle {
             }
             IconBtn { label: "\u{E72C}"; clicked => { root.refresh(); } }
         }
-        if !MountsG.winfsp-ok : Rectangle {
+        // WinFsp 状态横幅常驻（不再只在缺 WinFsp 时出现）：
+        // 缺 → 警告色 + 一键安装入口；已装 → 成功色 + 入口置灰。
+        // 常驻的理由：用户装完、或本来就装了，也需要看到「已安装」这个事实，
+        // 否则横幅整条消失，会让人以为功能丢了。
+        Rectangle {
             height: 56px;
             background: ThemeG.panel;
             border-radius: ThemeG.radius;
             border-width: 1px;
-            border-color: ThemeG.warn;
+            border-color: MountsG.winfsp-ok || MountsG.winfsp-done ? ThemeG.accent : ThemeG.warn;
             HorizontalLayout {
                 padding-left: 14px;
                 padding-right: 14px;
                 spacing: 10px;
-                Text { text: "⚠"; font-size: 16px; vertical-alignment: center; }
-                Text { text: MountsG.winfsp-msg; font-size: 12px; color: ThemeG.warn; wrap: word-wrap; vertical-alignment: center; }
+                // 状态点：不用 ✓/⚠ 字符——默认字体里没有这两个字形，会渲染成豆腐块（实测）。
+                // 小圆点纯靠颜色表达状态，不依赖字体覆盖。
+                // 外面套一层 VerticalLayout 是因为 HorizontalLayout 里定高的子项会贴顶，
+                // 想让它垂直居中只能靠 alignment: center 的这层布局来兜。
+                VerticalLayout {
+                    width: 8px;
+                    alignment: center;
+                    Rectangle {
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: MountsG.winfsp-ok || MountsG.winfsp-done ? ThemeG.accent : ThemeG.warn;
+                    }
+                }
+                Text {
+                    // 已装但本进程还没重启时要说清「重启才生效」，否则用户会以为已经能挂载了
+                    text: MountsG.winfsp-ok
+                        ? "WinFsp 已安装"
+                        : (MountsG.winfsp-done ? "WinFsp 已安装，重启本程序后生效" : MountsG.winfsp-msg);
+                    font-size: 12px;
+                    color: MountsG.winfsp-ok || MountsG.winfsp-done ? ThemeG.text : ThemeG.warn;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                // 源二选一：两种都走 winget，只是镜像源多一个 --source <设置页里配的源名>。
+                // 装好之后（含待重启）就不需要再选源，整组隐藏，只留一个禁用按钮说明状态。
+                // 外面套 VerticalLayout 的原因同上：定高的子项在 HorizontalLayout 里会贴顶。
+                if !MountsG.winfsp-ok && !MountsG.winfsp-done : VerticalLayout {
+                    alignment: center;
+                    HorizontalLayout {
+                        height: 26px;
+                        spacing: 6px;
+                        PillBtn {
+                            label: "官方源";
+                            compact: true;
+                            primary: MountsG.winget-src == 0;
+                            disabled: MountsG.winfsp-busy;
+                            clicked => { MountsG.winget-src = 0; }
+                        }
+                        PillBtn {
+                            label: "镜像源";
+                            compact: true;
+                            primary: MountsG.winget-src == 1;
+                            disabled: MountsG.winfsp-busy;
+                            clicked => { MountsG.winget-src = 1; }
+                        }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    PillBtn {
+                        label: MountsG.winfsp-busy ? "安装中…"
+                            : (MountsG.winfsp-ok ? "已安装"
+                            : (MountsG.winfsp-done ? "待重启生效" : "一键安装 WinFsp"));
+                        compact: true;
+                        primary: !MountsG.winfsp-ok && !MountsG.winfsp-done && !MountsG.winfsp-busy;
+                        busy: MountsG.winfsp-busy;
+                        disabled: MountsG.winfsp-ok || MountsG.winfsp-done || MountsG.winfsp-busy;
+                        clicked => { root.install-winfsp(MountsG.winget-src); }
+                    }
+                }
             }
         }
         // 实例不匹配：当前端点报告没有挂载，但本机确有 rclone 盘符（属于另一个实例）。
@@ -4069,10 +4175,14 @@ component PluginsView inherits Rectangle {
                                         spacing: 8px;
                                         Rectangle {}
                                         for b[bi] in r.buttons : PillBtn {
-                                            label: b.label;
+                                            // 正在执行这个动作：换成进行时文案 + 转圈；
+                                            // 同时整排按钮置灰，避免连点触发第二次调用。
+                                            label: (PluginsG.panel-busy-action == b.action && PluginsG.panel-busy-label != "")
+                                                ? PluginsG.panel-busy-label : b.label;
                                             primary: b.style == "primary";
                                             danger: b.style == "danger";
-                                            disabled: !b.enabled || !p.enabled;
+                                            busy: PluginsG.panel-busy-action == b.action;
+                                            disabled: !b.enabled || !p.enabled || PluginsG.panel-busy-action != "";
                                             clicked => { root.panel-action(b.action); }
                                         }
                                     }
@@ -4529,6 +4639,39 @@ component SettingsView inherits Rectangle {
                         }
                     }
                 }
+            }
+            // 第二行：winget 与 rclone 参数各占一半。四张卡片挤在一行时，窗口一窄最右边的卡
+            // 就会被窗口边缘切掉（卡片有最小宽度、横向布局不能再压），所以拆成两行。
+            HorizontalLayout {
+                spacing: 12px;
+                // winget 镜像源：挂载页「一键安装 WinFsp」选镜像源时，命令里会带 --source <这里填的源名>。
+                // 程序只认名字，不管源地址——镜像源由用户自己 `winget source add` 注册，
+                // 这样既不用内置任何镜像地址，也不会替用户改 winget 配置。
+                Card {
+                    title: "winget 镜像源（安装 WinFsp 用）";
+                    horizontal-stretch: 1;
+                    VerticalLayout {
+                        spacing: 10px;
+                        HorizontalLayout {
+                            spacing: 12px;
+                            height: 32px;
+                            FieldLabel { text: "源名"; width: 34px; vertical-alignment: center; }
+                            LineEdit {
+                                width: 200px;
+                                text <=> SettingsG.winget-mirror-source;
+                                placeholder-text: "例如 winget-mirror";
+                            }
+                            PillBtn { label: "保存"; compact: true; clicked => { root.save(); } }
+                            Rectangle {}
+                        }
+                        Text {
+                            text: "先在命令行注册镜像源：winget source add -n <源名> -a <源地址>；此处填的源名要和 -n 一致。留空则在挂载页只能用官方源。";
+                            font-size: 11px;
+                            color: ThemeG.text-dim;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
                 Card {
                     title: "rclone 运行参数（立即生效）";
                     horizontal-stretch: 1;
@@ -4856,6 +4999,7 @@ export component MainWindow inherits Window {
     callback files-move-confirm();
     callback mounts-refresh();
     callback mount-add();
+    callback install-winfsp(int);
     callback mount-remove(string);
     callback mount-path-nav(string);
     callback mounts-search(string);
@@ -5181,6 +5325,7 @@ export component MainWindow inherits Window {
                 if NavG.idx == 3 : MountsView {
                     refresh => { root.mounts-refresh(); }
                     add => { root.mount-add(); }
+                    install-winfsp(src) => { root.install-winfsp(src); }
                     remove(mp) => { root.mount-remove(mp); }
                     browse => { root.browse-open(0); }
                     path-nav(n) => { root.mount-path-nav(n); }

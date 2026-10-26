@@ -16,9 +16,9 @@
       "id": "onerclone",
       "name": "一键 rclone",
       "repo": "https://github.com/h897105167/rcgui-plugin-oneclick",
-      "tag": "v0.3.1",
-      "asset": "onerclone-0.3.1.zip",
-      "sha256": "43f4e2e4867c5c5d4bb42e5a364769e26e3cf4c0e2ef2d5116006f0456be69ad",
+      "tag": "v0.3.2",
+      "asset": "onerclone-0.3.2.zip",
+      "sha256": "84b19036a5ad05b60a929ee6010d8a088ac9c491208e7160e33973b0c2ff37f3",
       "dir": "onerclone"
     }
   ]

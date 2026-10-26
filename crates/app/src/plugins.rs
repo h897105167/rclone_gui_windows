@@ -867,6 +867,7 @@ async fn apply_rc(
     ctx: &Arc<Ctx>,
     ui: &slint::Weak<crate::MainWindow>,
     body: &Value,
+    hold: bool,
 ) -> Result<()> {
     let Some(rc) = body.get("rc") else { return Ok(()) };
     let url = rc.get("url").and_then(|v| v.as_str()).unwrap_or("");
@@ -888,7 +889,20 @@ async fn apply_rc(
         // `if ready` 分支被跳过（那时 `ready == false`，走的是「让插件去启动」），
         // 于是 replay 再也没人调用，用户看到的是「一键 rclone 启动成功，但挂载/服务
         // 列表是空的」（会话 16 宿主实测）。
-        let out = crate::connect_report(ctx).await;
+        let mut out = crate::connect_report(ctx).await;
+        // `hold`：用户点了「启动 rclone」时，面板 loading 必须撑到握手成功为止。
+        // 插件 spawn 完进程就回传 rc 端点，而 rclone 往往还没 bind 上端口，宿主只探
+        // 一次的话 loading 会在「已启动，正在连接…」就收掉（会话 27 宿主实测：
+        // 2.5 s 收掉、握手其实还在路上）。这里补几次短探测覆盖这段竞态，硬上限 1.6 s；
+        // 真慢的机器仍由下面的 spawn_connect_retry 接手（最多 40 s）。
+        let mut tries = 0;
+        if hold {
+            while !out.view.live && tries < 4 {
+                tries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                out = crate::connect_report(ctx).await;
+            }
+        }
         let live = out.view.live;
         crate::apply_conn_view(ui, out.view);
         if live {
@@ -1200,7 +1214,7 @@ pub async fn run_action(
     if let Some((kind, msg)) = apply_body(ctx, id, &body) {
         crate::toast(ui, kind, msg);
     }
-    apply_rc(ctx, ui, &body).await?;
+    apply_rc(ctx, ui, &body, action == "start").await?;
     Ok(())
 }
 
@@ -1220,11 +1234,19 @@ pub async fn autostart(ctx: &Arc<Ctx>, ui: &slint::Weak<crate::MainWindow>) {
                 if let Some((kind, msg)) = apply_body(ctx, &r.id, &body) {
                     crate::toast(ui, kind, msg);
                 }
-                if let Err(e) = apply_rc(ctx, ui, &body).await {
+                if let Err(e) = apply_rc(ctx, ui, &body, false).await {
+                    // 自动连接失败以前只写 stderr：用户看到的是「rclone 起来了但界面离线」，
+                    // 完全不知道原因。这条路径必须可见。
                     eprintln!("自动连接失败: {e:#}");
+                    crate::toast(ui, 2, format!("自动连接失败: {e:#}"));
                 }
             }
-            Err(e) => eprintln!("插件 {} 自启动失败: {e:#}", r.id),
+            Err(e) => {
+                // 插件抛错（wasm 校验失败、能力被拒、轮次超限…）同样不能静默：
+                // 以前只有 eprintln!，用户视角就是「自动启动什么都没发生」。
+                eprintln!("插件 {} 自启动失败: {e:#}", r.id);
+                crate::toast(ui, 2, format!("插件 {} 自启动失败: {e:#}", r.id));
+            }
         }
     }
 }

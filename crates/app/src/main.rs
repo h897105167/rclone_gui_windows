@@ -106,6 +106,11 @@ enum Cmd {
     },
     MountsRefresh,
     MountAdd,
+    /// 一键安装 WinFsp（走 winget）。`mirror` = 用设置页配置的镜像源而不是官方源。
+    ///
+    /// 单独一个命令而不是塞进 MountAdd：安装要走 winget 子进程（几十秒），
+    /// 必须能在 UI 上显示「安装中…」并禁掉按钮，跟挂载表单的生命周期完全不同。
+    WinFspInstall { mirror: bool },
     MountRemove { point: String },
     /// 从历史记录里选择远程路径（scope: 0 挂载 / 1 服务）
     HistPick { scope: i32, path: String },
@@ -626,6 +631,190 @@ fn winfsp_installed() -> (bool, String) {
         false,
         "未检测到 WinFsp。挂载功能需要安装 WinFsp：https://winfsp.dev/rel/ 安装后重启本程序。".into(),
     )
+}
+
+/// 改 WinFsp 横幅的状态。集中一处，省得几个分支各写一遍 global。
+///
+/// **必须走 `upgrade_in_event_loop`**：Cmd 派发在后台线程上跑，直接
+/// `upgrade()` 拿不到窗口（返回 None），改属性会静默失效——启动时那次能生效
+/// 只是因为它在 UI 线程上。这里和 `toast()` 用同一套搬运动作。
+fn winfsp_banner(ui: &Weak<MainWindow>, busy: bool, msg: Option<&str>, done: Option<bool>) {
+    let msg = msg.map(|m| m.to_string());
+    let _ = ui.upgrade_in_event_loop(move |w| {
+        let g = w.global::<MountsG>();
+        g.set_winfsp_busy(busy);
+        if let Some(m) = msg {
+            g.set_winfsp_msg(m.into());
+        }
+        if let Some(d) = done {
+            g.set_winfsp_done(d);
+        }
+    });
+}
+
+/// 从子进程输出里挑一句能贴给用户看的话（winget 的输出很长，toast 只容得下一行）。
+///
+/// 优先 stderr 的最后一条非空行（winget 的错误都在那儿）；都没有就说「无输出」，
+/// 而不是把几十行日志塞进 toast。
+fn tail_line(stdout: &[u8], stderr: &[u8]) -> String {
+    for raw in [stderr, stdout] {
+        let s = String::from_utf8_lossy(raw);
+        if let Some(last) = s
+            .lines()
+            .rev()
+            .map(str::trim)
+            // 去掉 winget 的进度条字符行（"  █████  ███" 之类）
+            .find(|l| !l.is_empty() && !l.chars().all(|c| "█▒░ ".contains(c)))
+        {
+            let mut one = last.to_string();
+            if one.chars().count() > 160 {
+                one = one.chars().take(160).collect::<String>() + "…";
+            }
+            return one;
+        }
+    }
+    "（无输出）".into()
+}
+
+/// winget 的「没有可用的较新版本」退出码（0x8A15002B）。
+///
+/// 包已经装着、且源里没有更新版本时 winget 就返回它——在这种场景下它不是错误，
+/// 只是「无事可做」。所以判定时不能只看 `status.success()`。
+const WINGET_ERR_UPDATE_NOT_APPLICABLE: i32 = -1_978_335_189;
+
+/// 一键安装 WinFsp（走 winget）。
+///
+/// 顺序：装 → 立刻重测 → 按「本进程能不能用」落状态。三个细节都是踩过的坑：
+/// 1. `--disable-interactivity`：不加的话 winget 会在无窗口子进程里等交互，看起来像卡死；
+/// 2. 装完必须**重新检测**而不能假定成功：winget 返回 0 也可能因为「已是最新」而没装；
+/// 3. 检测到已安装 ≠ 本进程能用：WinFsp 的驱动/服务在进程启动时才加载，
+///    所以只置 `winfsp-done`（待重启），绝不置 `winfsp-ok`——否则用户以为能挂载，
+///    真去挂载时才失败，比现在先说清楚糟得多。
+///
+/// 镜像源只拼 `--source <设置页里填的源名>`：源地址是用户自己 `winget source add` 注册的，
+/// 程序不内置、也不替用户改 winget 配置。源名留空时直接报错，不悄悄回落官方源
+/// ——那会让人以为走了镜像。
+async fn install_winfsp(ui: &Weak<MainWindow>, mirror: bool, mirror_source: String) {
+    let src = mirror_source.trim();
+    if mirror && src.is_empty() {
+        toast(
+            ui,
+            2,
+            "还没配置 winget 镜像源名：请到「设置 → winget 镜像源」填写，或改用官方源",
+        );
+        return;
+    }
+    // 装之前先探一次：本来就有 WinFsp 就不用再跑 winget（横幅按钮此时本就禁用了，
+    // 这里是兜底，避免设置页/快捷键之类的新入口绕过按钮状态）。
+    if winfsp_installed().0 {
+        winfsp_banner(
+            ui,
+            false,
+            Some("WinFsp 已安装，重启本程序后生效"),
+            Some(true),
+        );
+        return;
+    }
+    winfsp_banner(
+        ui,
+        true,
+        Some("正在用 winget 安装 WinFsp，如弹出授权窗口请点「是」…"),
+        None,
+    );
+
+    let source = if mirror { Some(src.to_string()) } else { None };
+    let res = tokio::task::spawn_blocking(move || -> std::io::Result<std::process::Output> {
+        let mut c = std::process::Command::new("winget");
+        c.args([
+            "install",
+            "--id",
+            "WinFsp.WinFsp",
+            "-e",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+            "--disable-interactivity",
+        ]);
+        if let Some(s) = source.as_deref() {
+            c.args(["--source", s]);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW：别弹一个黑框出来
+        }
+        c.output()
+    })
+    .await;
+
+    // 先解除 busy：卡住的转圈比慢一点更难受，后面用横幅文案讲结果
+    winfsp_banner(ui, false, None, None);
+
+    let (ok_now, _) = winfsp_installed();
+    match res {
+        Ok(Ok(out)) => {
+            if ok_now {
+                // 判定以「装完能不能检测到」为准，不以退出码为准：
+                // winget 对「已经装了」会返回非 0（见下面的 UPDATE_NOT_APPLICABLE），
+                // 只看退出码会把「本来就好」报成失败。
+                winfsp_banner(
+                    ui,
+                    false,
+                    Some("WinFsp 已安装，重启本程序后生效"),
+                    Some(true),
+                );
+                toast(ui, 1, "WinFsp 安装成功：重启本程序后即可使用挂载");
+            } else if out.status.success() {
+                // 退出码 0 但目录还是不在：常见于 winget 把它当「已是最新」跳过
+                winfsp_banner(
+                    ui,
+                    false,
+                    Some("winget 报告成功，但仍未检测到 WinFsp；请重启本程序再试或手动安装"),
+                    None,
+                );
+                toast(ui, 2, "winget 结束了，但没检测到 WinFsp");
+            } else if out.status.code() == Some(WINGET_ERR_UPDATE_NOT_APPLICABLE) {
+                // winget 说「没有可用的较新版本」，即它认为已经装着；可我们检测不到。
+                // 这种自相矛盾要如实讲，别报成「安装失败」把用户引去重装。
+                winfsp_banner(
+                    ui,
+                    false,
+                    Some("winget 认为已是最新版本，但没检测到 WinFsp；请重启本程序再试"),
+                    None,
+                );
+                toast(ui, 2, "winget 认为已是最新，但没检测到 WinFsp");
+            } else {
+                let why = tail_line(&out.stdout, &out.stderr);
+                winfsp_banner(
+                    ui,
+                    false,
+                    Some(&format!("安装失败：{why}")),
+                    None,
+                );
+                toast(ui, 2, format!("WinFsp 安装失败：{why}"));
+            }
+        }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            winfsp_banner(
+                ui,
+                false,
+                Some("系统里找不到 winget（App Installer 未安装）：请手动下载安装 WinFsp"),
+                None,
+            );
+            toast(
+                ui,
+                2,
+                "找不到 winget：请从 https://winfsp.dev/rel/ 手动安装，或先装「应用安装程序」",
+            );
+        }
+        Ok(Err(e)) => {
+            winfsp_banner(ui, false, Some(&format!("启动 winget 失败：{e}")), None);
+            toast(ui, 2, format!("启动 winget 失败：{e}"));
+        }
+        Err(e) => {
+            winfsp_banner(ui, false, Some(&format!("安装线程异常：{e}")), None);
+            toast(ui, 2, format!("安装线程异常：{e}"));
+        }
+    }
 }
 
 fn join_path(dir: &str, name: &str) -> String {
@@ -2857,6 +3046,8 @@ fn main() {
     ui.global::<SettingsG>().set_close_to_tray(cfg.close_to_tray);
     ui.global::<SettingsG>().set_http_enabled(cfg.http.enabled);
     ui.global::<SettingsG>().set_http_port(cfg.http.port.to_string().into());
+    ui.global::<SettingsG>()
+        .set_winget_mirror_source(cfg.winget_mirror_source.clone().into());
     ui.global::<SettingsG>()
         .set_cfg_path(config::config_path().display().to_string().into());
     // 复选框反映**当前进程真实权限**，而不是记忆的偏好：重启后状态自然对齐
@@ -6258,6 +6449,12 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             refresh::refresh_state(ctx, ui, true).await;
             false
         }
+        Cmd::WinFspInstall { mirror } => {
+            // 源名现读配置：设置页改完立刻生效，不用重启程序
+            let src = config::load().winget_mirror_source;
+            install_winfsp(ui, mirror, src).await;
+            false
+        }
         Cmd::MountAdd => {
             let (remote, sub_path, point_raw, ro, cache) = read_ui(ui, |ui| {
                 let m = ui.global::<MountsG>();
@@ -8014,16 +8211,52 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if id.is_empty() || action.is_empty() {
                 return false;
             }
+            // 面板动作可能跨好几轮能力协商（「启动 rclone」还要等进程起来并握手），
+            // 期间必须给出可见反馈：按钮换成进行时文案 + 转圈、整排置灰，
+            // 否则用户会以为点了没反应而反复点击，反而拉起第二个实例。
+            {
+                let act = action.clone();
+                let label = match action.as_str() {
+                    "start" => "启动中…",
+                    "stop" => "停止中…",
+                    "install" => "下载校验中…",
+                    "revalidate" => "校验中…",
+                    "pick_exe" => "选择中…",
+                    "search_exe" => "搜索中…",
+                    "search_deep" => "深度扫描中…",
+                    "pick_history" => "读取中…",
+                    _ => "处理中…",
+                }
+                .to_string();
+                let _ = ui.upgrade_in_event_loop(move |ui| {
+                    let g = ui.global::<PluginsG>();
+                    g.set_panel_busy_action(act.as_str().into());
+                    g.set_panel_busy_label(label.as_str().into());
+                });
+            }
             match plugins::run_action(ctx, &id, &action, ui).await {
                 Ok(()) => {
-                    // 动作可能改变了状态与表单，重新拉一次面板
-                    if let Ok(rows) = plugins::build_panel(ctx, &id).await {
-                        let _ = ui.upgrade_in_event_loop(move |ui| {
-                            let g = ui.global::<PluginsG>();
-                            let list = plugins::panel_to_slint(&rows);
-                            g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(list))));
-                            g.set_panel_loading(false);
-                        });
+                    // 动作可能改变了状态与表单，重新拉一次面板；
+                    // 进行时状态要等新面板刷上去再清掉，避免中间闪一帧旧按钮。
+                    match plugins::build_panel(ctx, &id).await {
+                        Ok(rows) => {
+                            let _ = ui.upgrade_in_event_loop(move |ui| {
+                                let g = ui.global::<PluginsG>();
+                                let list = plugins::panel_to_slint(&rows);
+                                g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(list))));
+                                g.set_panel_loading(false);
+                                g.set_panel_busy_action("".into());
+                                g.set_panel_busy_label("".into());
+                            });
+                        }
+                        Err(_) => {
+                            let _ = ui.upgrade_in_event_loop(move |ui| {
+                                let g = ui.global::<PluginsG>();
+                                g.set_panel_loading(false);
+                                g.set_panel_busy_action("".into());
+                                g.set_panel_busy_label("".into());
+                            });
+                        }
                     }
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::PluginsRescan)).await;
                 }
@@ -8034,6 +8267,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         let g = ui.global::<PluginsG>();
                         g.set_panel_loading(false);
                         g.set_panel_error(msg2.as_str().into());
+                        g.set_panel_busy_action("".into());
+                        g.set_panel_busy_label("".into());
                     });
                     toast(ui, 2, format!("插件动作失败: {msg}"));
                 }
@@ -8178,6 +8413,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     }
                     cfg.http.enabled = s.get_http_enabled();
                     cfg.http.port = s.get_http_port().parse().unwrap_or(5273);
+                    cfg.winget_mirror_source = s.get_winget_mirror_source().to_string();
                     set_autostart(cfg.autostart, cfg.silent_start);
                     apply_theme(&ui, cfg.theme_mode);
                     ui.global::<ThemeG>().set_accent_idx(cfg.accent_idx as i32);
@@ -9273,10 +9509,19 @@ fn wire_callbacks(
         move || {
             let _ = tx.send(Cmd::MountsRefresh);
         }
-    });    ui.on_mount_add({
+    });
+    ui.on_mount_add({
         let tx = tx.clone();
         move || {
             let _ = tx.send(Cmd::MountAdd);
+        }
+    });
+    // 一键安装 WinFsp：源（0 官方 / 1 镜像）由横幅上的两个小按钮选，
+    // 点安装时把当前选择直接带进来，省得再读一遍全局。
+    ui.on_install_winfsp({
+        let tx = tx.clone();
+        move |src| {
+            let _ = tx.send(Cmd::WinFspInstall { mirror: src == 1 });
         }
     });
     ui.on_mount_remove({
