@@ -4802,7 +4802,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plugin_host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5186,11 +5186,11 @@ dependencies = [
 
 [[package]]
 name = "rcgui-i18n"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "rcgui-profile"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "rcgui-i18n",
@@ -5200,7 +5200,7 @@ dependencies = [
 
 [[package]]
 name = "rcgui-rc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rcgui-i18n",
  "reqwest",
@@ -5211,7 +5211,7 @@ dependencies = [
 
 [[package]]
 name = "rclone-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -5244,7 +5244,7 @@ dependencies = [
 
 [[package]]
 name = "rclone_client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "rand 0.8.8",
