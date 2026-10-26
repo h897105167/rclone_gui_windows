@@ -301,15 +301,12 @@ pub struct Row {
     pub path: String,
 }
 
-/// 插件文案的中英切换：只翻展示用的中文，落盘值仍然是插件认识的中文原值。
-fn plugin_tr(id: &str, s: &str) -> String {
-    crate::plugin_i18n::tr(id, s)
-}
-
 impl Row {
     /// 检索用的合并文本（名称 / id / 标签 / 描述，均已小写）。
+    ///
+    /// 名称与描述在解析 `config.json` 时已经按当前语言挑好（见
+    /// [`plugin_host::config::pick_localized`]），所以这里直接拼就是当前语言的那一份。
     fn blob(&self) -> String {
-        // 中英文两份都拼进来：英文界面下用户可能搜英文名，中文界面下可能搜中文名。
         let mut s = format!(
             "{} {} {} {}",
             self.name,
@@ -317,36 +314,28 @@ impl Row {
             self.tags.join(" "),
             self.desc
         );
-        s.push(' ');
-        s.push_str(&plugin_tr(&self.id, &self.name));
-        s.push(' ');
-        s.push_str(&plugin_tr(&self.id, &self.desc));
         s.make_ascii_lowercase();
         s
     }
 
     pub fn to_slint(&self) -> PluginRow {
-        let tr = |s: &str| plugin_tr(&self.id, s);
-        let name = tr(&self.name);
-        let desc = tr(&self.desc);
-        let status = tr(&self.status);
-        let tags: Vec<SharedString> = self.tags.iter().map(|t| tr(t).as_str().into()).collect();
+        let tags: Vec<SharedString> = self.tags.iter().map(|t| t.as_str().into()).collect();
         PluginRow {
             id: self.id.as_str().into(),
-            name: name.as_str().into(),
+            name: self.name.as_str().into(),
             version: self.version.as_str().into(),
-            desc: desc.as_str().into(),
+            desc: self.desc.as_str().into(),
             loaded: self.loaded,
             enabled: self.enabled,
             kind: self.kind.as_str().into(),
-            author: tr(&self.author).as_str().into(),
+            author: self.author.as_str().into(),
             entry: self.entry.as_str().into(),
             verified: self.verified,
             builtin: self.builtin,
             has_panel: self.has_panel,
             tags: ModelRc::from(Rc::new(VecModel::from(tags))),
             lamp: self.lamp.as_str().into(),
-            status: status.as_str().into(),
+            status: self.status.as_str().into(),
             path: self.path.as_str().into(),
         }
     }
@@ -613,11 +602,31 @@ pub fn effective_form(setting: &PluginSetting, store: &KvStore, id: &str) -> Map
 
 /// 写一个表单字段（用户输入时立刻落盘，避免崩溃丢配置）。
 pub fn set_form_field(store: &KvStore, id: &str, key: &str, value: &str) {
-    // 英文界面里下拉框显示的是译文，落盘前必须还原成插件认识的中文原值。
-    let value = crate::plugin_i18n::tr_back(id, value);
+    // 英文界面里下拉框显示的是译文，落盘前必须还原成插件认识的原值。
+    let value = display_to_value(id, key, value);
     let mut form = form_of(store, id);
     form.insert(key.to_string(), Value::String(value));
     let _ = store.set(id, "form", Value::Object(form));
+}
+
+/// 下拉框回传的是**显示文案**，落盘前按 `config.json` 的选项表反查回落盘值。
+///
+/// 运行时候选（`choices.<key>`）的显示文案与值相同，原样返回即可；自由输入的
+/// 路径 / 端口也走这条兜底，所以查不到时不做任何加工。
+fn display_to_value(id: &str, key: &str, shown: &str) -> String {
+    let Some((_, cfg)) = loaded_config(id) else {
+        return shown.to_string();
+    };
+    for c in &cfg.plugin_setting.controls {
+        if c.key == key {
+            for o in &c.options {
+                if o.label() == shown {
+                    return o.value().to_string();
+                }
+            }
+        }
+    }
+    shown.to_string()
 }
 
 /// 把插件目录 + config 找出来（只处理新格式）。
@@ -700,7 +709,7 @@ async fn call_plugin(
     }
     let out = call_entry(ctx, id, &dir, &cfg, params)
         .await
-        .map_err(|e| anyhow!("{}", plugin_tr(id, &format!("{e:#}"))))?;
+        .map_err(|e| anyhow!("{e:#}"))?;
     // result.body 是插件的业务返回；没有 body 时按空对象处理
     Ok(out.get("body").cloned().unwrap_or(Value::Null))
 }
@@ -870,7 +879,7 @@ fn apply_body(ctx: &Arc<Ctx>, id: &str, body: &Value) -> Option<(i32, String)> {
     }
     // 3) 提示
     body.get("toast").and_then(|t| {
-        let msg = plugin_tr(id, t.get("message").and_then(|m| m.as_str())?);
+        let msg = t.get("message").and_then(|m| m.as_str())?.to_string();
         let kind = match t.get("level").and_then(|l| l.as_str()) {
             Some("err") => 2,
             Some("warn") => 1,
@@ -997,7 +1006,7 @@ fn choices_for(body: &Value, key: &str) -> Vec<String> {
 
 
 /// 合成面板行：声明式控件 + 插件运行时状态 → 一维列表。
-fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, id: &str) -> Vec<PanelData> {
+fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, _id: &str) -> Vec<PanelData> {
     let mut out: Vec<PanelData> = Vec::new();
     let mut pending: Vec<BtnData> = Vec::new();
     let mut pending_line = String::new();
@@ -1124,25 +1133,31 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, id:
                 //   否则退回 config.json 里写死的 `options`。
                 let field_kind = FieldKind::as_str(c.field_enum().unwrap_or(FieldKind::Text));
                 let runtime_choices = choices_for(body, &c.key);
-                let mut options = if field_kind == "path" {
+                // 候选一律先摊成 `(落盘值, 显示文案)`：界面只认文案，
+                // 落盘靠 `display_to_value` 反查回值，插件永远收不到译文。
+                let mut options: Vec<(String, String)> = if field_kind == "path" {
                     // path 字段只认插件运行时给的候选（子目录 / 历史路径），
                     // 写死的 options 对路径没有意义
-                    runtime_choices
+                    Vec::new()
                 } else if runtime_choices.is_empty() {
-                    c.options.clone()
+                    c.options
+                        .iter()
+                        .map(|o| (o.value().to_string(), o.label()))
+                        .collect()
                 } else {
-                    runtime_choices
+                    runtime_choices.iter().map(|o| (o.clone(), o.clone())).collect()
                 };
                 // 当前值不在候选里就补到第一位：插件还没给候选时（如远程列表要
                 // 点「刷新远程」才来），下拉框也必须显示真实值而不是空着。
-                if !value.is_empty() && !options.iter().any(|o| o == &value) {
-                    options.insert(0, value.clone());
+                if !value.is_empty() && !options.iter().any(|(v, _)| v == &value) {
+                    options.insert(0, (value.clone(), value.clone()));
                 }
                 let sel = options
                     .iter()
-                    .position(|o| o == &value)
+                    .position(|(v, _)| v == &value)
                     .map(|i| i as i32)
                     .unwrap_or(0);
+                let options: Vec<String> = options.into_iter().map(|(_, label)| label).collect();
                 out.push(PanelData {
                     kind: "field".into(),
                     key: c.key.clone(),
@@ -1176,33 +1191,7 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, id:
         }
     }
     flush(&mut out, &mut pending, &mut pending_line);
-    localize_panel(id, &mut out);
     out
-}
-
-/// 把一枚面板行里的展示文案换成当前语言。
-///
-/// 只动「给人看」的字段：`value` 是插件表单里的数据（路径 / 端口 / 选项原值），
-/// 翻掉会让插件收到自己不认识的值，所以只有 `check` 行的 `value`（通过 / 未通过这类
-/// 状态词）才翻。
-fn localize_panel(id: &str, rows: &mut [PanelData]) {
-    if !rcgui_i18n::is_en() {
-        return;
-    }
-    for r in rows.iter_mut() {
-        r.label = plugin_tr(id, &r.label);
-        r.text = plugin_tr(id, &r.text);
-        r.placeholder = plugin_tr(id, &r.placeholder);
-        for o in r.options.iter_mut() {
-            *o = plugin_tr(id, o);
-        }
-        for b in r.buttons.iter_mut() {
-            b.label = plugin_tr(id, &b.label);
-        }
-        if r.kind == "check" {
-            r.value = plugin_tr(id, &r.value);
-        }
-    }
 }
 
 fn simple_row(kind: &str, key: &str, text: &str) -> PanelData {
@@ -1481,26 +1470,32 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 文案里还有没有中日韩汉字。
+    fn has_cjk(s: &str) -> bool {
+        s.chars().any(|c| ('一'..='鿿').contains(&c))
+    }
+
     /// 英文界面下，随包插件的整张设置面板不该出现中文。
     ///
-    /// 面板上的每个字（分组标题、提示、占位符、下拉选项、按钮）都由 `compose` 从
-    /// config.json 拷进 `PanelData`，所以这里拿真实 config.json 走一遍 `compose`，
-    /// 再逐字段检查——比逐个函数单测更接近上屏效果。
+    /// 插件**自带**译文：`config.json` 的展示字段写成 `{"zh": …, "en": …}`，
+    /// 宿主在解析时按当前语言挑一条（`plugin_host::config::pick_localized`）。
+    /// 所以这里先把语言切成英文再读 config.json，然后拿真实配置走一遍 `compose`
+    /// 逐字段检查——比逐个函数单测更接近上屏效果。
     #[test]
     fn shipped_panel_is_english_in_en_mode() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/plugins");
         let mut checked = 0usize;
+        let mut bad: Vec<String> = Vec::new();
 
         for id in ["imagehost", "onerclone"] {
+            rcgui_i18n::set_lang(rcgui_i18n::Lang::En);
             let dir = root.join(id);
             let cfg = bundle::read_config_lenient(&dir)
                 .unwrap_or_else(|| panic!("读不到随包插件 {id} 的 config.json"));
-            rcgui_i18n::set_lang(rcgui_i18n::Lang::En);
             let panels = compose(&cfg.plugin_setting, &json!({}), &Map::new(), id);
             rcgui_i18n::set_lang(rcgui_i18n::Lang::Zh);
 
             assert!(!panels.is_empty(), "{id}: 面板一行都没合成出来");
-            let mut bad: Vec<String> = Vec::new();
             for p in &panels {
                 // `value` 是数据（用户填的路径、勾选状态等），不参与翻译。
                 for (field, text) in [
@@ -1508,26 +1503,26 @@ mod tests {
                     ("text", &p.text),
                     ("placeholder", &p.placeholder),
                 ] {
-                    if crate::plugin_i18n::has_cjk(text) {
+                    if has_cjk(text) {
                         bad.push(format!("{id}.{field} = {text}"));
                     }
                 }
                 for opt in &p.options {
                     checked += 1;
-                    if crate::plugin_i18n::has_cjk(opt) {
+                    if has_cjk(opt) {
                         bad.push(format!("{id}.option = {opt}"));
                     }
                 }
                 for b in &p.buttons {
                     checked += 1;
-                    if crate::plugin_i18n::has_cjk(&b.label) {
+                    if has_cjk(&b.label) {
                         bad.push(format!("{id}.button = {}", b.label));
                     }
                 }
                 checked += 1;
             }
-            assert!(bad.is_empty(), "英文模式下仍有中文：\n{}", bad.join("\n"));
         }
+        assert!(bad.is_empty(), "英文模式下仍有中文：\n{}", bad.join("\n"));
         assert!(checked > 0);
     }
 }

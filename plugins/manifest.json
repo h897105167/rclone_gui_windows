@@ -7,18 +7,18 @@
       "id": "imagehost",
       "name": "图床",
       "repo": "https://github.com/h897105167/rcgui-plugin-imagehost",
-      "tag": "v0.5.0",
-      "asset": "imagehost-0.5.0.zip",
-      "sha256": "e097764d2124b83984dd22d6a49ec0461de711f370f6f682528bf82aa82238b7",
+      "tag": "v0.6.1",
+      "asset": "imagehost-0.6.1.zip",
+      "sha256": "223248d77feb63f86182410eff8a42213e05f2c29f30175f64cc4497b59093c2",
       "dir": "imagehost"
     },
     {
       "id": "onerclone",
       "name": "一键 rclone",
       "repo": "https://github.com/h897105167/rcgui-plugin-oneclick",
-      "tag": "v0.3.2",
-      "asset": "onerclone-0.3.2.zip",
-      "sha256": "84b19036a5ad05b60a929ee6010d8a088ac9c491208e7160e33973b0c2ff37f3",
+      "tag": "v0.3.3",
+      "asset": "onerclone-0.3.3.zip",
+      "sha256": "33f2668d865fe3e6ac001c4f47c473b5cdf7d80671f8d4d33c83ddd3e0eed1b0",
       "dir": "onerclone"
     }
   ]

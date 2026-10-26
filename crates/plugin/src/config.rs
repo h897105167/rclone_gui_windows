@@ -197,6 +197,167 @@ fn d_true() -> bool {
     true
 }
 
+// ---------------- 多语言字段 ----------------
+
+/// 从「可能是单语、也可能按语言分列」的值里挑出当前语言的那一条。
+///
+/// 插件**自带**译文（宿主不再维护插件词典），`config.json` 的展示字段因此允许两种写法：
+/// ```json
+/// "label": "上传"
+/// "label": { "zh": "上传", "en": "Upload" }
+/// ```
+/// 取值顺序：当前界面语言 → 该语言的区域变体（`en-US`）→ 英文 → 任意非空值。
+/// 缺语言时落到英文，这条规则和插件 wasm 里的 `i18n` 模块保持一致。
+pub fn pick_localized(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Object(map) => {
+            let want = rcgui_i18n::lang().tag(); // "zh" / "en"
+            if let Some(Value::String(s)) = map.get(want) {
+                return s.clone();
+            }
+            // 区域变体：en-US、zh-CN 之类；键的大小写不敏感
+            let lower = want.to_ascii_lowercase();
+            for (k, val) in map {
+                if k.to_ascii_lowercase().starts_with(&lower) {
+                    if let Value::String(s) = val {
+                        return s.clone();
+                    }
+                }
+            }
+            if let Some(Value::String(s)) = map.get("en") {
+                return s.clone();
+            }
+            for val in map.values() {
+                if let Value::String(s) = val {
+                    return s.clone();
+                }
+            }
+            String::new()
+        }
+        _ => String::new(),
+    }
+}
+
+/// `serde` 适配：字段既接受字符串，也接受语言映射。
+fn de_localized<'de, D>(d: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Value::deserialize(d)?;
+    Ok(pick_localized(&v))
+}
+
+/// 从「可能是纯数组、也可能按语言分列」的值里挑出当前语言的那一组。
+///
+/// ```json
+/// "tags": ["rclone", "图床"]
+/// "tags": { "zh": ["rclone", "图床"], "en": ["rclone", "image host"] }
+/// ```
+///
+/// 取语言的顺序与 [`pick_localized`] 一致。
+pub fn pick_localized_list(v: &Value) -> Vec<String> {
+    pick_localized_list_for(v, rcgui_i18n::lang().tag())
+}
+
+/// [`pick_localized_list`] 的显式语言版本（测试用，避免动全局语言）。
+fn pick_localized_list_for(v: &Value, want: &str) -> Vec<String> {
+    fn strings(v: &Value) -> Option<Vec<String>> {
+        let arr = v.as_array()?;
+        Some(
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect(),
+        )
+    }
+    match v {
+        Value::Array(_) => strings(v).unwrap_or_default(),
+        Value::Object(map) => {
+            if let Some(list) = map.get(want).and_then(strings) {
+                return list;
+            }
+            let lower = want.to_ascii_lowercase();
+            for (k, val) in map {
+                if k.to_ascii_lowercase().starts_with(&lower) {
+                    if let Some(list) = strings(val) {
+                        return list;
+                    }
+                }
+            }
+            if let Some(list) = map.get("en").and_then(strings) {
+                return list;
+            }
+            for val in map.values() {
+                if let Some(list) = strings(val) {
+                    return list;
+                }
+            }
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `serde` 适配：列表字段既接受字符串数组，也接受语言映射。
+fn de_localized_list<'de, D>(d: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Value::deserialize(d)?;
+    Ok(pick_localized_list(&v))
+}
+
+/// 下拉框的一个候选：显示文案可以翻译，落盘值必须是插件认识的原值。
+///
+/// 两种写法等价：
+/// ```json
+/// "options": ["不选择", "模板一"]
+/// "options": [
+///   { "value": "不选择", "label": { "zh": "不选择", "en": "No short link" } },
+///   { "value": "模板一", "label": { "zh": "模板一", "en": "Template 1" } }
+/// ]
+/// ```
+/// 第一种写法里值即文案（老插件照旧）；第二种写法把「给人看」和「给插件」分开，
+/// 宿主显示 `label`、落盘 `value`，于是英文界面下插件收不到英文。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Choice {
+    /// 简写：值即显示文案
+    Plain(String),
+    /// 全写：`value` 落盘，`label` 显示（支持语言映射）
+    Full {
+        #[serde(default)]
+        value: String,
+        #[serde(default)]
+        label: Value,
+    },
+}
+
+impl Choice {
+    /// 落盘值（插件认识的原值）。
+    pub fn value(&self) -> &str {
+        match self {
+            Choice::Plain(s) => s,
+            Choice::Full { value, .. } => value,
+        }
+    }
+
+    /// 当前语言下要显示的文案；没写 `label` 时退回 `value`。
+    pub fn label(&self) -> String {
+        match self {
+            Choice::Plain(s) => s.clone(),
+            Choice::Full { value, label } => {
+                let l = pick_localized(label);
+                if l.trim().is_empty() {
+                    value.clone()
+                } else {
+                    l
+                }
+            }
+        }
+    }
+}
+
 /// 一个界面控件。
 ///
 /// 所有字段都是可选的：不同 `kind` 只用其中一部分，多余字段被忽略，
@@ -208,19 +369,23 @@ pub struct Control {
     /// 稳定标识：字段存值、按钮回调、状态取值都用它
     #[serde(default)]
     pub key: String,
-    #[serde(default)]
+    /// 多语言：可写字符串，也可写 `{"zh": …, "en": …}`
+    #[serde(default, deserialize_with = "de_localized")]
     pub label: String,
-    /// 说明文字 / 占位内容（`hint` 的正文也放这里）
-    #[serde(default)]
+    /// 说明文字 / 占位内容（`hint` 的正文也放这里）；支持语言映射
+    #[serde(default, deserialize_with = "de_localized")]
     pub text: String,
-    #[serde(default)]
+    /// 多语言：可写字符串，也可写语言映射
+    #[serde(default, deserialize_with = "de_localized")]
     pub placeholder: String,
     /// 字段类型（`kind == "field"` 时）
     #[serde(default)]
     pub field: String,
-    /// 下拉选项
+    /// 下拉选项：字符串，或 `{ "value": …, "label": … }`（见 [`Choice`]）
+    ///
+    /// 前者值即文案；后者把「落盘值」和「显示文案」分开，英文界面下插件仍收到中文原值。
     #[serde(default)]
-    pub options: Vec<String>,
+    pub options: Vec<Choice>,
     /// 按钮权重（`kind == "action"` 时）
     #[serde(default)]
     pub style: ButtonStyle,
@@ -233,8 +398,8 @@ pub struct Control {
     /// 是否显示指示灯（`kind == "status"` 时）
     #[serde(default)]
     pub lamp: bool,
-    /// 选择文件/目录时的对话框标题
-    #[serde(default)]
+    /// 选择文件/目录时的对话框标题（支持语言映射）
+    #[serde(default, deserialize_with = "de_localized")]
     pub dialog_title: String,
     /// 扩展名过滤（`path` 字段用），如 `["exe"]`
     #[serde(default)]
@@ -291,8 +456,8 @@ pub struct PluginSetting {
     /// 设置界面版本号，便于以后演进
     #[serde(default)]
     pub version: u32,
-    /// 折叠行右侧显示的摘要（可选文案）
-    #[serde(default)]
+    /// 折叠行右侧显示的摘要（可选文案，支持语言映射）
+    #[serde(default, deserialize_with = "de_localized")]
     pub summary: String,
     #[serde(default)]
     pub controls: Vec<Control>,
@@ -350,7 +515,8 @@ pub struct PluginConfig {
     /// 全局唯一标识；同时用作插件目录名（净化后）
     #[serde(default)]
     pub id: String,
-    #[serde(default)]
+    /// 插件显示名（支持语言映射）
+    #[serde(default, deserialize_with = "de_localized")]
     pub name: String,
     /// 语义化版本
     #[serde(default)]
@@ -362,12 +528,14 @@ pub struct PluginConfig {
     pub plugin_setting: PluginSetting,
 
     // ---- 以下为可选元数据 ----
-    #[serde(default)]
+    /// 简介（支持语言映射）
+    #[serde(default, deserialize_with = "de_localized")]
     pub description: String,
-    #[serde(default)]
+    /// 作者（支持语言映射；插件作者一般写纯文本）
+    #[serde(default, deserialize_with = "de_localized")]
     pub author: String,
-    /// 检索用的标签（插件商店按标签精确搜索）
-    #[serde(default)]
+    /// 检索用的标签（插件商店按标签精确搜索；支持语言映射）
+    #[serde(default, deserialize_with = "de_localized_list")]
     pub tags: Vec<String>,
     /// 需要宿主授权的能力组，见 [`CAP_GROUPS`]
     #[serde(default)]
@@ -703,5 +871,63 @@ mod tests {
         assert_eq!(f.check, CHECK_SHA256);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 标签既可以用纯数组，也可以按语言分列（插件自带译文）。
+    #[test]
+    fn tags_accept_localized_lists() {
+        let v = json!({
+            "zh": ["进程", "安装"],
+            "en": ["process", "install"]
+        });
+        assert_eq!(
+            pick_localized_list_for(&v, "zh"),
+            vec!["进程".to_string(), "安装".to_string()]
+        );
+        assert_eq!(
+            pick_localized_list_for(&v, "en"),
+            vec!["process".to_string(), "install".to_string()]
+        );
+        // 区域变体 en-US 命中 en
+        assert_eq!(
+            pick_localized_list_for(&v, "en-US"),
+            vec!["process".to_string(), "install".to_string()]
+        );
+        // 缺当前语言时回落英文，再回落任意一组
+        let only_en = json!({ "en": ["process"] });
+        assert_eq!(
+            pick_localized_list_for(&only_en, "zh"),
+            vec!["process".to_string()]
+        );
+        // 老写法：纯数组
+        let plain = json!(["rclone", "图床"]);
+        assert_eq!(
+            pick_localized_list_for(&plain, "en"),
+            vec!["rclone".to_string(), "图床".to_string()]
+        );
+        // 非法输入不 panic
+        assert!(pick_localized_list_for(&json!("rclone"), "en").is_empty());
+        assert!(pick_localized_list_for(&json!({ "en": "rclone" }), "en").is_empty());
+    }
+
+    /// `tags` 字段接受两种写法：老插件（数组）与自带译文（语言映射）。
+    #[test]
+    fn tags_field_deserializes_both_forms() {
+        let plain: PluginConfig = serde_json::from_value(json!({
+            "id": "onerclone", "name": "一键 rclone", "version": "0.3.3",
+            "entry": "main.wasm", "tags": ["rclone", "进程"]
+        }))
+        .unwrap();
+        assert_eq!(plain.tags, vec!["rclone".to_string(), "进程".to_string()]);
+
+        let localized: PluginConfig = serde_json::from_value(json!({
+            "id": "onerclone", "name": "一键 rclone", "version": "0.3.3",
+            "entry": "main.wasm",
+            "tags": { "zh": ["进程"], "en": ["process"] }
+        }))
+        .unwrap();
+        // 默认界面语言是中文
+        assert_eq!(localized.tags, vec!["进程".to_string()]);
+        assert!(localized.search_blob().contains("进程"));
     }
 }

@@ -4,6 +4,17 @@
 `git log` 与提交说明为准；设计与接入规则见 [PLUGIN.md](PLUGIN.md)、
 [proxy-verification.md](proxy-verification.md) 等专题文档。
 
+## 2026-10-26
+
+- **插件自带译文**：宿主每次调用插件都带 `params.lang`，插件按它回答中文或英文；宿主侧
+  的插件词典（`plugin_i18n`）整块删除，翻译不再由宿主代劳。`config.json` 的展示字段、
+  `tags` 可写 `{"zh":…,"en":…}`，选项可写 `{"value":…,"label":{…}}`，落盘值仍是原文。
+- 图床插件 **v0.6.1**、一键 rclone 插件 **v0.3.3** 发布，`plugins/manifest.json` 已锁新版。
+- 修 `crates/plugin/examples/protocol_test.rs`：上轮 i18n 包装误把测试数据当文案翻，
+  导致 `format argument must be a string literal` 编不过。
+- `crates/plugin/src/config.rs` 的 `tags` 支持语言映射（`de_localized_list`）。
+- 文档：`docs/PLUGIN.md` 补「展示字段的多语言」与 `params.lang`。
+
 ## 2026-10-24
 
 - **插件与本体彻底分离**：插件源码移出本仓库，构建前由 `scripts/fetch_plugins.ps1`

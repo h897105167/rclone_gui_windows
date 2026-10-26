@@ -138,11 +138,11 @@ async fn main() -> Result<()> {
     // 6) obsidian 布局：app=obsidian, vault=MyVault, notePath=日记/2026/abc.md, layout=note
     //    默认配置 dirLayout=note → obsidian/MyVault/日记/2026/
     let mp = json!({
-        "fields": {"app": "obsidian", "vault": "MyVault", "notePath": rcgui_i18n::t("日记/2026/abc.md")},
+        "fields": {"app": "obsidian", "vault": "MyVault", "notePath": "日记/2026/abc.md"},
         "files": [{"filename": "shot.png", "dataB64": base64_of(b"shot-bytes")}],
     });
     let r = host.invoke(&wasm, "request", http("POST", "/upload", json!({}), Some(mp)), Some(caps.clone()), "imagehost").await?;
-    assert_eq!(r["body"]["items"][0]["storedPath"], "{}", rcgui_i18n::t("obsidian/MyVault/日记/2026/20261015213000123.png"));
+    assert_eq!(r["body"]["items"][0]["storedPath"], "obsidian/MyVault/日记/2026/20261015213000123.png", "{}", rcgui_i18n::f("实际: {}", &[&(r)]));
     println!("[test] obsidian layout ok");
 
     // 7) raw body 模式（Obsidian 插件路径）

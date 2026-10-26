@@ -261,6 +261,13 @@ impl PluginHost {
                 if let Some(c) = caps.as_ref() {
                     obj.insert("live".into(), c.live());
                 }
+                // 宿主界面语言（`zh` / `en`）：插件自带译文，只按这个标签挑语言，
+                // 缺对应语言时回落英文。放在 params 根上而不是 `now` 里，
+                // 这样 manifest 调用（不经过 app 的 now_json）也能拿到。
+                obj.insert(
+                    "lang".into(),
+                    Value::String(rcgui_i18n::lang().tag().to_string()),
+                );
             }
             req["params"] = p;
 

@@ -12,7 +12,6 @@ mod http;
 mod kv;
 mod kvault;
 mod persist;
-mod plugin_i18n;
 mod plugins;
 mod profiles;
 mod proxy;

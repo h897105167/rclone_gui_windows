@@ -12,7 +12,7 @@ members = [
 # 见 plugins/manifest.json 与 docs/PLUGIN.md。本工作区只编译本体。
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 [workspace.dependencies]

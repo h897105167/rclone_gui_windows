@@ -111,6 +111,37 @@ myplugin/
 字段全部宽松解析：未知字段会被忽略（便于向后兼容），缺失的可选字段取默认值。
 `id` / `name` / `version` 缺失时插件不会被加载。
 
+#### 2.1.1 展示字段的多语言
+
+`name` / `description` / `author` / `summary` / `tags` / 控件的 `label` / `text` /
+`placeholder` / 选项的 `label` 都可以写成**按语言分列**的形式，宿主按当前界面语言挑一份：
+
+```jsonc
+{
+  "name": { "zh": "图床", "en": "Image host" },
+  "tags": { "zh": ["图床", "图床"], "en": ["imagehost", "upload"] },
+  "plugin_setting": {
+    "version": 2,
+    "controls": [
+      { "kind": "select", "key": "dirLayout", "label": { "zh": "目录结构", "en": "Directory layout" },
+        "options": [
+          { "value": "官方版", "label": { "zh": "官方版", "en": "Official" } }
+        ] }
+    ]
+  }
+}
+```
+
+规则（实现见 `crates/plugin/src/config.rs::pick_localized` / `pick_localized_list`）：
+
+- 先精确匹配 `rcgui_i18n::lang().tag()`（`zh` / `en`），再匹配同语种前缀（`en-US` → `en`），
+  最后回落 `en`、再回落任意一份；**纯字符串/纯数组照旧可用**，老插件不受影响。
+- **落盘值永远是 `value` 或控件的 `value` 原文**，翻译只影响显示：下拉选项回传的是
+  `label` 里的显示串时，宿主会用同一张表反查出 `value` 再交给插件。
+- `plugin_setting.version: 2` 起选项支持 `{ value, label }`；仍为 1 的按纯字符串数组解析。
+- 插件**自身的文案**（wasm 里弹出的提示、错误信息）不归宿主管：宿主每轮调用都会带
+  `params.lang`（`"zh"` / `"en"`），插件据此切自己的译文表（见 §5.2）。
+
 ### 2.2 `check.sha256`
 
 纯文本，每行 `sha256  相对路径`（两个空格分隔，与 `sha256sum -c` 同格式）：
@@ -336,6 +367,7 @@ call_plugin(ctx, id, action_key, form) → 方法 "request"，params 至少含�
 | `params.live` | 宿主当前长任务进度 `{"busy","label","done","total"}`，无需 need |
 | `params.now` | 宿主时间与版本等环境信息 |
 | `params.req_id` | 本次调用的唯一 id，便于日志关联 |
+| `params.lang` | 当前界面语言 `"zh"` / `"en"`。插件自带译文的入口：拿到后切自己的表再回话，见 §2.1.1 |
 | `params.http` | 仅 HTTP 入口调用时出现：这次请求的快照，见 §5.7 |
 
 ### 5.3 插件 → 宿主
