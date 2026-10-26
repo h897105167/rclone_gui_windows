@@ -12,6 +12,7 @@ mod http;
 mod kv;
 mod kvault;
 mod persist;
+mod plugin_i18n;
 mod plugins;
 mod profiles;
 mod proxy;
@@ -3038,13 +3039,18 @@ fn tag_to_lang_idx(tag: &str) -> i32 {
 /// 切换 Slint 侧 `@tr` 的译文。
 ///
 /// 必须在第一个组件（`MainWindow::new()`）之后调用：打包进去的语言是随组件
-/// 创建一起登记的，之前调用会返回 `NoTranslationsBundled`。切换会置脏
-/// `translations_dirty`，所有 `@tr` 属性随之重算，因此不需要重建窗口。
+/// 创建一起登记的，之前调用会返回 `NoTranslationsBundled`。
+///
+/// `select_bundled_translation` 只给 `translations_dirty` 赋语言下标，窗口里
+/// **已经求值过**的 `@tr` 属性未必跟着重算（实测：下拉里选中 English，Rust 侧
+/// 文案已是英文，导航栏与标题栏仍停在中文）。所以再显式把下标标脏一次，强制
+/// 所有 `@tr` 重新求值——Slint 文档说打包译文不需要这一步，实测需要。
 fn apply_slint_language(lang: rcgui_i18n::Lang) {
     if let Err(e) = slint::select_bundled_translation(lang.slint_language()) {
         // 只影响界面语言，不该拦住启动；日志按全局约定不翻译。
         eprintln!("select_bundled_translation({:?}) 失败: {e}", lang);
     }
+    slint::update_all_translations();
 }
 
 fn main() {
@@ -8200,15 +8206,15 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             {
                 let act = action.clone();
                 let label = match action.as_str() {
-                    "start" => "启动中…",
-                    "stop" => "停止中…",
-                    "install" => "下载校验中…",
-                    "revalidate" => "校验中…",
-                    "pick_exe" => "选择中…",
-                    "search_exe" => "搜索中…",
-                    "search_deep" => "深度扫描中…",
-                    "pick_history" => "读取中…",
-                    _ => "处理中…",
+                    "start" => rcgui_i18n::t("启动中…"),
+                    "stop" => rcgui_i18n::t("停止中…"),
+                    "install" => rcgui_i18n::t("下载校验中…"),
+                    "revalidate" => rcgui_i18n::t("校验中…"),
+                    "pick_exe" => rcgui_i18n::t("选择中…"),
+                    "search_exe" => rcgui_i18n::t("搜索中…"),
+                    "search_deep" => rcgui_i18n::t("深度扫描中…"),
+                    "pick_history" => rcgui_i18n::t("读取中…"),
+                    _ => rcgui_i18n::t("处理中…"),
                 }
                 .to_string();
                 let _ = ui.upgrade_in_event_loop(move |ui| {
@@ -8415,16 +8421,48 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             };
             if want_lang != rcgui_i18n::lang() {
                 rcgui_i18n::set_lang(want_lang);
-                apply_slint_language(want_lang);
+                // 译文索引是**界面线程本地**的：`slint::select_bundled_translation`
+                // 在工作线程里调只会拿到 `NoTranslationsBundled`（GLOBAL_CONTEXT 不在
+                // 这个线程上），界面一动不动。这条命令由 tokio 派生在工作线程执行，
+                // 所以必须投回界面线程。刷新命令不依赖它完成，不用等回执。
+                if let Err(e) = slint::invoke_from_event_loop(move || apply_slint_language(want_lang)) {
+                    eprintln!("界面语言切换无法投递到界面线程: {e}");
+                }
+                // 托盘菜单是宿主用 `t()` 在创建时定下的文字，重建不了图标，只能通知
+                // 托盘线程把它自己持有的两个菜单项重设一遍。
+                TRAY_TEXT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // 各页面顶部的状态条、列表里的状态词、插件面板……都是 Rust 侧算好再
+                // 写进界面属性的，`@tr` 重算碰不到它们，必须重发一遍加载命令。
                 for cmd in [
                     Cmd::RefreshDashboard,
+                    Cmd::Foregrounded,
                     Cmd::RemotesRefresh,
                     Cmd::MountsRefresh,
                     Cmd::ServesRefresh,
                     Cmd::TransfersEnter,
+                    Cmd::ProxyListRefresh,
+                    Cmd::PluginsRescan,
                     Cmd::OptionsLoad,
                 ] {
                     let _ = Box::pin(handle_cmd(ctx, ui, cmd)).await;
+                }
+                // 插件面板若正开着，就地重建一遍：面板文案由宿主按插件配置合成，
+                // 不重跑就还是旧语言。
+                let open_panel = read_ui(ui, |u| {
+                    let g = u.global::<PluginsG>();
+                    let id = g.get_panel_plugin().to_string();
+                    if id.is_empty() {
+                        None
+                    } else {
+                        g.get_rows()
+                            .iter()
+                            .position(|r| r.id.as_str() == id.as_str())
+                            .map(|i| i as i32)
+                    }
+                })
+                .await;
+                if let Some(Some(idx)) = open_panel {
+                    let _ = Box::pin(handle_cmd(ctx, ui, Cmd::PluginPanelOpen { idx })).await;
                 }
             }
             match save_result {
@@ -10053,6 +10091,12 @@ fn wire_callbacks(
 
 // ---------------- 托盘 ----------------
 
+/// 托盘菜单文案的「代」计数。
+///
+/// 托盘线程自己跑消息循环，宿主没有别的通道通知它，切语言时把计数 +1，
+/// 线程每次循环比较一下，变了就把菜单项文字重设成新语言。
+static TRAY_TEXT_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// 托盘图标 + 右键菜单。
 ///
 /// ## 为什么必须在**同一个线程**里创建并跑消息循环
@@ -10178,8 +10222,18 @@ fn spawn_tray(ui: Weak<MainWindow>, tx: mpsc::UnboundedSender<Cmd>) {
             // 不能用 TrayIconEvent::DoubleClick：tray-icon 在 Windows 上
             // 只对部分版本可靠，手动计时更稳（阈值取系统默认的 500ms）。
             let mut last_left_click: Option<std::time::Instant> = None;
+            // 菜单文字对应的「代」；切语言时宿主会把 TRAY_TEXT_EPOCH 加一。
+            let mut last_text_epoch = TRAY_TEXT_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
 
             loop {
+                // 0) 语言变了就重设菜单项文字（热更新，不重启）。
+                let epoch = TRAY_TEXT_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+                if epoch != last_text_epoch {
+                    last_text_epoch = epoch;
+                    open_item.set_text(rcgui_i18n::t("主界面"));
+                    quit_item.set_text(rcgui_i18n::t("退出"));
+                }
+
                 // 1) 先把消息队列里的消息泵出去。
                 //
                 // 用 PeekMessageW（非阻塞）而不是 GetMessageW（阻塞）：

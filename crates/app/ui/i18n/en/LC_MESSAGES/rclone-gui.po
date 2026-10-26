@@ -151,6 +151,9 @@ msgstr "Download to current local directory"
 msgid "下载到本机"
 msgstr "Download to this computer"
 
+msgid "下载校验中…"
+msgstr "Downloading and verifying…"
+
 msgid "下载限速"
 msgstr "Download limit"
 
@@ -237,6 +240,9 @@ msgstr "Modified"
 
 msgid "停止"
 msgstr "Stop"
+
+msgid "停止中…"
+msgstr "Stopping…"
 
 msgid "先在命令行注册镜像源：winget source add -n <源名> -a <源地址>；此处填的源名要和 -n 一致。留空则在挂载页只能用官方源。"
 msgstr "Register the mirror source from a command line first: winget source add -n <name> -a <url>. The name entered here must match the one given to -n; leave it empty to use only the official source on the Mounts page."
@@ -351,6 +357,9 @@ msgstr "Start"
 
 msgid "启动 winget 失败：{}"
 msgstr "Failed to start winget: {}"
+
+msgid "启动中…"
+msgstr "Starting…"
 
 msgid "启动时连接该地址（只连 API，不启动 rclone）"
 msgstr "Connect to this address at startup (API only, never starts rclone)"
@@ -556,6 +565,9 @@ msgstr "Plugin directory: {}"
 msgid "搜索 ID / 服务名称"
 msgstr "Search ID / service name"
 
+msgid "搜索中…"
+msgstr "Searching…"
+
 msgid "搜索任务"
 msgstr "Search transfers"
 
@@ -637,6 +649,9 @@ msgstr "This computer"
 msgid "标签"
 msgstr "Tags"
 
+msgid "校验中…"
+msgstr "Verifying…"
+
 msgid "校验失败"
 msgstr "Verification failed"
 
@@ -678,6 +693,9 @@ msgstr "Test connection"
 
 msgid "浏览远程路径"
 msgstr "Browse remote path"
+
+msgid "深度扫描中…"
+msgstr "Deep scanning…"
 
 msgid "深色"
 msgstr "Dark"
@@ -826,6 +844,9 @@ msgstr "Resources"
 msgid "语言"
 msgstr "Language"
 
+msgid "读取中…"
+msgstr "Reading…"
+
 msgid "跟随系统"
 msgstr "Follow system"
 
@@ -867,6 +888,9 @@ msgstr "Exit multi-select"
 
 msgid "选择…"
 msgstr "Choose…"
+
+msgid "选择中…"
+msgstr "Selecting…"
 
 msgid "速度"
 msgstr "Speed"

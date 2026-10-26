@@ -110,11 +110,11 @@ async fn shipped_plugins_answer_state_with_panel_body() {
                 &allowed,
             )
             .await
-            .unwrap_or_else(|e| panic("{}", rcgui_i18n::f("{}: state 调用失败: {}", &[&(cfg.id), &(e)])));
+            .unwrap_or_else(|e| panic!("{}", rcgui_i18n::f("{}: state 调用失败: {}", &[&(cfg.id), &(e)])));
 
         let body = out
             .get("body")
-            .unwrap_or_else(|| panic("{}", rcgui_i18n::f("{}: state 没有 result.body，实际: {}", &[&(cfg.id), &(out)])));
+            .unwrap_or_else(|| panic!("{}", rcgui_i18n::f("{}: state 没有 result.body，实际: {}", &[&(cfg.id), &(out)])));
 
         // 面板渲染只认这几样；至少 status 或 checks 之一要出现，否则用户看到空面板
         let has_status = body.get("status").and_then(|v| v.as_str()).is_some();
