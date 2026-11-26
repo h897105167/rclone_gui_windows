@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use plugin_host::config::REMOTE_OPS;
 use plugin_host::Allowed;
 use plugin_it::{
-    expect_error, kvault_harness, plain_webdav_harness, Harness, MockHost, MockSite, PLUGIN_ID,
-    SKIP_NOTE,
+    expect_error, kvault_harness, plain_webdav_harness, Fixture, Harness, MockHost, MockSite,
+    PLUGIN_ID, SKIP_NOTE,
 };
 use serde_json::{json, Value};
 
@@ -282,12 +282,12 @@ async fn adopt_legacy_fills_only_the_slots_that_are_still_empty() {
     };
     // 插件里已经有一份设置（用户在插件面板里填过的），旧数据只能补空缺。
     //
-    // 形状要和插件真实存的一致：整站设置放在 `site` 这一格里（插件读的是
-    // `kv["site"]`），不是摊在命名空间顶层。摊平了写进来，插件会以为「一格都没填」，
-    // 于是把旧地址、旧令牌全部盖上去——测出来的红是夹具的错，不是迁移的错。
+    // 形状要和插件真实存的一致：宿主只给插件看它自己那一格，那一格里的键就叫 `site`
+    // （插件读的是 `kv["site"]`）。再套一层插件 id，插件就会读到一张空表，把旧地址、
+    // 旧令牌全部盖上去——那时红的是夹具，不是迁移。
     h.host.put_kv(
-        PLUGIN_ID,
-        json!({ "site": { "base": "https://new.example.com", "token": "fresh-token" } }),
+        "site",
+        json!({ "base": "https://new.example.com", "token": "fresh-token" }),
     );
     // 旧库的形状（`crates/app/src/kvault.rs` 被删之前的样子）：`kvault` 命名空间里
     // 一个 `site` 键放开店设置，其余键是「远程名 → {token}」；`kvault_tokens` 里
@@ -317,11 +317,7 @@ async fn adopt_legacy_fills_only_the_slots_that_are_still_empty() {
     );
 
     let kept = h.host.kv_snapshot();
-    let site = kept
-        .get(PLUGIN_ID)
-        .and_then(|ns| ns.get("site"))
-        .cloned()
-        .unwrap_or(Value::Null);
+    let site = kept.get("site").cloned().unwrap_or(Value::Null);
     // 已有的两项必须原样留着：覆盖是最坏的失败方式，用户的令牌会悄悄失效。
     assert_eq!(
         site.get("token").and_then(Value::as_str),
@@ -343,13 +339,8 @@ async fn adopt_legacy_fills_only_the_slots_that_are_still_empty() {
         text_of(&site)
     );
     // 另一条远程的令牌也搬了过来，而且只搬 token 这一项。
-    // 快照是按插件 id 分层的（`kv_get_all` 只给插件看它自己那一格），所以先取
-    // `kvault` 这一层，再取里面的远程名。
-    let remote = kept
-        .get(PLUGIN_ID)
-        .and_then(|ns| ns.get("vault"))
-        .cloned()
-        .unwrap_or(Value::Null);
+    // 插件自己的 kv 是一张扁表（宿主只给它看自己那一格），远程名就是表里的键。
+    let remote = kept.get("vault").cloned().unwrap_or(Value::Null);
     assert_eq!(
         remote.get("token").and_then(Value::as_str),
         Some("remote-token"),
@@ -364,10 +355,8 @@ async fn adopt_legacy_refuses_garbage_instead_of_wiping_settings() {
         eprintln!("{SKIP_NOTE}");
         return;
     };
-    h.host.put_kv(
-        PLUGIN_ID,
-        json!({ "site": { "base": "https://keep.example.com" } }),
-    );
+    h.host
+        .put_kv("site", json!({ "base": "https://keep.example.com" }));
     let got = h
         .call(
             "adopt_legacy",
@@ -382,12 +371,77 @@ async fn adopt_legacy_refuses_garbage_instead_of_wiping_settings() {
     );
     let kept = h.host.kv_snapshot();
     assert_eq!(
-        kept.get(PLUGIN_ID)
-            .and_then(|ns| ns.get("site"))
+        kept.get("site")
             .and_then(|site| site.get("base"))
             .and_then(Value::as_str),
         Some("https://keep.example.com"),
         "拒绝时手里的设置被动了"
+    );
+}
+
+/// 上一版写下的设置，换上新二进制之后要照旧读得懂，而且一个键都不许动。
+///
+/// 插件不记「设置版本号」——它按形状读 `kv["site"]`，缺的字段取默认值。所以升级路径
+/// 真正的风险不是「迁移没跑」，而是「新版本把老形状读成空，再把一坨半成品写回去」。
+/// 这条用例把「config.json 还是旧版本号」这个状态真造出来，再验旧设置能不能用、
+/// 用完有没有被动过。
+#[tokio::test]
+async fn settings_written_by_the_previous_version_still_work() {
+    let Some(pkg) = Fixture::load() else {
+        eprintln!("{SKIP_NOTE}");
+        return;
+    };
+    let Some(stale) = pkg.with_version("0.3.0") else {
+        panic!("造不出上一版的 config.json：{}", pkg.config.display());
+    };
+    let site = MockSite::start();
+    // 设置页里存的是站点根（不带 `/dav`），0.3 存的也是这一串。
+    let base = site.base();
+    let host = MockHost::kvault(&site.dav_url(), "test-token");
+    let Some(h) = Harness::with_fixture(stale, site, host).await else {
+        eprintln!("{SKIP_NOTE}");
+        return;
+    };
+
+    // 先确认「确实处在升级状态」：config 说 0.3.0，wasm 自己不是。两边一样的话，
+    // 这条用例什么都没验到，却会一直是绿的。
+    assert_eq!(
+        h.fixture
+            .config_json()
+            .expect("config.json 读不出来")
+            .version,
+        "0.3.0",
+        "夹具的版本号没改成上一版"
+    );
+    let born = h.manifest().await.expect("wasm 清单读不出来");
+    assert_ne!(
+        born.get("version").and_then(Value::as_str),
+        Some("0.3.0"),
+        "wasm 与 config 版本一致，验不到升级路径：{}",
+        text_of(&born)
+    );
+
+    // 0.3 只写站点地址、令牌、目录三样；`storage`/`dedup` 是后来才有的字段。
+    // 老形状读得懂读不懂，正是升级最该验的那一条。
+    h.host.put_kv(
+        "site",
+        json!({ "base": base.clone(), "token": "test-token", "folder": "album" }),
+    );
+    let before = h.host.kv_snapshot();
+    let got = h
+        .call("remote.list", json!({ "remote": "", "path": "" }))
+        .await
+        .expect("换了二进制之后，上一版的设置应当照旧能用");
+    let rows = items_of(&got);
+    assert!(
+        rows.iter()
+            .any(|(name, is_dir)| name == "photo.png" && !*is_dir),
+        "上一版设置的目录没被用上：{rows:?}"
+    );
+    assert_eq!(
+        h.host.kv_snapshot(),
+        before,
+        "只是列了一次目录，用户存的设置却被改写了"
     );
 }
 

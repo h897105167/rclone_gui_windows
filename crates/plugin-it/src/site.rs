@@ -223,9 +223,12 @@ fn route(
         );
     }
 
-    if method == "DELETE" && without_query.starts_with("/api/v1/files/") {
+    // 站点删一个文件走的是单数路径 `DELETE /api/v1/file/<id>`（旧版本体实现也是这么发的），
+    // 复数 `/api/v1/files/<id>` 在真站点上不存在。这里只认真实形状：万一哪天调用方改成复数，
+    // 会掉到下面的 404 让用例当场红，而不是被宽容匹配收下、看着像删成功了。
+    if method == "DELETE" && without_query.starts_with("/api/v1/file/") {
         let id = without_query
-            .trim_start_matches("/api/v1/files/")
+            .trim_start_matches("/api/v1/file/")
             .to_string();
         deleted.lock().unwrap().push(Delete { id });
         return (200, json!({ "ok": true }));
