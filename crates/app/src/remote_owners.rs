@@ -1020,13 +1020,27 @@ mod tests {
             &declared,
             &current,
         );
-        assert_eq!(merged.table.get("相册"), current.get("相册"));
-        assert_eq!(merged.dropped, 0);
-        assert!(
-            merged.notes.iter().any(|n| n.contains("没有读到它的参数")),
-            "{:?}",
+        assert_eq!(
+            merged.table.get("相册"),
+            current.get("相册"),
+            "读不到参数时登记表一个字节都不能改"
+        );
+        assert_eq!(
+            merged.dropped, 0,
+            "读不到参数不等于「用户把它改成普通远程」，一条都不能撤"
+        );
+        // 话要说全：点名哪台远程、说清它还归谁、以及这次没动它。不逐字比对整句——
+        // 那句话是给人看的，改词不该让行为测试红；但少说其中任何一条都要红。
+        assert_eq!(
+            merged.notes.len(),
+            1,
+            "这台远程只该有一条说明：{:?}",
             merged.notes
         );
+        let note = &merged.notes[0];
+        assert!(note.contains("相册"), "要点名是哪台远程：{note}");
+        assert!(note.contains("K-Vault"), "要说清它还归谁管：{note}");
+        assert!(note.contains("没有动"), "要说清这次没改它：{note}");
     }
 
     #[test]
