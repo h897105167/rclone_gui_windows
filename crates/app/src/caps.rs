@@ -853,7 +853,9 @@ impl CapProvider for HostCaps {
                     if !start.is_empty() {
                         d = d.set_directory(&start);
                     }
-                    d.pick_file()
+                    // 取消是正常结果（`None`），不是错误；包成 `Ok` 只是因为
+                    // 宿主这个 `spawn_blocking` 只收「返回 `Result` 的闭包」。
+                    Ok(d.pick_file())
                 })
                 .await?;
                 let path = picked.map(|p| p.display().to_string()).unwrap_or_default();

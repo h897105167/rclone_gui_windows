@@ -3233,12 +3233,11 @@ fn edit_single_choice(ty: &str, derived: &[remote_types::Derived]) -> TypeChoice
 /// 让用户看见「写入功能不在」而不是继续看到那个名字。
 ///
 /// 返回类型 id：命中插件时是插件的 id，否则是 `stored` 原样。
-fn display_type_of(
-    entry_params: &Value,
-    stored: &str,
-    derived: &[remote_types::Derived],
-) -> String {
-    if !kvault::KvCfg::is_marked(entry_params) {
+///
+/// 收整条条目（`Value::Object`，来自 `rclone config dump`）而不是拆出来的参数表：
+/// 调用方手里本来就有一条条目，标记键在两种形状里的读法一样。
+fn display_type_of(entry: &Value, stored: &str, derived: &[remote_types::Derived]) -> String {
+    if !kvault::KvCfg::is_marked_entry(entry) {
         return stored.to_string();
     }
     match remote_types::marker_owner(derived, kvault::MARKER) {
@@ -8506,7 +8505,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // 哪个类型」得另算：参数里有标记、且当前有插件声明那个类型 id，才显示插件
             // 给的名字；插件不在就老实显示 `webdav` —— 它现在确实只是一个 webdav 远程。
             let derived = remote_types::collect(ctx);
-            let ty = display_type_of(&existing_params, &ty, &derived);
+            let ty = display_type_of(&entry, &ty, &derived);
             let choice = edit_single_choice(&ty, &derived);
             let providers = get_providers(&ctx).await;
             // 参数表按后端取：派生类型落盘就是 base_type，它自己没有另一张参数表。
