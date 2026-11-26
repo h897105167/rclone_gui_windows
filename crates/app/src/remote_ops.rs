@@ -211,7 +211,10 @@ pub async fn blocked_map(ctx: &Arc<Ctx>, cfg: &config::AppConfig) -> HashMap<Str
     for name in names {
         if claims.contains_key(&name) {
             if let Owner::Orphan { marker } = resolve_in(&claims, &table, &name) {
-                out.insert(name, orphan_msg(&name, &marker));
+                // 先把要说的话拼好，再把名字交进 map：`insert` 会拿走 `name`，
+                // 写成 `insert(name, orphan_msg(&name, …))` 就是先移动后借用。
+                let why = orphan_msg(&name, &marker);
+                out.insert(name, why);
             }
             continue;
         }
@@ -686,7 +689,7 @@ mod tests {
                 name: "插件甲".into(),
                 id: "alpha".into(),
                 base_type: "webdav".into(),
-                defaults: Map::new(),
+                defaults: BTreeMap::new(),
                 plugin: "alpha".into(),
                 marker: "alpha".into(),
                 ops: vec![LIST.into(), DELETE.into()],
@@ -696,7 +699,7 @@ mod tests {
                 name: "插件乙".into(),
                 id: "beta".into(),
                 base_type: "sftp".into(),
-                defaults: Map::new(),
+                defaults: BTreeMap::new(),
                 plugin: "beta".into(),
                 marker: "b_flag".into(),
                 ops: Vec::new(),
