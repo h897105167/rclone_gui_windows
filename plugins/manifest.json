@@ -20,6 +20,15 @@
       "asset": "onerclone-0.3.3.zip",
       "sha256": "33f2668d865fe3e6ac001c4f47c473b5cdf7d80671f8d4d33c83ddd3e0eed1b0",
       "dir": "onerclone"
+    },
+    {
+      "id": "teldrive",
+      "name": "Teldrive",
+      "repo": "https://github.com/h897105167/rcgui-plugin-teldrive",
+      "tag": "v0.3.0",
+      "asset": "teldrive-0.3.0.zip",
+      "sha256": "f14d231150b1e5a9f96fc573961b34eeec51b0a14b8114b1075415e8cba8ef1d",
+      "dir": "teldrive"
     }
   ]
 }
