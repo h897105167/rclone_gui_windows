@@ -2324,14 +2324,9 @@ mod tests {
     /// 扫源码。这不是镜像实现：断言的是调用点存在，行为由被调用的函数各自的测试负责。
     fn core_install_body() -> &'static str {
         let src = include_str!("maintenance.rs");
-        let start = src
-            .find("async fn core_install(")
-            .expect("core_install 不见了");
-        let rest = &src[start..];
-        let end = rest
-            .find("\nasync fn core_start(")
-            .expect("core_start 不见了");
-        &rest[..end]
+        // 用两个函数名做两端锚点，不写死行尾：CRLF 检出下 `"\n}\n"` 这类终止符永远匹配不到。
+        crate::source_scan::region(src, "async fn core_install(", "async fn core_start(")
+            .expect("core_install 与 core_start 都应该还在，并且相邻")
     }
 
     /// 换内核之后必须重新握手——这条钉的是实际验收里卡住的那个 bug。

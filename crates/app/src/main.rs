@@ -25,6 +25,8 @@ mod reconcile;
 mod refresh;
 mod remote_types;
 mod script;
+#[cfg(test)]
+mod source_scan;
 mod state;
 mod store;
 mod sync_tasks;
@@ -13433,17 +13435,20 @@ mod tests {
     #[test]
     fn apply_conn_view_rewrites_the_dashboard_identity() {
         let src = include_str!("main.rs");
-        let start = src
-            .find("fn apply_conn_view(")
-            .expect("apply_conn_view 必须存在");
-        let rest = &src[start..];
-        let end = rest.find("\n}\n").expect("函数必须有结尾");
-        let body = &rest[..end];
-        for setter in ["set_url", "set_managed", "set_version"] {
-            assert!(
-                body.contains(setter),
-                "apply_conn_view 必须写 DashboardG.{setter}，否则换内核后顶栏/连接卡继续显示旧端口与旧版本"
-            );
+        // 两种行尾都测：CI 检出常见 CRLF、开发机是 LF，扫描只对一种成立就会一边绿一边红。
+        let lf = src.replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        for (label, text) in [("LF", &lf), ("CRLF", &crlf)] {
+            let body = crate::source_scan::function_body(text, "fn apply_conn_view(")
+                .unwrap_or_else(|| {
+                    panic!("{label}: apply_conn_view 必须存在，且以独占一行的 }} 收尾")
+                });
+            for setter in ["set_url", "set_managed", "set_version"] {
+                assert!(
+                    body.contains(setter),
+                    "{label}: apply_conn_view 必须写 DashboardG.{setter}，否则换内核后顶栏/连接卡继续显示旧端口与旧版本"
+                );
+            }
         }
     }
 }
