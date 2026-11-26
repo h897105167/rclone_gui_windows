@@ -55,7 +55,10 @@ const PLUGIN_TABS: &[&str] = &["已安装", "商店"];
 /// 文档检查"界面上有的动作，命令行也知道"。
 const MAINTENANCE_ACTIONS: &[(&str, &str)] = &[
     ("core-detect", "检测本机 rclone 内核"),
-    ("core-install", "下载并安装官方内核"),
+    ("core-check", "查询渠道最新版本"),
+    ("core-flavor", "切换内核渠道（原版/增强版）"),
+    ("core-adopt-managed", "改回托管内核（保留原文件）"),
+    ("core-install", "下载并安装内核"),
     ("core-start", "启动应用管理的内核"),
     ("core-stop", "停止应用管理的内核"),
     ("core-save", "保存内核设置"),
@@ -92,6 +95,13 @@ struct Flags {
     want_help: bool,
     validate: Option<String>,
     tree: Option<String>,
+    core_status: bool,
+    core_check: bool,
+    core_install: bool,
+    core_adopt: bool,
+    /// `--flavor` 的原始值，校验留给 `pick_flavor`（那里能给出"可选值"提示）。
+    flavor: Option<String>,
+    force: bool,
 }
 
 /// 解析参数并执行。返回 `Some(退出码)` 表示进程应该就此结束，`None` 表示
@@ -133,6 +143,18 @@ fn parse_args(args: &[String]) -> Result<Flags, i32> {
                 }
                 None => return Err(usage_error("--export-accessibility-tree 需要一个输出路径")),
             },
+            "--core-status" => f.core_status = true,
+            "--core-check" => f.core_check = true,
+            "--core-install" => f.core_install = true,
+            "--core-adopt-managed" => f.core_adopt = true,
+            "--force" => f.force = true,
+            "--flavor" => match args.get(i + 1) {
+                Some(v) => {
+                    f.flavor = Some(v.clone());
+                    i += 1;
+                }
+                None => return Err(usage_error("--flavor 需要一个渠道名（extra / upstream）")),
+            },
             other => {
                 if GUI_FLAGS.contains(&other) {
                     // 界面自己的开关：不处理，继续扫后面的参数——
@@ -157,6 +179,12 @@ fn dispatch(f: Flags) -> Option<i32> {
         want_help,
         validate,
         tree,
+        core_status,
+        core_check: want_core_check,
+        core_install: want_core_install,
+        core_adopt,
+        flavor,
+        force,
     } = f;
 
     if want_help {
@@ -203,6 +231,26 @@ fn dispatch(f: Flags) -> Option<i32> {
     if let Some(path) = tree {
         return Some(export_tree(&path));
     }
+    if core_status {
+        return Some(core_status_report(json));
+    }
+    if want_core_check {
+        return Some(core_check(json, flavor.as_deref()));
+    }
+    if want_core_install {
+        return Some(core_install(json, flavor.as_deref(), force));
+    }
+    if core_adopt {
+        return Some(core_adopt_managed(json));
+    }
+    // `--flavor`/`--force` 只有配合内核动词才有意义。剩下的情况（例如只写了
+    // `rcgui --flavor extra`）绝不能落到 `None`：那会打开窗口，脚本里表现为
+    // 「命令不返回、屏幕上多一个窗口」。
+    if flavor.is_some() || force {
+        return Some(usage_error(
+            "--flavor / --force 只配合 --core-check 或 --core-install 使用",
+        ));
+    }
     None
 }
 
@@ -223,6 +271,16 @@ fn print_help() {
   rcgui --validate-config <文件> [--json]  校验一份 rcgui.conf，不写入任何文件
   rcgui --list-plugins [--json]         列出已安装插件
   rcgui --export-accessibility-tree <文件>  导出界面语义结构快照（不是运行时 UIA 树）
+
+内核（下载/更新/换渠道都能在没有窗口时做，方便脚本与验收）:
+  rcgui --core-status [--json]          只看本机：用的哪个内核、什么渠道、上次装了哪版
+  rcgui --core-check [--flavor 渠道] [--json]   查渠道最新版本，并说清要不要重下
+  rcgui --core-install [--flavor 渠道] [--force] [--json]  下载、校验、替换托管内核
+  rcgui --core-adopt-managed [--json]   改用托管内核：手填的 core.path 记进备选、文件不删
+  渠道写法: extra（增强版 gulp79/rclone-extra，默认）/ upstream（原版 rclone/rclone）
+
+  注意：--core-install 不会停任何正在运行的内核。它先把旧文件改名备份再放新的：
+  正在跑的内核继续用旧文件，下次启动才是新版本；只有改不了名才失败并保持原样。
 
 退出码: 0 成功 / 1 运行出错 / 2 参数错误 / 3 输入内容不合法",
         env!("CARGO_PKG_VERSION")
@@ -339,7 +397,12 @@ pub fn diagnostics_with(facts: RuntimeFacts) -> Result<serde_json::Value> {
         .unwrap_or_else(|| PathBuf::from("."));
     // 自定义路径无效时 `resolve` 报错而不是回落到随包/PATH（回落到别的内核会换掉
     // 用户特意指定的 fork），所以这里要把错误原样报出来，不能当成"没找到内核"。
-    let (located, resolve_error) = match core::resolve(&cfg.core.path, &exe_dir, &data_dir) {
+    let (located, resolve_error) = match core::resolve(
+        &cfg.core.path,
+        &exe_dir,
+        &data_dir,
+        cfg.core.has_managed_install(),
+    ) {
         Ok(l) => (l, None),
         Err(e) => (None, Some(crate::logging::redact(&format!("{e:#}")))),
     };
@@ -930,6 +993,479 @@ pub fn tree_json() -> serde_json::Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// 内核动作（无界面）
+//
+// 有窗口时这些动作用 `maintenance.rs` 里的同名处理函数，它们要 `Weak<MainWindow>`
+// 才能写状态栏和 toast，无窗口时拿不到。所以在命令行这边重新走一遍 `core::` 的
+// 公开接口，而不是把 UI 函数改成"可选界面"——那样每个动作都要多一层 if，
+// 界面里的分支反而更容易坏。
+//
+// 这里**不启动、不停止任何进程**：脚本调 `--core-install` 时如果顺手停掉用户
+// 正在用的内核，传输和挂载就会断，而且没人知道是谁断的。占用就明确失败，
+// 让界面去停（界面装完还会自己启回来）。
+// ---------------------------------------------------------------------------
+
+/// 拒绝下载/替换的两种原因。
+///
+/// 写成纯函数是因为它决定"会不会动用户的文件"：`core.path` 指向插件部署的 fork
+/// 时，下载来的官方 exe 盖上去会让依赖该 fork 的远程直接不可用。
+#[derive(Debug, PartialEq, Eq)]
+enum InstallBlock {
+    /// 外部模式：用户自己管内核，程序不下载也不替换。
+    ExternalMode,
+    /// 手填了 `core.path`。
+    CustomPath(String),
+}
+
+fn install_block(mode: &str, custom: &str) -> Option<InstallBlock> {
+    if mode != "managed" {
+        return Some(InstallBlock::ExternalMode);
+    }
+    let custom = custom.trim();
+    if custom.is_empty() {
+        None
+    } else {
+        Some(InstallBlock::CustomPath(custom.to_string()))
+    }
+}
+
+/// 「要不要重下」那一句。`needs` 来自 [`core::needs_install`]：同版本号但渠道
+/// 不同（`1.76.0` 与 `1.76.0-extra`）也算要重下，所以不能只看版本号大小。
+fn verdict_text(needs: bool, local: Option<&str>, remote: &str) -> &'static str {
+    if !needs {
+        return "已经是最新";
+    }
+    match local {
+        None => "可以安装",
+        Some(v) if core::newer_than(remote, v) => "有新版本",
+        Some(_) => "版本号相同但渠道不同，需要重新下载",
+    }
+}
+
+/// `--flavor` 的取值。`core::Flavor::parse` 把不认识的值一律当增强版，那对
+/// 手工编辑的配置算宽容，对命令行算糟糕：打错一个字母就静默下载另一个渠道。
+fn pick_flavor(want: Option<&str>) -> std::result::Result<core::Flavor, i32> {
+    let Some(raw) = want else {
+        return Ok(config::load().core.normalized_flavor());
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "extra" | "enhanced" => Ok(core::Flavor::Extra),
+        "upstream" | "official" | "original" => Ok(core::Flavor::Official),
+        other => Err(usage_error(&format!(
+            "不认识的渠道：{other}（可选 extra / upstream）"
+        ))),
+    }
+}
+
+/// 反过来给提示用的写法：说「下一步跑 `--flavor upstream`」，而不是配置里的
+/// `official`——`--help` 教的是 extra / upstream，提示照抄才能直接用。
+fn flavor_arg(flavor: core::Flavor) -> &'static str {
+    match flavor {
+        core::Flavor::Extra => "extra",
+        core::Flavor::Official => "upstream",
+    }
+}
+
+fn exe_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 命令行进程里还没有 tokio 运行时（`main()` 先调 `cli::run()`，之后才起界面
+/// 那套），网络动作自建一个当前线程运行时即可。
+fn block_on<F: std::future::Future<Output = i32>>(fut: F) -> i32 {
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt.block_on(fut),
+        Err(e) => {
+            eprintln!(
+                "rcgui: 起不来网络运行时：{}",
+                crate::logging::redact(&format!("{e:#}"))
+            );
+            EXIT_FAIL
+        }
+    }
+}
+
+/// `--core-status`：只看本机，不联网、不写文件、不起进程。
+fn core_status_report(json: bool) -> i32 {
+    let data_dir = config::data_dir();
+    let cfg = config::load();
+    let managed_exe = core::data_core_exe(&data_dir);
+    let managed_version = core::probe_version(&managed_exe).ok();
+    let (in_use, in_use_version, in_use_source, resolve_error) = match core::resolve(
+        &cfg.core.path,
+        &exe_dir(),
+        &data_dir,
+        cfg.core.has_managed_install(),
+    ) {
+        Ok(Some(l)) => (
+            Some(mask_path(&l.exe)),
+            core::probe_version(&l.exe).ok(),
+            Some(l.source.label().to_string()),
+            None,
+        ),
+        Ok(None) => (None, None, None, None),
+        Err(e) => (
+            None,
+            None,
+            None,
+            Some(crate::logging::redact(&format!("{e:#}"))),
+        ),
+    };
+    let flavor = cfg.core.normalized_flavor();
+    let recorded = cfg.core.recorded_flavor();
+    let custom = {
+        let p = cfg.core.path.trim();
+        if p.is_empty() {
+            None
+        } else {
+            Some(mask_path(Path::new(p)))
+        }
+    };
+
+    if json {
+        let v = serde_json::json!({
+            "schema": 1,
+            "data_dir": mask_str(&data_dir),
+            "mode": cfg.core.normalized_mode(),
+            "custom_path": custom,
+            "flavor": flavor.as_str(),
+            "flavor_label": flavor.label(),
+            "recorded_flavor": recorded.map(|f| f.as_str()),
+            "last_version": cfg.core.last_version,
+            "managed": {
+                "exe": mask_str(&managed_exe),
+                "exists": managed_exe.is_file(),
+                "version": managed_version,
+            },
+            "in_use": {
+                "exe": in_use,
+                "source": in_use_source,
+                "version": in_use_version,
+            },
+            "resolve_error": resolve_error,
+        });
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return EXIT_OK;
+    }
+
+    println!("数据目录: {}", mask_str(&data_dir));
+    println!("模式: {}", cfg.core.normalized_mode());
+    println!(
+        "手填内核: {}",
+        custom.as_deref().unwrap_or("（没填，用自动查找）")
+    );
+    println!("渠道: {}（{}）", flavor.label(), flavor.as_str());
+    println!(
+        "上次安装版本: {}",
+        if cfg.core.last_version.trim().is_empty() {
+            "（没记录）"
+        } else {
+            cfg.core.last_version.as_str()
+        }
+    );
+    println!(
+        "托管内核: {}（{}）",
+        mask_str(&managed_exe),
+        match &managed_version {
+            Some(v) => format!("版本 {v}"),
+            None if managed_exe.is_file() => "版本读不出来".to_string(),
+            None => "还没下载过".to_string(),
+        }
+    );
+    match (&in_use, &in_use_version, &in_use_source) {
+        (Some(exe), v, Some(src)) => println!(
+            "当前会用: {exe}（来源：{src}）{}",
+            match v {
+                Some(v) => format!(" · 版本 {v}"),
+                None => " · 版本读不出来".to_string(),
+            }
+        ),
+        _ => println!("当前会用: 没找到可用内核"),
+    }
+    if let Some(err) = resolve_error {
+        println!("注意: {err}");
+    }
+    EXIT_OK
+}
+
+/// `--core-check`：查渠道最新版本，并说清本机这份要不要重下。
+fn core_check(json: bool, want: Option<&str>) -> i32 {
+    let flavor = match pick_flavor(want) {
+        Ok(f) => f,
+        Err(code) => return code,
+    };
+    block_on(core_check_async(flavor, json))
+}
+
+async fn core_check_async(flavor: core::Flavor, json: bool) -> i32 {
+    let data_dir = config::data_dir();
+    let cfg = config::load();
+    let exe = core::data_core_exe(&data_dir);
+    let local = core::probe_version(&exe).ok();
+    let recorded = cfg.core.recorded_flavor();
+    let info = match core::release_info(flavor).await {
+        Ok(i) => i,
+        Err(e) => {
+            let msg = crate::logging::redact(&format!("{e:#}"));
+            if json {
+                let v = serde_json::json!({
+                    "schema": 1,
+                    "flavor": flavor.as_str(),
+                    "ok": false,
+                    "error": msg,
+                });
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            }
+            eprintln!("rcgui: 查询内核版本失败：{msg}");
+            return EXIT_FAIL;
+        }
+    };
+    let needs = core::needs_install(flavor, &info.version, local.as_deref(), recorded);
+    let verdict = verdict_text(needs, local.as_deref(), &info.version);
+
+    if json {
+        let v = serde_json::json!({
+            "schema": 1,
+            "ok": true,
+            "flavor": flavor.as_str(),
+            "flavor_label": flavor.label(),
+            "latest": {
+                "version": info.version,
+                "tag": info.tag,
+                "size": info.size,
+                "asset": info.asset,
+                "url": info.url,
+                "published_at": info.published_at,
+            },
+            "local": {
+                "exe": mask_str(&exe),
+                "version": local,
+                "recorded_flavor": recorded.map(|f| f.as_str()),
+            },
+            "needs_install": needs,
+            "verdict": verdict,
+        });
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return EXIT_OK;
+    }
+
+    let size = info.size_text();
+    // 有的渠道不发大小；空串打印成"大小未知"比留个括号好看。
+    let size_text = if size.is_empty() {
+        "大小未知"
+    } else {
+        size.as_str()
+    };
+    println!("渠道: {}（{}）", flavor.label(), flavor.as_str());
+    println!("远端最新: {}（{}）", info.tag, size_text);
+    println!(
+        "本机托管内核: {}（{}）",
+        mask_str(&exe),
+        local.as_deref().unwrap_or("没装或版本读不出来")
+    );
+    println!("判断: {verdict}");
+    if needs {
+        println!(
+            "下一步: rcgui --core-install --flavor {}",
+            flavor_arg(flavor)
+        );
+    }
+    EXIT_OK
+}
+
+/// `--core-install`：下载、校验、替换托管内核。
+///
+/// 与界面的差别只有一条：**不停任何进程**。脚本没有资格中断用户正在跑的传输，
+/// 所以这里只换文件：正在运行的内核继续用旧映像，下次启动才是新的；换不了
+/// （改名被拒）才失败，原有文件保持原位。
+fn core_install(json: bool, want: Option<&str>, force: bool) -> i32 {
+    let flavor = match pick_flavor(want) {
+        Ok(f) => f,
+        Err(code) => return code,
+    };
+    block_on(core_install_async(flavor, json, force))
+}
+
+async fn core_install_async(flavor: core::Flavor, json: bool, force: bool) -> i32 {
+    let data_dir = config::data_dir();
+    let target = core::data_core_dir(&data_dir);
+    // 与界面同一条闸门：目录不可用（无权限、指向别处）就明确失败，不静默换地方。
+    if let Err(e) = core::guard_target_dir(&target) {
+        eprintln!(
+            "rcgui: 内核安装目录不可用：{}",
+            crate::logging::redact(&format!("{e:#}"))
+        );
+        eprintln!("（目录：{}）", mask_str(&target));
+        return EXIT_FAIL;
+    }
+
+    let mut cfg = config::load();
+    match install_block(&cfg.core.normalized_mode(), &cfg.core.path) {
+        Some(InstallBlock::ExternalMode) => {
+            eprintln!("rcgui: 当前是外部模式，不会下载或替换内核。");
+            eprintln!(
+                "要让程序管内核，先把设置里的「内核来源」改成托管内核（core.mode = managed）。"
+            );
+            return EXIT_FAIL;
+        }
+        Some(InstallBlock::CustomPath(p)) => {
+            eprintln!(
+                "rcgui: 已手动指定内核路径（{}），不会用下载的版本覆盖它。",
+                mask_path(Path::new(&p))
+            );
+            eprintln!(
+                "要改用下载的内核请先运行 rcgui --core-adopt-managed（原文件保留在原处，不会删除）。"
+            );
+            return EXIT_FAIL;
+        }
+        None => {}
+    }
+
+    let installed_exe = core::data_core_exe(&data_dir);
+    let probed = core::probe_version(&installed_exe).ok();
+    let recorded = cfg.core.recorded_flavor();
+    let info = match core::release_info(flavor).await {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!(
+                "rcgui: 查询内核版本失败：{}",
+                crate::logging::redact(&format!("{e:#}"))
+            );
+            return EXIT_FAIL;
+        }
+    };
+    if !force && !core::needs_install(flavor, &info.version, probed.as_deref(), recorded) {
+        if json {
+            let v = serde_json::json!({
+                "schema": 1,
+                "installed": false,
+                "reason": "up-to-date",
+                "flavor": flavor.as_str(),
+                "version": info.version,
+                "exe": mask_str(&installed_exe),
+            });
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        } else {
+            println!(
+                "{} 已经是最新（{}），不需要重新下载",
+                flavor.label(),
+                info.version
+            );
+        }
+        return EXIT_OK;
+    }
+
+    let size = info.size_text();
+    let size_text = if size.is_empty() {
+        "大小未知"
+    } else {
+        size.as_str()
+    };
+    eprintln!("正在下载 {} {}（{}）…", flavor.label(), info.tag, size_text);
+    let exe = match core::install_release(&target, &info).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "rcgui: 安装内核失败：{}",
+                crate::logging::redact(&format!("{e:#}"))
+            );
+            eprintln!("如果目标文件正被占用，请先在界面里停掉内核再重试。");
+            return EXIT_FAIL;
+        }
+    };
+    // 有进程正从旧内核运行时，Windows 允许把文件改名，却不允许删除被映射的文件，
+    // 于是旧版本会留在 .bak 上。新文件照样生效，但那份占几十 MB，得说出来。
+    let leftover = target.join(format!("{}.bak", core::CORE_EXE)).exists();
+    let version = core::probe_version(&exe).unwrap_or_else(|_| info.version.clone());
+    // 文件已经就位。配置写不进去要单独报：否则下次启动还按旧渠道判断，
+    // 用户会看到"装了又像是没装"。
+    cfg.core.mode = "managed".to_string();
+    cfg.core.last_version = version.clone();
+    cfg.core.flavor = flavor.as_str().to_string();
+    let saved = config::save(&cfg);
+    if json {
+        let v = serde_json::json!({
+            "schema": 1,
+            "installed": true,
+            "flavor": flavor.as_str(),
+            "version": version,
+            "exe": mask_str(&exe),
+            "config_saved": saved.is_ok(),
+            "old_core_leftover": leftover,
+        });
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+    } else {
+        println!("已装好 {} {}：{}", flavor.label(), version, mask_str(&exe));
+    }
+    if leftover {
+        eprintln!(
+            "注意：旧内核还在被运行中的进程占用，删不掉，暂时留在 {}；下次安装会清掉它。",
+            mask_str(&target.join(format!("{}.bak", core::CORE_EXE)))
+        );
+    }
+    match saved {
+        Ok(()) => EXIT_OK,
+        Err(e) => {
+            eprintln!(
+                "rcgui: 内核文件已就位，但保存配置失败：{}",
+                crate::logging::redact(&format!("{e:#}"))
+            );
+            EXIT_FAIL
+        }
+    }
+}
+
+/// `--core-adopt-managed`：把 `core.path` 记进备选、模式改回托管内核。
+///
+/// 只改配置，**不移动、不删除**那个 exe：它是用户自己选的（往往是插件要的
+/// fork），删了就再也指不回去。
+fn core_adopt_managed(json: bool) -> i32 {
+    let mut cfg = config::load();
+    let was_external = cfg.core.normalized_mode() != "managed";
+    let kept = cfg.core.adopt_managed();
+    let changed = kept.is_some() || was_external;
+    if changed {
+        if let Err(e) = config::save(&cfg) {
+            eprintln!(
+                "rcgui: 保存内核路径失败：{}",
+                crate::logging::redact(&format!("{e:#}"))
+            );
+            return EXIT_FAIL;
+        }
+    }
+    let kept_masked = kept
+        .as_deref()
+        .map(|p| mask_path(Path::new(p)))
+        .filter(|p| !p.trim().is_empty());
+
+    if json {
+        let v = serde_json::json!({
+            "schema": 1,
+            "changed": changed,
+            "mode": "managed",
+            "kept_path": kept_masked,
+        });
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return EXIT_OK;
+    }
+
+    match kept_masked {
+        Some(p) => {
+            println!("已改用托管内核；原内核 {p} 保留在原处（记进备选，没删文件）。");
+            println!("下一步: rcgui --core-check 看有没有新版本，再 rcgui --core-install 下载。");
+        }
+        None => println!("没有手填的内核路径，已经在用托管内核。"),
+    }
+    EXIT_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,5 +1669,96 @@ mod tests {
         }
         let f = parse_args(&args(&["--validate-config", "x.conf"])).expect("带值应放行");
         assert_eq!(f.validate.as_deref(), Some("x.conf"));
+    }
+
+    #[test]
+    fn install_block_refuses_external_and_custom() {
+        // 外部模式：用户自己管内核，程序不该下载。
+        assert_eq!(
+            install_block("external", ""),
+            Some(InstallBlock::ExternalMode)
+        );
+        // 手填路径：那是用户选的（常是插件要的 fork），不能盖。
+        assert_eq!(
+            install_block("managed", r"C:\tools\rclone.exe"),
+            Some(InstallBlock::CustomPath(r"C:\tools\rclone.exe".into()))
+        );
+        // 只有空白等于没填，托管模式正常放行。
+        assert_eq!(install_block("managed", "  \t"), None);
+        assert_eq!(install_block("managed", ""), None);
+    }
+
+    #[test]
+    fn verdict_tells_upgrade_from_flavor_switch() {
+        assert_eq!(verdict_text(false, Some("1.76.0"), "1.76.0"), "已经是最新");
+        assert_eq!(verdict_text(true, None, "1.76.0"), "可以安装");
+        assert_eq!(verdict_text(true, Some("1.75.0"), "1.76.0"), "有新版本");
+        // 同版本号不同渠道：版本号没变大，但仍要重下。
+        assert_eq!(
+            verdict_text(true, Some("1.76.0"), "1.76.0"),
+            "版本号相同但渠道不同，需要重新下载"
+        );
+        assert_eq!(
+            verdict_text(true, Some("1.76.0-extra"), "1.76.0"),
+            "版本号相同但渠道不同，需要重新下载"
+        );
+    }
+
+    #[test]
+    fn pick_flavor_accepts_aliases_and_rejects_typos() {
+        assert_eq!(pick_flavor(Some("extra")), Ok(core::Flavor::Extra));
+        assert_eq!(pick_flavor(Some("Enhanced")), Ok(core::Flavor::Extra));
+        assert_eq!(pick_flavor(Some("upstream")), Ok(core::Flavor::Official));
+        assert_eq!(pick_flavor(Some("official")), Ok(core::Flavor::Official));
+        assert_eq!(pick_flavor(Some("original")), Ok(core::Flavor::Official));
+        // core::Flavor::parse 把陌生值一律当增强版；命令行不能照抄这个宽容，
+        // 否则打错一个字母就静默下载了另一个渠道的内核。
+        assert_eq!(pick_flavor(Some("extrra")), Err(EXIT_USAGE));
+        assert_eq!(pick_flavor(Some("")), Err(EXIT_USAGE));
+    }
+
+    #[test]
+    fn the_hinted_flavor_spelling_is_what_the_parser_accepts() {
+        for flavor in [core::Flavor::Extra, core::Flavor::Official] {
+            let word = flavor_arg(flavor);
+            assert_eq!(
+                pick_flavor(Some(word)),
+                Ok(flavor),
+                "提示里写的 {word} 要能用"
+            );
+        }
+    }
+
+    #[test]
+    fn core_verbs_parse_with_flavor_and_force() {
+        let f =
+            parse_args(&args(&["--core-check", "--flavor", "upstream", "--json"])).expect("放行");
+        assert!(f.core_check && f.json && !f.core_install);
+        assert_eq!(f.flavor.as_deref(), Some("upstream"));
+
+        let f = parse_args(&args(&["--core-install", "--force"])).expect("放行");
+        assert!(f.core_install && f.force);
+
+        let f = parse_args(&args(&["--core-status"])).expect("放行");
+        assert!(f.core_status && !f.core_check && f.flavor.is_none());
+
+        let f = parse_args(&args(&["--core-adopt-managed"])).expect("放行");
+        assert!(f.core_adopt);
+
+        // 缺值仍然是参数错误，而不是把后面的东西当渠道名吞掉。
+        assert_eq!(
+            parse_args(&args(&["--core-check", "--flavor"])).err(),
+            Some(EXIT_USAGE)
+        );
+    }
+
+    #[test]
+    fn flavor_or_force_alone_does_not_open_the_window() {
+        // 只写 --flavor / --force 若落到 None，脚本会以为命令跑完了，
+        // 屏幕上却多出一个窗口。必须当参数错误。
+        let f = parse_args(&args(&["--flavor", "extra"])).expect("解析通过");
+        assert_eq!(dispatch(f), Some(EXIT_USAGE));
+        let f = parse_args(&args(&["--force"])).expect("解析通过");
+        assert_eq!(dispatch(f), Some(EXIT_USAGE));
     }
 }

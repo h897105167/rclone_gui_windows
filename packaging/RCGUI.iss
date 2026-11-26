@@ -1,8 +1,9 @@
 ; RCGUI 安装包脚本（Inno Setup 6）。
 ;
-; 由 scripts\build-release.ps1 调用，四个定义从命令行传进来：
+; 由 scripts\build-release.ps1 调用，五个定义从命令行传进来：
 ;   /DAppVersion=<version>           版本号，只来自 Cargo.toml 的 [workspace.package]
 ;   /DAppVersionNumeric=<x.y.z.0>    同一版本的四段纯数字形式，只给 VersionInfoVersion 用
+;   /DArtifactSuffix=[-<source>]     非默认内核来源时为 -upstream 这类后缀，默认来源传空
 ;   /DSourceDir=<dir>                portable 目录（rclone-gui.exe + core\ + assets\plugins\ + licenses\）
 ;   /DOutputDir=<dir>                产物目录，通常是 dist
 ;
@@ -32,6 +33,11 @@
 #ifndef OutputDir
   #define OutputDir "..\dist"
 #endif
+; 内核来源后缀。默认来源（增强版）传空，安装包名就是 ...-setup.exe；
+; 换来源时 build-release.ps1 传 -upstream，让两个来源的安装包不会同名覆盖。
+#ifndef ArtifactSuffix
+  #define ArtifactSuffix ""
+#endif
 
 [Setup]
 ; AppId 是升级与卸载的识别键，发布后不要再改，否则新版本会被当成另一个程序并存。
@@ -56,7 +62,7 @@ PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir={#OutputDir}
-OutputBaseFilename=RCGUI-{#AppVersion}-windows-x64-setup
+OutputBaseFilename=RCGUI-{#AppVersion}-windows-x64-setup{#ArtifactSuffix}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern

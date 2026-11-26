@@ -18,6 +18,12 @@
 tag 是 `v<version>`（例如 `v0.3.0`）。两者不一致时 release workflow 直接失败：
 "改完版本号再打 tag，不要给旧代码贴新版本。"
 
+上面三个名字是**默认内核来源**（`packaging/core-manifest.json` 的 `default_source`，即增强版
+rclone-extra）发布件的名字。换来源打的包会带来源后缀，例如 `-CoreSource upstream` 时是
+`RCGUI-<version>-windows-x64-portable-upstream.zip`、`RCGUI-<version>-windows-x64-setup-upstream.exe`、
+`SHA256SUMS-upstream`。后缀是为了让两个来源能并排放在同一个 `dist\` 里而不互相覆盖，
+也让 release workflow 的固定名断言不会把非默认来源的包当成发布件。
+
 历史上 v0.2.1 的资产叫 `rclone-gui-v0.2.1-windows-amd64.zip`，那是旧命名，
 不改历史资产名；新命名从 0.3.0 开始。
 
@@ -61,33 +67,74 @@ RCGUI-<version>-windows-x64-portable\
 
 ## rclone 内核
 
-`packaging/core-manifest.json` 固定一个版本：
+`packaging/core-manifest.json` 固定了**两个**来源，`default_source` 指出发布件用哪一个：
 
 ```json
 {
-  "core": {
-    "version": "v1.76.0",
-    "asset_name": "rclone-v1.76.0-windows-amd64.zip",
-    "asset_url": "https://github.com/rclone/rclone/releases/download/v1.76.0/rclone-v1.76.0-windows-amd64.zip",
-    "asset_sha256": "8b4fd2737ade4e70c057ef4a49deb7cffe94b0fb9d7587c189d149823f21a1dc",
-    "asset_bytes": 32193987,
-    "checksums_url": "https://github.com/rclone/rclone/releases/download/v1.76.0/SHA256SUMS",
-    "checksums_format": "pgp-clearsigned"
+  "schema_version": 2,
+  "default_source": "extra",
+  "sources": {
+    "extra": {
+      "project": "gulp79/rclone-extra",
+      "version": "v1.76.0-extra",
+      "upstream_version": "v1.76.0",
+      "asset_name": "rclone-windows-amd64.zip",
+      "asset_url": "https://github.com/gulp79/rclone-extra/releases/download/v1.76.0-extra/rclone-windows-amd64.zip",
+      "asset_sha256": "a9bb4c6f30e7c6f73aba05d9ea3355c0c540e7add2e10480a7c976516dcd2d37",
+      "asset_bytes": 29973118,
+      "checksums_url": null,
+      "exe_sha256": "a72b8d123517696c4cc996fd17bd7509ddd7850b5e13893ee970f8c8a2b8390c",
+      "license_url": "https://raw.githubusercontent.com/gulp79/rclone-extra/v1.76.0-extra/COPYING",
+      "license_sha256": "8cd2e9e750b90a04b7d82dbbca3930c696ae0309d7c10464f90a44f45754cd04",
+      "exe_version_output": "rclone v1.76.0-extra"
+    },
+    "upstream": { "…": "官方 rclone v1.76.0，字段同上" }
   }
 }
 ```
 
-`scripts/fetch_core.ps1` 做四件事：核对 `asset_sha256`；核对字节数；下载官方
-`SHA256SUMS` 并**只解析 `<64位哈希>  <文件名>` 这样的行**（这个文件是 PGP 明文签名的，
-签名头和 `-----BEGIN PGP SIGNED MESSAGE-----` 之类的内容不是数据，不能当哈希行读，
-可参考 <https://rclone.org/release_signing/>）；最后运行 `rclone.exe version` 确认能跑且版本对得上。
-任何一步对不上就失败，不会打包。
+- **`extra`（默认）**：gulp79/rclone-extra，是 rclone 的 fork，多出 alist、alldebrid、teldrive、
+  terabox 这些上游没有的后端。版本号 `v1.76.0-extra`，基于上游 `v1.76.0`，MIT 许可证与上游**逐字节相同**。
+- **`upstream`**：官方 rclone v1.76.0，行为与之前的发布件一致。
+- 两个来源的 exe 不同、zip 不同，但版本号的前缀一样，所以"哪一份内核"只能靠 `source_key` 判断，
+  不能靠版本号字符串。
 
-换内核版本 = 改这三个字段（version / asset_url / asset_sha256，字节数顺手改）+ 让 CI 重新验证。
-**不要**把新内核 exe 手塞进产物里。
+`scripts/fetch_core.ps1` 对选中的来源做这些事：
+
+1. 核对下载到的 zip 的 `asset_sha256` 与字节数。
+2. 下载官方 `SHA256SUMS` 并**只解析 `<64位哈希>  <文件名>` 这样的行**（这个文件是 PGP 明文签名的，
+   签名头和 `-----BEGIN PGP SIGNED MESSAGE-----` 之类的内容不是数据，不能当哈希行读，
+   可参考 <https://rclone.org/release_signing/>）。
+   **fork 不发 SHA256SUMS**，所以 `checksums_url` 是 `null`，这一步对 `extra` 会跳过，
+   并把跳过原因写进 `.fetched.json` 的 `checksums_check`（`no-official-sums-published`）。
+   也就是说 `extra` 的唯一信任锚是清单里钉住的 `asset_sha256`。
+3. 解开后核对包内 `rclone.exe` 的 `exe_sha256` 与字节数。
+4. 按 `license_url` 取 COPYING（两个来源的 zip 里都没有许可证文件），核对 `license_sha256` 与字节数。
+5. 运行 `rclone.exe version`，输出必须**整串**匹配 `exe_version_output`。
+   只比 `v1.76.0` 会让官方 exe 冒充增强版通过，所以这里比完整字符串。
+
+任何一步对不上就失败，不会打包。`scripts/build-release.ps1` 打包前还会用清单再核一遍 exe 与许可证，
+不拿 `.fetched.json` 自报的哈希当依据。
+
+### 换来源、换版本
+
+- 想用官方原版打本地包：`.\scripts\build-release.ps1 -CoreSource upstream`，
+  或开发时 `.\scripts\build.ps1 -Release -CoreSource upstream`。
+  产物名会带 `-upstream` 后缀（`…-portable-upstream.zip`、`…-setup-upstream.exe`、`SHA256SUMS-upstream`），
+  和默认来源的包并排放在 `dist\` 里也不会互相覆盖，更不会有人把 upstream 包当成默认包发出去。
+- 换内核版本 = 改对应来源块里的 `version` / `asset_url` / `asset_sha256` / `asset_bytes` /
+  `exe_sha256` / `exe_bytes` / `license_url` / `license_sha256` / `exe_version_output`，
+  然后让 CI 重新验证。**不要**把新内核 exe 手塞进产物里。
+- 改 `default_source` 会改变"发布件里是哪个内核"，`release.yml` 会核对打出来的包确实是当前默认来源，
+  改了就要连着改这一处的说明和 CHANGELOG。
+- 只改清单结构时可以先跑 `.\scripts\fetch_core.ps1 -CheckManifest`：不联网，只检查每个来源的字段、
+  64 位十六进制哈希、以及 URL 是否落在它自己声明的 `asset_url_prefix` / `license_url_prefix` 里。
+  CI 的编译测试任务每次都会跑这一步。
 
 `-LocalZip` 允许用本地已下载的 zip，但同样要过哈希校验；用它的构建不算可重现构建，
-不要用它出正式包。
+不要用它出正式包。`-LicenseFile` 是同一个用途给许可证的：清单里的 `license_url` 拿不到时
+（离线、内网、上游撤了 raw 地址），用本地那份 COPYING 代替，大小和 sha256 仍按清单核对，
+`.fetched.json` 里记 `license_source: local-file`。两者都只为打通网络受限环境，正常发布走清单地址。
 
 ## 插件
 
@@ -100,7 +147,9 @@ release workflow 还会核对解出来的 `.fetched.json` 与清单一致，不�
 
 ## SHA256SUMS
 
-格式是 `sha256sum` 的老格式，两个空格分隔，无 BOM：
+格式是 `sha256sum` 的老格式，两个空格分隔，无 BOM。
+非默认内核来源的构建里，文件名是 `SHA256SUMS-<来源>`（例如 `SHA256SUMS-upstream`），
+里面记的仍是那两个带同样后缀的产物：
 
 ```
 c0e97cea438b363ecf749b3731ba4cc3fefd7098dcbacb3c724747042e58b92b  RCGUI-0.3.0-windows-x64-portable.zip
@@ -128,9 +177,12 @@ certutil -hashfile .\RCGUI-0.3.0-windows-x64-setup.exe SHA256
 
 # 完整走一遍（需要网络、需要本机装了 Inno Setup 6）
 .\scripts\build-release.ps1
+
+# 用官方原版内核打一份，产物名带 -upstream 后缀，不和默认包互相覆盖
+.\scripts\build-release.ps1 -CoreSource upstream
 ```
 
-产物在 `dist\`。`-SkipBuild` 复用已有二进制；`-SkipCore` / `-SkipPlugins` 跳过下载，仍逐项核对已有文件与锁定清单，缺失或 hash 不符会失败。`-SkipInstaller` 只生成便携版。发布流水线不使用这些跳过开关，防止遗漏构建或资产。
+产物在 `dist\`。`-SkipBuild` 复用已有二进制；`-SkipCore` / `-SkipPlugins` 跳过下载，仍逐项核对已有文件与锁定清单，缺失或 hash 不符会失败。`-SkipInstaller` 只生成便携版。`-CoreSource` 只换内核来源，不含糊：名字写错直接失败，不会悄悄退回默认来源。发布流水线不使用这些跳过开关，防止遗漏构建或资产。
 
 workflow 的手动触发（`workflow_dispatch`）只构建并上传到 Actions，**不创建 Release**，
 方便先看一眼产物再决定要不要打 tag。

@@ -288,7 +288,7 @@ pub async fn refresh_state(ctx: &Arc<Ctx>, ui: &slint::Weak<MainWindow>, force: 
         // 离线：保留上次快照（指南 §3），不发请求、不清空列表
         return false;
     }
-    let guard = ctx.hub.begin_fetch();
+    let guard = ctx.hub.begin_fetch(ctx.rc.epoch());
     // 只看当前快照里是否已有数据，用于给用量字段做「沿用上次」的默认值
     let prev = ctx.hub.applied();
 
@@ -311,8 +311,9 @@ pub async fn refresh_state(ctx: &Arc<Ctx>, ui: &slint::Weak<MainWindow>, force: 
 
     let snapshot: Snapshot = fetched.merge_into(prev.as_ref());
 
-    // 世代号：取数期间用户动了手，或已有更新的结果提交过 → 这份数据不能用来画界面
-    if !guard.commit() {
+    // 世代号：取数期间用户动了手、已有更新的结果提交过，或内核被换掉（端点世代变了）
+    // → 这份数据不能用来画界面
+    if !guard.commit(ctx.rc.epoch()) {
         return false;
     }
     let changed = ctx.hub.note_applied(&snapshot, force);

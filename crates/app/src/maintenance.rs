@@ -75,6 +75,9 @@ struct State {
     /// 内核安装/更新进度，避免同一个安装动作并发重入。
     busy_core: bool,
     busy_store: bool,
+    /// 最近一次查到的内核发行版信息（含校验值）。只存内存：查询结果会过期，
+    /// 重启后必须重新问一次才能安装。
+    core_release: Option<core::ReleaseInfo>,
 }
 
 impl Maintenance {
@@ -161,6 +164,7 @@ pub fn load_into_ui(ui: &MainWindow, cfg: &crate::config::AppConfig) {
         _ => "managed".into(),
     });
     g.set_core_path(cfg.core.path.clone().into());
+    g.set_core_flavor(cfg.core.normalized_flavor().as_str().into());
     g.set_lightweight_enabled(cfg.light.enabled);
     g.set_lightweight_minutes(crate::lightweight::clamp_minutes(cfg.light.minutes) as i32);
     g.set_backup_url(cfg.backup.url.clone().into());
@@ -292,6 +296,36 @@ fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 用户装过托管内核、这次却没用到数据目录那份时，把原因写进日志。
+///
+/// 界面上只会显示"找到的内核来自程序目录 core/"，看的人无法分辨是没装过、还是装过
+/// 却用不上；两种情况都该留一条可查的记录：文件没了（被删、被安全软件清掉），或者
+/// 文件在但跑不起来（下载被截断、被杀软换成空壳）。
+fn note_managed_skipped(core_cfg: &crate::config::CoreCfg, located: &core::Located) {
+    if !core_cfg.has_managed_install()
+        || core_cfg.normalized_mode() != "managed"
+        || !core_cfg.path.trim().is_empty()
+        || matches!(located.source, core::Source::DataDir)
+    {
+        return;
+    }
+    let data_exe = core::data_core_exe(&crate::config::data_dir());
+    let why = if data_exe.is_file() {
+        "文件还在但跑不起来（下载不完整或被安全软件改坏）"
+    } else {
+        "文件不存在（被删除或被安全软件清掉）"
+    };
+    crate::logging::event(
+        "warn",
+        "core",
+        &format!(
+            "已装过的托管内核用不上，回落到{}：{}；{why}",
+            located.source.label(),
+            data_exe.display()
+        ),
+    );
+}
+
 /// 内核状态串：来源 + 版本 + 在跑还是停了。界面就靠这一行判断"到底有没有内核"。
 pub fn core_status_text(ctx: &Arc<Ctx>) -> String {
     let phase = ctx.maint.core.phase();
@@ -300,7 +334,12 @@ pub fn core_status_text(ctx: &Arc<Ctx>) -> String {
     }
     let cfg = ctx.cfg.lock().unwrap().clone();
     let data = crate::config::data_dir();
-    match core::resolve(&cfg.core.path, &exe_dir(), &data) {
+    match core::resolve(
+        &cfg.core.path,
+        &exe_dir(),
+        &data,
+        cfg.core.has_managed_install(),
+    ) {
         Ok(Some(located)) => {
             let version =
                 core::probe_version(&located.exe).unwrap_or_else(|_| t("版本未知").to_string());
@@ -333,7 +372,12 @@ pub async fn start_managed_core(ctx: &Arc<Ctx>) -> Option<String> {
         return None;
     }
     let data = crate::config::data_dir();
-    let located = match core::resolve(&cfg.core.path, &exe_dir(), &data) {
+    let located = match core::resolve(
+        &cfg.core.path,
+        &exe_dir(),
+        &data,
+        cfg.core.has_managed_install(),
+    ) {
         Ok(Some(l)) => l,
         Ok(None) => {
             return Some(
@@ -342,6 +386,7 @@ pub async fn start_managed_core(ctx: &Arc<Ctx>) -> Option<String> {
         }
         Err(e) => return Some(e.to_string()),
     };
+    note_managed_skipped(&cfg.core, &located);
     if let Err(e) = std::fs::create_dir_all(core::data_core_dir(&data)) {
         return Some(f("无法创建内核目录：{}", &[&e]));
     }
@@ -357,12 +402,16 @@ pub async fn start_managed_core(ctx: &Arc<Ctx>) -> Option<String> {
                 // 换了内核就等于换了一组作业号：老一代的 jobid 再拿去查会指到
                 // 别的传输上，所以这里必须先换代（见 sync_tasks::Engine::on_core_started）。
                 let gen = ctx.maint.engine.on_core_started();
+                // 把用的是哪个文件、从哪一档找来的记下来：同版本换渠道时两个内核的
+                // 版本号只差后缀，日志里没有这两项就只能靠文件大小猜（真发生过）。
                 crate::logging::event(
                     "info",
                     "core",
                     &format!(
-                        "托管内核已启动（pid={}，代次={gen}）",
-                        ctx.maint.core.pid().unwrap_or(0)
+                        "托管内核已启动（pid={}，代次={gen}，{}：{}）",
+                        ctx.maint.core.pid().unwrap_or(0),
+                        located.source.label(),
+                        located.exe.display()
                     ),
                 );
                 Some(f(
@@ -390,6 +439,9 @@ pub async fn handle(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, action: &str, id: &st
     let ui = ui.clone();
     match action {
         "core-detect" => core_detect(ctx, &ui).await,
+        "core-check" => core_check(ctx, &ui).await,
+        "core-flavor" => core_flavor(ctx, &ui, id).await,
+        "core-adopt-managed" => core_adopt_managed(ctx, &ui).await,
         "core-install" => core_install(ctx, &ui).await,
         "core-start" => core_start(ctx, &ui).await,
         "core-stop" => core_stop(ctx, &ui).await,
@@ -421,7 +473,12 @@ pub async fn handle(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, action: &str, id: &st
 async fn core_detect(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let cfg = ctx.cfg.lock().unwrap().clone();
     let data = crate::config::data_dir();
-    let text = match core::resolve(&cfg.core.path, &exe_dir(), &data) {
+    let text = match core::resolve(
+        &cfg.core.path,
+        &exe_dir(),
+        &data,
+        cfg.core.has_managed_install(),
+    ) {
         Ok(Some(l)) => {
             let version = core::probe_version(&l.exe).unwrap_or_else(|_| t("版本未知").to_string());
             f(
@@ -436,11 +493,279 @@ async fn core_detect(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     refresh_core_status(ctx, ui);
 }
 
+/// 查一下当前渠道有没有新版本，把结论写进状态行。
+///
+/// 只查询、不下载：一次下载是 30MB 流量加几秒钟，用户在设置页点"检查更新"时
+/// 还不想让它悄悄落盘。查到的东西留在内存里，重启后必须重新查。
+async fn core_check(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    {
+        let mut st = ctx.maint.state();
+        if st.busy_core {
+            set_core_status(ui, t("内核操作已在进行中，请稍等"));
+            return;
+        }
+        st.busy_core = true;
+    }
+    set_busy(ui, true);
+    let (flavor, installed) = {
+        let cfg = ctx.cfg.lock().unwrap();
+        (cfg.core.normalized_flavor(), cfg.core.last_version.clone())
+    };
+    set_core_status(ui, f("正在查询{}的最新版本…", &[&flavor.label()]));
+    let result = core::release_info(flavor).await;
+    {
+        let mut st = ctx.maint.state();
+        st.busy_core = false;
+        if let Ok(info) = &result {
+            st.core_release = Some(info.clone());
+        }
+    }
+    set_busy(ui, false);
+    match result {
+        Ok(info) => {
+            let size = if info.size_text().is_empty() {
+                t("大小未知").to_string()
+            } else {
+                info.size_text()
+            };
+            let local = if installed.trim().is_empty() {
+                t("尚未安装").to_string()
+            } else {
+                installed.clone()
+            };
+            let verdict = if installed.trim().is_empty() {
+                t("可以安装").to_string()
+            } else if core::newer_than(&info.version, &installed) {
+                t("有新版本").to_string()
+            } else {
+                t("已是最新").to_string()
+            };
+            crate::logging::event(
+                "info",
+                "core",
+                &format!(
+                    "{} 最新 {}（{}，{}），本机 {}，{}",
+                    flavor.as_str(),
+                    info.tag,
+                    info.asset,
+                    info.published_at,
+                    local,
+                    verdict
+                ),
+            );
+            // 状态行只放用户能一眼用上的：版本、大小、本机、结论。发行说明第一行
+            // 跟在后面，写不下时界面自己省略号收尾。
+            let mut status = f(
+                "{} 最新 {}（{}）：本机 {}，{}",
+                &[&flavor.label(), &info.tag, &size, &local, &verdict],
+            );
+            if !info.notes.trim().is_empty() {
+                status.push_str(" · ");
+                status.push_str(info.notes.trim());
+            }
+            set_core_status(ui, status);
+        }
+        Err(e) => {
+            crate::logging::event("error", "core", &format!("查询内核版本失败：{e}"));
+            set_core_status(ui, f("查询内核版本失败：{}", &[&e]));
+            crate::toast(ui, 2, t("查不到最新内核，请检查网络或稍后再试"));
+            refresh_core_status(ctx, ui);
+        }
+    }
+}
+
+/// 切换下载渠道（原版 / 增强版）。只决定"以后下载哪个"，不动已经装好的内核。
+async fn core_flavor(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
+    let want = core::Flavor::parse(id);
+    let (mode, custom, explicit, running, recorded, last_version) = {
+        let cfg = ctx.cfg.lock().unwrap();
+        (
+            cfg.core.normalized_mode(),
+            cfg.core.path.trim().to_string(),
+            cfg.core.flavor.trim().to_string(),
+            ctx.maint.core.is_running(),
+            cfg.core.recorded_flavor(),
+            cfg.core.last_version.clone(),
+        )
+    };
+    // 本机那份是哪个渠道：配置里记过就信记录，没记过就按版本串推（老配置）。
+    let installed_flavor = recorded.or_else(|| {
+        if last_version.trim().is_empty() {
+            None
+        } else {
+            Some(core::Flavor::of_version(&last_version))
+        }
+    });
+    // 同版本换渠道也算换：`1.76.0` 与 `1.76.0-extra` 数字段一样、二进制不一样。
+    let switching_binary = installed_flavor.is_some_and(|f| f != want);
+    if want.as_str() == explicit {
+        // 点自己已经选中的那个：不写盘、不警告，只把状态行说清楚。
+        set_core_status(ui, f("已经使用{}", &[&want.label()]));
+        return;
+    }
+    {
+        let mut cfg = ctx.cfg.lock().unwrap();
+        cfg.core.flavor = want.as_str().to_string();
+        if let Err(e) = crate::config::save(&cfg) {
+            crate::logging::event("error", "core", &format!("保存内核渠道失败：{e}"));
+            set_core_status(ui, f("保存内核渠道失败：{}", &[&e]));
+            return;
+        }
+    }
+    with_ui(ui, move |u| {
+        u.global::<MaintenanceG>()
+            .set_core_flavor(want.as_str().into());
+    });
+    crate::logging::event("info", "core", &format!("内核渠道切换为 {}", want.as_str()));
+    // 同版本换渠道：数字一样不代表不用换，重下之前先说清本机装的是哪个渠道。
+    // 这段要跟着界面语言走，所以也走 `f()`；没换渠道时是空串，模板末尾的 `{}` 就空着。
+    let same_version_note = if switching_binary {
+        f(
+            "（本机装的是{}，版本号相同也要重下：两份 exe 不同）",
+            &[&installed_flavor.map(|f| f.label()).unwrap_or("")],
+        )
+    } else {
+        String::new()
+    };
+    if mode != "managed" {
+        // 外部模式不存在"我们下载的内核"，记下来等切回托管用。
+        set_core_status(
+            ui,
+            f(
+                "已记住{}：外部模式下不会下载内核{}",
+                &[&want.label(), &same_version_note],
+            ),
+        );
+    } else if !custom.is_empty() {
+        // 「程序路径」优先是真的，但别让人以为只能手动清空——旁边就有按钮。
+        set_core_status(
+            ui,
+            f(
+                "已记住{}；「程序路径」里指定的内核仍优先，要换成下载的版本请点「改用托管内核」（原文件保留，不覆盖）{}",
+                &[&want.label(), &same_version_note],
+            ),
+        );
+    } else if running {
+        set_core_status(
+            ui,
+            f(
+                "已切换到{}：需要重启内核才生效，正在进行的传输与挂载会中断{}",
+                &[&want.label(), &same_version_note],
+            ),
+        );
+        crate::toast(
+            ui,
+            2,
+            t("切换渠道后要重启内核；现在这份仍在运行，点「安装 / 更新内核」会一并替换"),
+        );
+    } else {
+        set_core_status(
+            ui,
+            f(
+                "已切换到{}：点「检查更新」看有没有新版本，再点「安装 / 更新内核」下载{}",
+                &[&want.label(), &same_version_note],
+            ),
+        );
+    }
+}
+
+/// 改用托管内核：把手填的路径收进备选，之后由我们自己下载与替换。
+///
+/// 只改配置、不碰文件——用户填的那份 exe 原地留着，我们只是不再用它。下载与替换留在
+/// `core-install`，于是「不再用你挑的那份」和「真把它换掉」是两次点击，中间那步用户
+/// 能看清后果（换内核要重启内核，挂载与传输会断）。
+async fn core_adopt_managed(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    if ctx.maint.state().busy_core {
+        set_core_status(ui, t("内核操作已在进行中，请稍等"));
+        return;
+    }
+    let (kept, running) = {
+        let mut cfg = ctx.cfg.lock().unwrap();
+        let was_external = cfg.core.normalized_mode() != "managed";
+        let kept = cfg.core.adopt_managed();
+        let running = ctx.maint.core.is_running();
+        if kept.is_some() || was_external {
+            if let Err(e) = crate::config::save(&cfg) {
+                crate::logging::event("error", "core", &format!("保存内核路径失败：{e}"));
+                set_core_status(ui, f("保存内核路径失败：{}", &[&e]));
+                return;
+            }
+        }
+        (kept, running)
+    };
+    with_ui(ui, |u| {
+        let g = u.global::<MaintenanceG>();
+        g.set_core_mode("managed".into());
+        g.set_core_path("".into());
+    });
+    match kept {
+        Some(p) => {
+            crate::logging::event(
+                "info",
+                "core",
+                &format!("改用托管内核；原路径保留在备选里：{p}"),
+            );
+            set_core_status(
+                ui,
+                f(
+                    "已改用托管内核：原内核 {} 保留在原处（记进备选，不删文件）；点「安装 / 更新内核」下载所选渠道的版本",
+                    &[&p],
+                ),
+            );
+            if running {
+                crate::toast(
+                    ui,
+                    2,
+                    t("正在运行的内核是从那个路径启动的；点「安装 / 更新内核」会先停掉它（传输与挂载会中断）"),
+                );
+            } else {
+                crate::toast(ui, 1, t("已改用托管内核；原文件保留，随时可以填回去"));
+            }
+        }
+        None => {
+            set_core_status(ui, t("没有手填的内核路径，已经在用托管内核"));
+        }
+    }
+    refresh_core_status(ctx, ui);
+}
+
+/// 重启内核之后的三种真实结局。
+///
+/// 判定只看两件事实：进程还在不在、握手成不成。**不看** `start_managed_core`
+/// 返回的那句话——它把失败原因也包在 `Some` 里，照着 `Some` 报「已重启」就会把
+/// 启动失败说成成功，用户看到「已更新并重启」却连不上。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartOutcome<'a> {
+    /// 进程起来了，而且连上了。
+    Connected,
+    /// 进程起来了，但没能连上：端口还没就绪、鉴权被拒、对端能力不足都可能。
+    RunningOffline,
+    /// 进程根本没起来，附带启动那一步给的说明。
+    NotRunning(&'a str),
+}
+
+fn restart_outcome<'a>(started: Option<&'a str>, running: bool, live: bool) -> RestartOutcome<'a> {
+    if !running {
+        // 起不来时 `started` 里是我们的原因文案；真没有就给一句通用的，
+        // 不留空字符串让用户面对一个没有下半句的状态栏。
+        return RestartOutcome::NotRunning(started.unwrap_or(t("没有找到可以启动的内核")));
+    }
+    if live {
+        RestartOutcome::Connected
+    } else {
+        RestartOutcome::RunningOffline
+    }
+}
+
+/// 下载并替换「我们自己的」内核，渠道取设置里选的那一个。
+///
+/// 三条不做的事：外部模式不下载（那台 rclone 不是我们的）、用户手填的内核路径不覆盖
+/// （那是他特意挑的 fork）、同版本且能跑的 exe 不重下（30MB 换不来任何东西）。
 async fn core_install(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     {
         let mut st = ctx.maint.state();
         if st.busy_core {
-            set_core_status(ui, t("内核安装已在进行中，请稍等"));
+            set_core_status(ui, t("内核操作已在进行中，请稍等"));
             return;
         }
         st.busy_core = true;
@@ -459,64 +784,179 @@ async fn core_install(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         refresh_core_status(ctx, ui);
         return;
     }
-    let version = {
+    let (mode, custom, flavor) = {
         let cfg = ctx.cfg.lock().unwrap();
-        if cfg.core.last_version.trim().is_empty() {
-            None
-        } else {
-            Some(cfg.core.last_version.clone())
+        (
+            cfg.core.normalized_mode(),
+            cfg.core.path.trim().to_string(),
+            cfg.core.normalized_flavor(),
+        )
+    };
+    // 外部模式只连别人跑着的 rclone：替换本地 exe 对那个进程毫无影响，只会让人
+    // 以为自己连的那份被换掉了。
+    if mode != "managed" {
+        ctx.maint.state().busy_core = false;
+        set_busy(ui, false);
+        set_core_status(ui, t("当前是外部模式，不会下载或替换内核"));
+        crate::toast(
+            ui,
+            2,
+            t("外部模式下不提供内核下载；需要的话先切到「托管内核」"),
+        );
+        return;
+    }
+    // 用户亲手指定的内核永远优先：那通常是他为了某个后端（例如 teldrive）特意挑的
+    // fork，用下载来的版本盖掉等于把选择丢了。要换只有一条明路：「改用托管内核」那一下
+    // 先把路径收进备选（文件不动），下一次点这里才轮到我们下载替换。
+    if !custom.is_empty() {
+        ctx.maint.state().busy_core = false;
+        set_busy(ui, false);
+        set_core_status(
+            ui,
+            f(
+                "已手动指定内核路径（{}），不会用下载的版本覆盖它",
+                &[&custom],
+            ),
+        );
+        crate::toast(
+            ui,
+            2,
+            t("要改用下载的内核，请先点「改用托管内核」（原文件会保留，不会被覆盖）"),
+        );
+        return;
+    }
+    set_core_status(ui, f("正在查询{}的最新版本…", &[&flavor.label()]));
+    let info = match core::release_info(flavor).await {
+        Ok(i) => i,
+        Err(e) => {
+            ctx.maint.state().busy_core = false;
+            set_busy(ui, false);
+            crate::logging::event("error", "core", &format!("查询内核版本失败：{e}"));
+            set_core_status(ui, f("查询内核版本失败：{}", &[&e]));
+            crate::toast(ui, 2, t("查不到最新内核，请检查网络或稍后再试"));
+            refresh_core_status(ctx, ui);
+            return;
         }
     };
+    ctx.maint.state().core_release = Some(info.clone());
+    // 同版本就不重下；但"能跑"必须实测，否则一个坏掉的 exe 永远修不好。版本相同还得
+    // 看渠道：`1.76.0` 与 `1.76.0-extra` 数字段一样、二进制不一样，换渠道必须重下。
+    let installed_exe = core::data_core_exe(&data);
+    let probed = core::probe_version(&installed_exe).ok();
+    let recorded = ctx.cfg.lock().unwrap().core.recorded_flavor();
+    if !core::needs_install(flavor, &info.version, probed.as_deref(), recorded) {
+        ctx.maint.state().busy_core = false;
+        set_busy(ui, false);
+        set_core_status(
+            ui,
+            f(
+                "{} 已经是最新（{}），不需要重新下载",
+                &[&flavor.label(), &info.tag],
+            ),
+        );
+        crate::toast(ui, 1, t("已是最新版本，不需要重新下载"));
+        refresh_core_status(ctx, ui);
+        return;
+    }
     // 替换内核要把旧 exe 重命名成 .bak，Windows 会拒绝正在运行的那个文件。所以先停掉
     // **我们自己启动的**内核；外部接入的实例一律不碰（那个 exe 本来也不是我们要替换的
     // 文件，而且规则是永不结束不是自己启动的进程）。
     let was_running = ctx.maint.core.is_running();
     if was_running {
         ctx.maint.core.stop();
-        crate::disconnect_now(ctx, ui).await;
+        // 端口随刚才那个进程一起消失。留着它当"上次快照"，用户会一直看到
+        // "已断开（显示的是上次快照）"和一个再也不会应答的端口。
+        forget_core_endpoint(ctx, ui, Some(t("正在更换内核，下载完成后会自动重新连接"))).await;
     }
+    let size = if info.size_text().is_empty() {
+        t("大小未知").to_string()
+    } else {
+        info.size_text()
+    };
     set_core_status(
         ui,
         if was_running {
-            t("已停止自家内核，正在下载官方 rclone 内核…")
+            // 停内核会连带停掉挂载和正在传输的任务，这句必须说出来。
+            f(
+                "已停止自家内核（正在进行的传输与挂载会中断），正在下载 {} {}…",
+                &[&flavor.label(), &info.tag],
+            )
         } else {
-            t("正在下载官方 rclone 内核…")
+            f(
+                "正在下载 {} {}（{}）…",
+                &[&flavor.label(), &info.tag, &size],
+            )
         },
     );
-    let result = core::install_official(&target, version.as_deref()).await;
+    let result = core::install_release(&target, &info).await;
     ctx.maint.state().busy_core = false;
     set_busy(ui, false);
     match result {
         Ok(exe) => {
-            let v = core::probe_version(&exe).unwrap_or_else(|_| t("版本未知").to_string());
+            let v = core::probe_version(&exe).unwrap_or_else(|_| info.version.clone());
             {
                 let mut cfg = ctx.cfg.lock().unwrap();
                 // 装了就用这个：把模式切回 managed，否则用户装了内核却还是连外部实例。
                 cfg.core.mode = "managed".to_string();
-                cfg.core.path = String::new();
                 cfg.core.last_version = v.clone();
+                // 渠道写成显式值：以后即使 last_version 被清掉也不会退回推断。
+                cfg.core.flavor = flavor.as_str().to_string();
                 let _ = crate::config::save(&cfg);
             }
-            with_ui(ui, |u| {
+            let channel = flavor.as_str();
+            with_ui(ui, move |u| {
                 u.global::<MaintenanceG>().set_core_mode("managed".into());
-                u.global::<MaintenanceG>().set_core_path("".into());
+                u.global::<MaintenanceG>().set_core_flavor(channel.into());
             });
-            crate::logging::event("info", "core", &format!("官方内核已安装：{}", v));
+            crate::logging::event(
+                "info",
+                "core",
+                &format!("{} 内核已安装：{}（{}）", flavor.as_str(), exe.display(), v),
+            );
             set_core_status(ui, f("内核已安装：{}（{}）", &[&exe.display(), &v]));
             if was_running {
                 // 装了内核的人下一步一定是启动，替他重启并把结果说清楚，
                 // 免得"装完内核却停着"看起来像失败。
                 let started = start_managed_core(ctx).await;
-                match &started {
-                    Some(msg) => {
-                        set_core_status(ui, f("内核已安装（{}）并已重启：{}", &[&v, msg]));
-                        crate::toast(ui, 1, t("内核已更新并重新启动"));
-                    }
-                    None => {
+                // `start_managed_core` 的 `Some` 里也可能是失败原因（"内核启动失败：…"），
+                // 所以"到底起来没有"只能看进程本身。
+                let running = ctx.maint.core.is_running();
+                let live = if running {
+                    // 新进程是新端口 + 新随机凭据：必须用它的地址重新握手，
+                    // 否则界面停在上一个内核的端口上，看起来永远连不上。
+                    reconnect_after_core_change(ctx, ui).await
+                } else {
+                    false
+                };
+                let endpoint = ctx
+                    .maint
+                    .core
+                    .endpoint()
+                    .map(|(url, _, _)| url)
+                    .unwrap_or_default();
+                match restart_outcome(started.as_deref(), running, live) {
+                    RestartOutcome::Connected => {
                         set_core_status(
                             ui,
-                            f("内核已安装（{}），但没能重新启动，请看下面的状态", &[&v]),
+                            f(
+                                "内核已安装（{}）并在 {} 上重新启动，已重新连接",
+                                &[&v, &endpoint],
+                            ),
                         );
+                        crate::toast(ui, 1, t("内核已更新并重新连接"));
+                    }
+                    RestartOutcome::RunningOffline => {
+                        set_core_status(
+                            ui,
+                            f(
+                                "内核已安装（{}）并在 {} 上重新启动，但没能连上，请看下面的状态",
+                                &[&v, &endpoint],
+                            ),
+                        );
+                        crate::toast(ui, 2, t("新内核已启动，但自动连接失败；可点「连接」重试"));
+                    }
+                    RestartOutcome::NotRunning(why) => {
+                        set_core_status(ui, f("内核已安装（{}），但没能重新启动：{}", &[&v, &why]));
                         crate::toast(ui, 2, t("内核已更新，但自动重启失败，请点「启动内核」"));
                     }
                 }
@@ -533,6 +973,73 @@ async fn core_install(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     refresh_core_status(ctx, ui);
 }
 
+/// 我们自己停掉了内核：那个随机端口跟着进程一起没了，别再留着它当"上次快照"。
+///
+/// 只在自己拥有的子进程被停掉之后调用。外部实例是别人的进程，它的连接状态
+/// 以及快照都不该因为这里的一个动作被抹掉。
+///
+/// `hint` 会被放进连接面板的错误行：忘掉端点后状态是「未连接」、错误为空，
+/// 光看界面分不清是「正在换内核」还是「又出故障了」，所以由调用方给一句话。
+async fn forget_core_endpoint(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, hint: Option<&str>) {
+    ctx.rc.forget().await;
+    let mut view = crate::snapshot_view(ctx).await;
+    if let Some(hint) = hint {
+        view.error = hint.to_string();
+    }
+    crate::apply_conn_view(ui, view);
+}
+
+/// 换了一次内核（新进程、新端口、新随机凭据）之后，用**它自己的**地址重新握手。
+///
+/// 新旧端口没有任何继承关系，所以这里绝不沿用旧端点，只认 `ctx.maint.core.endpoint()`。
+/// 内核启动只等到 TCP 可连，鉴权请求可能还差一小会儿，因此允许短暂重试；
+/// 返回是否真的连上，调用方据此决定说"已重新连接"还是把失败原因留着。
+async fn reconnect_after_core_change(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) -> bool {
+    const ATTEMPTS: u32 = 5;
+    const GAP: Duration = Duration::from_millis(400);
+    let mut view = None;
+    for attempt in 0..ATTEMPTS {
+        if !ctx.maint.core.is_running() {
+            // 进程自己退了（端口被占、启动即崩）：别再去敲一个没有人听的端口。
+            let mut v = crate::snapshot_view(ctx).await;
+            v.error = t("新内核进程已退出，没有可连的端点").to_string();
+            view = Some(v);
+            break;
+        }
+        let out = crate::connect_report(ctx).await;
+        let live = out.view.live;
+        view = Some(out.view);
+        if live {
+            break;
+        }
+        if attempt + 1 < ATTEMPTS {
+            tokio::time::sleep(GAP).await;
+        }
+    }
+    let view = match view {
+        Some(v) => v,
+        None => crate::snapshot_view(ctx).await,
+    };
+    let live = view.live;
+    // 只记地址，不带凭据：内核的密码只属于那个进程。
+    let endpoint = view.endpoint.clone();
+    crate::apply_conn_view(ui, view);
+    if live {
+        // 连接卡换成新端口了，但远程列表、挂载、任务还是旧内核那一份。
+        // 这里主动拉一次（force）：等下一跳轮询不可靠——轮询有「内容没变就不重绘」
+        // 的闸门，取数失败时还会沿用旧快照，界面就停在上一代内核的数据上。
+        let ctx2 = ctx.clone();
+        let ui2 = ui.clone();
+        tokio::spawn(async move {
+            crate::refresh::refresh_state(&ctx2, &ui2, true).await;
+        });
+        crate::logging::event("info", "core", &format!("内核换代后已重新连接：{endpoint}"));
+    } else {
+        crate::logging::event("warn", "core", &format!("内核换代后没能连上：{endpoint}"));
+    }
+    live
+}
+
 async fn core_start(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     if ctx.maint.core.is_running() {
         set_core_status(ui, t("内核已经在运行"));
@@ -545,10 +1052,8 @@ async fn core_start(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     }
     if ctx.maint.core.is_running() {
         // 起来之后立刻握手一次：界面上的"已连接"要跟着变，不能让用户再点一次连接。
-        let outcome = crate::connect_report(ctx).await;
-        let live = outcome.view.live;
-        crate::apply_conn_view(ui, outcome.view);
-        if live {
+        // 新内核用的是新端口和新随机凭据，所以走同一个换代重连入口。
+        if reconnect_after_core_change(ctx, ui).await {
             crate::toast(ui, 1, t("内核已启动并连接"));
         }
     }
@@ -559,9 +1064,12 @@ async fn core_stop(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let was = ctx.maint.core.is_running();
     if was {
         ctx.maint.core.stop();
+        // 停掉自己起的进程后那个端口就没了，把端点一起忘掉；否则界面会一直显示
+        // "已断开（显示的是上次快照）"配一个再也不会应答的端口。
+        // 外部实例不在这里：它没被我们停，连接状态一个字都不动。
+        // 用户自己点的停止，不需要额外解释，因此不给提示语。
+        forget_core_endpoint(ctx, ui, None).await;
     }
-    // 停掉自己起的进程后连接必然失效；只动自己拥有的 child，外部实例一概不碰。
-    crate::disconnect_now(ctx, ui).await;
     set_core_status(
         ui,
         if was {
@@ -1766,5 +2274,104 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert!(strip_plugin_hooks(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 启动失败不能被报成「已重启」。
+    ///
+    /// `start_managed_core` 成功和失败都返回 `Some`（失败时 `Some` 里是原因），
+    /// 所以判定只能看进程在不在。这里连「进程不在却拿着一个地址」的畸形输入也
+    /// 一并钉住：那种情况下说「已重启并连接」比不说更糟。
+    #[test]
+    fn a_failed_start_is_not_a_restart() {
+        let why = "内核启动失败：没找到内核";
+        assert_eq!(
+            restart_outcome(Some(why), false, false),
+            RestartOutcome::NotRunning(why)
+        );
+        assert_eq!(
+            restart_outcome(Some("http://127.0.0.1:55981/"), false, true),
+            RestartOutcome::NotRunning("http://127.0.0.1:55981/")
+        );
+    }
+
+    /// 起来了但没连上，要和「起来了也连上了」分开说，否则用户以为已经能用。
+    #[test]
+    fn running_without_a_handshake_is_its_own_outcome() {
+        let started = Some("内核已启动：http://127.0.0.1:55981/");
+        assert_eq!(
+            restart_outcome(started, true, false),
+            RestartOutcome::RunningOffline
+        );
+        assert_eq!(
+            restart_outcome(started, true, true),
+            RestartOutcome::Connected
+        );
+    }
+
+    /// 连原因都没有时也要留一句话，别让状态栏停在半句上。
+    #[test]
+    fn a_silent_start_failure_still_gets_a_reason() {
+        match restart_outcome(None, false, false) {
+            RestartOutcome::NotRunning(why) => assert!(!why.trim().is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 取 `core_install` 的函数体源码。
+    ///
+    /// `Ctx` 在单测里构造不出来（要插件宿、KV、tokio 全套），`crates/app/tests/`
+    /// 又 import 不到 bin crate，所以凡是要守住"这一步确实接上了"的地方都退到这里
+    /// 扫源码。这不是镜像实现：断言的是调用点存在，行为由被调用的函数各自的测试负责。
+    fn core_install_body() -> &'static str {
+        let src = include_str!("maintenance.rs");
+        let start = src
+            .find("async fn core_install(")
+            .expect("core_install 不见了");
+        let rest = &src[start..];
+        let end = rest
+            .find("\nasync fn core_start(")
+            .expect("core_start 不见了");
+        &rest[..end]
+    }
+
+    /// 换内核之后必须重新握手——这条钉的是实际验收里卡住的那个 bug。
+    #[test]
+    fn installing_a_core_reconnects_instead_of_leaving_the_old_endpoint() {
+        let body = core_install_body();
+        assert!(
+            body.contains("forget_core_endpoint("),
+            "停掉自家内核后要先忘掉旧端点，否则界面一直显示那个已经不存在的端口"
+        );
+        assert!(
+            body.contains("reconnect_after_core_change("),
+            "新内核起来后要用它的新端口和新凭据重新握手"
+        );
+        assert!(
+            !body.contains("disconnect_now("),
+            "旧写法只把状态降级成「显示的是上次快照」，端口还留在旧值上"
+        );
+    }
+
+    /// 外部模式和手填路径都不该走到"停内核"那一步，更不该换文件。
+    ///
+    /// 外部接的实例不是我们拉起的进程，手填的路径通常是用户特意挑的 fork；
+    /// 两个分支必须先返回，否则点一次安装就把别人的进程或用户的选择动了。
+    #[test]
+    fn install_never_touches_a_kernel_it_does_not_own() {
+        let body = core_install_body();
+        let stop = body
+            .find("ctx.maint.core.stop()")
+            .expect("core_install 里应该有停内核那一步");
+        let external = body
+            .find("当前是外部模式，不会下载或替换内核")
+            .expect("外部模式的早退不见了");
+        let custom = body
+            .find("已手动指定内核路径（{}），不会用下载的版本覆盖它")
+            .expect("手填路径的早退不见了");
+        assert!(
+            external < stop,
+            "外部模式必须先去返回，不能顺路停掉某个进程"
+        );
+        assert!(custom < stop, "手填路径必须先返回，原文件不能被动");
     }
 }

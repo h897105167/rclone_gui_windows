@@ -35,8 +35,15 @@
   内核许可证和选定插件（不含 onerclone）；安装包按用户目录安装，不覆盖 `%APPDATA%` 下的数据。
   详见 [RELEASE.md](RELEASE.md)。
 - 可复现打包：`scripts/fetch_core.ps1` 按 [../packaging/core-manifest.json](../packaging/core-manifest.json)
-  里的固定版本与 sha256 取 rclone（当前 v1.76.0），`scripts/build-release.ps1` 逐文件复核
+  里的固定版本与 sha256 取 rclone（当前默认 v1.76.0-extra），`scripts/build-release.ps1` 逐文件复核
   插件哈希、缺内核或许可证直接失败。
+- 内核双来源：清单升到 `schema_version: 2`，`sources` 下同时钉住**增强版**
+  `gulp79/rclone-extra v1.76.0-extra`（rclone v1.76.0 的分支，多出 alist、alldebrid、
+  teldrive、terabox 等后端）和官方原版 rclone v1.76.0，`default_source` 是增强版。
+  `-CoreSource` 选来源，写错直接失败而不退回默认；非默认来源的产物带 `-<来源>` 后缀，
+  两个来源可以并排放在同一个 `dist\` 里而不互相覆盖。`fetch_core.ps1 -CheckManifest`
+  离线校验清单结构，CI 每次编译测试都跑。增强版不发布 SHA256SUMS，所以它的校验锚点是
+  清单里钉住的 zip sha256，`.fetched.json` 会记下 `checksums_check: no-official-sums-published`。
 - 插件商店投稿对任何 GitHub 账号开放：地址必须指向声明仓库自己的 Release 资产，
   人工审核看代码、许可证与申请的权限。字段与审核门槛见
   [store/README.md](store/README.md)，机器校验是 `scripts/validate-store-index.ps1`。
@@ -54,6 +61,13 @@
 
 ### Fixed
 
+- 打包步骤成功却被 CI 判成失败：`build-release.ps1` 原来用 `$LASTEXITCODE -ne 0` 判断每个子步骤，
+  而 `fetch_plugins.ps1` 成功时只打印结果、从不设置这个变量，调用方读到的是 `$null`（或上一条原生
+  命令留下的旧值），`$null -ne 0` 为真，于是插件明明已就绪、打包仍报失败（run 45793075820 /
+  job 139823454789）。现在四个调用点（取插件、`cargo build`、取内核、ISCC）统一走 `Invoke-Native`：
+  调用前把 `$LASTEXITCODE` 清零，调用包进 try/catch 接住子脚本的 `throw`（`throw` 时这个变量仍是 0，
+  只靠退出码判断会漏掉）；`build-release.ps1`、`build.ps1`、`fetch_core.ps1`、`fetch_plugins.ps1`
+  成功时都显式 `exit 0`，不再让调用方猜。
 - 文档中"插件会被嵌进二进制、必须在 `cargo build` 之前就位"的过时说明已改正：
   插件由 `scripts/fetch_plugins.ps1` 拉取并校验，`build.rs` 只负责把资产复制到二进制旁边。
 

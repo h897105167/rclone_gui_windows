@@ -201,7 +201,7 @@ Services 的共同约束：
 ### 4.7 发布契约
 
 - 版本号唯一来源是工作区 `Cargo.toml` 的 `[workspace.package] version`，六个成员 crate 全部 `version.workspace = true`；运行时通过 `env!("CARGO_PKG_VERSION")` 取（`crates/app/src/caps.rs` 已经在发给插件的能力表里带 `gui_version`）。
-- 资产命名固定：`RCGUI-<version>-windows-x64-setup.exe`、`RCGUI-<version>-windows-x64-portable.zip`，配套 `SHA256SUMS.txt`。命名规则和校验方式见 [RELEASE.md](RELEASE.md)。
+- 资产命名固定：`RCGUI-<version>-windows-x64-setup.exe`、`RCGUI-<version>-windows-x64-portable.zip`，配套 `SHA256SUMS`（没有扩展名；内核来源不是清单的 `default_source` 时，三个名字统一带 `-<来源>` 后缀，如 `SHA256SUMS-upstream`）。命名规则和校验方式见 [RELEASE.md](RELEASE.md)。
 - 可重现：发布包里的 rclone 内核来自固定 tag 的官方资产并按 sha256 校验；插件来自 `plugins/manifest.json` 锁定版本并校验；构建脚本不允许"用本机上碰到的那个 exe"。
 - 不得发布的东西：开发数据、token、绝对路径、未校验的二进制、测试用的临时 release。
 

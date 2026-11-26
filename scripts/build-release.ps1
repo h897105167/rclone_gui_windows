@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     打一个可发布的 RCGUI 版本：portable zip、安装包 exe、SHA256SUMS。
 
@@ -7,6 +7,13 @@
         dist\RCGUI-<version>-windows-x64-portable.zip
         dist\RCGUI-<version>-windows-x64-setup.exe
         dist\SHA256SUMS
+
+    内核来源不是清单里的 default_source 时，上面三个名字都带 -<来源> 后缀：
+        dist\RCGUI-<version>-windows-x64-portable-upstream.zip
+        dist\RCGUI-<version>-windows-x64-setup-upstream.exe
+        dist\SHA256SUMS-upstream
+    这样同一次版本能并排打出两个来源的包而不互相覆盖，
+    也不会有人把 upstream 包当成默认（增强版）包发出去。
 
     版本号只有一个来源：Cargo.toml 里 [workspace.package] 的 version。
     传 -Version 只是为了让"打错版本号"当场失败，不能用来临时改名。
@@ -57,6 +64,11 @@
 .PARAMETER CoreZip
     本地已有的 rclone 内核 zip，传给 fetch_core.ps1（仍然校验 sha256）。
 
+.PARAMETER CoreSource
+    用哪个内核来源，取值是 core-manifest.json 里 sources 的键（extra、upstream）。
+    留空就用清单的 default_source。名字写错直接失败，不会悄悄退回默认来源——
+    打错一个字就发出另一个内核的包，是最不该靠猜的错误。
+
 .PARAMETER CoreDir
     已就位内核所在目录，默认依次看 target\release\core 和 core。
 
@@ -79,6 +91,7 @@ param(
     [switch]$SkipInstaller,
     [string]$IsccPath = "",
     [string]$CoreZip = "",
+    [string]$CoreSource = "",
     [string]$CoreDir = "",
     # 额外排除的插件 id。清单里没有的插件本来就不会进包，这里只是排查时临时少打一个；
     # 写了个不存在的 id 不报错（清单才是白名单），但会在输出里说一声。
@@ -99,6 +112,30 @@ function Fail {
 function Get-Sha256 {
     param([string]$Path)
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLower()
+}
+
+# 跑一条命令，退出码不为 0 就中止打包。脚本和原生 exe 都走这里。
+#
+# 失败有两种形态，两种都得接住：原生命令用退出码报错，只体现在 $LASTEXITCODE；
+# 脚本用 throw 报错，只体现在终止性错误上，那时 $LASTEXITCODE 还是 0。所以先清零
+# $LASTEXITCODE（子脚本成功时不会设置它，残留值或 $null 会让 `-ne 0` 把成功判成
+# 失败 —— CI run 45793075820 就是这么红的：fetch_plugins.ps1 明明成功），再把调用
+# 包进 try/catch，否则子脚本的 throw 会一路穿出打包流程。
+function Invoke-Native {
+    param(
+        [scriptblock]$Command,
+        [string]$What,
+        [string]$Hint = ""
+    )
+    $global:LASTEXITCODE = 0
+    try {
+        & $Command
+    } catch {
+        Fail "$What 失败：$($_.Exception.Message)。$Hint"
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Fail "$What 失败（退出码 $LASTEXITCODE）。$Hint"
+    }
 }
 
 function Resolve-RepoRoot {
@@ -221,19 +258,49 @@ $version = $workspaceVersion
 $numericVersion = Get-NumericVersion $version
 $outDirPath = [System.IO.Path]::GetFullPath($(if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path $repoRoot $OutDir }))
 $repoFull = [System.IO.Path]::GetFullPath($repoRoot)
-$stagingName = "RCGUI-$version-windows-x64-portable"
+
+# 清单在这一步就要读：产物名带不带来源后缀取决于是不是 default_source，
+# 而名字必须在下载和构建之前定下来，否则后面每条失败信息报的路径都和实际产物对不上。
+$coreManifestPath = Join-Path $repoRoot "packaging\core-manifest.json"
+if (-not (Test-Path -LiteralPath $coreManifestPath)) {
+    Fail "找不到 packaging\core-manifest.json。内核的固定哈希就在这个文件里，没有它没法核对。"
+}
+try {
+    $coreManifest = Get-Content -LiteralPath $coreManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+} catch {
+    Fail "packaging\core-manifest.json 解析失败：$($_.Exception.Message)"
+}
+if ($coreManifest.schema_version -ne 2) {
+    Fail "core-manifest.json 的 schema_version 应为 2，实际是 $($coreManifest.schema_version)。"
+}
+if (-not $coreManifest.sources) { Fail "core-manifest.json 里没有 sources 段。" }
+$sourceKeys = @($coreManifest.sources.PSObject.Properties.Name)
+$defaultSource = $coreManifest.default_source
+if (-not $defaultSource -or $sourceKeys -notcontains $defaultSource) {
+    Fail "core-manifest.json 的 default_source 是 '$defaultSource'，但 sources 里只有：$($sourceKeys -join ', ')。"
+}
+$sourceKey = if ($CoreSource) { $CoreSource } else { $defaultSource }
+if ($sourceKeys -notcontains $sourceKey) {
+    Fail "没有名为 '$sourceKey' 的内核来源。可选：$($sourceKeys -join ', ')。"
+}
+
+# 非默认来源的产物名带 -<来源>。两个用途：同一次版本能并排打出两个来源的包而不互相覆盖；
+# upstream 的包不可能被当成默认（增强版）包发出去。
+$artifactSuffix = if ($sourceKey -ne $defaultSource) { "-$sourceKey" } else { "" }
+$stagingName = "RCGUI-$version-windows-x64-portable$artifactSuffix"
 $stagingDir = Join-Path $outDirPath $stagingName
 $zipPath = Join-Path $outDirPath "$stagingName.zip"
-$setupPath = Join-Path $outDirPath "RCGUI-$version-windows-x64-setup.exe"
-$sumsPath = Join-Path $outDirPath "SHA256SUMS"
+$setupPath = Join-Path $outDirPath "RCGUI-$version-windows-x64-setup$artifactSuffix.exe"
+# 校验和文件同理：两个来源都往 dist 打时，后跑的不能把前一个的 SHA256SUMS 覆盖掉。
+$sumsName = if ($artifactSuffix) { "SHA256SUMS$artifactSuffix" } else { "SHA256SUMS" }
+$sumsPath = Join-Path $outDirPath $sumsName
 
-Write-Step "版本 $version（数字版本 $numericVersion），产物目录 $outDirPath"
+Write-Step "版本 $version（数字版本 $numericVersion），内核来源 $sourceKey，产物目录 $outDirPath"
 
 # ---- 1. 插件：按清单下载并校验 ----
 if (-not $SkipPlugins) {
     Write-Step "取插件（按 plugins/manifest.json 固定版本，sha256 必须匹配）"
-    & (Join-Path $repoRoot "scripts\fetch_plugins.ps1")
-    if ($LASTEXITCODE -ne 0) { Fail "fetch_plugins.ps1 失败（退出码 $LASTEXITCODE）。插件哈希对不上时不会继续打包。" }
+    Invoke-Native { & (Join-Path $repoRoot "scripts\fetch_plugins.ps1") } "fetch_plugins.ps1" "插件哈希对不上时不会继续打包。"
 }
 
 # ---- 2. 构建 ----
@@ -247,8 +314,7 @@ if (-not $SkipBuild) {
     }
     if (-not $cargo) { Fail "找不到 cargo。先装 Rust 工具链，或把 %USERPROFILE%\.cargo\bin 加进 PATH。" }
 
-    & cargo build -p rclone-gui --release
-    if ($LASTEXITCODE -ne 0) { Fail "cargo build --release 失败（退出码 $LASTEXITCODE）。" }
+    Invoke-Native { & cargo build -p rclone-gui --release } "cargo build --release"
 }
 
 $exeSource = Join-Path $repoRoot "target\release\rclone-gui.exe"
@@ -266,10 +332,9 @@ $coreCandidates += (Join-Path $repoRoot "core")
 
 if (-not $SkipCore) {
     Write-Step "取 rclone 内核（固定版本 + sha256 校验）"
-    $fetchArgs = @{ Dest = "target\release\core" }
+    $fetchArgs = @{ Dest = "target\release\core"; Source = $sourceKey }
     if ($CoreZip) { $fetchArgs["LocalZip"] = $CoreZip }
-    & (Join-Path $repoRoot "scripts\fetch_core.ps1") @fetchArgs
-    if ($LASTEXITCODE -ne 0) { Fail "fetch_core.ps1 失败（退出码 $LASTEXITCODE）。内核没通过校验，不要打包。" }
+    Invoke-Native { & (Join-Path $repoRoot "scripts\fetch_core.ps1") @fetchArgs } "fetch_core.ps1" "内核没通过校验，不要打包。"
 }
 
 $coreDirPath = $null
@@ -292,20 +357,11 @@ Write-Host "    内核目录：$coreDirPath" -ForegroundColor DarkGray
 
 # ---- 3b. 内核内容核对：以固定清单为准，不拿 marker 自报的哈希当依据 ----
 # 这一步对 -SkipCore 同样生效：跳过的是下载，不是校验。
-Write-Step "核对内核内容与固定清单"
-$coreManifestPath = Join-Path $repoRoot "packaging\core-manifest.json"
-if (-not (Test-Path -LiteralPath $coreManifestPath)) {
-    Fail "找不到 packaging\core-manifest.json。内核的固定哈希就在这个文件里，没有它没法核对。"
-}
-try {
-    $coreManifest = Get-Content -LiteralPath $coreManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-} catch {
-    Fail "packaging\core-manifest.json 解析失败：$($_.Exception.Message)"
-}
-$pinned = $coreManifest.core
-if (-not $pinned) { Fail "core-manifest.json 里没有 core 段。" }
+Write-Step "核对内核内容与固定清单（来源 $sourceKey）"
+$pinned = $coreManifest.sources.PSObject.Properties[$sourceKey].Value
+if (-not $pinned) { Fail "core-manifest.json 的 sources.$sourceKey 是空的。" }
 foreach ($field in @("version", "exe_sha256", "license_sha256")) {
-    if (-not $pinned.$field) { Fail "core-manifest.json 缺少 core.$field，无法核对内核。" }
+    if (-not $pinned.$field) { Fail "core-manifest.json 缺少 sources.$sourceKey.$field，无法核对内核。" }
 }
 
 # marker 只用来确认这份内核确实是 fetch_core 按这个清单取下来的；
@@ -328,6 +384,10 @@ try {
 }
 if ($coreMeta.version -ne $pinned.version) {
     Fail "内核记录的版本是 $($coreMeta.version)，清单固定的是 $($pinned.version)。换了内核就要同步更新 manifest。"
+}
+# 版本号撞车是可能的（两个 fork 都叫 v1.76.0 的衍生版），来源键才是"哪一份内核"的正身。
+if ($coreMeta.source_key -ne $sourceKey) {
+    Fail "内核目录里的内核来自来源 '$($coreMeta.source_key)'，这次要打的是 '$sourceKey'。先跑 fetch_core.ps1 -Source $sourceKey 换内核，或改用 -CoreDir 指到对应来源的目录。"
 }
 if ($coreMeta.exe_sha256 -ne $pinned.exe_sha256) {
     Fail "内核记录里的 exe_sha256 与清单不符：记录 $($coreMeta.exe_sha256)，清单 $($pinned.exe_sha256)。"
@@ -521,10 +581,11 @@ $notice = @(
     "",
     "第三方组件：",
     "  rclone   MIT 许可，全文见 core\rclone-COPYING.txt。",
+    "           本次打的是 $sourceKey 来源（$($pinned.project) $($pinned.version)），许可证两份内容相同。",
     "  插件     各自仓库与版本见 assets\plugins\<id>\config.json；随包插件清单见仓库 plugins\manifest.json。",
     "",
     "本程序（RCGUI）尚未声明项目许可证，见仓库根目录的说明。",
-    "校验：同目录 SHA256SUMS 记录了两个发布文件的 sha256，发布页给出同一份。"
+    "校验：dist 目录里的 $sumsName 记录了两个发布文件的 sha256，发布页给出同一份。"
 ) -join "`r`n"
 [System.IO.File]::WriteAllText((Join-Path $stagingDir "licenses\NOTICE.txt"), $notice, (New-Object System.Text.UTF8Encoding($false)))
 
@@ -576,7 +637,7 @@ if (-not $SkipInstaller) {
 找不到 ISCC.exe（Inno Setup 6 的编译器）。装 Inno Setup 6 之后重跑，或者：
   - 只想出 portable zip：加 -SkipInstaller
   - 自己指定编译器：-IsccPath "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-CI 上由 .github\workflows\release.yml 装好 Inno Setup 再调用，本地没装是正常的。
+GitHub 的 windows 运行器预装了 Inno Setup 6，CI 上不需要额外安装；本地没装是正常的，装到默认位置后本脚本会自动找到。
 "@
     }
     $iss = Join-Path $repoRoot "packaging\RCGUI.iss"
@@ -598,9 +659,11 @@ CI 上由 .github\workflows\release.yml 装好 Inno Setup 再调用，本地没�
 
     # 两个版本号分开传：AppVersion 给人看（可以是 0.3.0-rc.1），
     # AppVersionNumeric 只给 PE 版本资源，必须是纯数字。
+    # ArtifactSuffix 让安装包的输出名跟着 portable 一起带来源后缀，两者永远同进同出。
     $isccArgs = @(
         "/DAppVersion=$version"
         "/DAppVersionNumeric=$numericVersion"
+        "/DArtifactSuffix=$artifactSuffix"
         "/DSourceDir=$stagingDir"
         "/DOutputDir=$outDirPath"
         "/Qp"
@@ -612,8 +675,7 @@ CI 上由 .github\workflows\release.yml 装好 Inno Setup 再调用，本地没�
         Write-Host "          想装中文向导：把中文语言文件放到 packaging\languages\ChineseSimplified.isl 再打包" -ForegroundColor DarkGray
     }
     $isccArgs += $iss
-    & $iscc @isccArgs
-    if ($LASTEXITCODE -ne 0) { Fail "ISCC 失败（退出码 $LASTEXITCODE）。" }
+    Invoke-Native { & $iscc @isccArgs } "ISCC"
     if (-not (Test-Path -LiteralPath $setupPath)) {
         Fail "ISCC 退出码 0，但没有生成 $setupPath。检查 RCGUI.iss 的 OutputBaseFilename。"
     }
@@ -621,11 +683,11 @@ CI 上由 .github\workflows\release.yml 装好 Inno Setup 再调用，本地没�
     Write-Host "    跳过安装包（-SkipInstaller），这次只有 portable zip" -ForegroundColor Yellow
 }
 
-Write-Step "写 SHA256SUMS"
+Write-Step "写 $sumsName"
 $artifactNames = @()
 if (Test-Path -LiteralPath $setupPath) { $artifactNames += (Split-Path -Leaf $setupPath) }
 if (Test-Path -LiteralPath $zipPath) { $artifactNames += (Split-Path -Leaf $zipPath) }
-if ($artifactNames.Count -eq 0) { Fail "没有生成任何产物，SHA256SUMS 无从写起。" }
+if ($artifactNames.Count -eq 0) { Fail "没有生成任何产物，$sumsName 无从写起。" }
 
 $lines = @()
 foreach ($name in ($artifactNames | Sort-Object)) {
@@ -655,3 +717,6 @@ if ($SkipInstaller) { $usedSkips += "-SkipInstaller" }
 if ($usedSkips.Count -gt 0) {
     Write-Host ("    注意：这次用了 {0}。跳过的只是下载或编译，插件与内核仍然逐项校验过；但产物可能不全，发布流水线不用这些开关。" -f ($usedSkips -join " ")) -ForegroundColor Yellow
 }
+
+# 成功也必须显式 exit 0。CI 里这一步的成败只看退出码，而脚本自然结束不会设置它。
+exit 0

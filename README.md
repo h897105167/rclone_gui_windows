@@ -73,6 +73,7 @@ RCGUI-<version>-windows-x64-portable.zip   # portable
 
 - **Setup** installs per user by default — under `%LOCALAPPDATA%\Programs\RCGUI` — and asks for elevation only if you choose a location that needs it. Your data lives in `%APPDATA%\RCGUI` and is never overwritten by an upgrade: an uninstall leaves it in place.
 - **Portable**: unzip anywhere and run the exe next to an empty file named `portable`. The archive contains `rclone-gui.exe`, the pinned `core\rclone.exe`, the plugins that ship with the app, and a `licenses\` folder. Data then goes to `data\` beside the exe.
+- Both ship the **enhanced** rclone core by default: [gulp79/rclone-extra](https://github.com/gulp79/rclone-extra) at `v1.76.0-extra`, a fork of rclone v1.76.0 that adds backends upstream does not have (alist, alldebrid, teldrive, terabox). `core\.fetched.json` inside the package records which source was used and its SHA-256. Builds from plain upstream rclone are still possible and are named with an `-upstream` suffix, so the two can never be confused.
 - Both carry `SHA256SUMS` and the third-party license files (`licenses\`), including rclone's MIT `COPYING`. Download the checksums from the same Release page and compare before running.
 
 **The 0.3.0 assets do not exist yet** — these filenames are the contract the release workflow implements, not links. The only published release is [v0.2.1](https://github.com/h897105167/rclone_gui_windows/releases/tag/v0.2.1), whose asset predates the scheme and is named `rclone-gui-v0.2.1-windows-amd64.zip`.
@@ -85,7 +86,7 @@ cd rclone_gui_windows
 .\scripts\build.ps1 -Release
 ```
 
-`build.ps1` does three things in order: fetches the pinned plugin archives into `crates\app\assets\plugins\`, verifies each SHA-256 against `plugins/manifest.json`, then fetches the pinned rclone release into `target\release\core\` (that is the "core" — the `rclone.exe` the app manages itself), and finally builds the workspace. It prints the path of `target\release\rclone-gui.exe`. `-SkipPlugins` builds without touching the plugin cache, `-SkipCore` leaves `core\rclone.exe` out (the app then only has external endpoints to talk to), `-CoreZip <path>` uses a local rclone archive instead of downloading, and `-Run` launches the result.
+`build.ps1` does three things in order: fetches the pinned plugin archives into `crates\app\assets\plugins\`, verifies each SHA-256 against `plugins/manifest.json`, then fetches the pinned rclone release into `target\release\core\` (that is the "core" — the `rclone.exe` the app manages itself), and finally builds the workspace. It prints the path of `target\release\rclone-gui.exe`. `-SkipPlugins` builds without touching the plugin cache, `-SkipCore` leaves `core\rclone.exe` out (the app then only has external endpoints to talk to), `-CoreZip <path>` uses a local rclone archive instead of downloading, `-CoreSource upstream` fetches plain upstream rclone instead of the default enhanced fork, and `-Run` launches the result.
 
 Packaging (`.\scripts\build-release.ps1`) refuses to run if the core or its `COPYING` is missing, so a release can never ship rclone without its license.
 

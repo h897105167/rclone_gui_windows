@@ -4788,6 +4788,8 @@ struct ConnView {
     /// 裸地址（仪表盘用）
     endpoint_url: String,
     version: String,
+    /// 当前端点是不是我们自己拉起的托管内核（仪表盘据此显示「托管 / 外部」）
+    managed: bool,
     config_path: String,
     last_refresh: String,
     /// 失败原因，或「已连接但有告警」的说明
@@ -4835,6 +4837,14 @@ fn apply_conn_view(ui: &Weak<MainWindow>, v: ConnView) {
         let d = ui.global::<DashboardG>();
         d.set_running(v.live);
         d.set_stale(v.stale);
+        // 连接身份（地址/版本/托管）以前只在启动时写一次，换内核后就一直显示旧端口。
+        // 这里每次投影都重写：谁最后知道真实端点，顶栏和连接卡就跟着谁走。
+        d.set_url(v.endpoint_url.as_str().into());
+        d.set_managed(v.managed);
+        if !v.version.is_empty() {
+            // 离线/失败快照里版本是空的，别用它清掉上次握手拿到的版本号
+            d.set_version(v.version.as_str().into());
+        }
     });
 }
 
@@ -4848,6 +4858,7 @@ async fn snapshot_view(ctx: &Arc<Ctx>) -> ConnView {
         stale: status == ConnStatus::Stale,
         endpoint: ep.display(),
         endpoint_url: ep.url.clone(),
+        managed: ctx.maint.core.is_running(),
         error: ctx.rc.last_error().await.unwrap_or_default(),
         last_refresh: now_hms(),
         ..Default::default()
@@ -13412,5 +13423,27 @@ mod tests {
         let p = edit_single_choice("s3", &[]);
         assert_eq!(p.backend, "s3");
         assert!(!p.derived);
+    }
+
+    /// 顶栏与连接卡的地址/版本/托管标记只由 `apply_conn_view` 投影写入。
+    ///
+    /// 换内核（新进程、新端口、新口令）后，启动时那段一次性赋值再也不会跑，
+    /// 所以这里少了哪个 setter，界面就会长期显示上一代内核的端口和版本。
+    /// 直接读真实源码：Slint 全局属性在无窗口的测试进程里建不出来。
+    #[test]
+    fn apply_conn_view_rewrites_the_dashboard_identity() {
+        let src = include_str!("main.rs");
+        let start = src
+            .find("fn apply_conn_view(")
+            .expect("apply_conn_view 必须存在");
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").expect("函数必须有结尾");
+        let body = &rest[..end];
+        for setter in ["set_url", "set_managed", "set_version"] {
+            assert!(
+                body.contains(setter),
+                "apply_conn_view 必须写 DashboardG.{setter}，否则换内核后顶栏/连接卡继续显示旧端口与旧版本"
+            );
+        }
     }
 }

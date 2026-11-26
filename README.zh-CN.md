@@ -74,6 +74,7 @@ RCGUI-<version>-windows-x64-portable.zip   # 便携版
 - **安装包**默认按用户安装，装到 `%LOCALAPPDATA%\Programs\RCGUI`，只有当你选了一个需要管理员权限的目录时才会请求提权。数据在 `%APPDATA%\RCGUI`，升级从不覆盖它；卸载也会把它留下。
 - **便携版**：解压到任意目录，在与 exe 同级放一个名为 `portable` 的空文件，然后运行。压缩包里是 `rclone-gui.exe`、固定版本的 `core\rclone.exe`、随应用发布的插件，以及 `licenses\`。此时数据写到 exe 旁边的 `data\`。
 - 两者都带 `SHA256SUMS` 与第三方许可证（`licenses\`，含 rclone 的 MIT `COPYING`）。请从同一个 Release 页面下载校验文件，运行前先比对。
+- 两者默认带的是**增强版** rclone 内核：[gulp79/rclone-extra](https://github.com/gulp79/rclone-extra) 的 `v1.76.0-extra`，它是 rclone v1.76.0 的分支，补了原版没有的后端（alist、alldebrid、teldrive、terabox）。包里的 `core\.fetched.json` 记着这次用的是哪个来源、哈希是多少。用原版 rclone 构建依然可以，产物名带 `-upstream` 后缀，两者不会混。
 
 **0.3.0 的产物现在还不存在**——上面是发布流程要实现的契约，不是链接。唯一已发布的版本是 [v0.2.1](https://github.com/h897105167/rclone_gui_windows/releases/tag/v0.2.1)，那个产物的命名早于本方案，叫 `rclone-gui-v0.2.1-windows-amd64.zip`。
 
@@ -85,7 +86,7 @@ cd rclone_gui_windows
 .\scripts\build.ps1 -Release
 ```
 
-`build.ps1` 依次做三件事：按 `plugins/manifest.json` 把插件包拉进 `crates\app\assets\plugins\` 并逐个核对 SHA-256；按 `packaging/core-manifest.json` 把固定版本的 rclone 取到 `target\release\core\`（这就是"内核"，程序自己管理的那个 `rclone.exe`）；然后构建 workspace，最后打印 `target\release\rclone-gui.exe` 的路径。`-SkipPlugins` 不碰插件缓存，`-SkipCore` 不放内核（那样程序只剩外部端点可连），`-CoreZip <路径>` 用本地已经下好的 rclone 压缩包代替下载，`-Run` 构建完直接启动。
+`build.ps1` 依次做三件事：按 `plugins/manifest.json` 把插件包拉进 `crates\app\assets\plugins\` 并逐个核对 SHA-256；按 `packaging/core-manifest.json` 把固定版本的 rclone 取到 `target\release\core\`（这就是"内核"，程序自己管理的那个 `rclone.exe`）；然后构建 workspace，最后打印 `target\release\rclone-gui.exe` 的路径。`-SkipPlugins` 不碰插件缓存，`-SkipCore` 不放内核（那样程序只剩外部端点可连），`-CoreZip <路径>` 用本地已经下好的 rclone 压缩包代替下载，`-CoreSource upstream` 改成取原版 rclone 而不是默认的增强版分支，`-Run` 构建完直接启动。
 
 打包脚本（`.\scripts\build-release.ps1`）在内核或缺它的 `COPYING` 时会直接中止，所以发布出来的包不会出现"带了 rclone 却没带许可证"。
 

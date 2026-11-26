@@ -67,6 +67,12 @@ jobs:
       - name: 取插件
         run: ./scripts/fetch_plugins.ps1
 
+      # 内核清单的结构检查：不联网、不下载，只核对每个来源的字段是否齐全、
+      # 哈希是不是 64 位十六进制、URL 是否落在自己声明的前缀里。
+      # 放在这里是为了让"清单写坏了"在几分钟内就红，而不是等到打包阶段才发现。
+      - name: 检查内核清单
+        run: ./scripts/fetch_core.ps1 -CheckManifest
+
       - name: cargo check
         run: cargo check --workspace --all-targets
 
@@ -112,6 +118,8 @@ jobs:
           Get-Content dist\SHA256SUMS
           Get-ChildItem dist | Select-Object Name, Length
           Get-ChildItem dist\RCGUI-*-windows-x64-portable\assets\plugins | Select-Object Name
+          # 打的是哪个内核来源，直接看这份记录：默认来源（增强版）时 source_key 是 extra。
+          Get-Content dist\RCGUI-*-windows-x64-portable\core\.fetched.json
 
       - uses: actions/upload-artifact@v4
         with:

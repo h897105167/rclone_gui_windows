@@ -658,6 +658,9 @@ export global MaintenanceG {
     in-out property <string> core-mode: "managed";
     /// 内核可执行文件路径。留空表示用随包内置的那个；填了就用填的那个。
     in-out property <string> core-path: "";
+    /// 下载渠道："extra" = 增强版（gulp79/rclone-extra，默认）/ "official" = 原版。
+    /// 只决定「以后下载哪个」，不改已经装好的内核；切换后要重启内核才生效。
+    in-out property <string> core-flavor: "extra";
     /// 内核状态一行话：未检测 / 已停止 / 运行中 :5572 / 启动失败：<原因>
     in-out property <string> core-status: "";
     in-out property <string> update-status: "";
@@ -5567,12 +5570,45 @@ component SettingsView inherits Rectangle {
                                 disabled: MaintenanceG.busy;
                                 clicked => { root.maintenance-action("core-save", ""); }
                             }
+                            // 填了路径时「安装 / 更新内核」会拒绝替换：这个按钮把路径收进备选
+                            // 并切回托管，原 exe 留在原处不动。
+                            if MaintenanceG.core-path != "" : PillBtn {
+                                label: @tr("改用托管内核");
+                                compact: true;
+                                disabled: MaintenanceG.busy;
+                                clicked => { root.maintenance-action("core-adopt-managed", ""); }
+                            }
                         }
                         Text {
-                            text: @tr("可选择已安装的 rclone；使用 Teldrive 时请选择支持该类型的内核。");
+                            text: @tr("可选择已安装的 rclone；使用 Teldrive 时请选择支持该类型的内核。填了路径就优先用它，想换成下载的版本点「改用托管内核」——原文件会保留。");
                             font-size: 12px;
                             color: ThemeG.text-dim;
                             wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            height: 32px;
+                            FieldLabel { text: @tr("渠道"); width: 70px; vertical-alignment: center; }
+                            PillBtn {
+                                label: @tr("增强版");
+                                primary: MaintenanceG.core-flavor == "extra";
+                                disabled: MaintenanceG.busy;
+                                clicked => { root.maintenance-action("core-flavor", "extra"); }
+                            }
+                            PillBtn {
+                                label: @tr("原版");
+                                primary: MaintenanceG.core-flavor == "official";
+                                disabled: MaintenanceG.busy;
+                                clicked => { root.maintenance-action("core-flavor", "official"); }
+                            }
+                            Text {
+                                text: @tr("增强版来自 gulp79/rclone-extra，带 fork 专属后端；原版取 rclone 官方发布。");
+                                font-size: 12px;
+                                color: ThemeG.text-dim;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Rectangle {}
                         }
                     }
                     Rectangle { height: 1px; background: ThemeG.border; }
@@ -5593,6 +5629,11 @@ component SettingsView inherits Rectangle {
                         spacing: 8px;
                         height: 32px;
                         PillBtn { label: @tr("检测"); disabled: MaintenanceG.busy; clicked => { root.maintenance-action("core-detect", ""); } }
+                        PillBtn {
+                            label: @tr("检查更新");
+                            disabled: MaintenanceG.busy;
+                            clicked => { root.maintenance-action("core-check", ""); }
+                        }
                         PillBtn {
                             label: @tr("安装 / 更新内核");
                             primary: true;

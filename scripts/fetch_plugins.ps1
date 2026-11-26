@@ -1,4 +1,4 @@
-﻿# 按 plugins/manifest.json 下载并校验插件包，解到 crates/app/assets/plugins/<dir>/
+# 按 plugins/manifest.json 下载并校验插件包，解到 crates/app/assets/plugins/<dir>/
 #
 # 本仓库**不存**插件源码：每个插件是独立仓库，Release 里挂打包好的 zip。
 # 这个脚本负责「锁文件 → 本地资产」这一步，构建前跑一次即可。
@@ -184,3 +184,8 @@ if ($failed.Count -gt 0) {
 
 Write-Host ""
 Write-Host "插件资产已就绪：$destRoot" -ForegroundColor Green
+
+# 成功也必须显式 exit 0。调用方（build-release.ps1 的 Invoke-Native、GitHub 的 pwsh 壳）
+# 只看退出码；脚本自然结束时 PowerShell 不会设置它，读到的要么是上一条原生命令留下的
+# 旧值，要么干脆不存在——两种情况都会把这次成功报成失败。
+exit 0

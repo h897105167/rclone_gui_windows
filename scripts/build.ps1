@@ -1,4 +1,4 @@
-﻿# 构建 RCGUI（Windows）
+# 构建 RCGUI（Windows）
 #
 # 三步，顺序有依赖：插件资产 → 内核 → 编本体。
 #   1. 插件资产 = crates/app/assets/plugins/<id>/（config.json + main.wasm + check.sha256），
@@ -8,6 +8,8 @@
 #      packaging/core-manifest.json 的固定版本下载并校验 sha256（连 MIT 许可证全文一起取）。
 #      放在 target 下是为了让 target/<profile>/rclone-gui.exe 和发布包长得一样：
 #      程序按 <exe>/core/rclone.exe 找内核，找不到才去别处找，所以开发时也能验证受管内核这条路。
+#      默认来源是清单的 default_source（增强版 rclone-extra，多出 alist、alldebrid 这些后端）；
+#      想用官方原版加 -CoreSource upstream。
 #   3. 应用本体。
 #
 # 随包插件在 exe 同级的 assets/plugins（程序只认这个位置）；首次运行会把它们释放到
@@ -23,6 +25,7 @@
 #   .\scripts\build.ps1 -SkipPlugins     # 不下载插件（资产缺失会警告；打包时仍会逐项校验）
 #   .\scripts\build.ps1 -SkipCore        # 不下载内核（本地已有别的内核位置时可跳过）
 #   .\scripts\build.ps1 -CoreZip <zip>   # 用手头的内核 zip（仍会校验 sha256）
+#   .\scripts\build.ps1 -CoreSource upstream  # 换成官方原版内核（默认是增强版）
 
 param(
     [switch]$Release,
@@ -30,7 +33,8 @@ param(
     [switch]$SkipPlugins,
     [switch]$ForcePlugins,
     [switch]$SkipCore,
-    [string]$CoreZip = ""
+    [string]$CoreZip = "",
+    [string]$CoreSource = ""
 )
 
 # 注意：这里**不能**设 $ErrorActionPreference = "Stop"。
@@ -43,7 +47,12 @@ function Invoke-Native {
     # 先清零：子脚本成功时只写 Write-Host，不会设置 $LASTEXITCODE，
     # 残留值或 $null 会让 `$LASTEXITCODE -ne 0` 把成功误判成失败。
     $global:LASTEXITCODE = 0
-    & $Command
+    try {
+        & $Command
+    } catch {
+        # 子脚本用 throw 报错时 $LASTEXITCODE 仍是 0，只有这里看得见。
+        throw "$What 失败：$($_.Exception.Message)"
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "$What 失败（退出码 $LASTEXITCODE）"
     }
@@ -87,6 +96,7 @@ if ($SkipCore) {
     $fetchCore = Join-Path $PSScriptRoot "fetch_core.ps1"
     $coreArgs = @{ Dest = "target\$profileDir\core" }
     if ($CoreZip) { $coreArgs["LocalZip"] = $CoreZip }
+    if ($CoreSource) { $coreArgs["Source"] = $CoreSource }
     Invoke-Native { & $fetchCore @coreArgs } "内核准备"
 }
 
@@ -101,6 +111,17 @@ Write-Host "    体积：$([Math]::Round((Get-Item $exe).Length / 1MB, 1)) MB" -
 $coreExe = Join-Path $coreDir "rclone.exe"
 if (Test-Path $coreExe) {
     Write-Host "    内核：$coreExe" -ForegroundColor Green
+    # 打印来源与版本：开发机上 target/ 里经常同时躺着原版和增强版内核，
+    # 光看路径分不出这次编出来的 exe 会用哪一个。
+    $coreMarker = Join-Path $coreDir ".fetched.json"
+    if (Test-Path $coreMarker) {
+        try {
+            $m = Get-Content -LiteralPath $coreMarker -Raw -Encoding UTF8 | ConvertFrom-Json
+            Write-Host "    来源：$($m.source_key)  $($m.version_output)" -ForegroundColor Green
+        } catch {
+            Write-Host "    警告：$coreMarker 读不出来，无法显示内核来源" -ForegroundColor Yellow
+        }
+    }
 } else {
     Write-Host "    提示：exe 同级没有 core/rclone.exe，这次跑起来只能用外部端点（加不上 -SkipCore 重跑即可取内核）" -ForegroundColor Yellow
 }
@@ -114,5 +135,10 @@ if (Test-Path $assets) {
 
 if ($Run) {
     Write-Host "`n==> 启动 rclone-gui..." -ForegroundColor Cyan
+    # 前台等 GUI 退出，并把它的退出码当成这次构建脚本的结果。
     & $exe
+    exit $LASTEXITCODE
 }
+
+# 成功也必须显式 exit 0。CI 里这一步的成败只看退出码，而脚本自然结束不会设置它。
+exit 0

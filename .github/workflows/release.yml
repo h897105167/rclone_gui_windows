@@ -191,7 +191,21 @@ jobs:
           # 内核标记跟着产物走：fetch_core 现在把内核放进 target\release\core，
           # 打包时随 core\ 一起进了 portable 目录。读这里才读得到本次实际用的内核。
           $core = Get-Content -LiteralPath "$staging\core\.fetched.json" -Raw | ConvertFrom-Json
-          Write-Host "内核：rclone $($core.version)  exe sha256 $($core.exe_sha256)"
+          Write-Host "内核：rclone $($core.version)（来源 $($core.source_key)）  exe sha256 $($core.exe_sha256)"
+
+          # 发布件必须是清单的默认来源（增强版）。上面那几个产物名是不带后缀的固定名，
+          # 带后缀的包本来就会在这里判缺；这条断言防的是另一种情况：
+          # 默认来源被改成 upstream 之后，发出去的包名照旧，但内核悄悄换了。
+          $coreManifest = Get-Content -LiteralPath packaging\core-manifest.json -Raw | ConvertFrom-Json
+          if ($coreManifest.schema_version -ne 2) { throw "core-manifest.json 的 schema_version 应为 2，实际是 $($coreManifest.schema_version)。" }
+          $defaultSource = $coreManifest.default_source
+          if ($core.source_key -ne $defaultSource) {
+            throw "这次打出来的内核来源是 '$($core.source_key)'，清单默认来源是 '$defaultSource'。发布件只发默认来源，换来源请单独出包并改清单。"
+          }
+          $pinnedCore = $coreManifest.sources.PSObject.Properties[$defaultSource].Value
+          if ($core.exe_sha256 -ne $pinnedCore.exe_sha256) {
+            throw "内核 exe sha256 是 $($core.exe_sha256)，清单钉的是 $($pinnedCore.exe_sha256)。"
+          }
 
       - name: 汇总
         shell: pwsh
@@ -200,7 +214,7 @@ jobs:
           $core = Get-Content -LiteralPath "dist\RCGUI-$version-windows-x64-portable\core\.fetched.json" -Raw | ConvertFrom-Json
           "## RCGUI $version" >> $env:GITHUB_STEP_SUMMARY
           "" >> $env:GITHUB_STEP_SUMMARY
-          "- rclone 内核：$($core.version)（$($core.asset_name)，sha256 $($core.asset_sha256)）" >> $env:GITHUB_STEP_SUMMARY
+          "- rclone 内核：$($core.version)（来源 $($core.source_key)，$($core.asset_name)，sha256 $($core.asset_sha256)）" >> $env:GITHUB_STEP_SUMMARY
           "" >> $env:GITHUB_STEP_SUMMARY
           '```' >> $env:GITHUB_STEP_SUMMARY
           Get-Content -LiteralPath dist\SHA256SUMS >> $env:GITHUB_STEP_SUMMARY
