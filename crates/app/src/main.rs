@@ -13261,7 +13261,9 @@ mod tests {
             "Cmd::FilesDownloadMany { items, dir } => {",
             "Cmd::FilesMoveList { path, seq } => {",
             "Cmd::MountAdd => {",
-            "Cmd::ServeAdd => {",
+            // 服务只有 ServeStart/ServeStop 两个分支，没有 ServeAdd：
+            // 标记写错名字会让这里 `找不到命令分支` 直接 panic，而不是静默少查一条。
+            "Cmd::ServeStart => {",
             "Cmd::RemoteEditLoad { name } => {",
             "Cmd::RemoteSave => {",
         ] {
@@ -13274,6 +13276,37 @@ mod tests {
             assert!(
                 rest[..end].contains("kv_access_blocked("),
                 "{marker} 没有问 kv_access_blocked：插件不在时这个入口就是旁路"
+            );
+        }
+
+        // 光有闸门不够，顺序也要对：闸门写在真正动手之后，用户看到的就是
+        // 「先报了错、可东西已经发出去了」。这里挑几处能一眼认出「动手」的位置
+        // 对一下先后，剩下的入口靠上面的存在性检查兜底。
+        for (marker, op) in [
+            ("Cmd::MountAdd => {", "client.mount("),
+            ("Cmd::ServeStart => {", "client.serve_start("),
+            (
+                "Cmd::FilesDownload { name, local } => {",
+                "client.copyfile(",
+            ),
+            ("Cmd::FilesMoveList { path, seq } => {", "client.list("),
+            ("Cmd::RemoteEditLoad { name } => {", "client.config_dump("),
+        ] {
+            let start = prod
+                .find(marker)
+                .unwrap_or_else(|| panic!("找不到命令分支 {marker}，是不是改名了"));
+            let rest = &prod[start..];
+            let end = rest.find("\n        Cmd::").unwrap_or(rest.len());
+            let body = &rest[..end];
+            let gate_at = body
+                .find("kv_access_blocked(")
+                .unwrap_or_else(|| panic!("{marker} 里没有 kv_access_blocked"));
+            let op_at = body
+                .find(op)
+                .unwrap_or_else(|| panic!("{marker} 里找不到 {op}，标记该更新了"));
+            assert!(
+                gate_at < op_at,
+                "{marker} 先调 {op} 才问闸门：插件不在时这一下已经打到远程上了"
             );
         }
 

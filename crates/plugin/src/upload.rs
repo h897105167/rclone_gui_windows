@@ -70,6 +70,21 @@ fn state() -> &'static State {
     })
 }
 
+/// 测试专用：把进程级单例清回初始状态。
+///
+/// `busy` 的语义是「整个进程同一时刻只跑一个上传」，而 `cargo test` 默认多线程：
+/// 两个测试同时进 `upload()`，后一个会被前一个占着的 `busy` 挡下，报
+/// `UPLOAD_BUSY`。那是测试互相干扰，不是被测代码错了，所以每个碰 `upload()`
+/// 的测试开始前都清一次，并在 [`tests::gate`] 后面排队。
+#[cfg(test)]
+fn reset_for_test() {
+    let s = state();
+    s.grants.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    s.live.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    s.busy.store(false, Ordering::SeqCst);
+    s.seq.store(0, Ordering::SeqCst);
+}
+
 /// 记下一次用户挑选。`plugin` 来自宿主注入的 `_plugin`，不是插件自己说的。
 ///
 /// 同一 `(plugin, form_key)` 只保留最新一次；同一栏再挑一次就是替换。
@@ -801,6 +816,23 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
+    /// 碰 `upload()` 的测试在这把锁后面排队，进去之前先把进程级状态清干净。
+    ///
+    /// 上传「同一时刻只许一个」是产品行为，不是缺陷：见
+    /// `refuses_a_second_upload_while_one_is_running`，那条测试专门去撞这道门。
+    /// 这把锁管的是另一件事——`cargo test` 默认多线程，两个测试同时进
+    /// `upload()` 时，后一个会被前一个占着的 `busy` 挡下，报一个与它自己无关的
+    /// `UPLOAD_BUSY`。只有碰 `upload()` 的测试排队，模块里其他测试照旧并行，
+    /// 也没有动 `--test-threads`。
+    static UPLOAD_GATE: Mutex<()> = Mutex::new(());
+
+    fn gate() -> std::sync::MutexGuard<'static, ()> {
+        // 上一个测试 panic 会让锁中毒，但状态已经清过，接着用不影响判断
+        let held = UPLOAD_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        super::reset_for_test();
+        held
+    }
+
     /// 一个只回固定响应的最小 HTTP 服务器：记下收到的原始字节和连接次数。
     struct Fake {
         url: String,
@@ -925,6 +957,7 @@ mod tests {
 
     #[tokio::test]
     async fn uploads_fields_then_file_with_digest() {
+        let _gate = gate();
         let payload: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
         let server = fake(
             "200 OK",
@@ -995,6 +1028,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_without_grant_and_sends_nothing() {
+        let _gate = gate();
         let server = fake("200 OK", "", b"{}");
         let path = tmp_file("nogrant.bin", b"never sent");
         // 授权是别的插件、别的栏位的，不能用。
@@ -1011,6 +1045,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_oversized_file_and_sends_nothing() {
+        let _gate = gate();
         let server = fake("200 OK", "", b"{}");
         let payload = vec![7u8; 4096];
         let path = tmp_file("big.bin", &payload);
@@ -1030,6 +1065,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_headers_the_host_owns() {
+        let _gate = gate();
         let server = fake("200 OK", "", b"{}");
         let path = tmp_file("header.bin", b"x");
         grant("plug-d", "file", &path).unwrap();
@@ -1043,6 +1079,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_unknown_scheme_and_sends_nothing() {
+        let _gate = gate();
         let path = tmp_file("scheme.bin", b"x");
         grant("plug-e", "file", &path).unwrap();
 
@@ -1054,6 +1091,7 @@ mod tests {
 
     #[tokio::test]
     async fn does_not_follow_redirects() {
+        let _gate = gate();
         let server = fake(
             "302 Found",
             "Location: http://127.0.0.1:9/elsewhere\r\n",
@@ -1073,6 +1111,7 @@ mod tests {
 
     #[tokio::test]
     async fn truncates_a_huge_reply() {
+        let _gate = gate();
         let server = fake("200 OK", "", &vec![b'z'; 5000]);
         let path = tmp_file("reply.bin", b"x");
         grant("plug-g", "file", &path).unwrap();
@@ -1087,6 +1126,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_pick_authorises_one_send() {
+        let _gate = gate();
         let server = fake("200 OK", "", b"{}");
         let path = tmp_file("once.bin", b"x");
         grant("plug-h", "file", &path).unwrap();
@@ -1101,7 +1141,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refuses_a_second_upload_while_one_is_running() {
+        let _gate = gate();
+        let server = fake("200 OK", "", b"{}");
+        let path = tmp_file("busy.bin", b"payload");
+        grant("plug-busy", "file", &path).unwrap();
+
+        // 装成「另一个上传正占着」：拿到 `Busy` 就等于门是关着的。
+        let held = Busy::acquire().unwrap();
+        let err = upload("plug-busy", &params_for(&server.url))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("UPLOAD_BUSY"), "{}", err);
+        // 被拒的那次既没取走授权，也没碰网络。
+        assert_eq!(server.hits.load(Ordering::SeqCst), 0);
+        assert!(server.seen.lock().unwrap().is_empty());
+
+        // 门一开，同一次挑选还能用：说明上面那次没把授权吃掉。
+        drop(held);
+        let out = upload("plug-busy", &params_for(&server.url)).await.unwrap();
+        assert_eq!(out["status"], 200);
+        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn refuses_file_that_changed_after_the_pick() {
+        let _gate = gate();
         let server = fake("200 OK", "", b"{}");
         let path = tmp_file("changed.bin", b"original");
         grant("plug-i", "file", &path).unwrap();
