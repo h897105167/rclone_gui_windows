@@ -1209,7 +1209,10 @@ a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2 *bin/helper.exe
     fn stderr_excerpt_keeps_the_reason_on_one_line() {
         let raw = "C:\\p\\main.ps1 : 无法加载文件 C:\\p\\main.ps1，因为在此系统上禁止运行脚本。\r\n    + CategoryInfo : SecurityError\r\n";
         let got = stderr_excerpt(raw.as_bytes());
-        assert!(!got.contains('\n') && !got.contains('\r'), "应压成一行: {got}");
+        assert!(
+            !got.contains('\n') && !got.contains('\r'),
+            "应压成一行: {got}"
+        );
         assert!(got.contains("禁止运行脚本"), "应保留原话: {got}");
 
         // 没有输出时也不能给出空提示
