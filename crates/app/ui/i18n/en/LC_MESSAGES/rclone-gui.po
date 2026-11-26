@@ -868,6 +868,9 @@ msgstr "Running services ({})"
 msgid "还没配置 winget 镜像源名：请到「设置 → winget 镜像源」填写，或改用官方源"
 msgstr "No winget mirror source name is configured. Fill it in under Settings → winget mirror source, or switch to the official source"
 
+msgid "进度"
+msgstr "Progress"
+
 msgid "远程"
 msgstr "Remotes"
 

@@ -55,7 +55,8 @@ pub fn cap_of_op(op: &str) -> Option<&'static str> {
         "kv.get" | "kv.set" | "kv.delete" | "kv.get_all" => "kv",
         "ui.toast" | "ui.confirm" | "ui.copy" => "ui",
 
-        "fs.meta" | "fs.sha256" | "fs.read_text" | "fs.read_b64" | "fs.write_text" | "fs.copy"
+        "fs.meta" | "fs.sha256" | "fs.read_text" | "fs.read_b64" | "fs.write_text"
+        | "fs.write_b64" | "fs.copy"
         | "fs.mkdir" | "fs.remove" | "fs.list_dir" | "fs.find" | "fs.unzip" | "fs.pick_file"
         | "fs.pick_dir" | "fs.open_dir" | "fs.pe_info" | "fs.signature" | "fs.search_exe" => "fs",
         // 早期命名，保留兼容
@@ -127,6 +128,8 @@ pub enum ControlKind {
     Hint,
     /// 进度条
     Progress,
+    /// 图片：插件在 `body.images.<key>` 里下发绝对路径，宿主读盘解码后显示
+    Image,
     /// 纯分隔线
     Divider,
 }
@@ -141,6 +144,7 @@ impl ControlKind {
             ControlKind::Status => "status",
             ControlKind::Hint => "hint",
             ControlKind::Progress => "progress",
+            ControlKind::Image => "image",
             ControlKind::Divider => "divider",
         }
     }
@@ -151,6 +155,8 @@ impl ControlKind {
 #[serde(rename_all = "snake_case")]
 pub enum FieldKind {
     Text,
+    /// 多行文本框：换行有意义的数据（例如一行一个 token）
+    Multiline,
     Password,
     Number,
     Bool,
@@ -164,6 +170,7 @@ impl FieldKind {
     pub fn as_str(self) -> &'static str {
         match self {
             FieldKind::Text => "text",
+            FieldKind::Multiline => "multiline",
             FieldKind::Password => "password",
             FieldKind::Number => "number",
             FieldKind::Bool => "bool",

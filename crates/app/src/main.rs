@@ -271,6 +271,11 @@ struct Ctx {
     drives: Arc<state::DriveProbe>,
     /// GUI 自己发起的「移动 / 重命名」登记（core/transferred 分不清这两者，见 `OpHints`）
     op_hints: Arc<std::sync::Mutex<OpHints>>,
+    /// 传输页「已完成」行的快照：1 s 快路径直接复用，不必每跳都重取 core/transferred
+    tasks_done: Arc<std::sync::Mutex<Vec<TaskRow>>>,
+    /// 上次完整重建时正在传的 (job, 文件名)。与当前集合不同就说明要重取 core/transferred；
+    /// None = 还没建过快照（轮询第一跳 t=1 先进快路径，必须能区分「空任务」和「还没查过」）。
+    tasks_live: Arc<std::sync::Mutex<Option<std::collections::HashSet<(String, String)>>>>,
 }
 
 /// 运行中的内嵌 HTTP 服务句柄
@@ -1411,6 +1416,29 @@ fn fmt_speed(v: f64) -> String {
     }
 }
 
+/// 传输进度，形如 "46%"；不足 1% 显示 "<1%"。
+/// 文件大小未知或百分比不可信（负数、NaN）时返回 "—"，不拿 0% 冒充真实进度。
+fn fmt_percent(size: f64, pct: f64) -> String {
+    if size <= 0.0 || !pct.is_finite() || pct < 0.0 {
+        return "—".into();
+    }
+    let p = pct.clamp(0.0, 100.0);
+    if p > 0.0 && p < 1.0 {
+        "<1%".into()
+    } else {
+        format!("{:.0}%", p)
+    }
+}
+
+/// 从 rclone 的 group 名（形如 "job/12345"）取 job 号。
+/// 取不到时给 0：调用方据此判断该行没有可停的 job，避免把 0 当成真任务发出去。
+fn job_id_of(group: &str) -> i32 {
+    group
+        .strip_prefix("job/")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0) as i32
+}
+
 /// 限速单位索引 → 倍率：0=B 1=KB 2=MB 3=GB
 fn limit_unit_mul(u: i32) -> f64 {
     match u {
@@ -1657,86 +1685,152 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         }
     }
 
-    // 运行中传输速度按 group 汇总；同时汇总全局上传/下载速度
-    let stats = client.core_stats().await.ok();
-    let mut rmap: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-    let (mut up_total, mut down_total) = (0.0f64, 0.0f64);
-    if let Some(s) = &stats {
-        for t in &s.transferring {
-            if !t.group.is_empty() {
-                *rmap.entry(t.group.clone()).or_insert(0.0) += t.speed;
-            }
-            // 上传：目标是远程；下载：来源是远程
-            if remote_name_of(&t.dst_fs).is_some() {
-                up_total += t.speed;
-            }
-            if remote_name_of(&t.src_fs).is_some() {
-                down_total += t.speed;
-            }
-        }
-    }
-    {
-        let (up, down) = (fmt_speed(up_total), fmt_speed(down_total));
-        let _ = ui.upgrade_in_event_loop(move |ui| {
-            let g = ui.global::<TransfersG>();
-            g.set_up_speed(up.into());
-            g.set_down_speed(down.into());
-        });
-    }
+    // core/transferred 只在传输「完成后」才追加条目，进行中的传输只出现在 core/stats.transferring。
+    // 两处都得读：transferring 建运行中的行，transferred 建已完成的行。
+    let transferring = client
+        .core_stats()
+        .await
+        .map(|s| s.transferring)
+        .unwrap_or_default();
+    publish_speeds(ui, &transferring);
 
     let serves = ctx.serves_cache.lock().unwrap().clone();
     // GUI 自己发起的移动/改名登记：记账分辨不出这两者，能对上就照登记贴标签
     let hints = ctx.op_hints.lock().unwrap().clone();
-    let mut rows: Vec<TaskRow> = Vec::new();
-    // 从 core/transferred 构建任务列表（只包含实际传输的文件，不含内部操作 job）
-    for (group, it) in &tmap {
-        // group 格式: "job/12345"，提取数字 id
-        let id = group
-            .strip_prefix("job/")
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(0) as i32;
 
+    // 进行中的文件：一个文件一行（同一个 job 并发传多个文件时各占一行）
+    let (mut rows, live) = running_task_rows(&transferring, &serves, &hints);
+
+    // 已完成的任务；`live` 里还在传的条目跳过，免得同一个文件在列表里出现两次
+    let done_rows = done_task_rows(&tmap, &live, &serves, &hints);
+    // 快路径（`refresh_tasks_fast`）复用这两份快照：已完成行原样写回，运行集合用来判断
+    // 「还是同一批任务在跑」还是「有文件开始/传完，必须重取 core/transferred」。
+    ctx.tasks_done.lock().unwrap().clone_from(&done_rows);
+    *ctx.tasks_live.lock().unwrap() = Some(live);
+    rows.extend(done_rows);
+    publish_task_rows(ui, hide, &filter, rows);
+}
+
+/// 运行中的传输行：一个文件一行（同一个 job 并发传多个文件时各占一行）。
+///
+/// 第二项返回这些行的 `(job, 文件名)`。刚传完的文件会短暂同时出现在
+/// core/stats.transferring 与 core/transferred 里，补已完成行时靠它跳过同一条。
+fn running_task_rows(
+    transferring: &[rcgui_rc::Transferring],
+    serves: &[ServeRow],
+    hints: &OpHints,
+) -> (Vec<TaskRow>, std::collections::HashSet<(String, String)>) {
+    let mut rows: Vec<TaskRow> = Vec::new();
+    let mut live: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for t in transferring {
+        if t.name.is_empty() {
+            continue;
+        }
+        live.insert((t.group.clone(), t.name.clone()));
+        // bytes 非 0 表示任务正在搬数据，task_op 据此走上传/下载判断，
+        // 不会被误认成「移动」或「重命名」。
+        let probe = TItem {
+            name: t.name.clone(),
+            src: t.src_fs.clone(),
+            dst: t.dst_fs.clone(),
+            bytes: 1.0,
+            size: t.size,
+            what: String::new(),
+        };
+        let op = task_op(&probe, hints.lookup(&probe.src, &probe.name));
+        let remote = remote_name_of(&probe.dst)
+            .or_else(|| remote_name_of(&probe.src))
+            .unwrap_or_default();
+        let svc = match_serve_for_task(serves, &probe.src, &probe.dst);
+        rows.push(TaskRow {
+            id: job_id_of(&t.group),
+            op: op.into(),
+            remote: remote.into(),
+            path: t.name.clone().into(),
+            svc: svc.into(),
+            status: rcgui_i18n::t("运行中").into(),
+            duration: "—".into(),
+            speed: fmt_speed(t.speed).into(),
+            progress: fmt_percent(t.size, t.percentage).into(),
+            done: false,
+        });
+    }
+    (rows, live)
+}
+
+/// 已完成的行：core/transferred 只含真正传过的文件，不含 about/list 等内部操作 job。
+/// 它是按 group 建的表，同一个 job 传过多个文件时只剩最后一条，正好「一个 job 一行」。
+///
+/// 这里不看「隐藏已完成」开关：开关只决定显示，快路径要能从缓存里补回这些行。
+fn done_task_rows(
+    tmap: &std::collections::HashMap<String, TItem>,
+    live: &std::collections::HashSet<(String, String)>,
+    serves: &[ServeRow],
+    hints: &OpHints,
+) -> Vec<TaskRow> {
+    let mut rows: Vec<TaskRow> = Vec::new();
+    for (group, it) in tmap {
+        if live.contains(&(group.clone(), it.name.clone())) {
+            continue;
+        }
         let op = task_op(it, hints.lookup(&it.src, &it.name));
         let remote = remote_name_of(&it.dst)
             .or_else(|| remote_name_of(&it.src))
             .unwrap_or_default();
 
-        let svc = match_serve_for_task(&serves, &it.src, &it.dst);
+        let svc = match_serve_for_task(serves, &it.src, &it.dst);
 
-        let running = rmap.contains_key(group);
-        if hide && !running {
-            continue;
-        }
-        let status = if running { rcgui_i18n::t("运行中") } else { rcgui_i18n::t("已完成") }.to_string();
-        let speed = if running {
-            rmap.get(group).map(|v| fmt_speed(*v)).unwrap_or_else(|| "—".into())
-        } else if it.bytes > 0.0 {
-            // 无 duration 信息，无法计算历史速度
-            "—".into()
-        } else {
-            "—".into()
-        };
         rows.push(TaskRow {
-            id,
+            id: job_id_of(group),
             op: op.into(),
             remote: remote.into(),
             path: it.name.clone().into(),
             svc: svc.into(),
-            status: status.into(),
+            status: rcgui_i18n::t("已完成").into(),
             duration: "—".into(),
-            speed: speed.into(),
-            done: !running,
+            speed: "—".into(),
+            progress: "100%".into(),
+            done: true,
         });
     }
-    rows.sort_by(|a, b| b.id.cmp(&a.id));
+    rows
+}
+
+/// 顶部那两个总速（上行/下行）。两档刷新都要更新，抽出来免得各写一遍。
+fn publish_speeds(ui: &Weak<MainWindow>, transferring: &[rcgui_rc::Transferring]) {
+    let (mut up_total, mut down_total) = (0.0f64, 0.0f64);
+    for t in transferring {
+        // 上传：目标在远程；下载：来源在远程
+        if remote_name_of(&t.dst_fs).is_some() {
+            up_total += t.speed;
+        }
+        if remote_name_of(&t.src_fs).is_some() {
+            down_total += t.speed;
+        }
+    }
+    let (up, down) = (fmt_speed(up_total), fmt_speed(down_total));
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let g = ui.global::<TransfersG>();
+        g.set_up_speed(up.into());
+        g.set_down_speed(down.into());
+    });
+}
+
+/// 排序 + 搜索过滤 + 写进界面，两档刷新共用的最后一步。
+fn publish_task_rows(ui: &Weak<MainWindow>, hide_done: bool, filter: &str, mut rows: Vec<TaskRow>) {
+    if hide_done {
+        rows.retain(|t| !t.done);
+    }
+    // 运行中的排在前面；同一状态里新任务在前（id 大 = 后提交）
+    rows.sort_by(|a, b| a.done.cmp(&b.done).then(b.id.cmp(&a.id)));
     // 任务搜索过滤（匹配 标签/远程/路径/服务/状态）
     if !filter.is_empty() {
         rows.retain(|t| {
-            t.op.as_str().contains(&filter)
-                || t.remote.as_str().to_lowercase().contains(&filter)
-                || t.path.as_str().to_lowercase().contains(&filter)
-                || t.svc.as_str().to_lowercase().contains(&filter)
-                || t.status.as_str().contains(&filter)
+            t.op.as_str().contains(filter)
+                || t.remote.as_str().to_lowercase().contains(filter)
+                || t.path.as_str().to_lowercase().contains(filter)
+                || t.svc.as_str().to_lowercase().contains(filter)
+                || t.status.as_str().contains(filter)
         });
     }
 
@@ -1744,6 +1838,50 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         ui.global::<TransfersG>()
             .set_tasks(ModelRc::from(Rc::new(VecModel::from(rows))));
     });
+}
+
+/// 传输页每秒走的快路径：只读 `core/stats`（响应小），把运行中行的速度/进度就地更新，
+/// 已完成的行直接用上一次完整重建的快照。
+///
+/// `core/transferred` 的响应随历史文件数增长（大批量任务可达数 MB），所以它留在 10 s 那一档。
+/// 但运行集合一变（有文件开始、有文件传完、任务全部结束）就立刻转一次完整重建：
+/// 否则刚传完的文件要等到下一次 10 s 重建才出现，界面上看着像「卡住不动」。
+async fn refresh_tasks_fast(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    let client = ctx.rc.client().await;
+    let Ok(stats) = client.core_stats().await else {
+        return;
+    };
+    let live_now: std::collections::HashSet<(String, String)> = stats
+        .transferring
+        .iter()
+        .filter(|t| !t.name.is_empty())
+        .map(|t| (t.group.clone(), t.name.clone()))
+        .collect();
+    // None = 还没有完整快照（轮询第一跳就会走到这里），此时必须先重建，否则会把列表清空
+    let same_batch = {
+        let cached = ctx.tasks_live.lock().unwrap();
+        cached.as_ref().map(|c| c == &live_now).unwrap_or(false)
+    };
+    if !same_batch {
+        build_tasks(ctx, ui).await;
+        return;
+    }
+
+    let (hide, filter) = read_ui(ui, |u| {
+        let g = u.global::<TransfersG>();
+        (
+            g.get_hide_done(),
+            g.get_task_search().to_string().to_lowercase(),
+        )
+    })
+    .await
+    .unwrap_or((false, String::new()));
+    publish_speeds(ui, &stats.transferring);
+    let serves = ctx.serves_cache.lock().unwrap().clone();
+    let hints = ctx.op_hints.lock().unwrap().clone();
+    let (mut rows, _live) = running_task_rows(&stats.transferring, &serves, &hints);
+    rows.extend(ctx.tasks_done.lock().unwrap().iter().cloned());
+    publish_task_rows(ui, hide, &filter, rows);
 }
 
 /// 展示当前生效的全局限速（空字符串表示不展示）
@@ -3147,6 +3285,8 @@ fn main() {
         usage_at: Arc::new(std::sync::Mutex::new(None)),
         drives: Arc::new(state::DriveProbe::default()),
         op_hints: Arc::new(std::sync::Mutex::new(OpHints::default())),
+        tasks_done: Arc::new(std::sync::Mutex::new(Vec::new())),
+        tasks_live: Arc::new(std::sync::Mutex::new(None)),
     });
 
     // 调试开关：`RCGUI_PANEL_DUMP=<插件 id>` 只打印该插件面板的行然后退出。
@@ -4407,6 +4547,43 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
                 // 本地进程状态（不产生任何 RC 请求，也不受「未连接」影响）：
                 // 插件长任务进度（下载 / 解压 / 安装）+ 插件子进程存活灯
                 caps::pump_progress(&ctx.progress);
+                // 插件要求的面板定时重跑（例如扫码登录在等用户在手机上确认）。
+                // 只在那个插件的面板确实开着、且没有别的动作在跑时触发；也不设
+                // busy —— 每秒闪一下「处理中…」比不动更难看。
+                if let Some((rid, raction)) = plugins::panel_repeat_due() {
+                    let open = ui
+                        .upgrade()
+                        .map(|u| {
+                            let g = u.global::<PluginsG>();
+                            g.get_panel_plugin().as_str() == rid.as_str()
+                                && g.get_panel_busy_action().is_empty()
+                        })
+                        .unwrap_or(false);
+                    if open {
+                        let ctx2 = ctx.clone();
+                        let ui2 = ui.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                plugins::run_action(&ctx2, &rid, &raction, &ui2).await
+                            {
+                                eprintln!("面板定时动作 {raction} 失败: {e:#}");
+                                return;
+                            }
+                            match plugins::build_panel(&ctx2, &rid).await {
+                                Ok(rows) => {
+                                    let _ = ui2.upgrade_in_event_loop(move |u| {
+                                        let g = u.global::<PluginsG>();
+                                        let list = plugins::panel_to_slint(&rows);
+                                        g.set_panel_rows(ModelRc::from(Rc::new(
+                                            VecModel::from(list),
+                                        )));
+                                    });
+                                }
+                                Err(e) => eprintln!("面板定时刷新失败: {e:#}"),
+                            }
+                        });
+                    }
+                }
                 // 周期任务门控：用户操作进行中 → 轮询让位；上一轮取数未完成 → 不叠加。
                 let live = ctx.rc.is_live();
                 if ctx.hub.status(true, live) == crate::state::PollStatus::Running
@@ -4418,9 +4595,12 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
                     tokio::spawn(async move {
                         // 线路①：一份完整快照 → 计数与三个列表同一帧更新
                         refresh::refresh_state(&ctx2, &ui2, false).await;
-                        // 传输页：后台任务列表（每 10s，core_transferred 响应大，不宜频繁）
+                        // 传输页：每 10s 全量重建（core_transferred 响应大，不宜频繁），
+                        // 其余各跳走快路径，只更新运行中行的速度/进度
                         if t % 10 == 0 {
                             build_tasks(&ctx2, &ui2).await;
+                        } else {
+                            refresh_tasks_fast(&ctx2, &ui2).await;
                         }
                         // 限速只在配置值变化时下发（apply_global_limit 内部已判重）
                         if t % 2 == 0 {
@@ -7882,13 +8062,19 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             false
         }
         Cmd::JobStop { id } => {
-            let client = ctx.rc.client().await;
-            match client.job_stop(id).await {
-                Ok(()) => {
-                    build_tasks(ctx, ui).await;
-                    toast(ui, 1, rcgui_i18n::f("任务 #{} 已停止", &[&(id)]));
+            // id 为 0 说明这一行没能对上 rclone 的 job（例如 core/stats 没给 group）。
+            // 直接发 job/stop 0 会打到别的任务上，所以只提示、不发请求。
+            if id <= 0 {
+                toast(ui, 2, rcgui_i18n::t("该任务没有可用的 job 号，无法取消"));
+            } else {
+                let client = ctx.rc.client().await;
+                match client.job_stop(id).await {
+                    Ok(()) => {
+                        build_tasks(ctx, ui).await;
+                        toast(ui, 1, rcgui_i18n::f("任务 #{} 已停止", &[&(id)]));
+                    }
+                    Err(e) => toast(ui, 2, rcgui_i18n::f("停止失败: {}", &[&(e)])),
                 }
-                Err(e) => toast(ui, 2, rcgui_i18n::f("停止失败: {}", &[&(e)])),
             }
             false
         }
@@ -8146,6 +8332,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             false
         }
         Cmd::PluginPanelClose => {
+            // 面板关了就别再催插件的定时动作了
+            plugins::panel_repeat_clear();
             let _ = ui.upgrade_in_event_loop(|ui| {
                 let g = ui.global::<PluginsG>();
                 g.set_panel_plugin("".into());

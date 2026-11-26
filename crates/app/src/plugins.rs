@@ -770,6 +770,11 @@ pub struct PanelData {
     pub lamp: String,
     pub warning: bool,
     pub enabled: bool,
+    /// `kind == "image"` 时这一行要显示的位图：RGBA 字节 + 宽 + 高。
+    ///
+    /// 解码放在合成线程（磁盘 IO 与解码都不该占 UI 线程），`slint::Image`
+    /// 等到 UI 线程才由 [`PanelData::to_slint`] 构造。
+    pub image: Option<(Vec<u8>, u32, u32)>,
 }
 
 impl PanelData {
@@ -801,6 +806,12 @@ impl PanelData {
             lamp: self.lamp.as_str().into(),
             warning: self.warning,
             enabled: self.enabled,
+            img: match &self.image {
+                Some((bytes, w, h)) => slint::Image::from_rgba8(
+                    slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(bytes, *w, *h),
+                ),
+                None => slint::Image::default(),
+            },
         }
     }
 }
@@ -1025,7 +1036,18 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, _id
         line.clear();
     }
 
+    // 插件可以让整段控件消失（`body.hide: ["key", …]`）：光靠 `enabled:false`
+    // 只能置灰，登录之后还挂着一整套登录框，看着像没用完的表单。
+    let hidden: std::collections::HashSet<&str> = body
+        .get("hide")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+
     for c in &setting.controls {
+        if !c.key.trim().is_empty() && hidden.contains(c.key.trim()) {
+            continue;
+        }
         let kind = c.kind_enum().unwrap_or(ControlKind::Group);
         match kind {
             ControlKind::Group => {
@@ -1080,6 +1102,39 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, _id
                         label: c.label.clone(),
                         ..simple_row("progress", &c.key, "")
                     });
+                }
+            }
+            // 图片行：插件只给绝对路径（`body.images.<key>`），读盘与解码在这里做。
+            ControlKind::Image => {
+                flush(&mut out, &mut pending, &mut pending_line);
+                let path = body
+                    .get("images")
+                    .and_then(|v| v.get(c.key.as_str()))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match load_panel_image(path) {
+                    Some(image) => out.push(PanelData {
+                        image: Some(image),
+                        label: c.label.clone(),
+                        ..simple_row("image", &c.key, "")
+                    }),
+                    None => {
+                        let hint = hint_text(body, &c.key, &c.text);
+                        let text = if path.is_empty() {
+                            hint
+                        } else if hint.is_empty() {
+                            rcgui_i18n::f("图片读不出来：{}", &[&path])
+                        } else {
+                            format!("{hint}（{path}）")
+                        };
+                        if !text.is_empty() {
+                            out.push(PanelData {
+                                warning: true,
+                                text,
+                                ..simple_row("hint", &c.key, "")
+                            });
+                        }
+                    }
                 }
             }
             ControlKind::Checks => {
@@ -1191,7 +1246,22 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, _id
         }
     }
     flush(&mut out, &mut pending, &mut pending_line);
-    out
+
+    // 藏掉一整段之后，它两侧的分隔线会连成两条空线（分隔线不参与 key 校验，
+    // 所以没法按 key 隐藏）。这里把连续的分隔线和首尾的分隔线去掉。
+    let mut tidy: Vec<PanelData> = Vec::with_capacity(out.len());
+    for row in out {
+        if row.kind == "divider"
+            && (tidy.is_empty() || tidy.last().map(|r| r.kind.as_str()) == Some("divider"))
+        {
+            continue;
+        }
+        tidy.push(row);
+    }
+    while tidy.last().map(|r| r.kind.as_str()) == Some("divider") {
+        tidy.pop();
+    }
+    tidy
 }
 
 fn simple_row(kind: &str, key: &str, text: &str) -> PanelData {
@@ -1204,6 +1274,98 @@ fn simple_row(kind: &str, key: &str, text: &str) -> PanelData {
     }
 }
 
+/// 读一张盘上的图片并转成面板能直接画的 RGBA。
+///
+/// 返回 `None` 表示读不动或者不像图片（路径不存在、格式不支持、尺寸离谱）。
+/// 调用方据此退化成一条提示行 —— 让整块面板消失比画不出图难查得多。
+fn load_panel_image(path: &str) -> Option<(Vec<u8>, u32, u32)> {
+    if path.is_empty() {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    // 面板里最多显示两百来像素，超大图没必要整张留在内存里
+    if w == 0 || h == 0 || w > 4096 || h > 4096 {
+        return None;
+    }
+    Some((rgba.into_raw(), w, h))
+}
+
+
+/// 面板定时重跑：插件用 `body.repeat {action, interval_ms}` 要求宿主隔一会儿
+/// 自己再点一次某个按钮。
+///
+/// 存在的理由是插件自己做不到：一次调用只有十几轮 need、也没有 sleep，
+/// 「等用户扫码」这种跨度几十秒的事必须由宿主来催。
+struct Repeat {
+    plugin: String,
+    action: String,
+    interval_ms: u64,
+    next_at: std::time::Instant,
+}
+
+/// 全局只有一个：同一时刻只会有一个插件的面板是打开的。
+static PANEL_REPEAT: std::sync::Mutex<Option<Repeat>> = std::sync::Mutex::new(None);
+
+/// 记录（或撤销）当前面板的定时重跑要求。`action` 为空即撤销。
+fn set_repeat(plugin: &str, body: &Value) {
+    let want = body.get("repeat");
+    let action = want
+        .and_then(|r| r.get("action"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // 插件写错了也得有个边界：250ms 以下等于让 wasm 满载，一分钟以上不如用户自己点
+    let interval_ms = want
+        .and_then(|r| r.get("interval_ms"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .clamp(250, 60_000);
+    let Ok(mut slot) = PANEL_REPEAT.lock() else {
+        return;
+    };
+    if action.is_empty() {
+        *slot = None;
+        return;
+    }
+    // 同一个插件同一个动作：保留原来的计时，否则每次重建面板（每个动作之后
+    // 都会重建）都把计时清零，间隔就永远轮不到
+    if let Some(cur) = slot.as_mut() {
+        if cur.plugin == plugin && cur.action == action && cur.interval_ms == interval_ms {
+            return;
+        }
+    }
+    *slot = Some(Repeat {
+        plugin: plugin.to_string(),
+        action,
+        interval_ms,
+        next_at: std::time::Instant::now() + std::time::Duration::from_millis(interval_ms),
+    });
+}
+
+/// 到点就返回 `(插件 id, 动作名)` 并推进下一次；没到点返回 `None`。
+///
+/// 调用方（主循环的 1 秒节拍）负责确认那个插件的面板确实开着。
+pub fn panel_repeat_due() -> Option<(String, String)> {
+    let mut slot = PANEL_REPEAT.lock().ok()?;
+    let cur = slot.as_mut()?;
+    let now = std::time::Instant::now();
+    if now < cur.next_at {
+        return None;
+    }
+    cur.next_at = now + std::time::Duration::from_millis(cur.interval_ms);
+    Some((cur.plugin.clone(), cur.action.clone()))
+}
+
+/// 面板关掉时停掉定时重跑：否则插件走了、动作还在后台一遍遍跑。
+pub fn panel_repeat_clear() {
+    if let Ok(mut slot) = PANEL_REPEAT.lock() {
+        *slot = None;
+    }
+}
 
 /// 拉取并合成某个插件的面板（`action` 默认 "state"）。
 pub async fn build_panel(ctx: &Arc<Ctx>, id: &str) -> Result<Vec<PanelData>> {
@@ -1224,6 +1386,8 @@ pub async fn build_panel(ctx: &Arc<Ctx>, id: &str) -> Result<Vec<PanelData>> {
     // 与传给插件的同一份有效表单：界面显示的值必须等于插件实际拿到的值
     let form = effective_form(&cfg.plugin_setting, &ctx.store, id);
     let body = merge_saved_choices(&ctx.store, id, body);
+    // 每次重建都刷新一次要求：插件不再要轮询时这里会把它撤掉
+    set_repeat(id, &body);
     Ok(compose(&cfg.plugin_setting, &body, &form, id))
 }
 

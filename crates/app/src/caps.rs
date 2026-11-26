@@ -568,6 +568,22 @@ impl CapProvider for HostCaps {
                 })
                 .await
             }
+            "fs.write_b64" => {
+                let path = Self::p_str(&params, "path");
+                let data_b64 = Self::p_str(&params, "data_b64");
+                spawn_blocking(move || {
+                    let raw = base64::engine::general_purpose::STANDARD
+                        .decode(data_b64.as_bytes())
+                        .map_err(|e| anyhow!("{}", rcgui_i18n::f("base64 解码失败: {}", &[&(e)])))?;
+                    if let Some(d) = Path::new(&path).parent() {
+                        let _ = std::fs::create_dir_all(d);
+                    }
+                    std::fs::write(&path, &raw)
+                        .with_context(|| rcgui_i18n::f("写入 {} 失败", &[&(path)]))?;
+                    Ok(json!({ "bytes": raw.len() }))
+                })
+                .await
+            }
             "fs.copy" => {
                 let from = Self::p_str(&params, "from");
                 let to = Self::p_str(&params, "to");

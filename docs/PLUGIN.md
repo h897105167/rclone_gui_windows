@@ -240,12 +240,12 @@ id 决定的东西：kv 存储目录、`config.json` 的 `id`、本体的安装�
 
 | 字段 | 类型 | 适用 kind | 说明 |
 |---|---|---|---|
-| `kind` | string | 全部 | `group` `field` `action` `checks` `status` `hint` `progress` `divider` |
+| `kind` | string | 全部 | `group` `field` `action` `checks` `status` `hint` `progress` `image` `divider` |
 | `key` | string | 除 `divider` | 唯一标识。`field` 的 key 就是表单字段名。⚠️ **`group` / `hint` / `status` 也必须写 key**：装载时会跑 `PluginSetting::validate`，缺 key 或 key 重复会让整份 `config.json` 校验失败，插件卡片直接显示「校验失败」（渲染层其实容忍 group 无 key，但校验层不容忍） |
 | `label` | string | all | 显示文字；`action` 必填（按钮文字） |
 | `text` | string | hint / status / checks | 正文；`hint` 支持多行，`checks` 里是"清单为空时的提示" |
 | `placeholder` | string | field | 输入提示 |
-| `field` | string | field | `text` `password` `number` `bool` `select` `path` |
+| `field` | string | field | `text` `password` `number` `bool` `select` `path` `multiline` |
 | `options` | string[] | field(select) | 下拉选项。静态候选就写在这里；候选项要在运行时才知道（比如列出 rclone 远程）就留空并置 `dynamic` |
 | `dynamic` | bool | field(select) | `true` = 候选项全部由返回值 `choices` 提供，允许 `options` 为空（校验通过）。`false`（默认）时 `options` 必填 |
 | `style` | string | action | `secondary`（默认）/ `primary` / `danger` |
@@ -262,12 +262,13 @@ id 决定的东西：kv 存储目录、`config.json` 的 `id`、本体的安装�
 | kind | 渲染为 | 说明 |
 |---|---|---|
 | `group` | 分组标题 + 分隔线 | 纯视觉 |
-| `field` | 输入框 / 密码框 / 数字 / 开关 / 下拉 / 路径（带「浏览」） | 值会随动作提交给插件 |
+| `field` | 输入框 / 密码框 / 数字 / 开关 / 下拉 / 路径（带「浏览」）/ 多行框 | 值会随动作提交给插件。`multiline` 是 96 px 高的多行框，换行有意义的内容（一行一个 token、一行一个路径）用它；提交时值里带真实换行符 |
 | `action` | 按钮 | 点击 → `call_plugin(id, key, form)` |
 | `checks` | ✓/✗ 清单 | 内容由返回值 `checks` 提供 |
 | `status` | 一行状态 + 指示灯 | 内容由返回值 `status` + `lamp` 提供 |
 | `hint` | 说明文字 | 可被返回值 `hints[key]` 覆盖 |
 | `progress` | 进度条 | 由返回值 `progress` 驱动（负数 = 不确定态） |
+| `image` | 一张图（最高 210 px） | 图由插件先写到磁盘，再把**绝对路径**放进返回值 `images[key]`；宿主读盘解码后显示。用 key 找图，所以必须有 key。支持 PNG 等常见格式（`image` crate 解出来的都能显示），**不支持 SVG**。路径为空或读不出来时，这一行退化成 `hint` 提示（`hints[key]` 有值就用它），面板其余部分照常显示 |
 | `divider` | 纯分隔线 | 不需要 key |
 
 ### 4.2 布局示例
@@ -312,6 +313,9 @@ call_plugin(ctx, id, action_key, form) → 方法 "request"，params 至少含�
 | `hints` | object | 覆盖某条 `hint` 的文字 |
 | `enabled` | object | 启用/禁用控件 `{"save": false}` |
 | `progress` | number | 0–100；负数 = 不确定态进度条 |
+| `images` | object | 给 `image` 控件指路：`{"qr": "C:\\path\\to\\file.png"}`，值是**绝对路径**。每次返回都要给，因为面板每次都重算 |
+| `hide` | array | 整行不显示：`["login_start","code"]`，写 `controls` 里的 `key`。`enabled:false` 只是置灰、还占着位置，藏掉用这个。`divider` 没有 key，所以藏掉一段后会顺手去掉多余的分隔线 |
+| `repeat` | object | 让本体过一会儿自动再跑一次动作：`{"action": "qr_poll", "interval_ms": 2500}`。`interval_ms` 夹在 250–60000。每次面板重算都按最新返回值重设，所以**不再返回 `repeat` 就自动停**；面板关掉时也停。动作本身要能幂等（轮询这类） |
 | `toast` | object | 主动弹通知 `{"level":"info|warn|err","message":"…"}` |
 | `rc` | object | 连接信息 `{"url","user","pass","connect":true}`，本体据此接管主界面的连接状态 |
 
@@ -480,7 +484,7 @@ call_plugin(ctx, id, action_key, form) → 方法 "request"，params 至少含�
 |---|---|---|
 | `kv` | `kv.get` `kv.set` `kv.delete` `kv.get_all` | 插件私有键值存储 |
 | `ui` | `ui.toast` `ui.confirm` `ui.copy` | 通知、确认框、写剪贴板 |
-| `fs` | `fs.meta` `fs.sha256` `fs.read_text` `fs.read_b64` `fs.write_text` `fs.copy` `fs.mkdir` `fs.remove` `fs.list_dir` `fs.find` `fs.unzip` `fs.pick_file` `fs.pick_dir` `fs.open_dir` `fs.pe_info` `fs.signature` `fs.search_exe` | 文件与可执行文件探测 |
+| `fs` | `fs.meta` `fs.sha256` `fs.read_text` `fs.read_b64` `fs.write_text` `fs.write_b64` `fs.copy` `fs.mkdir` `fs.remove` `fs.list_dir` `fs.find` `fs.unzip` `fs.pick_file` `fs.pick_dir` `fs.open_dir` `fs.pe_info` `fs.signature` `fs.search_exe` | 文件与可执行文件探测 |
 | `http` | `http.download` `http.request` `http.text` `http.json` | 下载与请求 |
 | `proc` | `proc.start` `proc.stop` `proc.status` `proc.run` | 子进程 |
 | `net` | `net.port_open` | 端口探测 |
@@ -497,6 +501,7 @@ call_plugin(ctx, id, action_key, form) → 方法 "request"，params 至少含�
 // fs.read_text{ path }                                   → { text }
 // fs.read_b64 { path, max_bytes? }                        → { data_b64, size }
 // fs.write_text{ path, text, append? }                    → { bytes }
+// fs.write_b64 { path, data_b64 }                         → { bytes }
 // fs.list_dir { path, recursive? }                        → { items: [{ name, path, is_dir, size }] }
 // fs.find     { root, pattern, max? }                     → { items: [...] }
 // fs.unzip    { src, dest }                               → { files }
@@ -909,3 +914,4 @@ fn main() {
 | 1.3 | `body.choices` 对 `select` 字段生效（运行时拉到的候选覆盖静态 `options`；`path` 仍只认 `choices`），候选与当前值一起持久化，面板重拉后不丢；`imagehost` v0.4.0 用它列出 rclone 远程与子目录 |
 | 1.4 | `select` 新增 `dynamic` 字段（候选项全由 `choices` 提供，`options` 可空）；新增 `rclone.remotes`（读本地 `rclone.conf`，绕开 RC 401）；面板加载失败时先清空行再显示错误，不再残留上一个插件的界面；`imagehost` v0.4.1 改用 `rclone.remotes`，v0.4.2 修掉首屏把已配置远程覆盖成候选列表第一个的毛病 |
 | 1.5 | 新增 `rclone.upload_file`（`fs` + `remote_path` + `filename` + `data_b64`，能当 `need` 用：站点型远程直接回 `{link,name,deduped}`，供插件上传后取直链，普通远程回 `{}`）；`rclone.cat`/`rclone.upload_file` 的 `fs` 都会补冒号，避免 `srcFs:"k-vault"` 被当成相对本地目录；RC 响应分类只把「方法缺失」判为不支持，其余 404 不再被当成 Unsupported 去回退；`status`/`group`/`hint` 控件同样必须写 `key`（否则插件卡片显示「校验失败」）；内置资产升到 `imagehost` v0.5.0、`rcgui-rc` 补测试 |
+| 1.6 | 新增 `field` 的 `multiline`（96 px 多行框）；`result.body` 新增 `hide`（按 `key` 整行隐藏，比 `enabled:false` 干净）与 `repeat`（让本体按 `interval_ms` 自动重跑同一动作，面板关闭即停）；`teldrive` v0.2.0 用它们做到登录前只显示登录控件、扫码后自动轮询、频道与机器人列表内联展示 |

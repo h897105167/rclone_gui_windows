@@ -118,6 +118,9 @@ export struct PanelRow {
     lamp: string,
     warning: bool,
     enabled: bool,
+    // kind == "image" 时这一行要画的位图：宿主已把插件给的路径解码好，
+    // 插件自己只提供绝对路径，界面这边不碰磁盘。
+    img: image,
 }
 
 export struct TokenRow {
@@ -195,6 +198,7 @@ export struct TaskRow {
     status: string,
     duration: string,
     speed: string,
+    progress: string,
     done: bool,
 }
 /// 一条历史消息（toast 的留档）。
@@ -3671,6 +3675,7 @@ component TransfersView inherits Rectangle {
                         Text { text: @tr("状态"); width: 90px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                         Text { text: @tr("耗时"); width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                         Text { text: @tr("速度"); width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
+                        Text { text: @tr("进度"); width: 70px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                         Text { text: @tr("操作"); width: 150px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                     }
                 }
@@ -3727,6 +3732,8 @@ component TransfersView inherits Rectangle {
                                 Text { text: t.status; width: 90px; horizontal-alignment: left; font-size: 12px; color: t.status == @tr("运行中") ? ThemeG.accent : (t.status == @tr("失败") ? ThemeG.err : ThemeG.text-dim); vertical-alignment: center; }
                                 Text { text: t.duration; width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
                                 Text { text: t.speed; width: 100px; horizontal-alignment: left; font-size: 12px; color: ThemeG.accent; vertical-alignment: center; }
+                                // 进度：rclone 只对「正在传输」的文件给百分比，已完成行固定 100%
+                                Text { text: t.progress; width: 70px; horizontal-alignment: left; font-size: 12px; color: ThemeG.text; vertical-alignment: center; }
                                 HorizontalLayout {
                                     width: 150px;
                                     spacing: 6px;
@@ -4143,6 +4150,22 @@ component PluginsView inherits Rectangle {
                                         color: r.warning ? ThemeG.warn : ThemeG.text-dim;
                                         wrap: word-wrap;
                                     }
+                                    // 图片行：面板里唯一能显示位图的地方。
+                                    // 高度留给二维码这类方图，image-fit: contain
+                                    // 保证长宽比不变（缩到 210 px 见方）。
+                                    if r.kind == "image" : VerticalLayout {
+                                        spacing: 6px;
+                                        if r.label != "" : Text {
+                                            text: r.label;
+                                            font-size: 11px;
+                                            color: ThemeG.text-dim;
+                                        }
+                                        Image {
+                                            source: r.img;
+                                            height: 210px;
+                                            image-fit: contain;
+                                        }
+                                    }
                                     // 进度条（-1 = 不确定进度）
                                     if r.kind == "progress" : VerticalLayout {
                                         spacing: 4px;
@@ -4275,6 +4298,14 @@ component PluginsView inherits Rectangle {
                                                 placeholder-text: r.placeholder;
                                                 edited(t) => { root.panel-field(r.key, t); }
                                             }
+                                        }
+                                        // 多行框放在 30px 的输入行之外：一行一个 token
+                                        // 这类内容塞进 LineEdit 就只能横向滚
+                                        if r.field-kind == "multiline" : TextEdit {
+                                            height: 96px;
+                                            text: r.value;
+                                            enabled: r.enabled && p.enabled;
+                                            edited(t) => { root.panel-field(r.key, t); }
                                         }
                                         // 历史下拉展开区（仅 path 字段、且点了 ▾ 时）
                                         if root.path-drop-key != "" && root.path-drop-key == r.key : Rectangle {
