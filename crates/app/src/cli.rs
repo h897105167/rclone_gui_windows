@@ -525,7 +525,9 @@ pub fn diagnostics_with(facts: RuntimeFacts) -> Result<serde_json::Value> {
         "managed_core": true,
         "external_endpoint": true,
         "plugins_wasm": true,
-        "kvault": true,
+        // 插件声明的远程类型和它们的操作（列表、上传、删除）由宿主按清单通用路由；
+        // 具体某个类型（例如 K-Vault）属于插件，不编进二进制也就不写在这一版的功能表里。
+        "plugin_remote_ops": true,
         "mounts": true,
         "serves": true,
         "transfers": true,

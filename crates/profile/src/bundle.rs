@@ -477,6 +477,30 @@ pub struct SyncTaskRef {
     pub interval_hours: u32,
 }
 
+/// 一条「这台远程归哪个插件管」的记录，随配置文件一起走。
+///
+/// 归属本身由插件声明加上用户当时的选择决定，这里带的是导出那一刻的结论。带上它的
+/// 唯一理由是：插件被卸载之后，把这份文件拿到另一台机器（或者同一台机器重装）再导入，
+/// 宿主仍能认出这台远程属于哪个插件；否则它会被当成普通远程，用原生协议去读写一份
+/// 插件托管的数据。
+///
+/// 导入端不照抄这条记录：它会拿本机远程的实际参数核对标记键，对不上就不登记，并把
+/// 原因告诉用户（`crates/app/src/remote_owners.rs` 里的 `decide_import`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RemoteOwnerRef {
+    /// rclone 远程名（不含 `:`）。
+    pub remote: String,
+    /// 接管这台远程的插件 id。
+    pub plugin: String,
+    /// 插件在远程参数里用的标记键，例如 `kvault`。
+    pub marker: String,
+    /// 插件当时的显示名，插件不在时用来说明「它归谁」。
+    pub label: String,
+    /// 这条记录当初怎么来的：`declared` / `legacy` / `scan` / `import`。
+    pub source: String,
+}
+
 /// `rcgui.conf` 根文档。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -503,6 +527,9 @@ pub struct RcguiConf {
     /// 同步文件夹任务
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sync_tasks: Vec<SyncTaskRef>,
+    /// 哪些远程归哪个插件管（导出那一刻的登记表快照）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_owners: Vec<RemoteOwnerRef>,
     /// 导出时记录的告警（如「离线导出，缺少远程参数」）
     pub warnings: Vec<String>,
 }
@@ -522,6 +549,7 @@ impl Default for RcguiConf {
             plugins: Vec::new(),
             app: None,
             sync_tasks: Vec::new(),
+            remote_owners: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -780,6 +808,46 @@ impl RcguiConf {
                 return Err(BundleError::Invalid(rcgui_i18n::f(
                     "同步任务 \"{}\" 的间隔 {} 小时过大（上限 720）",
                     &[&(t.name), &(t.interval_hours)],
+                )));
+            }
+        }
+        // 远程归属记录：只是「哪个名字归哪个插件」的对照表，形状不对就整份文件不受理，
+        // 免得导入端拿一条看不懂的记录去改本机的登记表。
+        if self.remote_owners.len() > 200 {
+            return Err(BundleError::Invalid(
+                rcgui_i18n::t("远程归属记录超出上限（≤200）").to_string(),
+            ));
+        }
+        for o in &self.remote_owners {
+            let name = o.remote.trim();
+            if name.is_empty() || o.plugin.trim().is_empty() {
+                return Err(BundleError::Invalid(rcgui_i18n::f(
+                    "远程归属记录 \"{}\" 缺少远程名或插件 id",
+                    &[&(o.remote)],
+                )));
+            }
+            // rclone 的远程名不能带冒号与空白，与远程列表的规则一致。
+            if name.contains(':') || name.chars().any(char::is_whitespace) {
+                return Err(BundleError::Invalid(rcgui_i18n::f(
+                    "远程归属记录里的远程名 \"{}\" 不合法",
+                    &[&(o.remote)],
+                )));
+            }
+            if o.plugin
+                .chars()
+                .any(|c| c.is_control() || c == '/' || c == '\\')
+            {
+                return Err(BundleError::Invalid(rcgui_i18n::f(
+                    "远程归属记录 \"{}\" 的插件 id \"{}\" 不合法",
+                    &[&(o.remote), &(o.plugin)],
+                )));
+            }
+            // 标记键就是 rclone 的参数名：空着、带 `=`、或带控制字符都没法拿去查参数。
+            let marker = o.marker.trim();
+            if marker.is_empty() || marker.contains('=') || marker.chars().any(char::is_control) {
+                return Err(BundleError::Invalid(rcgui_i18n::f(
+                    "远程归属记录 \"{}\" 的标记键 \"{}\" 不合法",
+                    &[&(o.remote), &(o.marker)],
                 )));
             }
         }

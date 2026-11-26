@@ -245,13 +245,6 @@ pub struct HostCaps {
     pub rc: Arc<RcState>,
     pub store: Arc<KvStore>,
     pub progress: Arc<ProgressHub>,
-    /// 「K-Vault 写桥此刻该工作吗」：远程参数里带 `kvault` 标记，**并且**现在有
-    /// 启用的插件声明了这个类型。
-    ///
-    /// 由装配层（`main.rs` 的 `Ctx::caps`）算好传进来，因为判据要看插件清单，
-    /// 而插件清单在 `Ctx` 里；能力层手里只有 `RcClient` + `KvStore`。一次插件调用
-    /// 只算一次，调用期间不变。
-    pub kv_bridge: bool,
 }
 
 impl HostCaps {
@@ -276,124 +269,6 @@ impl HostCaps {
     fn p_bool(params: &Value, k: &str, d: bool) -> bool {
         params.get(k).and_then(|v| v.as_bool()).unwrap_or(d)
     }
-}
-
-/// 把「源/目标是 K-Vault 远程」的写操作交给站点的 HTTP 接口；`None` = 与 k-vault
-/// 无关。
-///
-/// 站点只开放「上传 / 列表 / 删除」：删除映射到 `DELETE /api/v1/file/<id>`，
-/// 而改名、移动、建目录没有对应接口。那种情况给一句明确的原因，比把 rclone 的
-/// 403 原样抛给用户更有用。读方法（list/stat/cat…）不动，DAV 读是允许的。
-///
-/// `kv_bridge` 为假（插件被停用或卸载）时，带标记的远程一律拒绝写：见
-/// [`kv_plugin_gone`]。省掉这一步就等于让插件不在时也能绕过它写站点。
-///
-/// 返回 `Ok(Some(_))` 表示这次写已经由站点接口做完；`Ok(None)` 表示与 K-Vault
-/// 无关，调用方按普通 rclone 远程处理；`Err` 是明确拒绝，里面的原因可以直接
-/// 给用户看。
-async fn kv_write_op(
-    client: &rclone_client::RcClient,
-    store: &KvStore,
-    kv_bridge: bool,
-    method: &str,
-    params: &Value,
-) -> Result<Option<Value>> {
-    let deletes = matches!(method, "operations/deletefile" | "operations/purge");
-    let refuses = matches!(
-        method,
-        "operations/movefile"
-            | "operations/move"
-            | "operations/copyfile"
-            | "operations/copy"
-            | "operations/mkdir"
-            | "operations/rmdir"
-    );
-    if !deletes && !refuses {
-        return Ok(None);
-    }
-    let fs = params.get("fs").and_then(|v| v.as_str()).unwrap_or("");
-    let Some((remote, sub)) = fs.split_once(':') else {
-        return Ok(None);
-    };
-    let Some(cfg) = crate::kv_cfg_lookup(client, store, remote).await else {
-        return Ok(None);
-    };
-    if !kv_bridge {
-        return Err(anyhow!("{}", kv_plugin_gone(remote)));
-    }
-    if refuses {
-        let what = match method {
-            "operations/mkdir" => rcgui_i18n::t("新建目录"),
-            "operations/rmdir" => rcgui_i18n::t("删除目录"),
-            _ => rcgui_i18n::t("改名/移动/复制"),
-        };
-        return Err(anyhow!(
-            "{}",
-            rcgui_i18n::f(
-                "K-Vault 远程不支持{}：站点的 DAV 只读，API 也只开放上传、列表、删除。\
-             要在站点上调整目录，请到站点网页端操作。",
-                &[&(what)]
-            )
-        ));
-    }
-    let path = params
-        .get("remote")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim_matches('/');
-    let is_dir = method == "operations/purge";
-    let (parent, name) = match path.rsplit_once('/') {
-        Some((d, n)) => (d, n),
-        None => ("", path),
-    };
-    let folder = kv_join(&[sub, parent]);
-    let files = crate::kvault::list_files(&cfg.base, &cfg.token)
-        .await
-        .map_err(|e| anyhow!("{}", rcgui_i18n::f("站点索引读取失败: {}", &[&(e)])))?;
-    let ids = crate::kvault::pick_targets(&files, &folder, name, is_dir);
-    if ids.is_empty() {
-        return Err(anyhow!(
-            "{}",
-            rcgui_i18n::f(
-                "站点索引里没有 {}/{}（可能已经被删掉了）",
-                &[&(folder.trim_matches('/')), &(name)]
-            )
-        ));
-    }
-    for id in &ids {
-        crate::kvault::delete_file(&cfg.base, &cfg.token, id)
-            .await
-            .map_err(|e| anyhow!("{}", rcgui_i18n::f("站点删除失败: {}", &[&(e)])))?;
-    }
-    Ok(Some(json!({ "deleted": ids.len() })))
-}
-
-/// 拼远程内的路径：跳过空段，段之间用 `/`。
-fn kv_join(parts: &[&str]) -> String {
-    parts
-        .iter()
-        .map(|p| p.trim().trim_matches('/'))
-        .filter(|p| !p.is_empty())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-/// 远程还带着 `kvault` 标记，但声明这个类型的插件已经不在了：这个远程不能用的说法。
-///
-/// 挡住的不只是写。插件不在时这个类型在本程序里没有任何实现，浏览、下载、挂载、
-/// 改配置一并拒绝 —— 只留读的话，用户会以为「还能看就还能用」，等到上传才撞上
-/// 另一句报错。而放行给 rclone 更糟：写请求落到站点的 DAV 端点，那边写方法一律
-/// 403，用户看到的是一句「405 method not allowed」，既不知道发生了什么，也不知道
-/// 装回插件就能解决。
-///
-/// 远程的配置、令牌、站点上的文件都不动：装回插件立刻恢复原样。
-pub(crate) fn kv_plugin_gone(remote: &str) -> String {
-    rcgui_i18n::f(
-        "远程 {} 是 K-Vault 类型，但 K-Vault 插件没有启用：这个远程现在打不开。\
-         请在「设置 → 插件」里启用 K-Vault 再试。远程配置和站点上的文件都还在，\
-         插件停用的这段时间里不会被动过。",
-        &[&(remote)],
-    )
 }
 
 /// 只读解析 rclone.conf 里的 `[远程名]` 段：不启动进程、不碰 RC。
@@ -445,22 +320,20 @@ fn remotes_from_conf() -> Vec<String> {
 
 #[async_trait::async_trait]
 impl CapProvider for HostCaps {
+    // 能力层只按名字转给内核。哪一类远程要由插件接管、请求怎么编码、
+    // 认领者缺席时该说什么，全在 `remote_ops` 里：这里不该出现任何具体远程类型的业务。
     async fn rclone_call(&self, method: String, params: Value) -> Result<Value> {
         let client = self.rc.client().await;
-        // K-Vault 远程上 rclone 的写方法一定是 403（站点 DAV 只放行读）。
-        // 这是传输层的事实，不是插件策略：删除接到站点 API，改名/移动说明原因。
-        if let Some(v) = kv_write_op(&client, &self.store, self.kv_bridge, &method, &params).await?
-        {
-            return Ok(v);
-        }
         client.call(&method, &params).await.map_err(Into::into)
     }
 
+    // 插件要往「自己管的远程」上传，走的不是这里，而是 `http.upload`：宿主弹对话框
+    // 拿到路径、授权一次发送，字节不经过 wasm。这个函数只管普通 rclone 远程。
     async fn upload_file(
         &self,
         fs: String,
         remote_path: String,
-        filename: String,
+        _filename: String,
         data_b64: String,
     ) -> Result<Value> {
         let data = base64::engine::general_purpose::STANDARD
@@ -472,45 +345,6 @@ impl CapProvider for HostCaps {
         let tmp = tmp_dir.join(&name);
         std::fs::write(&tmp, &data)?;
         let client = self.rc.client().await;
-
-        // K-Vault 远程：站点 DAV 写方法一律 403，上传只能走 `POST /api/v1/upload`。
-        // 插件的上传全都汇到这一个函数，所以在这里分流就够了。
-        // 目录沿用插件算好的路径（相对存储根），是否在前缀之内由站点的令牌策略判；
-        // 越界时站点回 POLICY_FOLDER_DENIED，比这里悄悄搬到别的目录更可信。
-        if let Some((remote, sub)) = fs.split_once(':') {
-            if let Some(cfg) = crate::kv_cfg_lookup(&client, &self.store, remote).await {
-                // 插件没了：这条上传只能作废。往下走就是 rclone 的 `copyfile` →
-                // 站点 DAV 的 PUT → 403，用户拿到的是一句 method not allowed；
-                // 往上走又是插件的接口，而插件不在。所以在这里挡住并说清原因，
-                // 顺手把已经落盘的临时文件删掉（下面两个分支各自会删自己那份）。
-                if !self.kv_bridge {
-                    let _ = std::fs::remove_file(&tmp);
-                    return Err(anyhow!("{}", kv_plugin_gone(remote)));
-                }
-                let dir = remote_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-                let folder = kv_join(&[sub, dir]);
-                // 插件给的 final_name 才带扩展名（临时文件是 up-<pid>-<ts>），
-                // 站点按扩展名判类型，所以名字必须用 final_name。
-                let shown = if filename.trim().is_empty() {
-                    remote_path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(name.as_str())
-                        .to_string()
-                } else {
-                    filename.clone()
-                };
-                let r = crate::kvault::upload(&cfg, &tmp, &shown, &folder).await;
-                let _ = std::fs::remove_file(&tmp);
-                let up =
-                    r.map_err(|e| anyhow!("{}", rcgui_i18n::f("站点上传失败: {}", &[&(e)])))?;
-                return Ok(json!({
-                    "link": up.link,
-                    "name": up.name,
-                    "deduped": up.dedup,
-                }));
-            }
-        }
 
         let r = client
             .copyfile(&rclone_client::local_fs(&tmp_dir), &name, &fs, &remote_path)
@@ -1236,7 +1070,7 @@ impl CapProvider for HostCaps {
                 }
                 // 该 rclone 版本没有 operations/cat（实测 404），
                 // 因此走 copyfile 到唯一临时目录再读回来，和图片直链同一路径。
-                // fs 串必须带冒号：`k-vault` 会被当成相对本地目录，
+                // fs 串必须带冒号：不带冒号的串会被当成相对本地目录，
                 // copyfile 直接回 `object not found`（实测 404）。
                 let fs = if remote.contains(':') {
                     remote.clone()
@@ -1912,44 +1746,13 @@ mod search_tests {
         });
     }
 
-    /// 插件的 `fs` 是「远程名:存储根内的子路径」，站点目录要拼成
-    /// 「子路径 / remote_path 里的目录」，空段一律丢掉。
-    #[test]
-    fn kv_join_builds_site_folder() {
-        assert_eq!(super::kv_join(&["image_bed", ""]), "image_bed");
-        assert_eq!(super::kv_join(&["", "2026/10"]), "2026/10");
-        assert_eq!(
-            super::kv_join(&["image_bed", "/2026/10/"]),
-            "image_bed/2026/10"
-        );
-        assert_eq!(super::kv_join(&["", ""]), "");
-    }
-
-    /// 插件被停用或卸载后，这条远程要报错并说清三件事：是哪台远程、怎么办、
-    /// 数据有没有被动过。
+    /// 能力层不许认识任何具体远程类型：这类业务现在全在各自插件里。
     ///
-    /// 文案里必须出现远程名——一台机器上可能同时有好几台 K-Vault 站点，
-    /// 只说「插件没启用」用户不知道该去看哪一条。
+    /// 守的是分工。这里只要出现一个远程类型名或它的写桥，就意味着宿主又在替那个
+    /// 插件实现协议——而插件停用后这段代码依然在，于是「专用远程被当普通 WebDAV
+    /// 访问」的老问题就回来了。所以断言的是「一整片都不许出现」，不是「只许出现在某处」。
     #[test]
-    fn kv_plugin_gone_names_the_remote_and_what_to_do() {
-        let msg = super::kv_plugin_gone("my_blog");
-        assert!(msg.contains("my_blog"), "要说出是哪台远程：{msg}");
-        assert!(msg.contains("插件"), "要说是插件没启用：{msg}");
-        assert!(msg.contains("启用"), "要给出办法：{msg}");
-        assert!(msg.contains("还在"), "要说清数据没被动过：{msg}");
-        assert!(
-            !msg.contains("method not allowed") && !msg.contains("405"),
-            "别把 rclone 的原始错误甩给用户：{msg}"
-        );
-    }
-
-    /// 每一条「远程参数 → 是不是 K-Vault」的查询都必须先过插件检查。
-    ///
-    /// 这是结构测试：漏一处就等于插件不在时还能写站点（DAV 写方法 403，
-    /// 用户只看到一句 method not allowed）。插件检查还必须排在「不支持改名/
-    /// 移动」之前，否则插件已经没了，报的还是「这个远程不支持改名」。
-    #[test]
-    fn every_kv_lookup_in_caps_is_behind_the_plugin_check() {
+    fn the_capability_layer_knows_no_remote_type() {
         let src = include_str!("caps.rs").replace("\r\n", "\n");
         let prod = src
             .split("\n#[cfg(test)]\nmod search_tests {")
@@ -1959,34 +1762,18 @@ mod search_tests {
             prod.len() > 1000,
             "扫描基准不对（切分标记变了），先修这个用例"
         );
-
-        let lookups: Vec<&str> = prod
-            .lines()
-            .filter(|l| l.contains("kv_cfg_lookup("))
-            .collect();
-        assert_eq!(
-            lookups.len(),
-            2,
-            "多出来的查询会绕过插件检查，等于让宿主代插件写站点：{:?}",
-            lookups
-        );
-        assert_eq!(
-            prod.matches("if !kv_bridge {").count(),
-            1,
-            "rclone 写入路径上的插件检查没了"
-        );
-        assert_eq!(
-            prod.matches("if !self.kv_bridge {").count(),
-            1,
-            "上传路径上的插件检查没了"
-        );
-
-        let gate = prod.find("if !kv_bridge {").expect("上面刚断言过它在");
-        let refuses = prod.find("if refuses {").expect("写操作要先分流再判类别");
-        assert!(
-            gate < refuses,
-            "插件检查必须排在『不支持改名/移动』之前，否则插件没了还说错原因"
-        );
+        for bad in [
+            "kvault",
+            "k-vault",
+            "kv_bridge",
+            "kv_cfg_lookup",
+            "kv_write_op",
+            "kv_plugin_gone",
+            "站点",
+        ] {
+            let hit: Vec<&str> = prod.lines().filter(|l| l.contains(bad)).collect();
+            assert!(hit.is_empty(), "能力层里不该出现 {bad}：{hit:?}");
+        }
     }
 
     /// 路径只许出现在环境变量里，不许进 PowerShell 的脚本文本。

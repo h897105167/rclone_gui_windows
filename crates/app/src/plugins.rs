@@ -996,7 +996,12 @@ pub async fn dispatch_http(ctx: &Arc<Ctx>, id: &str, req: Value) -> Result<Value
 }
 
 /// 调一次插件：`action` 由 config.json 的 action 控件决定。
-async fn call_plugin(ctx: &Arc<Ctx>, id: &str, action: &str, extra: Value) -> Result<Value> {
+pub(crate) async fn call_plugin(
+    ctx: &Arc<Ctx>,
+    id: &str,
+    action: &str,
+    extra: Value,
+) -> Result<Value> {
     let (dir, cfg) =
         loaded_config(id).ok_or_else(|| anyhow!("{}", rcgui_i18n::f("找不到插件 {}", &[&(id)])))?;
     let mut params = json!({

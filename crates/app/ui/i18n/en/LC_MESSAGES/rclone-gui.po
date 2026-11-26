@@ -466,9 +466,6 @@ msgstr "Installed"
 msgid "已安装插件（点击插件栏展开 / 收起）"
 msgstr "Installed plugins (click a plugin row to expand / collapse)"
 
-msgid "已把 {} 个 K-Vault 远程的令牌复制到独立存储（卸载插件不会再连带删掉）"
-msgstr "Copied the tokens of {} K-Vault remote(s) to separate storage (uninstalling the plugin no longer removes them)."
-
 msgid "已断开"
 msgstr "Disconnected"
 
@@ -1296,3 +1293,66 @@ msgstr "Cannot parse this path: {}"
 
 msgid "列不出来：{}"
 msgstr "Cannot list it: {}"
+
+msgid "文件里有一条归属记录缺远程名、插件 id 或标记键，跳过这一条"
+msgstr "An ownership record in the file is missing its remote name, plugin id or marker key; skipping it"
+
+msgid "本机没有远程「{}」，文件里那条归属记录没有登记"
+msgstr "No remote named \"{}\" exists on this machine, so that ownership record was not registered"
+
+msgid "本机远程「{}」的参数里没有标记键「{}」，它现在是普通远程，文件里那条归属记录没有登记"
+msgstr "Remote \"{}\" has no marker key \"{}\" in its parameters, so it is a plain remote now; that ownership record was not registered"
+
+msgid "远程「{}」原本登记给插件「{}」，这份文件说是「{}」，本机参数与文件一致，已改成后者"
+msgstr "Remote \"{}\" was registered to plugin \"{}\" but this file says \"{}\"; the local parameters agree with the file, so the record now follows it"
+
+msgid "远程「{}」还登记为插件「{}」管的，但这次没读到它的参数，这条登记没有动"
+msgstr "Remote \"{}\" is still registered to plugin \"{}\" but its parameters could not be read this time, so that record was left alone"
+
+msgid "远程「{}」在文件里是普通远程、本机参数里也没有「{}」标记，原来的登记撤掉了"
+msgstr "Remote \"{}\" is a plain remote in this file and its local parameters carry no \"{}\" marker, so the old record was dropped"
+
+msgid "远程归属登记表读不出来，这次导入没有动它：{}"
+msgstr "The remote ownership table cannot be read, so this import left it untouched: {}"
+
+msgid "远程归属登记已更新（新登记 {} 条，撤销 {} 条），改动前的表存为 {}"
+msgstr "Remote ownership table updated ({} added, {} dropped); the previous table was saved as {}"
+
+msgid "远程归属登记已建立（新登记 {} 条）"
+msgstr "Remote ownership table created ({} added)"
+
+msgid "远程归属登记没写成功，导入的其他部分已完成：{}"
+msgstr "The remote ownership table could not be saved; the rest of the import is done: {}"
+
+msgid "这次启动没能读出远程列表，插件远程的归属无从判断：{}"
+msgstr "The remote list could not be read at startup, so plugin remotes cannot be identified: {}"
+
+msgid "远程归属登记表读不出来，插件远程的操作会全部被拒绝：{}"
+msgstr "The remote ownership table cannot be read, so every plugin remote will be refused: {}"
+
+msgid "远程归属登记表读不出来，这次导出没有带上归属：{}"
+msgstr "The remote ownership table cannot be read, so this export carries no ownership records: {}"
+
+msgid "；含 {} 条远程归属"
+msgstr "; includes {} ownership record(s)"
+
+msgid "；远程归属登记表读不出来，这次文件里没有归属记录"
+msgstr "; the remote ownership table cannot be read, so this file has no ownership records"
+
+msgid "；远程归属：{}"
+msgstr "; remote ownership: {}"
+
+msgid "远程归属记录超出上限（≤200）"
+msgstr "Too many remote ownership records (limit 200)"
+
+msgid "远程归属记录 \"{}\" 缺少远程名或插件 id"
+msgstr "Remote ownership record \"{}\" is missing its remote name or plugin id"
+
+msgid "远程归属记录里的远程名 \"{}\" 不合法"
+msgstr "Remote ownership record has an invalid remote name: \"{}\""
+
+msgid "远程归属记录 \"{}\" 的插件 id \"{}\" 不合法"
+msgstr "Remote ownership record \"{}\" has an invalid plugin id: \"{}\""
+
+msgid "远程归属记录 \"{}\" 的标记键 \"{}\" 不合法"
+msgstr "Remote ownership record \"{}\" has an invalid marker key: \"{}\""

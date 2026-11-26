@@ -14,7 +14,6 @@ mod core;
 mod http;
 mod icon_asset;
 mod kv;
-mod kvault;
 mod lightweight;
 mod logging;
 mod maintenance;
@@ -24,6 +23,8 @@ mod profiles;
 mod proxy;
 mod reconcile;
 mod refresh;
+mod remote_ops;
+mod remote_owners;
 mod remote_types;
 #[cfg(test)]
 mod source_scan;
@@ -447,18 +448,13 @@ struct HttpServer {
 impl Ctx {
     /// 一次插件调用的能力集合。
     ///
-    /// 收 `&Arc<Self>` 是为了算 [`kv_bridge_owns`]——它要看插件清单，而清单在
-    /// `Ctx` 里。两个调用点（`plugins.rs` 的 HTTP 入口与面板按钮）都手里有
-    /// `&Arc<Ctx>`，所以这个签名不用改动调用方。
-    ///
-    /// 判一次就固定下来：插件在同一次调用里发多个 `rclone.*`，不该出现「前一个
-    /// 走站点 API、后一个落到 DAV」的分裂结论。
+    /// 收 `&Arc<Self>` 是为了留下签名余地：能力层自己不需要 `Ctx`，但调用方
+    /// （`plugins.rs` 的 HTTP 入口与面板按钮）手里就是 `&Arc<Ctx>`。
     fn caps(self: &Arc<Self>) -> Arc<caps::HostCaps> {
         Arc::new(caps::HostCaps {
             rc: self.rc.clone(),
             store: self.store.clone(),
             progress: self.progress.clone(),
-            kv_bridge: kv_bridge_owns(self),
         })
     }
 }
@@ -2900,7 +2896,7 @@ async fn list_display_checked(
     // 挑目录的弹窗也走这里。插件不在时被标记的远程不能借它翻目录树，
     // 更不能被选成同步目标：选上了同步只会一路 403。
     let name = fs.trim_end_matches(':');
-    if let Some(msg) = kv_access_blocked(ctx, name).await {
+    if let Some(msg) = remote_blocked(ctx, name).await {
         return (Err(msg), format!("root://{}", rest));
     }
     match client.list(&fs, &r, None).await {
@@ -3227,20 +3223,20 @@ fn edit_single_choice(ty: &str, derived: &[remote_types::Derived]) -> TypeChoice
 
 /// 一个既有远程在界面上该显示成哪个类型。
 ///
-/// 存进 rclone 的 `type` 永远只是后端，所以「这是 K-Vault 而不是普通 WebDAV」这条
-/// 信息只能来自参数里的标记键。而标记键是不是还真有实现，取决于**当前有没有插件
-/// 声明那个类型 id**：插件停用或卸载后，同一个远程就该显示成它真实的样子（webdav），
-/// 让用户看见「写入功能不在」而不是继续看到那个名字。
+/// 存进 rclone 的 `type` 永远只是后端，所以「这是某个插件声明的类型而不是普通
+/// WebDAV」这条信息只能来自参数里的标记键。而标记键是不是还真有实现，取决于
+/// **当前有没有插件声明那个类型 id**：插件停用或卸载后，同一个远程就该显示成它
+/// 真实的样子（webdav），让用户看见「那个能力不在」而不是继续看到那个名字。
 ///
 /// 返回类型 id：命中插件时是插件的 id，否则是 `stored` 原样。
 ///
 /// 收整条条目（`Value::Object`，来自 `rclone config dump`）而不是拆出来的参数表：
 /// 调用方手里本来就有一条条目，标记键在两种形状里的读法一样。
 fn display_type_of(entry: &Value, stored: &str, derived: &[remote_types::Derived]) -> String {
-    if !kvault::KvCfg::is_marked_entry(entry) {
+    let Some(params) = entry.as_object() else {
         return stored.to_string();
-    }
-    match remote_types::marker_owner(derived, kvault::MARKER) {
+    };
+    match remote_types::owner_of_params(derived, params) {
         Some(d) => d.id.clone(),
         None => stored.to_string(),
     }
@@ -3299,452 +3295,71 @@ fn update_editor_fields(ui: &Weak<MainWindow>, providers: &Value, type_name: &st
     });
 }
 
-// ---------------- K-Vault：只剩远程操作桥 ----------------
+// ---------------- 插件接管的远程：宿主只做归属与分派 ----------------
 //
-// K-Vault 这个**类型**由 kvault 插件声明（`remote_types`），编辑表单也在插件面板里。
-// 主程序这边只剩一条操作桥：把文件字节搬到站点 API、列站点文件、删站点文件。
-// 需要它是因为站点的 DAV 端点只放行 OPTIONS/PROPFIND/GET/HEAD，写方法一律 403，
-// 而插件的 `http.request` 只能发字符串，搬不动文件。
+// 哪些远程由插件接管、接管哪些操作、认领者缺席时该说什么，全在 `remote_ops`
+// 里。这一层只留几个薄包装：调用点保持「可能被拒绝 / 可能不归我管」的原始形状，
+// 「要不要刷新列表、怎么把结果说清楚」这类界面自己的决定也留在这里。
 //
-// 桥认的参数形状没变：rclone 里就是一个 `webdav` 远程（`url=<站点>/dav`），
-// 靠参数里的 `kvault=1` 标记认出来。插件没装/没启用时没人声明这个类型，
-// 这个远程在本程序里就用不了（[`kv_access_blocked`] 会拒掉浏览、下载、挂载和
-// 改配置，[`kv_write_kind`] 拒掉写），而不是降级成普通 webdav 远程。
+// 归属只看远程参数里的**标记键**（键名由插件清单声明），不看 `type`：`type`
+// 永远是插件的 `base_type`，用户还可能改过显示名。
 
-/// 读一个远程的参数，判断它是不是 K-Vault 远程；是则返回配置（含明文令牌）。
-///
-/// 用 `config/get` 而不是 `config/dump`：只读这一个远程，不去拉全量凭据。
-/// 不缓存：用户可能刚在原始编辑器里改过参数，缓存会让上传用上过期配置。
-///
-/// 拆成两步是因为插件宿主（`caps.rs`）手里只有 `RcClient` + `KvStore`，没有 `Ctx`：
-/// 它执行插件的 `rclone.upload_file` 时也要判断目标是不是 K-Vault 远程。
-pub async fn kv_cfg_lookup(
-    client: &rclone_client::RcClient,
-    store: &crate::kv::KvStore,
-    remote: &str,
-) -> Option<kvault::KvCfg> {
-    let remote = remote.trim();
-    if remote.is_empty() {
-        return None;
-    }
-    let params = client.config_get(remote).await.ok()?;
-    if !kvault::KvCfg::is_marked(&params) {
-        return None;
-    }
-    let mut cfg = kvault::KvCfg::from_params(&params);
-    cfg.token = kv_token_resolve(client, store, remote, &params).await;
-    Some(cfg)
+/// 这条远程此刻能不能用。`Some(原因)` 就是拒绝，原因可以直接给用户看。
+async fn remote_blocked(ctx: &Arc<Ctx>, remote: &str) -> Option<String> {
+    remote_ops::blocked(ctx, remote).await
 }
 
-/// 插件的 id。它和 [`kvault::STORE_NS`] 现在同一个字符串，但含义不同：
-/// 这里是「插件目录名 / KV 命名空间」，那边是「旧版主程序存令牌的键空间」。
-/// 分开写是为了以后改名时不会顺手改错另一边。
-const KVAULT_PLUGIN_ID: &str = "kvault";
-
-/// 找出一枚能直接发 HTTP 的明文令牌。
-///
-/// 历史原因同一枚令牌有三处来源，优先级从旧到新：
-/// 1. 主程序按远程名记下的明文（见 [`kv_token_in`]）。旧版把令牌写在
-///    `kvault::STORE_NS` 命名空间里，那个命名空间与插件目录同名，卸载插件会连令牌
-///    一起删掉，所以现在写进 `kvault::TOKEN_NS`，读的时候两个都看；
-/// 2. rclone 远程参数里的 `bearer_token`——kvault 插件新建远程时写这里；
-/// 3. kvault 插件自己存的 `site.token`（整个站点一枚，不区分远程）。
-///
-/// 三处都空才返回空串；调用方据此判定「没令牌，只能浏览」，不要在这里猜一个。
-async fn kv_token_resolve(
-    client: &rclone_client::RcClient,
-    store: &crate::kv::KvStore,
-    remote: &str,
-    params: &serde_json::Map<String, Value>,
-) -> String {
-    let legacy = kv_token_in(store, remote);
-    if !legacy.is_empty() {
-        return legacy;
-    }
-    if let Some(raw) = params.get(kvault::TOKEN_KEY).and_then(|v| v.as_str()) {
-        let token = kv_reveal(client, raw).await;
-        if !token.is_empty() {
-            return token;
-        }
-    }
-    store
-        .get_all(KVAULT_PLUGIN_ID)
-        .get("site")
-        .and_then(|v| v.get("token"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
-}
-
-/// 把 rclone 存下的 `bearer_token` 还原成明文。
-///
-/// rclone 对 webdav 的 `bearer_token` 做 obscure 后存储——那是可逆编码，不是加密，
-/// 但直接拿去发请求会被站点拒绝。手工写进配置文件的明文令牌不是合法 obscure 串，
-/// `config/reveal` 会失败，这时原文就是明文，原样使用。
-///
-/// 失败一律当明文：宁可发出一个错的令牌让用户看见 401，也不要静默变成「没有凭据」。
-async fn kv_reveal(client: &rclone_client::RcClient, raw: &str) -> String {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return String::new();
-    }
-    match client.call("config/reveal", &json!({ "value": raw })).await {
-        Ok(v) => {
-            let plain = v.get("value").and_then(|v| v.as_str()).unwrap_or("").trim();
-            if plain.is_empty() {
-                raw.to_string()
-            } else {
-                plain.to_string()
-            }
-        }
-        Err(_) => raw.to_string(),
-    }
-}
-
-/// 这个远程现在归不归主程序的 K-Vault 操作桥管。
-///
-/// 判据是「有没有启用中的插件声明了这个标记键」：插件把**自己的类型 id** 当作远程
-/// 参数里的标记键（`config.json` 的 `remote_types[].defaults` 里写 `kvault: "1"`），
-/// 所以没人声明就等于这个类型现在没有实现，桥必须下线 —— 否则用户卸了插件，
-/// 主程序还在替他往站点传文件。
-///
-/// 注意它**不等于**「插件停用后这个远程退化成普通 webdav 远程」：远程还带着标记，
-/// 说明它本来就不是普通 WebDAV，停用后它在应用里用不了，见 [`kv_access_blocked`]。
-fn kv_bridge_owns(ctx: &Arc<Ctx>) -> bool {
-    remote_types::marker_owner(&remote_types::collect(ctx), kvault::MARKER).is_some()
-}
-
-async fn kv_cfg_for(ctx: &Arc<Ctx>, remote: &str) -> Option<kvault::KvCfg> {
-    if !kv_bridge_owns(ctx) {
-        return None;
-    }
-    let client = ctx.rc.client().await;
-    kv_cfg_lookup(&client, &ctx.store, remote).await
-}
-
-/// 一条远程在「写」这件事上归谁管。
-///
-/// 三种情况必须分开，不能像原来那样只用 `Option<cfg>` 表示：
-/// - `NotKv`：与 K-Vault 无关，照旧交给 rclone（普通 WebDAV 永远落在这里）；
-/// - `Bridge`：带标记且插件在，走站点 API；
-/// - `Orphan`：带标记但插件被停用/卸载了。此时**不能**悄悄回落到 rclone：
-///   站点 DAV 的写方法一律 403，用户只会看到「method not allowed」，既不知道
-///   发生了什么，也不知道装回插件就能解决。要显式拒绝并说明。
-enum KvWrite {
-    NotKv,
-    Bridge(kvault::KvCfg),
-    Orphan(String),
-}
-
-/// 判一条远程的写路径。插件不在时的结论与 [`kv_access_blocked`] 一致（拒绝），
-/// 那里管的是读、挂载和配置，两边共用 [`kv_write_kind`] 这一处判定。
-async fn kv_write_target(ctx: &Arc<Ctx>, remote: &str) -> KvWrite {
-    let client = ctx.rc.client().await;
-    let cfg = kv_cfg_lookup(&client, &ctx.store, remote).await;
-    kv_write_kind(cfg, kv_bridge_owns(ctx), remote)
-}
-
-/// [`kv_write_target`] 的判定部分，单独拎出来是为了能测：
-/// 真正那一步要去问 rclone，而三态的分岔点在拿到配置之后。
-///
-/// 先看标记：没有 `kvault` 键的远程是普通远程，插件装没装都与它无关。
-fn kv_write_kind(cfg: Option<kvault::KvCfg>, bridge: bool, remote: &str) -> KvWrite {
-    match cfg {
-        None => KvWrite::NotKv,
-        Some(cfg) if bridge => KvWrite::Bridge(cfg),
-        Some(_) => KvWrite::Orphan(caps::kv_plugin_gone(remote)),
-    }
-}
-
-/// 插件不在时，这条远程还能不能被用：浏览、下载、挂载、改配置都先问这里。
-///
-/// 判据和 [`kv_write_kind`] 是同一道闸门（带标记 + 插件不在 = 拒绝），覆盖面更大：
-/// 一个「类型没有实现」的远程在本程序里就不该有能用的入口。浏览尤其不能放过 ——
-/// 只读也能列能看，用户自然会以为插件可有可无，直到上传时才撞上另一句报错。
-///
-/// 返回 `Some(原因)` 就是拒绝，原因可以直接给用户看；`None` 表示放行：普通远程
-/// （没有标记键，插件装没装都与它无关），或者插件在。
-async fn kv_access_blocked(ctx: &Arc<Ctx>, remote: &str) -> Option<String> {
-    // 这里必须用不带闸的 `kv_cfg_lookup`：先拿到「是不是 K-Vault」，再判插件。
-    // 反过来的话插件不在时只能得到 `None`，看起来就像普通远程，闸门形同虚设。
-    let client = ctx.rc.client().await;
-    let cfg = kv_cfg_lookup(&client, &ctx.store, remote).await;
-    match kv_write_kind(cfg, kv_bridge_owns(ctx), remote) {
-        KvWrite::Orphan(msg) => Some(msg),
-        _ => None,
-    }
-}
-
-/// 给 [`reconcile::reconcile`] 用的「哪些远程现在不能用」表。
-///
-/// 对账模块只拿得到 `RcClient`，判断不了插件启没启用，所以结论在这里先算好传进去。
-/// 只看 `cfg.auto_mounts` 和 `cfg.auto_serves` 里出现过的远程：那正是对账会去
-/// 重建挂载和服务的范围，别的远程不用判。
-async fn kv_blocked_map(
+/// 对账用：自动挂载、自动起服务涉及的远程里，哪些现在不能用。
+async fn remote_blocked_map(
     ctx: &Arc<Ctx>,
     cfg: &config::AppConfig,
 ) -> std::collections::HashMap<String, String> {
-    let mut names: Vec<String> = Vec::new();
-    for m in &cfg.auto_mounts {
-        names.push(m.remote.clone());
-    }
-    for s in &cfg.auto_serves {
-        names.push(s.remote.clone());
-    }
-    names.sort();
-    names.dedup();
-
-    let mut out = std::collections::HashMap::new();
-    for name in names {
-        if let Some(msg) = kv_access_blocked(ctx, &name).await {
-            out.insert(name, msg);
-        }
-    }
-    out
+    remote_ops::blocked_map(ctx, cfg).await
 }
 
-/// 明文令牌（rclone 里那份是 obscured 的，API 用不了）。
-///
-/// 和上传/删除走同一套回落顺序（[`kv_token_resolve`]）：否则「界面说有令牌、
-/// 上传时却说没有凭据」，用户只能看到一句莫名其妙的 401。
-///
-/// 先看 [`kvault::TOKEN_NS`]，再退回 [`kvault::STORE_NS`]：后者与插件目录同名，
-/// 卸载插件时整个 `kv.json` 会被删掉，旧版写在那里的令牌也就跟着没了。启动时的
-/// [`kvault::migrate_kvault_tokens`] 把旧记录复制到新命名空间，这里两个都查是为了
-/// 迁移还没跑过（或迁移失败）时用户至少还能用一次。
-fn kv_token_in(store: &crate::kv::KvStore, remote: &str) -> String {
-    let read = |ns: &str| {
-        store
-            .get_all(ns)
-            .get(remote)
-            .and_then(|v| v.get("token"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-    let fresh = read(kvault::TOKEN_NS);
-    if fresh.is_empty() {
-        read(kvault::STORE_NS)
-    } else {
-        fresh
-    }
+/// 改名、移动、新建目录：认领的插件若声明不接管，就明说做不到。
+async fn remote_write_blocked(ctx: &Arc<Ctx>, remote: &str) -> Option<String> {
+    remote_ops::write_blocked(ctx, remote).await
 }
 
-/// 本次上传落到站点哪个目录。
+/// 列目录。
 ///
-/// 文件页当前路径就是用户看到的目录：非空时按它传（用户明确选了一个子目录），
-/// 否则用远程保存的上传目录（通常等于令牌的目录前缀）。
-///
-/// 站点按令牌策略要求目录落在前缀下，传到前缀之外一律 `POLICY_FOLDER_DENIED`；
-/// 所以当前路径不在上传目录里时退回上传目录，而不是让 rclone/站点回一个看不懂的错。
-/// 站点目录：用户在界面里选的路径优先，留空才用配置里的上传目录。
-///
-/// 不把「不在策略前缀下」的路径偷偷换成上传目录——那会让文件跑到用户没有指定的地方。
-/// 站点自己会用 `POLICY_FOLDER_DENIED` 明确拒绝，错误信息里也写了允许的前缀。
-fn kv_upload_folder(cfg: &kvault::KvCfg, gui_path: &str) -> String {
-    let p = gui_path.trim().trim_matches('/');
-    if p.is_empty() {
-        return cfg.folder.trim().trim_matches('/').to_string();
-    }
-    p.to_string()
-}
-
-/// 一次 K-Vault 上传的汇总（给 toast 用）。
-#[derive(Default)]
-struct KvUpload {
-    total: usize,
-    ok: usize,
-    failed: Vec<String>,
-    /// 最后一个成功的直链；只传了一个文件时复制到剪贴板
-    link: String,
-    /// 与 `link` 同一次上传的文件名（提示语里指名道姓，免得用户猜是哪个）
-    name: String,
-    /// 是否只有一个文件（决定要不要把直链丢进剪贴板）
-    single: bool,
-    /// 站点判定「同一份内容已存在」直接复用的个数（开了去重才会出现）
-    dedup: usize,
-}
-
-/// 递归列出目录下的文件：`(绝对路径, 相对目录的路径)`。
-///
-/// 跳过符号链接（避免绕圈），并对深度/数量设上限：这里只是给上传排个队，
-/// 真正的错误留给逐文件上传去报。
-fn kv_walk(dir: &Path) -> Vec<(PathBuf, String)> {
-    fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(PathBuf, String)>) {
-        if depth > 32 || out.len() > 20000 {
-            return;
-        }
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in rd.flatten() {
-            let Ok(ft) = e.file_type() else { continue };
-            if ft.is_symlink() {
-                continue;
-            }
-            let path = e.path();
-            if ft.is_dir() {
-                walk(root, &path, depth + 1, out);
-            } else if ft.is_file() {
-                if let Ok(rel) = path.strip_prefix(root) {
-                    out.push((path.clone(), rel.to_string_lossy().to_string()));
-                }
-            }
-        }
-    }
-    let mut v = Vec::new();
-    walk(dir, dir, 0, &mut v);
-    v
-}
-
-/// 把本机路径（文件或目录）上传到站点目录 `folder`。
-///
-/// **不做同名改名**：站点里文件名不是身份（记录靠 `file.id`），同名不会被覆盖，
-/// 而 `deduplicate` 正是按内容去重 —— 客户端抢先改名只会让去重失效。
-async fn kv_upload_paths(cfg: &kvault::KvCfg, folder: &str, paths: &[PathBuf]) -> KvUpload {
-    // 先排好队：目录展开成文件，这样 total 是「文件数」而不是「拖进来的项数」。
-    let mut jobs: Vec<(PathBuf, String, String)> = Vec::new();
-    let mut out = KvUpload::default();
-    for p in paths {
-        let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) else {
-            continue;
-        };
-        if p.is_dir() {
-            let files = kv_walk(p);
-            if files.is_empty() {
-                out.failed
-                    .push(rcgui_i18n::f("{}: 目录里没有文件", &[&(name)]));
-                continue;
-            }
-            let base_dir = join_path(folder, &name);
-            for (abs, rel) in files {
-                let rel = rel.replace('\\', "/");
-                let (sub, fname) = match rel.rsplit_once('/') {
-                    Some((d, n)) => (d.to_string(), n.to_string()),
-                    None => (String::new(), rel.clone()),
-                };
-                let dst = if sub.is_empty() {
-                    base_dir.clone()
-                } else {
-                    join_path(&base_dir, &sub)
-                };
-                jobs.push((abs, dst, fname));
-            }
-        } else {
-            jobs.push((p.clone(), folder.to_string(), name));
-        }
-    }
-    out.total = jobs.len();
-    out.single = jobs.len() == 1;
-    for (abs, dst, name) in jobs {
-        match kvault::upload(cfg, &abs, &name, &dst).await {
-            Ok(u) => {
-                out.ok += 1;
-                if u.dedup {
-                    out.dedup += 1;
-                }
-                if !u.link.is_empty() {
-                    out.name = u.name;
-                    out.link = u.link;
-                }
-            }
-            Err(e) => out.failed.push(format!("{name}: {e}")),
-        }
-    }
-    out
-}
-
-/// 上传结果 → 一句 toast（成功 1 / 失败 2）。
-fn kv_upload_report(up: &KvUpload, where_: &str) -> (i32, String) {
-    let place = if where_.is_empty() {
-        rcgui_i18n::t("站点根目录")
-    } else {
-        where_
-    };
-    if up.failed.is_empty() {
-        let mut msg = rcgui_i18n::f("已上传 {} 个文件到 {}", &[&(up.ok), &(place)]);
-        if up.dedup > 0 {
-            msg.push_str(&rcgui_i18n::f(
-                "；其中 {} 个站点已有同一份内容，直接复用了直链",
-                &[&(up.dedup)],
-            ));
-        }
-        return (1, msg);
-    }
-    // 失败项只列前 3 条：toast 是一行字，全塞进去就看不清了。
-    let shown: Vec<String> = up.failed.iter().take(3).cloned().collect();
-    let mut msg = rcgui_i18n::f(
-        "上传完成 {}/{}，失败 {}：{}",
-        &[
-            &(up.ok),
-            &(up.total),
-            &(up.failed.len()),
-            &(shown.join("；")),
-        ],
-    );
-    if up.failed.len() > shown.len() {
-        msg.push_str(&rcgui_i18n::f(
-            "（另有 {} 条未列出）",
-            &[&(up.failed.len() - shown.len())],
-        ));
-    }
-    (2, msg)
-}
-
-/// 改名/移动/新建目录在 K-Vault 远程上没得做：站点的 WebDAV 端点只读，HTTP API
-/// 也只开放上传、列表、删除和文本粘贴，没有移动或建目录的端点。这里给一句明确的
-/// 原因，而不是让 rclone 回一个干巴巴的 403。
-async fn kv_write_blocked(ctx: &Arc<Ctx>, remote: &str) -> Option<String> {
-    match kv_write_target(ctx, remote).await {
-        KvWrite::NotKv => None,
-        KvWrite::Bridge(_) => Some(
-            rcgui_i18n::t(
-                "K-Vault 远程不支持改名/移动/新建目录：站点只读（WebDAV 写方法一律 403），\
-API 也只开放上传、列表、删除。要在站点上调整目录，请到站点网页端操作。",
-            )
-            .to_string(),
-        ),
-        KvWrite::Orphan(msg) => Some(msg),
-    }
-}
-
-/// K-Vault 远程的列目录：直接读站点索引（`GET /api/v1/files`）。
-///
-/// 为什么不用 rclone 的 DAV：站点的目录树有一层 5 分钟 KV 缓存（`dav:tree:v2`，
-/// 上传和删除都不会主动失效），刚上传的文件那边要等好几分钟才出现；而站点索引
-/// 是直接读 KV 的，立刻可见。顺带也绕开了 Cloudflare 上偶发的 HTTP/2 建连抖动。
-///
-/// 返回 `None` 表示「这条远程不归我管」（不是 k-vault，或者没填令牌只能走 DAV）。
-async fn kv_list_rows(
+/// `None` 表示这条远程不归插件管，调用方照旧问 rclone；`Some(Err)` 表示归属判断
+/// 不出来（登记表坏了、启动扫描失败），调用方要把原因说给用户，不能继续往下读。
+async fn remote_list_rows(
     ctx: &Arc<Ctx>,
     remote: &str,
     path: &str,
     sort_key: &str,
     desc: bool,
 ) -> Option<Result<Vec<FileRow>, String>> {
-    let cfg = kv_cfg_for(ctx, remote).await?;
-    if cfg.token.trim().is_empty() {
-        return None;
-    }
-    match kvault::list_files(&cfg.base, &cfg.token).await {
-        Ok(files) => Some(Ok(kvault::list_folder(&files, path, sort_key, desc)
-            .into_iter()
-            .map(|i| FileRow {
-                name: i.name.into(),
-                is_dir: i.is_dir,
-                size: fmt_bytes(i.size as f64).into(),
-                mtime: fmt_mtime(&i.uploaded).into(),
-            })
-            .collect())),
-        Err(e) => Some(Err(e)),
-    }
+    let entries = match remote_ops::list(ctx, remote, path, sort_key, desc).await {
+        Ok(Some(items)) => items,
+        Ok(None) => return None,
+        Err(e) => return Some(Err(e)),
+    };
+    Some(Ok(entries
+        .into_iter()
+        .map(|e| FileRow {
+            name: e.name.into(),
+            is_dir: e.is_dir,
+            // 目录没有大小可看，留空比显示 0 B 更诚实。
+            size: if e.is_dir {
+                String::new()
+            } else {
+                fmt_bytes(e.size as f64)
+            }
+            .into(),
+            mtime: fmt_mtime(&e.uploaded).into(),
+        })
+        .collect()))
 }
 
 /// 删除成功后本地摘行（必须在 UI 线程内调用）。
 ///
-/// 不刷新列表的原因：站点目录树有一层 5 分钟 KV 缓存（`dav:tree:v2`，上传和
-/// 删除都不会主动失效），删完立刻刷新会把条目又读回来，看起来像「删了没效果」。
-/// 先本地摘掉，缓存过期后自然一致。
+/// 不刷新列表的原因：远端可能有目录缓存（几分钟才失效，删完不会主动失效），
+/// 立刻重取会把条目又读回来，看起来像「删了没效果」。先本地摘掉，下次刷新
+/// 再以服务端为准。
 fn prune_file_rows(ui: &MainWindow, names: &[String]) {
     let g = ui.global::<FilesG>();
     let model = g.get_entries();
@@ -3755,103 +3370,107 @@ fn prune_file_rows(ui: &MainWindow, names: &[String]) {
     set_file_entries(ui, kept);
 }
 
-/// K-Vault 远程的删除：走站点 API（`DELETE /api/v1/file/<id>`，要 delete 权限），
-/// 按站点索引把「目录 + 名字」翻成文件 id 再删。
+/// 插件管的远程上删除若干项：把「目录 + 名字」交给认领的插件，由它翻成能删的东西。
 ///
-/// 不用 DAV 路径直接删的原因：站点的 DAV 显示名可能被改过（同目录重名会补
-/// `~<主键末 6 位>`），而且目录树有 5 分钟缓存；站点索引
-/// （`GET /api/v1/files`）里的 `folderPath` / 文件名才是原始值。
-async fn kv_delete_into(
+/// 不用界面上的路径直接删的原因：远端显示名可能被改过（同目录重名会补后缀），
+/// 目录树也可能有缓存；只有认领这条远程的插件知道怎么把「名字」变成它自己的
+/// 文件标识。返回 `false` 与其它删除分支一致 —— 调用方拿它当「这条命令已处理完」。
+async fn remote_delete_into(
+    ctx: &Arc<Ctx>,
     ui: Weak<MainWindow>,
-    cfg: kvault::KvCfg,
+    remote: &str,
     dir: String,
     items: Vec<(String, bool)>,
 ) -> bool {
-    if cfg.token.trim().is_empty() {
-        toast(
-            &ui,
-            2,
-            rcgui_i18n::t("删除站点文件需要 API 令牌（WebDAV 通道只读）。请编辑该远程填入令牌。"),
-        );
-        return false;
-    }
     let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_busy(true));
-    let listed = kvault::list_files(&cfg.base, &cfg.token).await;
-    let files = match listed {
-        Ok(f) => f,
+    let res = remote_ops::delete(ctx, remote, &dir, &items).await;
+    let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_busy(false));
+    let d = match res {
+        Ok(d) => d,
         Err(e) => {
-            let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_busy(false));
-            toast(&ui, 2, rcgui_i18n::f("读取站点索引失败: {}", &[&(e)]));
+            toast(&ui, 2, e);
             return false;
         }
     };
-    let mut gone: Vec<String> = Vec::new();
-    let mut failed: Vec<String> = Vec::new();
-    let mut missing: Vec<String> = Vec::new();
-    for (name, is_dir) in &items {
-        let ids = kvault::pick_targets(&files, &dir, name, *is_dir);
-        if ids.is_empty() {
-            missing.push(name.clone());
-            continue;
-        }
-        // 站点允许同一目录里同名文件共存（靠主键区分）。删哪一条都不是用户在
-        // GUI 里看到的「那一条」，所以宁可不删，把话说明白。
-        if !*is_dir && ids.len() > 1 {
-            failed.push(rcgui_i18n::f(
-                "{}: 站点有 {} 个同名文件，请到站点网页端处理",
-                &[&(name), &(ids.len())],
-            ));
-            continue;
-        }
-        let mut err: Option<String> = None;
-        for id in &ids {
-            if let Err(e) = kvault::delete_file(&cfg.base, &cfg.token, id).await {
-                err = Some(e);
-                break;
-            }
-        }
-        match err {
-            Some(e) => failed.push(format!("{name}: {e}")),
-            None => gone.push(name.clone()),
-        }
-    }
-    let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_busy(false));
-    if !gone.is_empty() {
-        let names = gone.clone();
+    if !d.gone.is_empty() {
+        let names = d.gone.clone();
         let _ = ui.upgrade_in_event_loop(move |ui| prune_file_rows(&ui, &names));
     }
-    let mut msg = rcgui_i18n::f("已删除 {} 项", &[&(gone.len())]);
-    if !gone.is_empty() {
-        msg.push_str(rcgui_i18n::t(
-            "（站点目录树有 5 分钟缓存，其它视图可能还会显示一会儿）",
-        ));
+    let gone = d.gone.len();
+    let mut msg = rcgui_i18n::f("已删除 {} 项", &[&gone]);
+    if gone > 0 {
+        msg.push_str(&rcgui_i18n::t("（远端目录可能有缓存，其它视图稍后才一致）"));
     }
-    if !missing.is_empty() {
+    if !d.missing.is_empty() {
         msg.push_str(&rcgui_i18n::f(
-            "；{} 项在站点索引里找不到（可能已被删或改过名）",
-            &[&(missing.len())],
+            "；{} 项在远端索引里找不到（可能已被删或改过名）",
+            &[&(d.missing.len())],
         ));
     }
-    if !failed.is_empty() {
-        let shown: Vec<String> = failed.iter().take(2).cloned().collect();
+    if !d.failed.is_empty() {
+        let first: String = d
+            .failed
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("；");
         msg.push_str(&rcgui_i18n::f(
             "；失败 {}：{}",
-            &[&(failed.len()), &(shown.join("；"))],
+            &[&(d.failed.len()), &first],
         ));
     }
-    let level = if failed.is_empty() && missing.is_empty() {
-        1
-    } else {
-        2
+    toast(&ui, if d.failed.is_empty() { 1 } else { 2 }, msg);
+    false
+}
+
+/// 往插件管的远程上传：目录展开、逐文件授权与分派都在 `remote_ops` 里。
+///
+/// 这里只管忙态、刷新列表、以及「单个文件传成功就把直链放进剪贴板」——
+/// 传完能把链接直接发出去，是这类远程最常见的用法。
+async fn remote_upload_into(
+    ctx: Arc<Ctx>,
+    ui: Weak<MainWindow>,
+    remote: &str,
+    paths: Vec<PathBuf>,
+    gui_path: &str,
+) -> bool {
+    let _ = ui.upgrade_in_event_loop(|ui| {
+        ui.global::<FilesG>().set_busy(true);
+        ui.global::<LocalG>().set_busy(true);
+    });
+    let res = remote_ops::upload_paths(&ctx, remote, gui_path, &paths).await;
+    let _ = ui.upgrade_in_event_loop(|ui| {
+        ui.global::<FilesG>().set_busy(false);
+        ui.global::<LocalG>().set_busy(false);
+    });
+    let up = match res {
+        Ok(up) => up,
+        Err(e) => {
+            toast(&ui, 2, e);
+            return false;
+        }
     };
+    if up.ok > 0 {
+        Box::pin(handle_cmd(&ctx, &ui, Cmd::FilesRefresh { seq: -1 })).await;
+    }
+    let copied = up.single && !up.link.is_empty();
+    if copied {
+        clipboard_copy(&up.link);
+    }
+    let where_ = gui_path.trim().trim_matches('/');
+    let (level, mut msg) = up.report(where_);
+    if copied {
+        msg.push_str(&rcgui_i18n::f("；{} 的直链已复制到剪贴板", &[&(up.name)]));
+    }
     toast(&ui, level, msg);
     false
 }
 
 /// 这类错误重试一次就好：HTTP/2 建连抖动、连接被重置、TLS 握手中断。
 ///
-/// 站点挂在 Cloudflare 后面，实测偶发 `Propfind …: http2: client conn could not be
-/// established`，紧接着再请求就正常；把它当致命错误报给用户太吵。
+/// 实测偶发 `Propfind …: http2: client conn could not be established`，紧接着
+/// 再请求就正常；把它当致命错误报给用户太吵。
 fn looks_like_transient_net(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     [
@@ -3867,47 +3486,6 @@ fn looks_like_transient_net(msg: &str) -> bool {
     ]
     .iter()
     .any(|k| m.contains(k))
-}
-
-/// 上传入口的 K-Vault 分支：三个「上传到本机→远程」的入口共用。
-///
-/// 先判令牌（没有令牌时 rclone 那条路根本走不通），再逐个文件发站点 API，
-/// 最后刷新列表 + 报一句结果。单个文件成功时把签名直链放进剪贴板 ——
-/// 「传完就能发出去」是这个站点最主要的用法。
-async fn kv_upload_into(
-    ctx: Arc<Ctx>,
-    ui: Weak<MainWindow>,
-    cfg: kvault::KvCfg,
-    paths: Vec<PathBuf>,
-    gui_path: &str,
-) -> bool {
-    if let Err(why) = cfg.upload_ready() {
-        toast(&ui, 2, why);
-        return false;
-    }
-    let folder = kv_upload_folder(&cfg, gui_path);
-    let _ = ui.upgrade_in_event_loop(|ui| {
-        ui.global::<FilesG>().set_busy(true);
-        ui.global::<LocalG>().set_busy(true);
-    });
-    let up = kv_upload_paths(&cfg, &folder, &paths).await;
-    let _ = ui.upgrade_in_event_loop(|ui| {
-        ui.global::<FilesG>().set_busy(false);
-        ui.global::<LocalG>().set_busy(false);
-    });
-    if up.ok > 0 {
-        let _ = Box::pin(handle_cmd(&ctx, &ui, Cmd::FilesRefresh { seq: -1 })).await;
-    }
-    let copied = up.single && !up.link.is_empty();
-    if copied {
-        clipboard_copy(&up.link);
-    }
-    let (level, mut msg) = kv_upload_report(&up, &folder);
-    if copied {
-        msg.push_str(&rcgui_i18n::f("；{} 的直链已复制到剪贴板", &[&(up.name)]));
-    }
-    toast(&ui, level, msg);
-    false
 }
 
 fn fmt_mtime(mod_time: &str) -> String {
@@ -5280,7 +4858,7 @@ async fn export_conf(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, path: PathBuf, inclu
     let providers = get_providers(ctx).await;
     // 插件身份/版本/来源/启用/设置一并带出去，但不带二进制（导入端按 source+url 重装）
     let plugin_refs = plugins::bundle_refs(ctx);
-    let conf = conf_io::build_bundle(
+    let mut conf = conf_io::build_bundle(
         &cfg,
         dump.as_ref(),
         include_secrets,
@@ -5289,6 +4867,20 @@ async fn export_conf(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, path: PathBuf, inclu
         &live_mounts,
         &plugin_refs,
     );
+    // 远程归属也带上几行：换台机器、或者插件卸掉之后重新装回来再导入时，这是唯一
+    // 能认出「这台远程归哪个插件」的线索。表读不出来就明说这次没带上，而不是当它
+    // 没有归属——那样导入端会把这台远程当普通远程处理。
+    let mut owner_missing = false;
+    match remote_owners::load() {
+        Ok(table) => conf.remote_owners = remote_owners::export_refs(&table),
+        Err(e) => {
+            owner_missing = true;
+            conf.warnings.push(rcgui_i18n::f(
+                "远程归属登记表读不出来，这次导出没有带上归属：{}",
+                &[&(e)],
+            ));
+        }
+    }
     let summary = conf.summary();
     match conf_io::write_bundle(&path, &conf) {
         Ok(()) => {
@@ -5301,6 +4893,17 @@ async fn export_conf(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, path: PathBuf, inclu
                     &(summary.serve_count),
                 ],
             );
+            if !conf.remote_owners.is_empty() {
+                msg.push_str(&rcgui_i18n::f(
+                    "；含 {} 条远程归属",
+                    &[&(conf.remote_owners.len())],
+                ));
+            }
+            if owner_missing {
+                msg.push_str(&rcgui_i18n::t(
+                    "；远程归属登记表读不出来，这次文件里没有归属记录",
+                ));
+            }
             if summary.sensitive {
                 msg.push_str(&rcgui_i18n::f(
                     "；⚠ 含 {} 个远程的凭据，请妥善保管",
@@ -5332,18 +4935,11 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
     for note in maintenance::migrate_external_to_managed(&ctx) {
         toast(&ui, 1, note);
     }
-    // 0.2) K-Vault 明文令牌原来与插件目录同处一个 kv.json，卸载插件会连令牌
-    //      一起删掉。复制一份到独立命名空间；旧数据原样保留，只复制不搬走。
-    let moved_tokens = kvault::migrate_kvault_tokens(&ctx.store);
-    if !moved_tokens.is_empty() {
-        toast(
-            &ui,
-            1,
-            rcgui_i18n::f(
-                "已把 {} 个 K-Vault 远程的令牌复制到独立存储（卸载插件不会再连带删掉）",
-                &[&moved_tokens.len()],
-            ),
-        );
+    // 0.2) 有些插件是从主程序里搬出去的：它们当年留在主程序命名空间里的设置
+    //      （例如站点令牌）要交给插件自己保管。名单由插件清单声明（`adopt_legacy`），
+    //      主程序只做一次只读移交：不删旧数据，插件写坏了还能再来一次。
+    for note in remote_ops::adopt_legacy(&ctx).await {
+        toast(&ui, 1, note);
     }
 
     // 0.5) 托管内核：random 端口 + random 凭据，只活在本进程里。
@@ -5420,6 +5016,15 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
     // 具体「要不要拉起 rclone」由插件在 wasm 里判断并操作宿主能力，宿主不解释语义。
     if !ready {
         plugins::autostart(&ctx, &ui).await;
+    }
+
+    // 1.45) 远程归属：旧配置里属于某个插件的远程，登记进归属表。之后就算插件被
+    //       停用或卸载，这些远程也认得出来路，不会退化成普通 DAV 去读写用户的数据。
+    //       只补新登记，已有的一条都不重算（插件停用期间也不会被抹掉）。
+    if ready {
+        for note in remote_owners::scan_all(&ctx).await {
+            toast(&ui, 2, note);
+        }
     }
 
     // 1.5) 先刷新界面列表（远程 / 挂载 / 服务），保证“已连接的远程”先显示出来
@@ -5646,7 +5251,7 @@ async fn startup_flow(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             let _permit = sem.acquire().await;
             // 类型没有实现的远程不去预热：DAV 的 about/list 会成功，状态栏随即显示
             // 「正常」，而用户点进去只会看到拒绝。宁可不做这一步。
-            if kv_access_blocked(&ctx2, &name).await.is_some() {
+            if remote_blocked(&ctx2, &name).await.is_some() {
                 return;
             }
             // 1) 连接校验（失败 → 该预设流程终止）。8s 超时，防止慢后端把整个启动流程拖死
@@ -5932,7 +5537,12 @@ async fn apply_bundle_to_rclone(
     let mut errs: Vec<String> = Vec::new();
 
     // 1) 远程：只改给出的参数键，未通过凭据策略导出的字段保持原值
+    //
+    //    导入也要登记归属：包里带来的参数如果带插件标记，这条远程就是插件远程，
+    //    以后插件停用/卸载时得认得出来。判断只看「已启用插件声明的标记」和
+    //    `remote_owners::LEGACY` 那份历史名单，不做任何猜测。
     let existing = client.list_remotes().await.unwrap_or_default();
+    let table = remote_types::collect(ctx);
     for r in &conf.remotes {
         let params = serde_json::Value::Object(r.params.clone());
         let exists = existing.iter().any(|n| n == &r.name);
@@ -5942,7 +5552,18 @@ async fn apply_bundle_to_rclone(
             client.config_create(&r.name, &r.rtype, params).await
         };
         match res {
-            Ok(()) => ok_remotes += 1,
+            Ok(()) => {
+                ok_remotes += 1;
+                let claim = remote_owners::claim_of(&table, &r.params);
+                let note = match claim {
+                    Some(c) => remote_owners::claim(&r.name, c),
+                    // 包里这条远程不再带标记（用户可能改成了普通类型）：撤销旧登记。
+                    None => remote_owners::release(&r.name),
+                };
+                if let Err(e) = note {
+                    errs.push(rcgui_i18n::f("远程 {} 的归属登记: {}", &[&(r.name), &(e)]));
+                }
+            }
             Err(e) => errs.push(rcgui_i18n::f("远程 {}: {}", &[&(r.name), &(e)])),
         }
     }
@@ -5987,7 +5608,7 @@ async fn apply_bundle_to_rclone(
         }
         // 导入的档案里也可能有被标记的远程：它的类型插件不在时挂上去只会立刻
         // 403。档案条目已经记下了，插件装回来下次启动会自动重建。
-        if let Some(msg) = kv_access_blocked(ctx, &m.remote).await {
+        if let Some(msg) = remote_blocked(ctx, &m.remote).await {
             errs.push(rcgui_i18n::f(
                 "挂载 {} → {}: {}",
                 &[&(m.remote), &(point), &(msg)],
@@ -6069,7 +5690,7 @@ async fn apply_bundle_to_rclone(
         }
         // 同上：被标记的远程在本程序里用不了，起服务等于把它重新暴露成一个
         // 打不开的地址。档案条目已记下，插件装回来会自动重建。
-        if let Some(msg) = kv_access_blocked(ctx, &s.remote).await {
+        if let Some(msg) = remote_blocked(ctx, &s.remote).await {
             errs.push(rcgui_i18n::f(
                 "服务 {} {}: {}",
                 &[&(s.stype), &(s.addr), &(msg)],
@@ -6116,7 +5737,7 @@ async fn files_navigate(
         return;
     }
     // 进入子目录 / 返回上级 / 点面包屑都从这里过：插件不在就别往下走了
-    if let Some(msg) = kv_access_blocked(ctx, &remote).await {
+    if let Some(msg) = remote_blocked(ctx, &remote).await {
         let _ = ui.upgrade_in_event_loop(move |ui| {
             ui.global::<FilesG>().set_loading(false);
             toast_ui(&ui, 2, msg);
@@ -6384,7 +6005,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             }
             // 插件不在时，被标记的远程连列目录都不给：清空列表 + 说清原因。
             // 不能像以前那样悄悄落到 DAV 只读，那样用户看不出插件已经卸了。
-            if let Some(msg) = kv_access_blocked(ctx, &remote).await {
+            if let Some(msg) = remote_blocked(ctx, &remote).await {
                 let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq())
                     .await
                     .unwrap_or(-2);
@@ -6415,7 +6036,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             })
             .await
             .unwrap_or_else(|| ("name".to_string(), false));
-            if let Some(res) = kv_list_rows(&ctx, &remote, &path, &sort.0, sort.1).await {
+            if let Some(res) = remote_list_rows(&ctx, &remote, &path, &sort.0, sort.1).await {
                 // 请求期间用户可能已换目录（seq 变化），丢弃过期结果
                 let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq())
                     .await
@@ -6522,7 +6143,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let (remote, path) = ui_files_pos(ui).await;
             // 读同样要拦：下载拿到的是用户存在站点的真实文件，插件不在时这条通道
             // 也不该开着——否则「浏览被挡了但文件照样下得下来」才是真的怪
-            if let Some(msg) = kv_access_blocked(ctx, &remote).await {
+            if let Some(msg) = remote_blocked(ctx, &remote).await {
                 toast(ui, 2, msg);
                 return false;
             }
@@ -6552,7 +6173,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if remote.is_empty() {
                 return false;
             }
-            if let Some(msg) = kv_access_blocked(ctx, &remote).await {
+            if let Some(msg) = remote_blocked(ctx, &remote).await {
                 toast(ui, 2, msg);
                 return false;
             }
@@ -6624,7 +6245,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             }
             // 这是「移动到…」的目录选择器，走的是 DAV 列目录：不拦的话
             // 用户还能借它把整个站点目录树翻一遍。
-            if let Some(msg) = kv_access_blocked(ctx, &remote).await {
+            if let Some(msg) = remote_blocked(ctx, &remote).await {
                 let _ = ui.upgrade_in_event_loop(move |ui| {
                     ui.global::<FilesG>().set_move_busy(false);
                     toast_ui(&ui, 2, msg);
@@ -6673,7 +6294,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if remote.is_empty() || name.is_empty() {
                 return false;
             }
-            if let Some(msg) = kv_write_blocked(&ctx, &remote).await {
+            if let Some(msg) = remote_write_blocked(&ctx, &remote).await {
                 toast(ui, 2, msg);
                 return false;
             }
@@ -6791,7 +6412,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         }
         Cmd::FilesMkdir => {
             let (remote, path) = ui_files_pos(ui).await;
-            if let Some(msg) = kv_write_blocked(&ctx, &remote).await {
+            if let Some(msg) = remote_write_blocked(&ctx, &remote).await {
                 toast(ui, 2, msg);
                 return false;
             }
@@ -6833,19 +6454,25 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         }
         Cmd::FilesDel { name, is_dir } => {
             let (remote, path) = ui_files_pos(ui).await;
-            // K-Vault 远程：DAV 通道只读，但站点 API 有正经的删除端点，
-            // 按站点索引翻成文件 id 再删。插件不在时这条远程不能当普通 DAV 用，
-            // 所以 Orphan 分支直接拒绝，而不是让它落到下面的 `client.purge`。
-            match kv_write_target(&ctx, &remote).await {
-                KvWrite::Bridge(cfg) => {
+            // 插件接管的远程：普通 DAV 通道只读，正经的删除得由认领它的插件去做。
+            // 认领者不在时这条远程不能当普通 DAV 用，所以 Orphan 分支直接拒绝，
+            // 而不是让它落到下面的 `client.purge`。
+            match remote_ops::owner_of(&ctx, &remote).await {
+                Ok(remote_ops::Owner::Plugin { .. }) => {
                     let items = vec![(name, is_dir)];
-                    return kv_delete_into(ui.clone(), cfg, path, items).await;
+                    return remote_delete_into(&ctx, ui.clone(), &remote, path, items).await;
                 }
-                KvWrite::Orphan(msg) => {
-                    toast(ui, 2, msg);
+                Ok(remote_ops::Owner::Orphan { marker }) => {
+                    toast(ui, 2, remote_ops::orphan_message(&remote, &marker));
                     return false;
                 }
-                KvWrite::NotKv => {}
+                Ok(remote_ops::Owner::Native) => {}
+                // 归属读不出来（登记表坏了、启动扫描失败）：说不出这条远程是谁的，
+                // 就不能按原生那套去删。
+                Err(e) => {
+                    toast(ui, 2, e);
+                    return false;
+                }
             }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
@@ -6875,7 +6502,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 return false;
             }
             let (remote, path) = ui_files_pos(ui).await;
-            if let Some(msg) = kv_write_blocked(&ctx, &remote).await {
+            if let Some(msg) = remote_write_blocked(&ctx, &remote).await {
                 toast(ui, 2, msg);
                 return false;
             }
@@ -7071,18 +6698,29 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if let Some(d) = dest {
                 path = d;
             }
-            // K-Vault 远程的写入不走 rclone（DAV 只读，写方法一律 403），改发站点 API。
-            // 插件不在时这条远程也不能当普通 DAV 用：拒绝并说明，别让用户去猜那个 403。
-            match kv_write_target(&ctx, &remote).await {
-                KvWrite::Bridge(cfg) => {
-                    return Box::pin(kv_upload_into(ctx.clone(), ui.clone(), cfg, paths, &path))
-                        .await;
+            // 插件接管的远程：写入不走 rclone（普通 DAV 只读，写方法一律 403），
+            // 由认领它的插件自己去发。认领者不在时这条远程也不能当普通 DAV 用：
+            // 拒绝并说明，别让用户去猜那个 403。
+            match remote_ops::owner_of(&ctx, &remote).await {
+                Ok(remote_ops::Owner::Plugin { .. }) => {
+                    return Box::pin(remote_upload_into(
+                        ctx.clone(),
+                        ui.clone(),
+                        &remote,
+                        paths,
+                        &path,
+                    ))
+                    .await;
                 }
-                KvWrite::Orphan(msg) => {
-                    toast(ui, 2, msg);
+                Ok(remote_ops::Owner::Orphan { marker }) => {
+                    toast(ui, 2, remote_ops::orphan_message(&remote, &marker));
                     return false;
                 }
-                KvWrite::NotKv => {}
+                Ok(remote_ops::Owner::Native) => {}
+                Err(e) => {
+                    toast(ui, 2, e);
+                    return false;
+                }
             }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
@@ -7242,7 +6880,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if remote.is_empty() {
                 return false;
             }
-            if let Some(msg) = kv_access_blocked(ctx, &remote).await {
+            if let Some(msg) = remote_blocked(ctx, &remote).await {
                 toast(ui, 2, msg);
                 return false;
             }
@@ -7331,17 +6969,22 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if remote.is_empty() {
                 return false;
             }
-            // K-Vault 远程：走站点 API 删除（DAV 通道只读），逐项翻 id。
-            // 插件不在时同样拒绝，不让这批删除落到 rclone 的 DAV 写方法上。
-            match kv_write_target(&ctx, &remote).await {
-                KvWrite::Bridge(cfg) => {
-                    return kv_delete_into(ui.clone(), cfg, path, items).await;
+            // 插件接管的远程：删除交回认领它的插件（普通 DAV 通道只读）。
+            // 认领者不在时同样拒绝，不让这批删除落到 rclone 的写方法上。
+            match remote_ops::owner_of(&ctx, &remote).await {
+                Ok(remote_ops::Owner::Plugin { .. }) => {
+                    return remote_delete_into(&ctx, ui.clone(), &remote, path, items).await;
                 }
-                KvWrite::Orphan(msg) => {
-                    toast(ui, 2, msg);
+                Ok(remote_ops::Owner::Orphan { marker }) => {
+                    toast(ui, 2, remote_ops::orphan_message(&remote, &marker));
                     return false;
                 }
-                KvWrite::NotKv => {}
+                Ok(remote_ops::Owner::Native) => {}
+                // 归属读不出来：说不出这条远程是谁的，就不能按原生方式往下走。
+                Err(e) => {
+                    toast(ui, 2, e);
+                    return false;
+                }
             }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
@@ -7485,24 +7128,29 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 return false;
             }
             let src = Path::new(&cur).join(&name);
-            // K-Vault 远程：写入走站点 API，不经 rclone 的 DAV 通道（只读）。
-            // 插件不在时同样拒绝，别让这次拷贝落到 DAV 的写方法上。
-            match kv_write_target(&ctx, &remote).await {
-                KvWrite::Bridge(cfg) => {
-                    return Box::pin(kv_upload_into(
+            // 插件接管的远程：写入交回认领它的插件，不经 rclone 的只读 DAV 通道。
+            // 认领者不在时同样拒绝，别让这次拷贝落到 DAV 的写方法上。
+            match remote_ops::owner_of(&ctx, &remote).await {
+                Ok(remote_ops::Owner::Plugin { .. }) => {
+                    return Box::pin(remote_upload_into(
                         ctx.clone(),
                         ui.clone(),
-                        cfg,
+                        &remote,
                         vec![src],
                         &path,
                     ))
                     .await;
                 }
-                KvWrite::Orphan(msg) => {
-                    toast(ui, 2, msg);
+                Ok(remote_ops::Owner::Orphan { marker }) => {
+                    toast(ui, 2, remote_ops::orphan_message(&remote, &marker));
                     return false;
                 }
-                KvWrite::NotKv => {}
+                Ok(remote_ops::Owner::Native) => {}
+                // 归属读不出来：说不出这条远程是谁的，就不能按原生方式往下走。
+                Err(e) => {
+                    toast(ui, 2, e);
+                    return false;
+                }
             }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
@@ -7729,14 +7377,20 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if cur.trim().is_empty() || items.is_empty() {
                 return false;
             }
-            // K-Vault 远程：写入走站点 API，不经 rclone 的只读 DAV 通道。
-            // 插件不在时同样拒绝：这批上传不能落到 DAV 的写方法上。
-            match kv_write_target(&ctx, &remote).await {
-                KvWrite::Bridge(cfg) => {
+            // 插件接管的远程：写入交回认领它的插件，不经 rclone 的只读 DAV 通道。
+            // 认领者不在时同样拒绝：这批上传不能落到 DAV 的写方法上。
+            match remote_ops::owner_of(&ctx, &remote).await {
+                Ok(remote_ops::Owner::Plugin { .. }) => {
                     let paths: Vec<PathBuf> =
                         items.iter().map(|(n, _)| Path::new(&cur).join(n)).collect();
-                    let ret =
-                        Box::pin(kv_upload_into(ctx.clone(), ui.clone(), cfg, paths, &dest)).await;
+                    let ret = Box::pin(remote_upload_into(
+                        ctx.clone(),
+                        ui.clone(),
+                        &remote,
+                        paths,
+                        &dest,
+                    ))
+                    .await;
                     // 传完退出多选并清空勾选（与下面 rclone 分支的处理一致）
                     let _ = ui.upgrade_in_event_loop(|ui| {
                         let g = ui.global::<LocalG>();
@@ -7748,11 +7402,16 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     });
                     return ret;
                 }
-                KvWrite::Orphan(msg) => {
-                    toast(ui, 2, msg);
+                Ok(remote_ops::Owner::Orphan { marker }) => {
+                    toast(ui, 2, remote_ops::orphan_message(&remote, &marker));
                     return false;
                 }
-                KvWrite::NotKv => {}
+                Ok(remote_ops::Owner::Native) => {}
+                // 归属读不出来：说不出这条远程是谁的，就不能按原生方式往下走。
+                Err(e) => {
+                    toast(ui, 2, e);
+                    return false;
+                }
             }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
@@ -7854,7 +7513,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // 挂载就是「把这个远程当成本地盘用」，插件不在时挂上去只会立刻 403，
             // 而且会在资源管理器里留下一个打不开的盘符；先拒绝并说明。
             // 已有的自动挂载条目（`cfg.auto_mounts`）不动，装回插件下次启动照旧恢复。
-            if let Some(msg) = kv_access_blocked(ctx, &remote).await {
+            if let Some(msg) = remote_blocked(ctx, &remote).await {
                 toast(ui, 2, msg);
                 return false;
             }
@@ -8478,7 +8137,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         Cmd::RemoteEditLoad { name } => {
             // 类型没有实现的远程不给改配置：保存时会把参数重写成「普通 webdav」，
             // 标记键一旦被抹掉，装回插件它就再也认不回自己是 K-Vault 了。
-            if let Some(msg) = kv_access_blocked(ctx, &name).await {
+            if let Some(msg) = remote_blocked(ctx, &name).await {
                 toast(ui, 2, msg);
                 return false;
             }
@@ -8555,7 +8214,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // 改既有远程同样要拦，理由同 `RemoteEditLoad`：这一步会把参数整体重写。
             // 新建（`is_new`）不拦：那时名字对应的还不是一条 K-Vault 远程。
             if !is_new {
-                if let Some(msg) = kv_access_blocked(ctx, &name).await {
+                if let Some(msg) = remote_blocked(ctx, &name).await {
                     toast(ui, 2, msg);
                     return false;
                 }
@@ -8624,6 +8283,12 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             };
             match res {
                 Ok(()) => {
+                    // 记下这条远程归谁：以后插件被停用/卸载，靠这条登记才认得出
+                    // 它是插件远程。登记失败不影响保存本身，但要说明——不然下次
+                    // 启动前这条远程的归属就是「不知道」。
+                    if let Err(e) = remote_owners::note_remote(&ctx, &name).await {
+                        toast(ui, 2, e);
+                    }
                     let _ = ui.upgrade_in_event_loop(|ui| {
                         ui.global::<RemotesG>().set_show_editor(false);
                     });
@@ -8743,11 +8408,13 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // 3) 再删除远程
             match client.config_delete(&name).await {
                 Ok(()) => {
-                    // K-Vault 的明文令牌存在侧表里：远程没了，那份令牌也不该留着。
-                    // 两个命名空间都清：新的是现在写的地方，旧的是历史遗留
-                    // （迁移函数只复制不搬走，所以旧记录可能还在）。
-                    let _ = ctx.store.delete(kvault::TOKEN_NS, &name);
-                    let _ = ctx.store.delete(kvault::STORE_NS, &name);
+                    // 插件当年替这条远程存的设置（例如站点令牌）：远程没了，
+                    // 那些也不该留着。哪些命名空间归哪个插件，由插件清单声明；
+                    // 主程序只按名单清，不猜名字。
+                    remote_ops::forget_legacy(&ctx, &name);
+                    // 远程本身没了，归属登记也一起撤掉：留着只会让以后同名的
+                    // 普通远程被当成插件远程。
+                    let _ = remote_owners::release(&name);
                     // 4) 最后清理档案里的记忆（否则重放会一直失败并刷错误提示）
                     {
                         let mut cfg = ctx.cfg.lock().unwrap();
@@ -9005,7 +8672,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let client = ctx.rc.client().await;
                 let mut draft = ctx.cfg.lock().unwrap().clone();
                 // 插件不在的远程不重挂、不重起服务：对账本身不知道插件的事
-                let blocked = kv_blocked_map(ctx, &draft).await;
+                let blocked = remote_blocked_map(ctx, &draft).await;
                 let rep = reconcile::reconcile(&client, &mut draft, &blocked).await;
                 {
                     let mut cfg = ctx.cfg.lock().unwrap();
@@ -9117,7 +8784,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 // 持有 MutexGuard 跨 await 会让 future 非 Send（tokio::spawn 会拒绝）。
                 let mut draft = ctx.cfg.lock().unwrap().clone();
                 // 插件不在的远程不重挂、不重起服务：对账本身不知道插件的事
-                let blocked = kv_blocked_map(ctx, &draft).await;
+                let blocked = remote_blocked_map(ctx, &draft).await;
                 let rep = reconcile::reconcile(&client, &mut draft, &blocked).await;
                 {
                     // 写回：只把 reconcile 会改动的字段合并回真实配置，
@@ -9214,7 +8881,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let sub_path = sub_path.trim().trim_matches('/').to_string();
             // 服务等于把远程内容重新暴露成一个局域网地址：插件不在时启动它，
             // 只是多出一个打不开的地址，还会让用户以为这个远程还能用。
-            if let Some(msg) = kv_access_blocked(ctx, &remote).await {
+            if let Some(msg) = remote_blocked(ctx, &remote).await {
                 toast(ui, 2, msg);
                 return false;
             }
@@ -10208,6 +9875,13 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         let _busy = RemotesBusyGuard::new(ui);
                         apply_bundle_to_rclone(ctx, &conf).await
                     };
+                    // 归属登记要等远程都写进 rclone 之后再做：判据是本机实际参数里的
+                    // 标记键，而不是文件里写了什么。文件可能来自另一台机器，也可能
+                    // 是插件卸掉之前导出的；只有本机参数能作证。
+                    let owner_notes = remote_owners::adopt_from_bundle(&ctx, &conf).await;
+                    for note in &owner_notes {
+                        crate::logging::event("warn", "import", note);
+                    }
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::RemotesRefresh)).await;
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ServesRefresh)).await;
@@ -10226,6 +9900,14 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         info.push_str(&rcgui_i18n::f(
                             "；失败 {} 项：{}",
                             &[&(errs.len()), &(errs.join("；"))],
+                        ));
+                    }
+                    if !owner_notes.is_empty() {
+                        // 归属登记被跳过或撤销时一定要说出来：用户看到的「能打开/打不开」
+                        // 就是由这几行决定的。
+                        info.push_str(&rcgui_i18n::f(
+                            "；远程归属：{}",
+                            &[&(owner_notes.join("；"))],
                         ));
                     }
                     let info2 = info.clone();
@@ -13065,6 +12747,9 @@ mod tests {
             base_type: base.to_string(),
             defaults: std::collections::BTreeMap::new(),
             plugin: "kvault".to_string(),
+            marker: id.to_string(),
+            ops: Vec::new(),
+            legacy: Vec::new(),
         }
     }
 
@@ -13166,80 +12851,6 @@ mod tests {
         assert_eq!(display_type_of(&plain, stored, &owner), "webdav");
     }
 
-    /// 插件被停用/卸载后，带 K-Vault 标记的远程必须落进 `Orphan`，不能悄悄交给 rclone。
-    ///
-    /// 交给 rclone 的后果是站点 DAV 回一个 403「method not allowed」：用户既不知道
-    /// 发生了什么，也不知道装回插件就能解决。没有标记的普通 WebDAV 则永远走 `NotKv`。
-    #[test]
-    fn a_marked_remote_never_falls_through_to_the_dav_path() {
-        let params: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
-            serde_json::json!({"kvault": "1", "url": "https://kv.example/dav"}),
-        )
-        .unwrap();
-        let cfg = kvault::KvCfg::from_params(&params);
-
-        // 普通远程：插件在不在都与它无关。
-        assert!(matches!(kv_write_kind(None, true, "site"), KvWrite::NotKv));
-        assert!(matches!(kv_write_kind(None, false, "site"), KvWrite::NotKv));
-
-        // 带标记 + 插件在：走站点 API。
-        assert!(matches!(
-            kv_write_kind(Some(cfg.clone()), true, "site"),
-            KvWrite::Bridge(_)
-        ));
-
-        // 带标记 + 插件不在：拒绝，并且要点名是哪台远程、为什么、怎么办。
-        match kv_write_kind(Some(cfg), false, "site") {
-            KvWrite::Orphan(msg) => {
-                assert!(msg.contains("site"), "要说出是哪台远程：{}", msg);
-                assert!(msg.contains("插件"), "要说清是插件没启用：{}", msg);
-                assert!(msg.contains("启用"), "要告诉用户启用就能恢复：{}", msg);
-                assert!(msg.contains("还在"), "要说清数据没被动过：{}", msg);
-            }
-            KvWrite::NotKv => panic!("插件不在时不能落回 rclone 的 DAV 写"),
-            KvWrite::Bridge(_) => panic!("插件不在时没有站点 API 可走"),
-        }
-    }
-
-    /// 写路径不许再用 `kv_cfg_for`：它只回答「是不是 K-Vault」，插件不在时返回
-    /// `None` 就等于放行给 rclone（403 + 用户看不懂）。剩下的合法调用点只有两个：
-    /// 定义本身，和桥的读实现 `kv_list_rows`（**它前面已经有 `kv_access_blocked`
-    /// 挡着**，插件不在时根本走不到这里，见用例
-    /// `every_remote_entry_checks_the_plugin_gate`）。
-    #[test]
-    fn kv_cfg_for_is_only_used_by_the_bridge_read_path() {
-        // 只扫生产代码：用例自己也写着这个词，扫进来会把结果算多。
-        let src = include_str!("main.rs").replace("\r\n", "\n");
-        let prod = src
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .unwrap_or_default();
-        assert!(
-            prod.len() > 1000,
-            "扫描基准不对（切分标记变了），先修这个用例"
-        );
-        let sites: Vec<&str> = prod
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| l.contains("kv_cfg_for("))
-            .collect();
-        assert_eq!(
-            sites.len(),
-            2,
-            "多出来的调用点会绕过写闸门，应改走 kv_write_target：{:?}",
-            sites
-        );
-        assert!(sites[0].starts_with("async fn kv_cfg_for("));
-        // 参数表可能被折成多行，比之前先压掉空白：这一条要守的是「第二处是桥的读
-        // 实现里那句赋值」，不是它排成几行。
-        let want = crate::source_scan::squash("let cfg = kv_cfg_for(ctx, remote).await?;");
-        assert!(
-            crate::source_scan::squash(sites[1]).starts_with(&want),
-            "桥的读实现里那句调用变了：{}",
-            sites[1]
-        );
-    }
-
     /// 插件不在时，一条带标记的远程在**每个**入口都要被挡下来。
     ///
     /// 用源码扫描而不是逐个调用：这些入口都是 `Cmd` 分支里的长函数，要有 `Ctx` 和
@@ -13289,8 +12900,8 @@ mod tests {
             let rest = &prod[start..];
             let end = rest.find("\n        Cmd::").unwrap_or(rest.len());
             let body = crate::source_scan::squash(&rest[..end]);
-            let gate_at = body.find("kv_access_blocked(").unwrap_or_else(|| {
-                panic!("{marker} 没有问 kv_access_blocked：插件不在时这个入口就是旁路")
+            let gate_at = body.find("remote_blocked(").unwrap_or_else(|| {
+                panic!("{marker} 没有问 remote_blocked：插件不在时这个入口就是旁路")
             });
             // 凡是会对远程动手的调用，都必须排在闸门之后。清单里放的是「读/写远程」
             // 而不是「读内存」的调用，所以多列几个不会误报；真漏一个，改的人会在
@@ -13304,7 +12915,7 @@ mod tests {
                 "client.config_dump(",
                 "client.config_create(",
                 "client.config_update(",
-                "kv_list_rows(",
+                "remote_list_rows(",
                 "list_display_checked(",
                 "apply_bundle_to_rclone(",
             ] {
@@ -13339,8 +12950,8 @@ mod tests {
             let body = crate::source_scan::squash(body);
             let want = crate::source_scan::squash(op);
             let gate_at = body
-                .find("kv_access_blocked(")
-                .unwrap_or_else(|| panic!("{marker} 里没有 kv_access_blocked"));
+                .find("remote_blocked(")
+                .unwrap_or_else(|| panic!("{marker} 里没有 remote_blocked"));
             let op_at = body
                 .find(want.as_str())
                 .unwrap_or_else(|| panic!("{marker} 里找不到 {op}，标记该更新了"));
@@ -13364,8 +12975,8 @@ mod tests {
             let body = crate::source_scan::function_body(prod, sig)
                 .unwrap_or_else(|| panic!("找不到函数 {sig}，是不是改名了"));
             assert!(
-                crate::source_scan::squash(body).contains("kv_access_blocked("),
-                "{sig} 没有问 kv_access_blocked：插件不在时这个入口就是旁路"
+                crate::source_scan::squash(body).contains("remote_blocked("),
+                "{sig} 没有问 remote_blocked：插件不在时这个入口就是旁路"
             );
         }
 
@@ -13373,7 +12984,7 @@ mod tests {
         // 计数也压掉空白：折行不该让「少查一处」和「排版变了」混成一个红。
         let persist = crate::source_scan::squash(&include_str!("persist.rs").replace("\r\n", "\n"));
         assert_eq!(
-            persist.matches("crate::kv_access_blocked(").count(),
+            persist.matches("crate::remote_blocked(").count(),
             2,
             "自动恢复的挂载与服务都要先问闸门"
         );
@@ -13381,7 +12992,7 @@ mod tests {
         // 用量列也走 about：插件不在时问出来的是个数，看起来像「能用」
         let refresh = crate::source_scan::squash(&include_str!("refresh.rs").replace("\r\n", "\n"));
         assert_eq!(
-            refresh.matches("crate::kv_access_blocked(").count(),
+            refresh.matches("crate::remote_blocked(").count(),
             1,
             "用量抓取要先问闸门，别给打不开的远程填数字"
         );
@@ -13397,7 +13008,7 @@ mod tests {
         // 调用方必须把表真的递进去，否则上面那两处永远拿到空表
         let prod_flat = crate::source_scan::squash(prod);
         assert_eq!(
-            prod_flat.matches("kv_blocked_map(ctx,&draft)").count(),
+            prod_flat.matches("remote_blocked_map(ctx,&draft)").count(),
             2,
             "两处 reconcile 调用都要先算出 blocked 表"
         );
