@@ -128,6 +128,17 @@ pub fn find<'a>(list: &'a [Derived], type_id: &str) -> Option<&'a Derived> {
     list.iter().find(|d| d.id == type_id)
 }
 
+/// 谁在声明这个远程参数标记 —— 也就是「这个类型归谁管」。
+///
+/// 约定：插件把**自己的类型 id** 当作远程参数里的标记键（kvault 插件往 defaults 里写
+/// `kvault: "1"`）。于是「有插件声明这个 id」就等于「这个类型有实现」；插件停用或
+/// 卸载后这里给 `None`，调用方就该退回真实后端（webdav），而不是继续假装那个类型还在。
+/// 只看 `id`、不看 `defaults`：标记键是插件内部的约定，主程序跟着它走就等于把插件的
+/// 私事写进了判定逻辑。
+pub fn marker_owner<'a>(list: &'a [Derived], marker: &str) -> Option<&'a Derived> {
+    find(list, marker)
+}
+
 /// 落盘时应该写的 `type`：派生类型换成它的 `base_type`，普通类型原样返回。
 pub fn backend_of(list: &[Derived], type_id: &str) -> String {
     match find(list, type_id) {
@@ -295,5 +306,18 @@ mod tests {
     fn missing_plugin_directory_is_not_an_error() {
         let root = std::env::temp_dir().join("rcgui-no-such-plugins-dir");
         assert!(collect_in(&root, &enabled_of(&[]), "0.3.0").is_empty());
+    }
+
+    #[test]
+    fn marker_owner_is_none_once_the_declaring_plugin_is_gone() {
+        let list = vec![d("kvault", "K-Vault", "webdav", &[("kvault", "1")])];
+        assert_eq!(
+            marker_owner(&list, "kvault").map(|d| d.plugin.as_str()),
+            Some("com.example.plugin")
+        );
+        // 插件停用/卸载后清单里没有这一项：桥必须停手，别把普通 webdav 当 K-Vault。
+        assert!(marker_owner(&[], "kvault").is_none());
+        // 显示名不是 id，拿名字来问等于问错人。
+        assert!(marker_owner(&list, "K-Vault").is_none());
     }
 }

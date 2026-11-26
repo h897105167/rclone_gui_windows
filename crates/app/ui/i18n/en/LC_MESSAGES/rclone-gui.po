@@ -466,6 +466,9 @@ msgstr "Installed"
 msgid "已安装插件（点击插件栏展开 / 收起）"
 msgstr "Installed plugins (click a plugin row to expand / collapse)"
 
+msgid "已把 {} 个 K-Vault 远程的令牌复制到独立存储（卸载插件不会再连带删掉）"
+msgstr "Copied the tokens of {} K-Vault remote(s) to separate storage (uninstalling the plugin no longer removes them)."
+
 msgid "已断开"
 msgstr "Disconnected"
 
@@ -760,8 +763,8 @@ msgstr "Delete remote {}?"
 msgid "确认删除选中的 {} 项？（文件夹将整体删除）"
 msgstr "Delete the {} selected item(s)? (folders are removed entirely)"
 
-msgid "确认卸载「{}」？插件目录与该插件的设置会一并删除。"
-msgstr "Uninstall \"{}\"? Its plugin directory and settings will be deleted as well."
+msgid "确认卸载「{}」？插件目录与该插件的设置会一并删除（插件的历史数据会另存备份，重新安装后自动恢复）。"
+msgstr "Uninstall \"{}\"? Its plugin directory and settings will be deleted as well. (The plugin's historical data is backed up separately and restored automatically when you reinstall it.)"
 
 msgid "确认导出"
 msgstr "Confirm export"
@@ -1233,3 +1236,63 @@ msgstr "Parent folder"
 
 msgid "进入文件夹 {}"
 msgstr "Open folder {}"
+
+msgid "需要的权限"
+msgstr "Permissions required"
+
+msgid "重试启动内核"
+msgstr "Retry starting core"
+
+msgid "托管方式"
+msgstr "Managed core"
+
+msgid "正在连接内核…"
+msgstr "Connecting to core…"
+
+msgid "连接由本程序自动建立：内核一起来就握手，链路断了自动重试，不需要手动连接或断开。"
+msgstr "The app connects on its own: it handshakes as soon as the core is up and retries if the link drops. No manual connect or disconnect."
+
+msgid "内核随本应用一起启停，不需要手动开关。异常退出会在上面的状态里写明原因，并自动重试启动。"
+msgstr "The core starts and stops with this app, so there is no manual switch. If it exits unexpectedly, the status above says why and the app retries."
+
+msgid "打开系统窗口，选择本机的源文件夹"
+msgstr "Open the system dialog and pick the local source folder"
+
+msgid "连到远程仓库，选一个已有的目录；打不开时会保留现在填的值"
+msgstr "Connect to the remote and pick an existing directory; if it cannot be opened, the value you typed stays"
+
+msgid "正在读取远程目录…"
+msgstr "Reading remote directories…"
+
+msgid "选择本地文件夹"
+msgstr "Pick the local folder"
+
+msgid "选择本机目录"
+msgstr "Pick a local directory"
+
+msgid "已选择本地文件夹：{}"
+msgstr "Local folder selected: {}"
+
+msgid "还没连上 rclone，等连上再选云端目录"
+msgstr "rclone is not connected yet; pick the cloud directory once it is"
+
+msgid "没选远程，云端目录没有改动"
+msgstr "No remote was picked, so the cloud directory is unchanged"
+
+msgid "已选择云端目录：{}"
+msgstr "Cloud directory selected: {}"
+
+msgid "这个位置现在打不开，云端目录保持原值：{}"
+msgstr "This location cannot be opened right now, so the cloud directory keeps its previous value: {}"
+
+msgid "打不开这个位置：{}"
+msgstr "Cannot open this location: {}"
+
+msgid "读不到远程列表：{}"
+msgstr "Cannot read the remote list: {}"
+
+msgid "看不懂这个路径：{}"
+msgstr "Cannot parse this path: {}"
+
+msgid "列不出来：{}"
+msgstr "Cannot list it: {}"

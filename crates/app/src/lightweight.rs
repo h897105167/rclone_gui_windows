@@ -346,7 +346,7 @@ fn clear_ui(ui: &MainWindow) {
     // panel_rows 里带解码后的位图，这一条是界面侧真正的大头。
     // 页签和行一起清：留着上一个插件的页签，用户点进去只会看到空白。
     crate::plugins::clear_panel(ui);
-    // 表单相关的小对象保留：编辑器的字段表、类型下拉、K-Vault 表单都是几十条字符串，
+    // 表单相关的小对象保留：编辑器的字段表、类型下拉都是几十条字符串，
     // 清掉省不下内存，却可能让用户正在填的东西消失。
     let _ = ui.global::<MaintenanceG>().get_sync_name();
     let _ = ui.global::<RemotesG>().get_edit_fields();
@@ -386,7 +386,7 @@ pub fn what_is_kept() -> &'static [&'static str] {
     &[
         "内核连接与正在运行的传输/挂载/服务",
         "定时同步任务与它们的下一次运行时间",
-        "正在编辑的远程表单（字段表、类型下拉、K-Vault、代理）",
+        "正在编辑的远程表单（字段表、类型下拉、代理）",
         // 这几十行只是 id 和几个状态布尔，占不了多少地方；退出时得靠它把面板找回来。
         "插件列表本身（只有元数据，占地方的是面板位图）",
         "设置项、主题、语言",
@@ -401,8 +401,6 @@ pub struct Drafts {
     pub edit_name: String,
     pub type_idx: i32,
     pub type_query: String,
-    pub kv_base: String,
-    pub kv_folder: String,
     pub sync_name: String,
     pub sync_local: String,
     pub sync_remote: String,
@@ -424,8 +422,6 @@ impl Drafts {
             edit_name: r.get_edit_name().to_string(),
             type_idx: r.get_type_idx(),
             type_query: r.get_type_query().to_string(),
-            kv_base: r.get_kv_base().to_string(),
-            kv_folder: r.get_kv_folder().to_string(),
             sync_name: m.get_sync_name().to_string(),
             sync_local: m.get_sync_local().to_string(),
             sync_remote: m.get_sync_remote().to_string(),
@@ -463,12 +459,6 @@ impl Drafts {
         fill_text(r.get_type_query().as_str(), &self.type_query, |v| {
             r.set_type_query(v.into())
         });
-        fill_text(r.get_kv_base().as_str(), &self.kv_base, |v| {
-            r.set_kv_base(v.into())
-        });
-        fill_text(r.get_kv_folder().as_str(), &self.kv_folder, |v| {
-            r.set_kv_folder(v.into())
-        });
         let m = ui.global::<MaintenanceG>();
         fill_text(m.get_sync_name().as_str(), &self.sync_name, |v| {
             m.set_sync_name(v.into())
@@ -495,8 +485,6 @@ impl Drafts {
             || !self.sync_name.is_empty()
             || !self.sync_local.is_empty()
             || !self.sync_remote.is_empty()
-            || !self.kv_base.is_empty()
-            || !self.kv_folder.is_empty()
             || !self.type_query.is_empty()
             || self.fields.iter().any(|f| !f.value.is_empty())
     }

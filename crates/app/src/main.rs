@@ -12,6 +12,7 @@ mod conf_io;
 mod config;
 mod core;
 mod http;
+mod icon_asset;
 mod kv;
 mod kvault;
 mod lightweight;
@@ -24,7 +25,6 @@ mod proxy;
 mod reconcile;
 mod refresh;
 mod remote_types;
-mod script;
 #[cfg(test)]
 mod source_scan;
 mod state;
@@ -73,6 +73,7 @@ pub mod test_lang {
 }
 
 use anyhow::anyhow;
+use icon_asset::make_icon_rgba;
 use rcgui_rc::{ConnStatus, Handshake, ListEntry, RcState};
 use rclone_client::{local_fs, RcloneManager};
 use serde_json::{json, Value};
@@ -251,8 +252,6 @@ enum Cmd {
     RemoteTypeChanged,
     /// 类型下拉上方的搜索框：只过滤显示，不改变已选中的真实类型。
     RemoteTypeSearch(String),
-    /// 探测 K-Vault 站点与令牌（编辑器里的「测试连接」）
-    KvTest,
     // ---------------- 代理（按 remote 分配） ----------------
     /// 打开/刷新代理配置列表（供远程页的「代理」列与配置卡片使用）
     ProxyListRefresh,
@@ -337,12 +336,6 @@ enum Cmd {
     PluginSearch,
     SettingsSave,
     SettingsTest,
-    /// 连接：按设置页当前字段建立连接并握手（可能拉起托管 rcd）
-    Connect,
-    /// 断开：只停止使用该端点，不终止 rclone 进程
-    Disconnect,
-    /// 重新握手：不动进程，仅重跑版本/配置路径/能力探测
-    Reconnect,
     /// 导出 rcgui.conf 到指定路径
     ConfExport {
         path: PathBuf,
@@ -354,10 +347,6 @@ enum Cmd {
     },
     /// 应用上一次预览过的导入（先备份当前档案）
     ConfApply,
-    /// 生成恢复脚本并预览（只写文件，不执行、不注册启动项）
-    ScriptGenerate,
-    /// 复制当前预览的脚本到剪贴板
-    ScriptCopy,
     /// 复选框切换权限后：判断是否需要重启，并弹出确认弹层
     AdminToggle,
     /// 用户确认「以管理员身份运行」：按 UI 里的目标状态重启自身
@@ -456,11 +445,20 @@ struct HttpServer {
 }
 
 impl Ctx {
-    fn caps(&self) -> Arc<caps::HostCaps> {
+    /// 一次插件调用的能力集合。
+    ///
+    /// 收 `&Arc<Self>` 是为了算 [`kv_bridge_owns`]——它要看插件清单，而清单在
+    /// `Ctx` 里。两个调用点（`plugins.rs` 的 HTTP 入口与面板按钮）都手里有
+    /// `&Arc<Ctx>`，所以这个签名不用改动调用方。
+    ///
+    /// 判一次就固定下来：插件在同一次调用里发多个 `rclone.*`，不该出现「前一个
+    /// 走站点 API、后一个落到 DAV」的分裂结论。
+    fn caps(self: &Arc<Self>) -> Arc<caps::HostCaps> {
         Arc::new(caps::HostCaps {
             rc: self.rc.clone(),
             store: self.store.clone(),
             progress: self.progress.clone(),
+            kv_bridge: kv_bridge_owns(self),
         })
     }
 }
@@ -2796,7 +2794,6 @@ fn split_fs_str(fs: &str) -> (String, String) {
 }
 
 /// rclone fs（"name:sub"）→ 显示路径（"root://name/sub"）
-#[allow(dead_code)]
 fn fs_to_display(fs: &str) -> String {
     match fs.find(':') {
         Some(i) => format!("root://{}/{}", &fs[..i], fs[i + 1..].trim_matches('/')),
@@ -2845,11 +2842,15 @@ fn normalize_mount_point(p: &str) -> String {
 
 /// 列出显示路径的内容；dirs_only=true 只保留文件夹
 /// 根路径 "root://" 列出所有仓库名
-async fn list_display(
+///
+/// 第二个返回值是给界面显示的路径，`Err` 是失败原因。分成两支是因为「这个目录是
+/// 空的」和「连不上这个远程」在界面上长得一模一样，而用户该做的事完全不同：前者
+/// 换个目录，后者先查网络或凭据。挑目录的弹窗要靠这个区别决定开不开。
+async fn list_display_checked(
     ctx: &Arc<Ctx>,
     display: &str,
     dirs_only: bool,
-) -> (Vec<(String, bool)>, String) {
+) -> (Result<Vec<(String, bool)>, String>, String) {
     let d = display.trim();
     let rest = d
         .trim_end_matches('/')
@@ -2866,17 +2867,29 @@ async fn list_display(
             .map(|(n, _, _)| n.clone())
             .collect::<Vec<_>>();
         let names = if names.is_empty() {
-            client.list_remotes().await.unwrap_or_default()
+            // 缓存空就现问一次；问不到说明内核没应答，不能当成「一个远程都没配」
+            match client.list_remotes().await {
+                Ok(v) => v,
+                Err(e) => {
+                    return (
+                        Err(rcgui_i18n::f("读不到远程列表：{}", &[&format!("{:#}", e)])),
+                        "root://".into(),
+                    )
+                }
+            }
         } else {
             names
         };
         return (
-            names.into_iter().map(|n| (n, true)).collect(),
+            Ok(names.into_iter().map(|n| (n, true)).collect()),
             "root://".into(),
         );
     }
     let Some((fs, remote)) = split_display(d) else {
-        return (vec![], "root://".into());
+        return (
+            Err(rcgui_i18n::f("看不懂这个路径：{}", &[&display])),
+            "root://".into(),
+        );
     };
     let client = ctx.rc.client().await;
     let r = if remote.is_empty() {
@@ -2884,6 +2897,12 @@ async fn list_display(
     } else {
         remote.clone()
     };
+    // 挑目录的弹窗也走这里。插件不在时被标记的远程不能借它翻目录树，
+    // 更不能被选成同步目标：选上了同步只会一路 403。
+    let name = fs.trim_end_matches(':');
+    if let Some(msg) = kv_access_blocked(ctx, name).await {
+        return (Err(msg), format!("root://{}", rest));
+    }
     match client.list(&fs, &r, None).await {
         Ok(entries) => {
             let items: Vec<(String, bool)> = entries
@@ -2891,10 +2910,46 @@ async fn list_display(
                 .filter(|e| !dirs_only || e.is_dir)
                 .map(|e| (e.name, e.is_dir))
                 .collect();
-            (items, format!("root://{}", rest))
+            (Ok(items), format!("root://{}", rest))
         }
-        Err(_) => (vec![], format!("root://{}", rest)),
+        Err(e) => (
+            Err(rcgui_i18n::f("列不出来：{}", &[&format!("{:#}", e)])),
+            format!("root://{}", rest),
+        ),
     }
+}
+
+/// 云端目录弹窗点了「确定」：把选中的显示路径落成配置里的 `远程名:子路径`。
+///
+/// 写之前真去列一次目录：列表能拿到才算这个位置现在可用。列不到就一个字都不改，
+/// 并把原因写到同步卡片上——用户手填的旧值比一个打不开的新值有用。
+async fn browse_ok_sync(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, final_disp: &str) -> bool {
+    let Some((fs, sub)) = split_display(final_disp) else {
+        // 停在根上点了确定：没选远程，什么都不动
+        maintenance::set_sync_status(ui, rcgui_i18n::t("没选远程，云端目录没有改动"));
+        let _ = ui.upgrade_in_event_loop(move |ui| ui.global::<BrowseG>().set_show(false));
+        return false;
+    };
+    let value = compose_fs(&fs.trim_end_matches(':'), &sub);
+    let (listed, _) = list_display_checked(ctx, final_disp, true).await;
+    match listed {
+        Ok(_) => {
+            let shown = value.clone();
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                ui.global::<MaintenanceG>().set_sync_remote(shown.into());
+                ui.global::<BrowseG>().set_show(false);
+            });
+            maintenance::set_sync_status(ui, rcgui_i18n::f("已选择云端目录：{}", &[&value]));
+        }
+        Err(why) => {
+            let _ = ui.upgrade_in_event_loop(move |ui| ui.global::<BrowseG>().set_show(false));
+            maintenance::set_sync_status(
+                ui,
+                rcgui_i18n::f("这个位置现在打不开，云端目录保持原值：{}", &[&why]),
+            );
+        }
+    }
+    false
 }
 
 /// 从 UI 读取当前 FieldRow 列表（必须在后台线程通过 read_ui 调用）
@@ -3147,21 +3202,13 @@ fn build_type_choices(providers: &Value, derived: &[remote_types::Derived]) -> V
 
 /// 编辑一个**已经存在**的远程时，下拉里唯一那一项。
 ///
-/// 分三种情况，都与「新建」共用同一套类型表：
-/// - `ty` 是 legacy 的 `kvault`：老用户本地建的 k-vault 远程后端写的是 webdav，
-///   但内核不认识 `kvault` 这个类型名。这里给它合成一项，只出现在这条远程的编辑框里，
-///   保存时仍写回 `kvault::BACKEND`，旧数据与上传桥都不动。
+/// 分两种情况，都与「新建」共用同一套类型表：
 /// - `ty` 是某个已启用插件声明的 id：用插件的显示名与 base_type。
 /// - 其余（内核自带后端）：原名原样往返。
+///
+/// 这里不再为 K-Vault 合成专属项：那个类型现在由插件声明，插件没装它就不存在，
+/// 硬合成一项等于在界面上承诺一个没人负责的类型。
 fn edit_single_choice(ty: &str, derived: &[remote_types::Derived]) -> TypeChoice {
-    if ty == kvault::TYPE {
-        return TypeChoice {
-            display: kvault::TYPE.to_string(),
-            id: kvault::TYPE.to_string(),
-            backend: kvault::BACKEND.to_string(),
-            derived: false,
-        };
-    }
     match remote_types::find(derived, ty) {
         Some(d) => TypeChoice {
             display: d.name.clone(),
@@ -3175,6 +3222,28 @@ fn edit_single_choice(ty: &str, derived: &[remote_types::Derived]) -> TypeChoice
             backend: ty.to_string(),
             derived: false,
         },
+    }
+}
+
+/// 一个既有远程在界面上该显示成哪个类型。
+///
+/// 存进 rclone 的 `type` 永远只是后端，所以「这是 K-Vault 而不是普通 WebDAV」这条
+/// 信息只能来自参数里的标记键。而标记键是不是还真有实现，取决于**当前有没有插件
+/// 声明那个类型 id**：插件停用或卸载后，同一个远程就该显示成它真实的样子（webdav），
+/// 让用户看见「写入功能不在」而不是继续看到那个名字。
+///
+/// 返回类型 id：命中插件时是插件的 id，否则是 `stored` 原样。
+fn display_type_of(
+    entry_params: &Value,
+    stored: &str,
+    derived: &[remote_types::Derived],
+) -> String {
+    if !kvault::KvCfg::is_marked(entry_params) {
+        return stored.to_string();
+    }
+    match remote_types::marker_owner(derived, kvault::MARKER) {
+        Some(d) => d.id.clone(),
+        None => stored.to_string(),
     }
 }
 
@@ -3200,14 +3269,12 @@ fn push_type_selection(ui: &MainWindow, choices: &[TypeChoice], idx: Option<usiz
     });
 }
 
-/// 这个类型该用哪张参数表：k-vault 是插件，参数表按插件名（`kvault`）取，
-/// 其余按 rclone 的 backend 名取。
+/// 这个类型该用哪张参数表：一律按 rclone 的后端名取。
+///
+/// 派生类型落盘的就是 `base_type`（例如 `kvault` 存成 `webdav`），所以它的参数表
+/// 与后端自己的那张是同一张；插件独有的键由 `seed_derived_defaults` 铺进原始参数框。
 fn form_fields_type(choice: &TypeChoice) -> String {
-    if choice.id == kvault::TYPE {
-        kvault::TYPE.to_string()
-    } else {
-        choice.backend.clone()
-    }
+    choice.backend.clone()
 }
 
 /// 派生类型的初始参数，写成「原始参数」框里的那种一行一个 `k=v`。
@@ -3225,44 +3292,25 @@ fn derived_params_text(d: &remote_types::Derived) -> String {
 
 /// 更新编辑器字段列表和描述
 fn update_editor_fields(ui: &Weak<MainWindow>, providers: &Value, type_name: &str) {
-    // `k-vault` 不是 rclone 的 provider：没有 Option 元数据可读，走专用表单。
-    // 这里只切开关与说明，表单值由调用方（新建 / 改类型 / 编辑现有）负责填。
-    if type_name == kvault::TYPE {
-        let _ = ui.upgrade_in_event_loop(|ui| {
-            let g = ui.global::<RemotesG>();
-            g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(
-                Vec::<FieldRow>::new(),
-            ))));
-            g.set_provider_desc(kv_desc().into());
-            g.set_kv_editor(true);
-        });
-        return;
-    }
     let (desc, fields) = build_fields_from_provider(providers, type_name);
     let _ = ui.upgrade_in_event_loop(move |ui| {
         let g = ui.global::<RemotesG>();
         g.set_provider_desc(desc.into());
         g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(fields))));
-        g.set_kv_editor(false);
     });
 }
 
-// ---------------- K-Vault（`k-vault` 类型） ----------------
+// ---------------- K-Vault：只剩远程操作桥 ----------------
 //
-// 这一类型在 rclone 侧其实是一个 `webdav` 远程（`url=<站点>/dav`）：浏览与
-// 下载复用 rclone 现成的只读通道，写入走站点 HTTP API。识别靠远程参数里的
-// `kvault=1` 标记，而不是 rclone 的 type —— 对 rclone 来说它就是 webdav。
+// K-Vault 这个**类型**由 kvault 插件声明（`remote_types`），编辑表单也在插件面板里。
+// 主程序这边只剩一条操作桥：把文件字节搬到站点 API、列站点文件、删站点文件。
+// 需要它是因为站点的 DAV 端点只放行 OPTIONS/PROPFIND/GET/HEAD，写方法一律 403，
+// 而插件的 `http.request` 只能发字符串，搬不动文件。
 //
-// 为什么上传不经 rclone：站点的 DAV 端点只放行 OPTIONS/PROPFIND/GET/HEAD，
-// 写方法一律 403，所以这里自己发 `POST /api/v1/upload`。
-
-/// 选中 `k-vault` 类型时显示在类型下拉框下方的说明。
-fn kv_desc() -> &'static str {
-    rcgui_i18n::t(
-        "K-Vault 站点：浏览/下载走只读 WebDAV，上传走站点 API。\
-令牌在站点的「API 令牌」页创建（需要 upload 权限）；只填用户名/密码时只能浏览。",
-    )
-}
+// 桥认的参数形状没变：rclone 里就是一个 `webdav` 远程（`url=<站点>/dav`），
+// 靠参数里的 `kvault=1` 标记认出来。插件没装/没启用时没人声明这个类型，
+// 这个远程在本程序里就用不了（[`kv_access_blocked`] 会拒掉浏览、下载、挂载和
+// 改配置，[`kv_write_kind`] 拒掉写），而不是降级成普通 webdav 远程。
 
 /// 读一个远程的参数，判断它是不是 K-Vault 远程；是则返回配置（含明文令牌）。
 ///
@@ -3297,7 +3345,9 @@ const KVAULT_PLUGIN_ID: &str = "kvault";
 /// 找出一枚能直接发 HTTP 的明文令牌。
 ///
 /// 历史原因同一枚令牌有三处来源，优先级从旧到新：
-/// 1. 旧版主程序按远程名存下的明文（[`kv_token_put`] 写的）；
+/// 1. 主程序按远程名记下的明文（见 [`kv_token_in`]）。旧版把令牌写在
+///    `kvault::STORE_NS` 命名空间里，那个命名空间与插件目录同名，卸载插件会连令牌
+///    一起删掉，所以现在写进 `kvault::TOKEN_NS`，读的时候两个都看；
 /// 2. rclone 远程参数里的 `bearer_token`——kvault 插件新建远程时写这里；
 /// 3. kvault 插件自己存的 `site.token`（整个站点一枚，不区分远程）。
 ///
@@ -3352,172 +3402,133 @@ async fn kv_reveal(client: &rclone_client::RcClient, raw: &str) -> String {
     }
 }
 
+/// 这个远程现在归不归主程序的 K-Vault 操作桥管。
+///
+/// 判据是「有没有启用中的插件声明了这个标记键」：插件把**自己的类型 id** 当作远程
+/// 参数里的标记键（`config.json` 的 `remote_types[].defaults` 里写 `kvault: "1"`），
+/// 所以没人声明就等于这个类型现在没有实现，桥必须下线 —— 否则用户卸了插件，
+/// 主程序还在替他往站点传文件。
+///
+/// 注意它**不等于**「插件停用后这个远程退化成普通 webdav 远程」：远程还带着标记，
+/// 说明它本来就不是普通 WebDAV，停用后它在应用里用不了，见 [`kv_access_blocked`]。
+fn kv_bridge_owns(ctx: &Arc<Ctx>) -> bool {
+    remote_types::marker_owner(&remote_types::collect(ctx), kvault::MARKER).is_some()
+}
+
 async fn kv_cfg_for(ctx: &Arc<Ctx>, remote: &str) -> Option<kvault::KvCfg> {
+    if !kv_bridge_owns(ctx) {
+        return None;
+    }
     let client = ctx.rc.client().await;
     kv_cfg_lookup(&client, &ctx.store, remote).await
+}
+
+/// 一条远程在「写」这件事上归谁管。
+///
+/// 三种情况必须分开，不能像原来那样只用 `Option<cfg>` 表示：
+/// - `NotKv`：与 K-Vault 无关，照旧交给 rclone（普通 WebDAV 永远落在这里）；
+/// - `Bridge`：带标记且插件在，走站点 API；
+/// - `Orphan`：带标记但插件被停用/卸载了。此时**不能**悄悄回落到 rclone：
+///   站点 DAV 的写方法一律 403，用户只会看到「method not allowed」，既不知道
+///   发生了什么，也不知道装回插件就能解决。要显式拒绝并说明。
+enum KvWrite {
+    NotKv,
+    Bridge(kvault::KvCfg),
+    Orphan(String),
+}
+
+/// 判一条远程的写路径。插件不在时的结论与 [`kv_access_blocked`] 一致（拒绝），
+/// 那里管的是读、挂载和配置，两边共用 [`kv_write_kind`] 这一处判定。
+async fn kv_write_target(ctx: &Arc<Ctx>, remote: &str) -> KvWrite {
+    let client = ctx.rc.client().await;
+    let cfg = kv_cfg_lookup(&client, &ctx.store, remote).await;
+    kv_write_kind(cfg, kv_bridge_owns(ctx), remote)
+}
+
+/// [`kv_write_target`] 的判定部分，单独拎出来是为了能测：
+/// 真正那一步要去问 rclone，而三态的分岔点在拿到配置之后。
+///
+/// 先看标记：没有 `kvault` 键的远程是普通远程，插件装没装都与它无关。
+fn kv_write_kind(cfg: Option<kvault::KvCfg>, bridge: bool, remote: &str) -> KvWrite {
+    match cfg {
+        None => KvWrite::NotKv,
+        Some(cfg) if bridge => KvWrite::Bridge(cfg),
+        Some(_) => KvWrite::Orphan(caps::kv_plugin_gone(remote)),
+    }
+}
+
+/// 插件不在时，这条远程还能不能被用：浏览、下载、挂载、改配置都先问这里。
+///
+/// 判据和 [`kv_write_kind`] 是同一道闸门（带标记 + 插件不在 = 拒绝），覆盖面更大：
+/// 一个「类型没有实现」的远程在本程序里就不该有能用的入口。浏览尤其不能放过 ——
+/// 只读也能列能看，用户自然会以为插件可有可无，直到上传时才撞上另一句报错。
+///
+/// 返回 `Some(原因)` 就是拒绝，原因可以直接给用户看；`None` 表示放行：普通远程
+/// （没有标记键，插件装没装都与它无关），或者插件在。
+async fn kv_access_blocked(ctx: &Arc<Ctx>, remote: &str) -> Option<String> {
+    // 这里必须用不带闸的 `kv_cfg_lookup`：先拿到「是不是 K-Vault」，再判插件。
+    // 反过来的话插件不在时只能得到 `None`，看起来就像普通远程，闸门形同虚设。
+    let client = ctx.rc.client().await;
+    let cfg = kv_cfg_lookup(&client, &ctx.store, remote).await;
+    match kv_write_kind(cfg, kv_bridge_owns(ctx), remote) {
+        KvWrite::Orphan(msg) => Some(msg),
+        _ => None,
+    }
+}
+
+/// 给 [`reconcile::reconcile`] 用的「哪些远程现在不能用」表。
+///
+/// 对账模块只拿得到 `RcClient`，判断不了插件启没启用，所以结论在这里先算好传进去。
+/// 只看 `cfg.auto_mounts` 和 `cfg.auto_serves` 里出现过的远程：那正是对账会去
+/// 重建挂载和服务的范围，别的远程不用判。
+async fn kv_blocked_map(
+    ctx: &Arc<Ctx>,
+    cfg: &config::AppConfig,
+) -> std::collections::HashMap<String, String> {
+    let mut names: Vec<String> = Vec::new();
+    for m in &cfg.auto_mounts {
+        names.push(m.remote.clone());
+    }
+    for s in &cfg.auto_serves {
+        names.push(s.remote.clone());
+    }
+    names.sort();
+    names.dedup();
+
+    let mut out = std::collections::HashMap::new();
+    for name in names {
+        if let Some(msg) = kv_access_blocked(ctx, &name).await {
+            out.insert(name, msg);
+        }
+    }
+    out
 }
 
 /// 明文令牌（rclone 里那份是 obscured 的，API 用不了）。
 ///
 /// 和上传/删除走同一套回落顺序（[`kv_token_resolve`]）：否则「界面说有令牌、
 /// 上传时却说没有凭据」，用户只能看到一句莫名其妙的 401。
-async fn kv_token_get(ctx: &Arc<Ctx>, remote: &str) -> String {
-    match kv_cfg_for(ctx, remote).await {
-        Some(cfg) => cfg.token,
-        None => kv_token_in(&ctx.store, remote),
-    }
-}
-
+///
+/// 先看 [`kvault::TOKEN_NS`]，再退回 [`kvault::STORE_NS`]：后者与插件目录同名，
+/// 卸载插件时整个 `kv.json` 会被删掉，旧版写在那里的令牌也就跟着没了。启动时的
+/// [`kvault::migrate_kvault_tokens`] 把旧记录复制到新命名空间，这里两个都查是为了
+/// 迁移还没跑过（或迁移失败）时用户至少还能用一次。
 fn kv_token_in(store: &crate::kv::KvStore, remote: &str) -> String {
-    store
-        .get_all(kvault::STORE_NS)
-        .get(remote)
-        .and_then(|v| v.get("token"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
-}
-
-/// 写/清明文令牌。空令牌 = 删掉记录，不给站点留一份死凭据。
-fn kv_token_put(ctx: &Arc<Ctx>, remote: &str, token: &str) {
-    let token = token.trim();
-    if token.is_empty() {
-        let _ = ctx.store.delete(kvault::STORE_NS, remote);
+    let read = |ns: &str| {
+        store
+            .get_all(ns)
+            .get(remote)
+            .and_then(|v| v.get("token"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let fresh = read(kvault::TOKEN_NS);
+    if fresh.is_empty() {
+        read(kvault::STORE_NS)
     } else {
-        let _ = ctx
-            .store
-            .set(kvault::STORE_NS, remote, json!({ "token": token }));
+        fresh
     }
-}
-
-/// 从「key=value 每行一条」的参数文本里取一个值（改类型时用来认领已有参数）。
-fn kv_param_of(text: &str, key: &str) -> Option<String> {
-    text.lines().find_map(|l| {
-        let (k, v) = l.split_once('=')?;
-        if k.trim() == key {
-            Some(v.trim().to_string())
-        } else {
-            None
-        }
-    })
-}
-
-/// 编辑器里 K-Vault 表单的当前值（都在 UI 线程读出来）。
-#[derive(Clone, Debug, Default)]
-struct KvForm {
-    /// 正在编辑的远程名（新建时为空）
-    name: String,
-    /// 当前类型选的是 k-vault：表单可见，保存走 K-Vault 分支
-    editor: bool,
-    base: String,
-    token: String,
-    token_set: bool,
-    user: String,
-    pass: String,
-    pass_set: bool,
-    folder: String,
-    storage: String,
-    dedup: bool,
-}
-
-impl KvForm {
-    /// 表单值 → 待写入的配置（不含「留空=不修改」的取值，那部分由保存路径补）。
-    fn to_cfg(&self) -> kvault::KvCfg {
-        kvault::KvCfg {
-            base: self.base.clone(),
-            token: self.token.clone(),
-            user: self.user.clone(),
-            pass: self.pass.clone(),
-            folder: self.folder.clone(),
-            storage: self.storage.clone(),
-            dedup: self.dedup,
-        }
-    }
-}
-
-async fn read_kv_form(ui: &Weak<MainWindow>) -> KvForm {
-    read_ui(ui, |u| {
-        let g = u.global::<RemotesG>();
-        let storages = g.get_kv_storages();
-        let storage = storages
-            .row_data(g.get_kv_storage_idx().max(0) as usize)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| kvault::DEFAULT_STORAGE.to_string());
-        KvForm {
-            name: g.get_edit_name().trim().to_string(),
-            editor: g.get_kv_editor(),
-            base: g.get_kv_base().trim().to_string(),
-            token: g.get_kv_token().trim().to_string(),
-            token_set: g.get_kv_token_set(),
-            user: g.get_kv_user().trim().to_string(),
-            pass: g.get_kv_pass().to_string(),
-            pass_set: g.get_kv_pass_set(),
-            folder: g.get_kv_folder().trim().trim_matches('/').to_string(),
-            storage,
-            dedup: g.get_kv_dedup(),
-        }
-    })
-    .await
-    .unwrap_or_default()
-}
-
-/// 把已有远程的参数填进表单；令牌/口令不回显，只标记「已设置」。
-fn apply_kv_form(ui: &MainWindow, cfg: &kvault::KvCfg, token_set: bool, pass_set: bool) {
-    let g = ui.global::<RemotesG>();
-    // 存储下拉框以 Rust 侧常量为准（.slint 里的默认值只是首帧占位）
-    let storages: Vec<slint::SharedString> = kvault::STORAGES.iter().map(|s| (*s).into()).collect();
-    g.set_kv_storages(ModelRc::from(Rc::new(VecModel::from(storages))));
-    g.set_kv_base(cfg.base.clone().into());
-    g.set_kv_token("".into());
-    g.set_kv_token_set(token_set);
-    g.set_kv_user(cfg.user.clone().into());
-    g.set_kv_pass("".into());
-    g.set_kv_pass_set(pass_set);
-    g.set_kv_folder(cfg.folder.clone().into());
-    let storages = g.get_kv_storages();
-    let idx = (0..storages.row_count())
-        .find(|i| {
-            storages
-                .row_data(*i)
-                .map(|s| s.as_str() == cfg.storage)
-                .unwrap_or(false)
-        })
-        .unwrap_or(0);
-    g.set_kv_storage_idx(idx as i32);
-    g.set_kv_dedup(cfg.dedup);
-    g.set_kv_status("".into());
-    g.set_kv_status_level(0);
-    g.set_kv_testing(false);
-    g.set_kv_editor(true);
-}
-
-/// 新建远程 / 从别的类型切过来时的表单初值。
-fn reset_kv_form(ui: &MainWindow, base: &str) {
-    let g = ui.global::<RemotesG>();
-    let storages: Vec<slint::SharedString> = kvault::STORAGES.iter().map(|s| (*s).into()).collect();
-    g.set_kv_storages(ModelRc::from(Rc::new(VecModel::from(storages))));
-    g.set_kv_base(base.into());
-    g.set_kv_token("".into());
-    g.set_kv_token_set(false);
-    g.set_kv_user("".into());
-    g.set_kv_pass("".into());
-    g.set_kv_pass_set(false);
-    g.set_kv_folder("".into());
-    let storages = g.get_kv_storages();
-    let idx = (0..storages.row_count())
-        .find(|i| {
-            storages
-                .row_data(*i)
-                .map(|s| s.as_str() == kvault::DEFAULT_STORAGE)
-                .unwrap_or(false)
-        })
-        .unwrap_or(0);
-    g.set_kv_storage_idx(idx as i32);
-    g.set_kv_dedup(true);
-    g.set_kv_status("".into());
-    g.set_kv_status_level(0);
-    g.set_kv_testing(false);
-    g.set_kv_editor(true);
 }
 
 /// 本次上传落到站点哪个目录。
@@ -3685,13 +3696,17 @@ fn kv_upload_report(up: &KvUpload, where_: &str) -> (i32, String) {
 /// 也只开放上传、列表、删除和文本粘贴，没有移动或建目录的端点。这里给一句明确的
 /// 原因，而不是让 rclone 回一个干巴巴的 403。
 async fn kv_write_blocked(ctx: &Arc<Ctx>, remote: &str) -> Option<String> {
-    kv_cfg_for(ctx, remote).await.map(|_| {
-        rcgui_i18n::t(
-            "K-Vault 远程不支持改名/移动/新建目录：站点只读（WebDAV 写方法一律 403），\
+    match kv_write_target(ctx, remote).await {
+        KvWrite::NotKv => None,
+        KvWrite::Bridge(_) => Some(
+            rcgui_i18n::t(
+                "K-Vault 远程不支持改名/移动/新建目录：站点只读（WebDAV 写方法一律 403），\
 API 也只开放上传、列表、删除。要在站点上调整目录，请到站点网页端操作。",
-        )
-        .to_string()
-    })
+            )
+            .to_string(),
+        ),
+        KvWrite::Orphan(msg) => Some(msg),
+    }
 }
 
 /// K-Vault 远程的列目录：直接读站点索引（`GET /api/v1/files`）。
@@ -3998,6 +4013,13 @@ fn main() {
         return;
     }
 
+    // 让任务栏把本进程当成一个独立的 App 身份。
+    //
+    // 不设这个，Windows 会按 exe 路径给任务栏按钮归组，而每个版本的 exe 路径都是
+    // 新目录（portable 解压到不同文件夹、安装目录升级），于是同一程序的任务栏按钮
+    // 与固定到开始菜单的快捷方式对不上，表现为「图标丢失」或显示默认白纸图标。
+    set_app_user_model_id();
+
     // 配置
     // 必须在任何档案写入之前注册：程序若曾以管理员身份运行过，数据目录的 ACL
     // 会让普通权限进程写入报「拒绝访问」，这里给它一次自愈的机会。
@@ -4022,14 +4044,6 @@ fn main() {
     ui.set_window_label(format!("RCGUI {}", env!("CARGO_PKG_VERSION")).into());
     apply_slint_language(lang);
     apply_theme(&ui, cfg.theme_mode);
-    ui.global::<SettingsG>()
-        .set_rc_user(cfg.rclone.user.clone().into());
-    ui.global::<SettingsG>()
-        .set_rc_pass(cfg.rclone.pass.clone().into());
-    ui.global::<SettingsG>()
-        .set_rc_url(cfg.rclone.url.clone().into());
-    ui.global::<SettingsG>()
-        .set_connect_on_start(cfg.rclone.connect_on_start);
     ui.global::<SettingsG>()
         .set_theme_idx(cfg.theme_mode as i32);
     ui.global::<SettingsG>()
@@ -4447,6 +4461,27 @@ fn set_window_icon(ui: &MainWindow, cfg: &crate::config::AppConfig) {
     }
 }
 
+/// 设置进程的显式 AppUserModelID。
+///
+/// 任务栏按这个 ID 归组、并据此去取「快捷方式上写的图标」和「exe 里的图标资源」。
+/// 用一个固定的字符串而不是默认的路径推断值，固定到开始菜单/任务栏的快捷方式才会
+/// 一直指向同一个身份，升级换了安装目录也不会掉图标。
+///
+/// 失败只记日志：这只影响任务栏归组，不该拦住程序启动。
+#[cfg(windows)]
+fn set_app_user_model_id() {
+    use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+    let id = windows::core::w!("RCGUI.RcloneGui");
+    unsafe {
+        if let Err(e) = SetCurrentProcessExplicitAppUserModelID(id) {
+            write_icon_log(&format!("set_app_user_model_id failed: {e}\n"));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn set_app_user_model_id() {}
+
 /// 托盘诊断日志（同一文件，便于与图标日志对照）。
 fn tray_log(msg: &str) {
     write_icon_log(&format!("[tray] {msg}\n"));
@@ -4479,64 +4514,37 @@ fn write_icon_log(msg: &str) {
 }
 
 /// RGBA 像素 → Windows HICON。
+///
+/// 走 `CreateIconFromResourceEx` 吃一段图标格式的 DIB，而不是先 `CreateBitmap` 再
+/// `CreateIconIndirect`。原因：`CreateBitmap` 给的是设备相关位图（DDB），
+/// 32 位 alpha 在很多显卡驱动上会被丢掉，任务栏于是画出一个空方块——
+/// 托盘那边用 RGBA 直接喂 `tray-icon`，所以看起来「托盘正常、任务栏没图标」。
+/// 图标格式的 DIB 是显式的 32bpp BGRA + AND 掩码，alpha 原样保留。
+///
+/// 失败返回 `None`，调用方记日志并保持窗口原图标，不 panic。
 #[cfg(windows)]
 fn rgba_to_hicon(
     rgba: &[u8],
     size: usize,
 ) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
-    use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject, HGDIOBJ};
-    use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO};
+    use windows::Win32::UI::WindowsAndMessaging::{CreateIconFromResourceEx, HICON, IMAGE_FLAGS};
 
-    // 转成 BGRA：Windows 的 DIB 是 BGRA 顺序
-    let mut bgra = Vec::with_capacity(rgba.len());
-    for px in rgba.chunks_exact(4) {
-        bgra.push(px[2]); // B
-        bgra.push(px[1]); // G
-        bgra.push(px[0]); // R
-        bgra.push(px[3]); // A
-    }
-
+    let dib = icon_asset::dib_image(size, rgba);
     unsafe {
-        // 颜色位图（带 alpha）
-        let color = CreateBitmap(
+        // dwVer = 0x00030000 表示这是标准图标资源（Vista 起的老规矩，不能写 0）
+        match CreateIconFromResourceEx(
+            &dib,
+            windows::Win32::Foundation::BOOL(1),
+            0x0003_0000,
             size as i32,
             size as i32,
-            1,
-            32,
-            Some(bgra.as_ptr() as *const ::core::ffi::c_void),
-        );
-        if color.is_invalid() {
-            return None;
-        }
-        // 掩码位图：32 位图标靠 alpha 通道，掩码给全 0 即可
-        let mask_bytes = vec![0u8; (size * size) / 8];
-        let mask = CreateBitmap(
-            size as i32,
-            size as i32,
-            1,
-            1,
-            Some(mask_bytes.as_ptr() as *const ::core::ffi::c_void),
-        );
-        if mask.is_invalid() {
-            let _ = DeleteObject(HGDIOBJ(color.0));
-            return None;
-        }
-
-        let info = ICONINFO {
-            fIcon: windows::Win32::Foundation::BOOL(1),
-            xHotspot: 0,
-            yHotspot: 0,
-            hbmMask: mask,
-            hbmColor: color,
-        };
-        let icon: HICON = CreateIconIndirect(&info).unwrap_or(HICON(std::ptr::null_mut()));
-        // 位图内容已复制进图标，可以立即释放
-        let _ = DeleteObject(HGDIOBJ(color.0));
-        let _ = DeleteObject(HGDIOBJ(mask.0));
-        if icon.0.is_null() {
-            None
-        } else {
-            Some(icon)
+            IMAGE_FLAGS(0),
+        ) {
+            Ok(icon) if !icon.0.is_null() => Some(icon),
+            _ => {
+                write_icon_log(&format!("rgba_to_hicon: CreateIconFromResourceEx failed\n"));
+                None::<HICON>
+            }
         }
     }
 }
@@ -4809,10 +4817,10 @@ fn now_hms() -> String {
     format!("{:02}:{:02}:{:02}", n.hour(), n.minute(), n.second())
 }
 
-/// 「启动时未自动连接」这一支要显示的 RC 地址。
+/// 「没连上」这一支要显示的 RC 地址。
 ///
-/// 未连接时 `RcState` 里的端点是占位默认值（5572），而用户配置的可能是别的端口；
-/// 仪表盘必须显示**将要连的**那个，否则关掉自动连接后会看到一个自己没配过的地址。
+/// 未连接时 `RcState` 里的端点是占位默认值（5572），而旧配置里存的可能是别的地址；
+/// 仪表盘必须显示**将要连的**那个，否则用户会看到一个自己没配过的端口。
 /// 空/空白配置视为「没配」，回落到占位值。
 fn startup_endpoint_url(configured: &str, fallback: &str) -> String {
     let t = configured.trim();
@@ -4983,16 +4991,11 @@ async fn connect_report(ctx: &Arc<Ctx>) -> ConnOutcome {
     }
 }
 
-#[derive(Clone, Copy)]
-enum ConnAction {
-    /// 建立连接（可能拉起托管进程）+ 握手
-    Connect,
-    /// 只重新握手，不动进程
-    Handshake,
-}
-
-/// 用户触发的连接动作：置忙 → 执行 → 复位 → 应用到 UI → 分类提示。
-async fn conn_action(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, which: ConnAction) {
+/// 用户触发的重新握手：置忙 → 握手 → 复位 → 应用到 UI → 分类提示。
+///
+/// 只会握手，不会拉起或停止进程——进程的生命周期归托管值守所有，
+/// 界面上也没有手动连接/断开的入口了。
+async fn rehandshake(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     if ctx
         .conn_busy
         .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -5001,10 +5004,7 @@ async fn conn_action(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, which: ConnAction) {
         return;
     }
     let _ = ui.upgrade_in_event_loop(|ui| ui.global::<SettingsG>().set_conn_busy(true));
-    let out = match which {
-        ConnAction::Connect => connect_report(ctx).await,
-        ConnAction::Handshake => handshake_only(ctx).await,
-    };
+    let out = handshake_only(ctx).await;
     ctx.conn_busy
         .store(false, std::sync::atomic::Ordering::SeqCst);
     let live = out.view.live;
@@ -5031,7 +5031,7 @@ async fn conn_action(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, which: ConnAction) {
 /// 而 replay 内部要拿 std Mutex 与 Slint Weak，直接 `tokio::spawn` 会破坏 Send 约束。
 ///
 /// 调用点：
-/// - 用户手动「连接 / 重新握手」（`conn_action`）；
+/// - **托管内核值守自动重启成功之后**（`maintenance::attempt_core_start`）；
 /// - **插件拉起 rclone 之后的自动连接**（`plugins::apply_rc`）。这一条是会话 16 补的：
 ///   冷启动时 rclone 还没起来，启动流程里 `ready == false` 会走「让插件去启动」的分支，
 ///   那条分支原本不 replay；插件把 rclone 拉起来并回传 rc 凭据后，挂载/服务就再也没人
@@ -5052,6 +5052,12 @@ pub(crate) fn spawn_restore(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             Err(_) => {}
         }
     });
+}
+
+/// 连一次、只回答"通没通"。值守判断内核是不是真的可用，需要握手结果；
+/// 但 `ConnOutcome` 只在界面层用，没必要为它开可见性。
+pub(crate) async fn handshake_live(ctx: &Arc<Ctx>) -> bool {
+    connect_report(ctx).await.view.live
 }
 
 /// 插件刚拉起 rclone 之后的重连：按 2 秒间隔最多试 40 秒，连上就补挂载/服务恢复。
@@ -5248,14 +5254,6 @@ async fn delete_proxy_now(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ProxyListRefresh)).await;
 }
 
-/// 断开连接：**不终止 rclone 进程**，只停止使用该端点并保留上次快照。
-async fn disconnect_now(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
-    ctx.rc.set_disconnected(None).await;
-    let v = snapshot_view(ctx).await;
-    apply_conn_view(ui, v);
-    toast(ui, 0, rcgui_i18n::t("已断开连接（界面保留上次快照）"));
-}
-
 /// 真正的导出动作（唯一实现）。`include_secrets` 由调用方给出。
 /// 直接导出时传 false；确认后导出时传入 *点击时捕获* 的值，绝不重新读取 UI。
 async fn export_conf(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, path: PathBuf, include_secrets: bool) {
@@ -5330,9 +5328,27 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
     for note in maintenance::migrate_oneclick(&ctx) {
         toast(&ui, 1, note);
     }
+    // 0.1) 旧的「外部 rclone」连法改成托管内核。只翻一个开关，用户填过的
+    //      地址与口令原样留在配置里，不删。
+    for note in maintenance::migrate_external_to_managed(&ctx) {
+        toast(&ui, 1, note);
+    }
+    // 0.2) K-Vault 明文令牌原来与插件目录同处一个 kv.json，卸载插件会连令牌
+    //      一起删掉。复制一份到独立命名空间；旧数据原样保留，只复制不搬走。
+    let moved_tokens = kvault::migrate_kvault_tokens(&ctx.store);
+    if !moved_tokens.is_empty() {
+        toast(
+            &ui,
+            1,
+            rcgui_i18n::f(
+                "已把 {} 个 K-Vault 远程的令牌复制到独立存储（卸载插件不会再连带删掉）",
+                &[&moved_tokens.len()],
+            ),
+        );
+    }
 
     // 0.5) 托管内核：random 端口 + random 凭据，只活在本进程里。
-    //      失败不拦启动，界面照旧能连外部实例，维护页会显示原因。
+    //      失败不拦启动：维护页会写明原因，值守循环会接着重试。
     if let Some(note) = maintenance::start_managed_core(&ctx).await {
         toast(&ui, 1, note);
     }
@@ -5341,8 +5357,10 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
     tokio::spawn(maintenance::watch(ctx.clone(), ui.clone()));
     tokio::spawn(lightweight::watch(ctx.clone(), ui.clone()));
 
-    // 1) 启动时连接已保存的 endpoint（仅当用户开启「启动时连接」）。
-    //    连接失败 → 离线模式；**不会**回退成启动 rclone 进程。
+    // 1) 启动时连一次。托管内核起来了就连它（凭据在内存里）；
+    //    没起来而旧配置里存着外部地址、以前又勾过「启动时连接」，就照旧**只连**那个地址
+    //    兜底一次——内核这一轮起不来，不该把本来能用的外部 rclone 一起挡在门外。
+    //    连接失败 → 离线模式；**任何情况下都不会**在这里启动 rclone 进程。
     let conn = if ctx.maint.core.is_running() || ctx.cfg.lock().unwrap().rclone.connect_on_start {
         connect_report(&ctx).await
     } else {
@@ -5352,7 +5370,9 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
         // 否则关掉「启动时自动连接」后会看到一个自己没配过的端口（会话 11 实测踩到）。
         let saved = ctx.cfg.lock().unwrap().rclone.url.clone();
         v.endpoint_url = startup_endpoint_url(&saved, &v.endpoint_url);
-        v.error = rcgui_i18n::t("启动时未自动连接（可在设置里点「连接 / 握手」）").to_string();
+        v.error =
+            rcgui_i18n::t("尚未连接到内核：程序会自动重试；若一直不行，设置页的状态里会写明原因。")
+                .to_string();
         ConnOutcome {
             view: v,
             version: None,
@@ -5625,6 +5645,11 @@ async fn startup_flow(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         let sem = sem.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await;
+            // 类型没有实现的远程不去预热：DAV 的 about/list 会成功，状态栏随即显示
+            // 「正常」，而用户点进去只会看到拒绝。宁可不做这一步。
+            if kv_access_blocked(&ctx2, &name).await.is_some() {
+                return;
+            }
             // 1) 连接校验（失败 → 该预设流程终止）。8s 超时，防止慢后端把整个启动流程拖死
             let fs = format!("{name}:");
             let ok = tokio::time::timeout(std::time::Duration::from_secs(8), client.about(&fs))
@@ -5961,6 +5986,15 @@ async fn apply_bundle_to_rclone(
             skipped_auth.insert(m.remote.clone());
             continue;
         }
+        // 导入的档案里也可能有被标记的远程：它的类型插件不在时挂上去只会立刻
+        // 403。档案条目已经记下了，插件装回来下次启动会自动重建。
+        if let Some(msg) = kv_access_blocked(ctx, &m.remote).await {
+            errs.push(rcgui_i18n::f(
+                "挂载 {} → {}: {}",
+                &[&(m.remote), &(point), &(msg)],
+            ));
+            continue;
+        }
         if live
             .iter()
             .any(|x| mount_key(&x.mount_point) == mount_key(&point))
@@ -6034,6 +6068,15 @@ async fn apply_bundle_to_rclone(
             skipped_auth.insert(s.remote.clone());
             continue;
         }
+        // 同上：被标记的远程在本程序里用不了，起服务等于把它重新暴露成一个
+        // 打不开的地址。档案条目已记下，插件装回来会自动重建。
+        if let Some(msg) = kv_access_blocked(ctx, &s.remote).await {
+            errs.push(rcgui_i18n::f(
+                "服务 {} {}: {}",
+                &[&(s.stype), &(s.addr), &(msg)],
+            ));
+            continue;
+        }
         let fs = compose_fs(&s.remote, &s.sub_path);
         match client
             .serve_start(&s.stype, &fs, &s.addr, &s.user, &s.pass)
@@ -6071,6 +6114,14 @@ async fn files_navigate(
 ) {
     let (remote, _) = ui_files_pos(ui).await;
     if remote.is_empty() {
+        return;
+    }
+    // 进入子目录 / 返回上级 / 点面包屑都从这里过：插件不在就别往下走了
+    if let Some(msg) = kv_access_blocked(ctx, &remote).await {
+        let _ = ui.upgrade_in_event_loop(move |ui| {
+            ui.global::<FilesG>().set_loading(false);
+            toast_ui(&ui, 2, msg);
+        });
         return;
     }
     let proxy_ep = remote_proxy_endpoint(ctx, &remote);
@@ -6155,9 +6206,6 @@ impl Cmd {
                 | Cmd::ProxySave
                 | Cmd::ProxyDelete { .. }
                 | Cmd::ConfApply
-                | Cmd::Connect
-                | Cmd::Disconnect
-                | Cmd::Reconnect
         )
     }
 }
@@ -6192,6 +6240,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 std::process::exit(0);
             });
             caps::stop_plugin_procs_on_exit();
+            // 还有没发完的上传也一并撤掉：进程马上就没了，留着授权只会让它
+            // 在退出清理的那几秒里被某个远程动作捡起来用。
+            plugin_host::upload::cancel_all();
             // 自己起的 rclone 内核跟着退出。只可能结束本进程亲手 spawn 的那个 child
             // （`core::Core` 里只保存自己启动的句柄）；连外部实例时这里是空操作，
             // 用户的 rclone 一个字都不会被动到。
@@ -6332,6 +6383,27 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if remote.is_empty() {
                 return false;
             }
+            // 插件不在时，被标记的远程连列目录都不给：清空列表 + 说清原因。
+            // 不能像以前那样悄悄落到 DAV 只读，那样用户看不出插件已经卸了。
+            if let Some(msg) = kv_access_blocked(ctx, &remote).await {
+                let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq())
+                    .await
+                    .unwrap_or(-2);
+                if seq >= 0 && cur_seq != seq {
+                    let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
+                    return false;
+                }
+                let _ = ui.upgrade_in_event_loop(move |ui| {
+                    let g = ui.global::<FilesG>();
+                    set_file_entries(&ui, Vec::<FileRow>::new());
+                    // 面包屑照旧重建：路径本身还是用户看到的那个，只是里面没东西可看
+                    apply_crumbs(&ui, file_crumbs(&remote, &path));
+                    g.set_sel(-1);
+                    g.set_loading(false);
+                    toast_ui(&ui, 2, msg);
+                });
+                return false;
+            }
             // 取一次「该远程是否绑了代理」：网络类错误没有代理证据时，
             // 只给弱提示（见 proxy::annotate_error），不能断言是谁的问题。
             let proxy_ep = remote_proxy_endpoint(ctx, &remote);
@@ -6449,6 +6521,12 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         }
         Cmd::FilesDownload { name, local } => {
             let (remote, path) = ui_files_pos(ui).await;
+            // 读同样要拦：下载拿到的是用户存在站点的真实文件，插件不在时这条通道
+            // 也不该开着——否则「浏览被挡了但文件照样下得下来」才是真的怪
+            if let Some(msg) = kv_access_blocked(ctx, &remote).await {
+                toast(ui, 2, msg);
+                return false;
+            }
             // 「另存为」里用户可能改了文件名，必须按最终选择落盘
             let dst_name = local
                 .file_name()
@@ -6473,6 +6551,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         Cmd::FilesDownloadToDir { name, dir, is_dir } => {
             let (remote, path) = ui_files_pos(ui).await;
             if remote.is_empty() {
+                return false;
+            }
+            if let Some(msg) = kv_access_blocked(ctx, &remote).await {
+                toast(ui, 2, msg);
                 return false;
             }
             if is_dir {
@@ -6539,6 +6621,15 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         Cmd::FilesMoveList { path, seq } => {
             let (remote, _) = ui_files_pos(ui).await;
             if remote.is_empty() {
+                return false;
+            }
+            // 这是「移动到…」的目录选择器，走的是 DAV 列目录：不拦的话
+            // 用户还能借它把整个站点目录树翻一遍。
+            if let Some(msg) = kv_access_blocked(ctx, &remote).await {
+                let _ = ui.upgrade_in_event_loop(move |ui| {
+                    ui.global::<FilesG>().set_move_busy(false);
+                    toast_ui(&ui, 2, msg);
+                });
                 return false;
             }
             let client = ctx.rc.client().await;
@@ -6744,10 +6835,18 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         Cmd::FilesDel { name, is_dir } => {
             let (remote, path) = ui_files_pos(ui).await;
             // K-Vault 远程：DAV 通道只读，但站点 API 有正经的删除端点，
-            // 按站点索引翻成文件 id 再删。
-            if let Some(cfg) = kv_cfg_for(&ctx, &remote).await {
-                let items = vec![(name, is_dir)];
-                return kv_delete_into(ui.clone(), cfg, path, items).await;
+            // 按站点索引翻成文件 id 再删。插件不在时这条远程不能当普通 DAV 用，
+            // 所以 Orphan 分支直接拒绝，而不是让它落到下面的 `client.purge`。
+            match kv_write_target(&ctx, &remote).await {
+                KvWrite::Bridge(cfg) => {
+                    let items = vec![(name, is_dir)];
+                    return kv_delete_into(ui.clone(), cfg, path, items).await;
+                }
+                KvWrite::Orphan(msg) => {
+                    toast(ui, 2, msg);
+                    return false;
+                }
+                KvWrite::NotKv => {}
             }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
@@ -6974,8 +7073,17 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 path = d;
             }
             // K-Vault 远程的写入不走 rclone（DAV 只读，写方法一律 403），改发站点 API。
-            if let Some(cfg) = kv_cfg_for(&ctx, &remote).await {
-                return Box::pin(kv_upload_into(ctx.clone(), ui.clone(), cfg, paths, &path)).await;
+            // 插件不在时这条远程也不能当普通 DAV 用：拒绝并说明，别让用户去猜那个 403。
+            match kv_write_target(&ctx, &remote).await {
+                KvWrite::Bridge(cfg) => {
+                    return Box::pin(kv_upload_into(ctx.clone(), ui.clone(), cfg, paths, &path))
+                        .await;
+                }
+                KvWrite::Orphan(msg) => {
+                    toast(ui, 2, msg);
+                    return false;
+                }
+                KvWrite::NotKv => {}
             }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
@@ -7135,6 +7243,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if remote.is_empty() {
                 return false;
             }
+            if let Some(msg) = kv_access_blocked(ctx, &remote).await {
+                toast(ui, 2, msg);
+                return false;
+            }
             let total = items.len();
             let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_busy(true));
             let ctx2 = ctx.clone();
@@ -7221,8 +7333,16 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 return false;
             }
             // K-Vault 远程：走站点 API 删除（DAV 通道只读），逐项翻 id。
-            if let Some(cfg) = kv_cfg_for(&ctx, &remote).await {
-                return kv_delete_into(ui.clone(), cfg, path, items).await;
+            // 插件不在时同样拒绝，不让这批删除落到 rclone 的 DAV 写方法上。
+            match kv_write_target(&ctx, &remote).await {
+                KvWrite::Bridge(cfg) => {
+                    return kv_delete_into(ui.clone(), cfg, path, items).await;
+                }
+                KvWrite::Orphan(msg) => {
+                    toast(ui, 2, msg);
+                    return false;
+                }
+                KvWrite::NotKv => {}
             }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
@@ -7367,15 +7487,23 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             }
             let src = Path::new(&cur).join(&name);
             // K-Vault 远程：写入走站点 API，不经 rclone 的 DAV 通道（只读）。
-            if let Some(cfg) = kv_cfg_for(&ctx, &remote).await {
-                return Box::pin(kv_upload_into(
-                    ctx.clone(),
-                    ui.clone(),
-                    cfg,
-                    vec![src],
-                    &path,
-                ))
-                .await;
+            // 插件不在时同样拒绝，别让这次拷贝落到 DAV 的写方法上。
+            match kv_write_target(&ctx, &remote).await {
+                KvWrite::Bridge(cfg) => {
+                    return Box::pin(kv_upload_into(
+                        ctx.clone(),
+                        ui.clone(),
+                        cfg,
+                        vec![src],
+                        &path,
+                    ))
+                    .await;
+                }
+                KvWrite::Orphan(msg) => {
+                    toast(ui, 2, msg);
+                    return false;
+                }
+                KvWrite::NotKv => {}
             }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
@@ -7603,21 +7731,29 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 return false;
             }
             // K-Vault 远程：写入走站点 API，不经 rclone 的只读 DAV 通道。
-            if let Some(cfg) = kv_cfg_for(&ctx, &remote).await {
-                let paths: Vec<PathBuf> =
-                    items.iter().map(|(n, _)| Path::new(&cur).join(n)).collect();
-                let ret =
-                    Box::pin(kv_upload_into(ctx.clone(), ui.clone(), cfg, paths, &dest)).await;
-                // 传完退出多选并清空勾选（与下面 rclone 分支的处理一致）
-                let _ = ui.upgrade_in_event_loop(|ui| {
-                    let g = ui.global::<LocalG>();
-                    let n = g.get_entries().row_count();
-                    g.set_multi(false);
-                    g.set_checked(ModelRc::from(Rc::new(VecModel::from(vec![false; n]))));
-                    g.set_checked_count(0);
-                    g.set_anchor(-1);
-                });
-                return ret;
+            // 插件不在时同样拒绝：这批上传不能落到 DAV 的写方法上。
+            match kv_write_target(&ctx, &remote).await {
+                KvWrite::Bridge(cfg) => {
+                    let paths: Vec<PathBuf> =
+                        items.iter().map(|(n, _)| Path::new(&cur).join(n)).collect();
+                    let ret =
+                        Box::pin(kv_upload_into(ctx.clone(), ui.clone(), cfg, paths, &dest)).await;
+                    // 传完退出多选并清空勾选（与下面 rclone 分支的处理一致）
+                    let _ = ui.upgrade_in_event_loop(|ui| {
+                        let g = ui.global::<LocalG>();
+                        let n = g.get_entries().row_count();
+                        g.set_multi(false);
+                        g.set_checked(ModelRc::from(Rc::new(VecModel::from(vec![false; n]))));
+                        g.set_checked_count(0);
+                        g.set_anchor(-1);
+                    });
+                    return ret;
+                }
+                KvWrite::Orphan(msg) => {
+                    toast(ui, 2, msg);
+                    return false;
+                }
+                KvWrite::NotKv => {}
             }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
@@ -7714,6 +7850,13 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             .unwrap_or_default();
             if remote.is_empty() {
                 toast(ui, 2, rcgui_i18n::t("请先在「远程」页添加仓库，再选择仓库"));
+                return false;
+            }
+            // 挂载就是「把这个远程当成本地盘用」，插件不在时挂上去只会立刻 403，
+            // 而且会在资源管理器里留下一个打不开的盘符；先拒绝并说明。
+            // 已有的自动挂载条目（`cfg.auto_mounts`）不动，装回插件下次启动照旧恢复。
+            if let Some(msg) = kv_access_blocked(ctx, &remote).await {
+                toast(ui, 2, msg);
                 return false;
             }
             let fs = compose_fs(&remote, &sub_path);
@@ -7907,8 +8050,17 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         }
         Cmd::BrowseOpen { scope } => {
             let cur = read_ui(ui, move |ui| {
-                // 由「仓应 + 子路径」拼出当前显示路径 root://remote/sub
-                if scope == 0 {
+                // 由「仓库 + 子路径」拼出当前显示路径 root://remote/sub
+                if scope == 2 {
+                    // 同步任务的云端目录：字段里存的是 "远程名:子路径"，转成浏览用的
+                    // 显示路径。空值从根开始选。
+                    let fs = ui.global::<MaintenanceG>().get_sync_remote().to_string();
+                    if fs.trim().is_empty() {
+                        String::new()
+                    } else {
+                        fs_to_display(fs.trim())
+                    }
+                } else if scope == 0 {
                     let g = ui.global::<MountsG>();
                     let r = g
                         .get_remotes()
@@ -7943,7 +8095,17 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             } else {
                 cur
             };
-            let (items, disp) = list_display(ctx, &start, false).await;
+            let (items, disp) = list_display_checked(ctx, &start, scope == 2).await;
+            let items = match items {
+                Ok(v) => v,
+                Err(why) if scope == 2 => {
+                    // 同步的云端目录打不开：把原因写回卡片，别弹一个空窗让人以为目录是空的
+                    maintenance::set_sync_status(ui, rcgui_i18n::f("打不开这个位置：{}", &[&why]));
+                    return false;
+                }
+                // 挂载和服务的浏览窗一直把失败当空目录显示，这里保持原样，别顺手改行为
+                Err(_) => vec![],
+            };
             let rows: Vec<PathItem> = items
                 .into_iter()
                 .map(|(n, d)| PathItem {
@@ -7962,9 +8124,14 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             false
         }
         Cmd::BrowseGoto { name } => {
-            let path = read_ui(ui, |ui| ui.global::<BrowseG>().get_path().to_string())
-                .await
-                .unwrap_or_default();
+            // scope 决定只列文件夹还是连文件一起列：同步任务的云端目录只能选目录，
+            // 选了文件也没法当目标。
+            let (path, scope) = read_ui(ui, |ui| {
+                let g = ui.global::<BrowseG>();
+                (g.get_path().to_string(), g.get_scope())
+            })
+            .await
+            .unwrap_or_default();
             let base = path.trim().trim_end_matches('/');
             let target = if name == ".." {
                 match display_parent(&path) {
@@ -7976,7 +8143,17 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             } else {
                 format!("{base}/{name}")
             };
-            let (items, disp) = list_display(ctx, &target, false).await;
+            let (items, disp) = list_display_checked(ctx, &target, scope == 2).await;
+            let items = match items {
+                Ok(v) => v,
+                Err(why) if scope == 2 => {
+                    // 弹窗里没有地方放错误文字，就关掉它把原因写到卡片上
+                    maintenance::set_sync_status(ui, rcgui_i18n::f("打不开这个位置：{}", &[&why]));
+                    let _ = ui.upgrade_in_event_loop(|ui| ui.global::<BrowseG>().set_show(false));
+                    return false;
+                }
+                Err(_) => vec![],
+            };
             let rows: Vec<PathItem> = items
                 .into_iter()
                 .map(|(n, d)| PathItem {
@@ -8034,8 +8211,12 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     }
                 }
             };
+            if scope == 2 {
+                // 同步任务的云端目录要写成 "远程名:子路径" 并存进配置，先验一次再写
+                return browse_ok_sync(ctx, ui, &final_disp).await;
+            }
             let _ = ui.upgrade_in_event_loop(move |ui| {
-                // root://name/sub → 定位仓库下拉须 + 填子路径
+                // root://name/sub → 定位仓库下拉框 + 填子路径
                 let (remote, sub) = split_display(&final_disp)
                     .map(|(fs, sub)| (fs.trim_end_matches(':').to_string(), sub))
                     .unwrap_or_default();
@@ -8135,8 +8316,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     .and_then(|c| remote_types::find(&derived, &c.id))
                     .map(derived_params_text)
                     .unwrap_or_default();
-                // k-vault 走专用表单，字段按它的语义渲染；其它派生类型按
-                // base_type 的选项渲染（rclone 认识的是 base_type）。
+                // 派生类型只是个名字：字段表按它落盘时的 base_type 取，
+                // 插件额外要的键由插件声明的默认值补上。
                 let fields_type = first.as_ref().map(form_fields_type).unwrap_or_default();
                 let shown = choices.clone();
                 // 空清单必须传 `None`：界面写 -1，保存路径据此拒绝，而不是
@@ -8157,14 +8338,18 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         .clone()
                         .unwrap_or_else(|| rcgui_i18n::t("rclone 未返回后端类型列表").to_string());
                     // rclone 对 config/* 这类敏感接口要求配置 RC 认证；只连上
-                    // core/version 并不代表能读配置（实测踩过）。给一句能照做的指引。
+                    // core/version 并不代表能读配置（实测踩过）。托管内核由本程序
+                    // 带着自己生成的凭据启动，所以真出现认证失败，通常是端口上跑的
+                    // 不是本程序起的那个内核——指引就指向状态页，而不是命令行参数。
                     let auth_hint = if why
                         .to_ascii_lowercase()
                         .contains("authentication must be set up")
                     {
-                        rcgui_i18n::t("rclone 没有启用 RC 认证：请加 --rc-user/--rc-pass（与「设置」里的一致）或 --rc-no-auth 后重启 rclone，再点「重新握手」。")
+                        rcgui_i18n::t("端口上的 rclone 没有接受本程序的凭据：可能不是本程序启动的内核。请到「设置 → 内核与连接」查看状态。")
                     } else {
-                        rcgui_i18n::t("请到「设置」点「连接/握手」或「重新握手」。")
+                        rcgui_i18n::t(
+                            "请到「设置 → 内核与连接」查看内核状态：内核由本程序自动启动并握手。",
+                        )
                     };
                     toast(
                         &ui2,
@@ -8226,34 +8411,6 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         ui.global::<RemotesG>().set_edit_params(seeded.into());
                     });
                 }
-            }
-            if choice.id == kvault::TYPE {
-                // 切到 k-vault：表单给初值。改的是已有远程（比如用户自己建的
-                // webdav 远程）时，把他填过的站点地址/用户名带过来，别让他重打。
-                let adopt = read_ui(ui, |ui| {
-                    let g = ui.global::<RemotesG>();
-                    (g.get_edit_is_new(), g.get_edit_params().to_string())
-                })
-                .await
-                .unwrap_or((true, String::new()));
-                let base = kv_param_of(&adopt.1, "url")
-                    .map(|u| kvault::base_from_url(&u))
-                    .filter(|b| !b.is_empty());
-                let user = kv_param_of(&adopt.1, "user").unwrap_or_default();
-                let token_set = !adopt.0
-                    && kv_param_of(&adopt.1, "bearer_token").is_some_and(|t| !t.is_empty());
-                let pass_set =
-                    !adopt.0 && kv_param_of(&adopt.1, "pass").is_some_and(|p| !p.is_empty());
-                let _ = ui.upgrade_in_event_loop(move |ui| {
-                    // 站点地址不预填：用户自己粘自己的站点，别给一个看起来像默认值的示例。
-                    reset_kv_form(&ui, base.as_deref().unwrap_or(""));
-                    let g = ui.global::<RemotesG>();
-                    if !user.is_empty() {
-                        g.set_kv_user(user.into());
-                    }
-                    g.set_kv_token_set(token_set);
-                    g.set_kv_pass_set(pass_set);
-                });
             }
             false
         }
@@ -8319,102 +8476,13 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let _ = ui.upgrade_in_event_loop(move |ui| push_type_selection(&ui, &shown, idx));
             false
         }
-        Cmd::KvTest => {
-            let form = read_kv_form(ui).await;
-            if form.base.trim().is_empty() {
-                let _ = ui.upgrade_in_event_loop(|ui| {
-                    let g = ui.global::<RemotesG>();
-                    g.set_kv_testing(false);
-                    g.set_kv_status(rcgui_i18n::t("请先填站点地址（根地址，不要带 /dav）").into());
-                    g.set_kv_status_level(3);
-                });
+        Cmd::RemoteEditLoad { name } => {
+            // 类型没有实现的远程不给改配置：保存时会把参数重写成「普通 webdav」，
+            // 标记键一旦被抹掉，装回插件它就再也认不回自己是 K-Vault 了。
+            if let Some(msg) = kv_access_blocked(ctx, &name).await {
+                toast(ui, 2, msg);
                 return false;
             }
-            let _ = ui.upgrade_in_event_loop(|ui| {
-                let g = ui.global::<RemotesG>();
-                g.set_kv_testing(true);
-                g.set_kv_status(rcgui_i18n::t("正在连接站点…").into());
-                g.set_kv_status_level(0);
-            });
-            // 令牌框留空时用已存的那份：点「测试连接」多半就是想验证现有配置。
-            let mut token = form.token.clone();
-            if token.is_empty() && !form.name.is_empty() {
-                token = kv_token_get(&ctx, &form.name).await;
-            }
-            let base = form.base.clone();
-            let res = kvault::probe(&base, &token).await;
-            let _ = ui.upgrade_in_event_loop(move |ui| {
-                let g = ui.global::<RemotesG>();
-                g.set_kv_testing(false);
-                match res {
-                    Err(e) => {
-                        g.set_kv_status(rcgui_i18n::f("连接失败：{}", &[&(e)]).into());
-                        g.set_kv_status_level(3);
-                    }
-                    Ok(p) => {
-                        let mut notes: Vec<String> = Vec::new();
-                        let mut level = 1;
-                        if p.id.is_empty() {
-                            notes.push(
-                                rcgui_i18n::t("站点可访问；未填令牌，只验证到站点本身（浏览可用，上传需要令牌）")
-                                    .to_string(),
-                            );
-                            level = 2;
-                        } else {
-                            notes.push(rcgui_i18n::f("令牌 {}", &[&(if p.name.is_empty() {
-                                    p.id.clone()
-                                } else {
-                                    format!("{}（{}）", p.id, p.name)
-                                })]));
-                            if !p.scopes.is_empty() {
-                                notes.push(rcgui_i18n::f("作用域 {}", &[&(p.scopes.join(","))]));
-                            }
-                            if !p.storages.is_empty() {
-                                notes.push(rcgui_i18n::f("可用存储 {}", &[&(p.storages.join(","))]));
-                            }
-                            if p.max_file > 0 {
-                                notes.push(rcgui_i18n::f("单文件上限 {}", &[&(fmt_size_bytes(p.max_file as i64))]));
-                            }
-                            if !p.folder_prefix.is_empty() {
-                                notes.push(rcgui_i18n::f("目录前缀 /{}", &[&(p.folder_prefix)]));
-                            }
-                            if !p.scopes.iter().any(|s| s.as_str() == "upload") {
-                                notes.push(rcgui_i18n::t("令牌没有 upload 作用域，上传会被站点拒绝").to_string());
-                                level = 2;
-                            }
-                            // 存储选错会被 POLICY_STORAGE_DENIED 拒；只剩一个可选时
-                            // 直接替用户选上，省一次来回。
-                            let picked_ok = p.storages.is_empty()
-                                || p.storages.iter().any(|s| s == &form.storage);
-                            if !picked_ok {
-                                notes.push(rcgui_i18n::f("当前存储 {} 不在允许列表里", &[&(form.storage)]));
-                                level = 2;
-                                if p.storages.len() == 1 {
-                                    let only = p.storages[0].clone();
-                                    let storages = g.get_kv_storages();
-                                    if let Some(i) = (0..storages.row_count()).find(|i| {
-                                        storages
-                                            .row_data(*i)
-                                            .map(|s| s.as_str() == only)
-                                            .unwrap_or(false)
-                                    }) {
-                                        g.set_kv_storage_idx(i as i32);
-                                    }
-                                }
-                            }
-                        }
-                        // 目录前缀空着就按策略补：填错的目录会被 POLICY_FOLDER_DENIED 拒掉。
-                        if g.get_kv_folder().trim().is_empty() && !p.folder_prefix.is_empty() {
-                            g.set_kv_folder(p.folder_prefix.clone().into());
-                        }
-                        g.set_kv_status(notes.join(" · ").into());
-                        g.set_kv_status_level(level);
-                    }
-                }
-            });
-            false
-        }
-        Cmd::RemoteEditLoad { name } => {
             let client = ctx.rc.client().await;
             let dump = client.config_dump().await.unwrap_or(json!({}));
             let entry = dump.get(&name).cloned().unwrap_or(json!({}));
@@ -8434,30 +8502,20 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 })
                 .unwrap_or_default();
             let existing_params = entry.as_object().cloned().unwrap_or_default();
-            // 带 `kvault=1` 标记的远程按 K-Vault 展示：类型显示成 k-vault，
-            // 表单换成专用的那块，而不是 rclone 的 webdav 参数表。
-            let kv_cfg = if kvault::KvCfg::is_marked(&existing_params) {
-                Some(kvault::KvCfg::from_params(&existing_params))
-            } else {
-                None
-            };
-            let (ty, kv_token_set, kv_pass_set) = match kv_cfg {
-                Some(ref c) => (
-                    kvault::TYPE.to_string(),
-                    !kv_token_get(&ctx, &name).await.is_empty()
-                        || kvault::KvCfg::has_secret(&existing_params, kvault::TOKEN_KEY),
-                    kvault::KvCfg::has_secret(&existing_params, kvault::PASS_KEY)
-                        || !c.user.is_empty(),
-                ),
-                None => (ty, false, false),
-            };
+            // 存进 rclone 的 `type` 只是后端（K-Vault 存的是 `webdav`），所以「该显示成
+            // 哪个类型」得另算：参数里有标记、且当前有插件声明那个类型 id，才显示插件
+            // 给的名字；插件不在就老实显示 `webdav` —— 它现在确实只是一个 webdav 远程。
+            let derived = remote_types::collect(ctx);
+            let ty = display_type_of(&existing_params, &ty, &derived);
+            let choice = edit_single_choice(&ty, &derived);
             let providers = get_providers(&ctx).await;
-            let (desc, mut fields) = build_fields_from_provider(&providers, &ty);
+            // 参数表按后端取：派生类型落盘就是 base_type，它自己没有另一张参数表。
+            let (desc, mut fields) =
+                build_fields_from_provider(&providers, &form_fields_type(&choice));
             fill_fields_with_existing(&mut fields, &existing_params);
             // 既有远程的类型下拉是只读的，只显示当前这一项。平行表也重置成这一项：
             // 保存时要靠它拿回同一个真实类型（派生类型落 base_type，不能让显示名
             // 参与往返，否则插件改一次措辞就会把 type 写坏）。
-            let choice = edit_single_choice(&ty, &remote_types::collect(ctx));
             let choice_idx = match ctx.type_choices.lock() {
                 Ok(mut t) => t.reset(vec![choice.clone()], Some(&choice.id)),
                 Err(_) => 0,
@@ -8469,20 +8527,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 g.set_edit_is_new(false);
                 g.set_edit_name(name.into());
                 g.set_edit_params(params_text.into());
-                match kv_cfg {
-                    Some(cfg) => {
-                        g.set_provider_desc(kv_desc().into());
-                        g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(
-                            Vec::<FieldRow>::new(),
-                        ))));
-                        apply_kv_form(&ui, &cfg, kv_token_set, kv_pass_set);
-                    }
-                    None => {
-                        g.set_provider_desc(desc.into());
-                        g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(fields))));
-                        g.set_kv_editor(false);
-                    }
-                }
+                g.set_provider_desc(desc.into());
+                g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(fields))));
                 g.set_show_advanced(false);
                 g.set_show_raw(false);
                 g.set_show_editor(true);
@@ -8506,6 +8552,14 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if name.trim().is_empty() || name.contains(':') || name.contains(' ') {
                 toast(ui, 2, rcgui_i18n::t("名称不能为空，且不能包含空格或冒号"));
                 return false;
+            }
+            // 改既有远程同样要拦，理由同 `RemoteEditLoad`：这一步会把参数整体重写。
+            // 新建（`is_new`）不拦：那时名字对应的还不是一条 K-Vault 远程。
+            if !is_new {
+                if let Some(msg) = kv_access_blocked(ctx, &name).await {
+                    toast(ui, 2, msg);
+                    return false;
+                }
             }
             let choice = match ctx.type_choices.lock() {
                 Ok(t) => t.selected(picked_idx),
@@ -8537,61 +8591,6 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     );
                     return false;
                 }
-            }
-            // K-Vault 走专用表单：下拉框里是 k-vault，落盘的是 webdav + `kvault=1` 标记。
-            let kv_form = read_kv_form(ui).await;
-            if kv_form.editor && choice.id == kvault::TYPE {
-                let cfg = kv_form.to_cfg();
-                if cfg.base.trim().is_empty() {
-                    toast(ui, 2, rcgui_i18n::t("站点地址不能为空"));
-                    return false;
-                }
-                if cfg.token.is_empty()
-                    && cfg.user.is_empty()
-                    && !kv_form.token_set
-                    && !kv_form.pass_set
-                {
-                    toast(
-                        ui,
-                        2,
-                        rcgui_i18n::t("至少填 API 令牌（推荐）或用户名/密码：没有凭据的 K-Vault 远程只能看到 401"),
-                    );
-                    return false;
-                }
-                let mut params = cfg.params(!cfg.token.is_empty());
-                let client = ctx.rc.client().await;
-                let res = if is_new {
-                    client
-                        .config_create(&name, kvault::BACKEND, serde_json::Value::Object(params))
-                        .await
-                } else {
-                    // 更新时显式带 type：用户可能是把一个已有的远程改成 k-vault
-                    params.insert(
-                        "type".to_string(),
-                        serde_json::Value::String(kvault::BACKEND.to_string()),
-                    );
-                    client
-                        .config_update(&name, serde_json::Value::Object(params))
-                        .await
-                };
-                return match res {
-                    Ok(()) => {
-                        // 明文令牌另存一份：rclone 里的是 obscured 的，API 调用用不了。
-                        if !cfg.token.is_empty() {
-                            kv_token_put(&ctx, &name, &cfg.token);
-                        }
-                        let _ = ui.upgrade_in_event_loop(|ui| {
-                            ui.global::<RemotesG>().set_show_editor(false);
-                        });
-                        let _ = Box::pin(handle_cmd(&ctx.clone(), ui, Cmd::RemotesRefresh)).await;
-                        toast(ui, 1, rcgui_i18n::f("K-Vault 远程 {} 已保存", &[&(name)]));
-                        false
-                    }
-                    Err(e) => {
-                        toast(ui, 2, rcgui_i18n::f("保存失败: {}", &[&(e)]));
-                        false
-                    }
-                };
             }
             // 优先使用模板字段，原始模式或字段为空时用 key=value
             let user = if !show_raw {
@@ -8746,6 +8745,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             match client.config_delete(&name).await {
                 Ok(()) => {
                     // K-Vault 的明文令牌存在侧表里：远程没了，那份令牌也不该留着。
+                    // 两个命名空间都清：新的是现在写的地方，旧的是历史遗留
+                    // （迁移函数只复制不搬走，所以旧记录可能还在）。
+                    let _ = ctx.store.delete(kvault::TOKEN_NS, &name);
                     let _ = ctx.store.delete(kvault::STORE_NS, &name);
                     // 4) 最后清理档案里的记忆（否则重放会一直失败并刷错误提示）
                     {
@@ -9003,7 +9005,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let _busy = RemotesBusyGuard::new(ui);
                 let client = ctx.rc.client().await;
                 let mut draft = ctx.cfg.lock().unwrap().clone();
-                let rep = reconcile::reconcile(&client, &mut draft).await;
+                // 插件不在的远程不重挂、不重起服务：对账本身不知道插件的事
+                let blocked = kv_blocked_map(ctx, &draft).await;
+                let rep = reconcile::reconcile(&client, &mut draft, &blocked).await;
                 {
                     let mut cfg = ctx.cfg.lock().unwrap();
                     cfg.proxy_bindings = draft.proxy_bindings.clone();
@@ -9113,7 +9117,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 // 关键：先 clone 出配置并**立刻放锁**，再 await reconcile。
                 // 持有 MutexGuard 跨 await 会让 future 非 Send（tokio::spawn 会拒绝）。
                 let mut draft = ctx.cfg.lock().unwrap().clone();
-                let rep = reconcile::reconcile(&client, &mut draft).await;
+                // 插件不在的远程不重挂、不重起服务：对账本身不知道插件的事
+                let blocked = kv_blocked_map(ctx, &draft).await;
+                let rep = reconcile::reconcile(&client, &mut draft, &blocked).await;
                 {
                     // 写回：只把 reconcile 会改动的字段合并回真实配置，
                     // 避免整份覆盖掉这期间 UI 可能改过的其他设置。
@@ -9207,6 +9213,12 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 return false;
             }
             let sub_path = sub_path.trim().trim_matches('/').to_string();
+            // 服务等于把远程内容重新暴露成一个局域网地址：插件不在时启动它，
+            // 只是多出一个打不开的地址，还会让用户以为这个远程还能用。
+            if let Some(msg) = kv_access_blocked(ctx, &remote).await {
+                toast(ui, 2, msg);
+                return false;
+            }
             let fs = compose_fs(&remote, &sub_path);
             let addr_t = addr.trim().to_string();
             if addr_t.is_empty() {
@@ -9603,6 +9615,12 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     cfg.plugin_enabled.insert(id.clone(), enabled);
                     let _ = config::save(&cfg);
                 }
+                if !enabled {
+                    // 停用 = 这个插件不再有面板，也不再能要求宿主替它弹对话框；
+                    // 它之前挑过、还没发出去的文件授权必须一起失效，
+                    // 否则一次已经停用的插件仍能把那个文件发出去。
+                    plugin_host::upload::revoke_plugin(&id);
+                }
                 let _ = ui.upgrade_in_event_loop(move |ui| {
                     let g = ui.global::<PluginsG>();
                     let model = g.get_rows();
@@ -9843,6 +9861,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if let Some((id, name, path, version)) = row {
                 // 先让插件自己收尾（停进程等），再删本体
                 plugins::shutdown_plugin(ctx, &id).await;
+                // 卸载后这个 id 不复存在：它挑过的文件授权留着没有任何用处，
+                // 只会在用户日后装回同名插件时变成一份来历不明的许可。
+                plugin_host::upload::revoke_plugin(&id);
                 match plugins::uninstall(ctx, &id, &path) {
                     Ok(removed) => {
                         let recoverable = plugins::ships_with_app(&id);
@@ -9955,13 +9976,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 move |ui| -> Result<(), String> {
                     let s = ui.global::<SettingsG>();
                     let mut cfg = ctx.cfg.lock().unwrap().clone();
-                    cfg.rclone.user = s.get_rc_user().to_string();
-                    cfg.rclone.pass = s.get_rc_pass().to_string();
-                    let url = s.get_rc_url().trim().to_string();
-                    if !url.is_empty() {
-                        cfg.rclone.url = url;
-                    }
-                    cfg.rclone.connect_on_start = s.get_connect_on_start();
+                    // 这里**不写** rclone.url/user/pass/connect_on_start：
+                    // 界面上已经没有能改它们的控件了，界面里的副本永远是启动时的旧值，
+                    // 写回去只会把用户以前填的外部地址覆盖成我们自己的默认值。
                     cfg.theme_mode = s.get_theme_idx() as u8;
                     cfg.accent_idx = s.get_accent_idx() as u8;
                     cfg.language = lang_idx_to_tag(s.get_language_idx()).to_string();
@@ -10057,41 +10074,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         }
         Cmd::SettingsTest => {
             // 测试连接 = 完整握手，并把结果写回连接状态区（不再只报「连接正常」）
-            conn_action(ctx, ui, ConnAction::Handshake).await;
-            false
-        }
-        Cmd::Connect => {
-            // 先把设置页上的连接字段落盘，否则「改完直接点连接」会用到旧值
-            let saved = read_ui(ui, {
-                let ctx = ctx.clone();
-                move |ui| -> Result<(), String> {
-                    let s = ui.global::<SettingsG>();
-                    let mut cfg = ctx.cfg.lock().unwrap().clone();
-                    cfg.rclone.user = s.get_rc_user().to_string();
-                    cfg.rclone.pass = s.get_rc_pass().to_string();
-                    let url = s.get_rc_url().trim().to_string();
-                    if !url.is_empty() {
-                        cfg.rclone.url = url;
-                    }
-                    cfg.rclone.connect_on_start = s.get_connect_on_start();
-                    *ctx.cfg.lock().unwrap() = cfg.clone();
-                    config::save(&cfg).map_err(|e| e.to_string())
-                }
-            })
-            .await;
-            if let Some(Err(e)) = saved {
-                toast(ui, 2, rcgui_i18n::f("保存连接设置失败: {}", &[&(e)]));
-                return false;
-            }
-            conn_action(ctx, ui, ConnAction::Connect).await;
-            false
-        }
-        Cmd::Disconnect => {
-            disconnect_now(ctx, ui).await;
-            false
-        }
-        Cmd::Reconnect => {
-            conn_action(ctx, ui, ConnAction::Handshake).await;
+            rehandshake(ctx, ui).await;
             false
         }
         Cmd::ConfExport {
@@ -10126,45 +10109,6 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     });
                     toast(ui, 2, rcgui_i18n::f("导入预览失败: {}", &[&(e)]));
                 }
-            }
-            false
-        }
-        Cmd::ScriptGenerate => {
-            let cfg = ctx.cfg.lock().unwrap().clone();
-            match script::generate_and_save(&cfg) {
-                Ok((path, body)) => {
-                    let p = path.display().to_string();
-                    let b = body.clone();
-                    let _ = ui.upgrade_in_event_loop(move |ui| {
-                        let g = ui.global::<SettingsG>();
-                        g.set_script_path(p.into());
-                        g.set_script_preview(b.into());
-                    });
-                    toast(
-                        ui,
-                        1,
-                        rcgui_i18n::f("已生成恢复脚本（未执行）：{}", &[&(path.display())]),
-                    );
-                }
-                Err(e) => toast(ui, 2, rcgui_i18n::f("生成恢复脚本失败: {}", &[&(e)])),
-            }
-            false
-        }
-        Cmd::ScriptCopy => {
-            let text = read_ui(ui, |u| {
-                u.global::<SettingsG>().get_script_preview().to_string()
-            })
-            .await
-            .unwrap_or_default();
-            if text.is_empty() {
-                toast(
-                    ui,
-                    0,
-                    rcgui_i18n::t("还没有可复制的脚本，请先「生成恢复脚本」"),
-                );
-            } else {
-                clipboard_copy(&text);
-                toast(ui, 1, rcgui_i18n::t("脚本已复制到剪贴板"));
             }
             false
         }
@@ -10429,6 +10373,8 @@ async fn plugin_add_from_file(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
 
     match res {
         Ok(Ok(outcome)) => {
+            // 卸载过又装回来：把当时备份的设置放回原位（只补空位，不覆盖新填的值）。
+            crate::plugins::restore_backup_after_install(&outcome);
             toast(ui, 1, outcome.message());
             rescan_plugins(ctx, ui).await;
         }
@@ -10465,6 +10411,8 @@ async fn plugin_add_from_dir(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
 
     match res {
         Ok(Ok(outcome)) => {
+            // 卸载过又装回来：把当时备份的设置放回原位（只补空位，不覆盖新填的值）。
+            crate::plugins::restore_backup_after_install(&outcome);
             toast(ui, 1, outcome.message());
             rescan_plugins(ctx, ui).await;
         }
@@ -11342,13 +11290,6 @@ fn wire_callbacks(
             let _ = tx.send(Cmd::RemoteTypeSearch(q.to_string()));
         }
     });
-    // K-Vault 表单里的「测试连接」（回调挂在 RemotesG 上，因为表单在 global 里）
-    ui.global::<RemotesG>().on_kv_test({
-        let tx = tx.clone();
-        move || {
-            let _ = tx.send(Cmd::KvTest);
-        }
-    });
     // ---------------- 代理 ----------------
     ui.on_proxy_changed({
         let tx = tx.clone();
@@ -11611,25 +11552,6 @@ fn wire_callbacks(
             let _ = tx.send(Cmd::SettingsTest);
         }
     });
-    // 连接动作（阶段 3）：三个按钮都只影响 RC 连接，不启停 rclone 进程
-    ui.on_conn_connect({
-        let tx = tx.clone();
-        move || {
-            let _ = tx.send(Cmd::Connect);
-        }
-    });
-    ui.on_conn_disconnect({
-        let tx = tx.clone();
-        move || {
-            let _ = tx.send(Cmd::Disconnect);
-        }
-    });
-    ui.on_conn_reconnect({
-        let tx = tx.clone();
-        move || {
-            let _ = tx.send(Cmd::Reconnect);
-        }
-    });
     // 档案导入导出（阶段 5A）：文件选择在 UI 线程做，真正的读写交给后台
     ui.on_conf_export({
         let tx = tx.clone();
@@ -11697,18 +11619,6 @@ fn wire_callbacks(
         move || {
             // 直接提示即可：这里没有任何状态需要清理（确认项从未登记）
             println!("[conf] 已取消导出（未生成文件）");
-        }
-    });
-    ui.on_script_generate({
-        let tx = tx.clone();
-        move || {
-            let _ = tx.send(Cmd::ScriptGenerate);
-        }
-    });
-    ui.on_script_copy({
-        let tx = tx.clone();
-        move || {
-            let _ = tx.send(Cmd::ScriptCopy);
         }
     });
     // 「以管理员身份运行」：确定 → 按目标权限重启；取消 → 复选框回到真实状态
@@ -12027,98 +11937,6 @@ fn bring_to_front(_ui: &MainWindow) -> bool {
     true
 }
 
-/// 程序化生成应用图标（RGBA，用于托盘与窗口/任务栏）。
-///
-/// 造型与 Slint 里的 `AppMark` 保持一致：圆角方块底 + 白色云 + 云内的终端窗口。
-/// 颜色由调用方传入，因此能跟随强调色。
-///
-/// **全部用代码画**而不是嵌入 PNG：图标需要随强调色变化、还要多个尺寸
-/// （托盘 32、任务栏 64），程序化生成可以一次算好任意尺寸，也不必维护资源文件。
-fn make_icon_rgba(size: usize, accent: [u8; 3]) -> Vec<u8> {
-    let mut buf = vec![0u8; size * size * 4];
-    let s = size as f32;
-    let radius = s * 0.24; // 与 AppMark 的 border-radius 一致
-    let (ar, ag, ab) = (accent[0], accent[1], accent[2]);
-
-    // 圆角方块内部判定：四个角按圆角半径切掉
-    let in_rounded_rect = |x: f32, y: f32| -> bool {
-        let (cx, cy) = (x.clamp(radius, s - radius), y.clamp(radius, s - radius));
-        let dx = x - cx;
-        let dy = y - cy;
-        dx * dx + dy * dy <= radius * radius
-            || (x >= radius && x <= s - radius)
-            || (y >= radius && y <= s - radius)
-    };
-
-    // 三个圆的并集构成云（与 AppMark 的几何比例一致）
-    let circle = |x: f32, y: f32, cx: f32, cy: f32, r: f32| -> bool {
-        let dx = x - cx;
-        let dy = y - cy;
-        dx * dx + dy * dy <= r * r
-    };
-    let in_cloud = |x: f32, y: f32| -> bool {
-        // 左圆
-        circle(x, y, s * 0.35, s * 0.53, s * 0.21)
-            // 右大圆
-            || circle(x, y, s * 0.63, s * 0.45, s * 0.25)
-            // 底部横条：用矩形近似（原 Slint 版本是圆角条）
-            || (x >= s * 0.14 && x <= s * 0.88 && y >= s * 0.52 && y <= s * 0.74)
-    };
-    // 云内终端窗口（主色挖空）
-    let in_terminal = |x: f32, y: f32| -> bool {
-        let (x0, y0) = (s * 0.30, s * 0.44);
-        let (w, h) = (s * 0.46, s * 0.34);
-        let r = s * 0.07;
-        if x < x0 || x > x0 + w || y < y0 || y > y0 + h {
-            return false;
-        }
-        let (cx, cy) = (x.clamp(x0 + r, x0 + w - r), y.clamp(y0 + r, y0 + h - r));
-        let dx = x - cx;
-        let dy = y - cy;
-        dx * dx + dy * dy <= r * r
-            || (x >= x0 + r && x <= x0 + w - r)
-            || (y >= y0 + r && y <= y0 + h - r)
-    };
-    // 终端里的 ">_"：用斜线 + 横线近似，小尺寸下也能看出是命令行
-    let in_chevron = |x: f32, y: f32| -> bool {
-        let (bx, by) = (s * 0.355, s * 0.585); // 尖角位置
-                                               // 上斜边：从左上到尖角
-        let up = (y >= by - s * 0.075 && y <= by) && (x - (bx - (by - y) * 0.9)).abs() <= s * 0.035;
-        // 下斜边：从尖角到左下
-        let dn = (y >= by && y <= by + s * 0.075) && (x - (bx - (y - by) * 0.9)).abs() <= s * 0.035;
-        up || dn
-    };
-    let in_underscore = |x: f32, y: f32| -> bool {
-        x >= s * 0.53 && x <= s * 0.67 && y >= s * 0.645 && y <= s * 0.685
-    };
-
-    for y in 0..size {
-        for x in 0..size {
-            let (fx, fy) = (x as f32, y as f32);
-            let i = (y * size + x) * 4;
-            if !in_rounded_rect(fx, fy) {
-                continue; // 方块外保持透明
-            }
-            let (r, g, b) = if in_terminal(fx, fy) {
-                if in_chevron(fx, fy) || in_underscore(fx, fy) {
-                    (255, 255, 255)
-                } else {
-                    (ar, ag, ab) // 终端底色 = 主色
-                }
-            } else if in_cloud(fx, fy) {
-                (255, 255, 255)
-            } else {
-                (ar, ag, ab)
-            };
-            buf[i] = r;
-            buf[i + 1] = g;
-            buf[i + 2] = b;
-            buf[i + 3] = 255;
-        }
-    }
-    buf
-}
-
 /// 取当前主题的强调色（RGB），用于生成图标。
 ///
 /// 与 Slint 的 `ThemeG.accent` 对齐：这里按主题模式 + 强调色索引算出同一份颜色。
@@ -12146,84 +11964,6 @@ fn accent_rgb(cfg: &crate::config::AppConfig) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---------------- 应用图标 ----------------
-
-    /// 图标必须真的画出内容，而不是全透明。
-    ///
-    /// 这条测试的价值：图标生成是纯几何运算，写错一个坐标就可能整张空白，
-    /// 而空白图标在界面里表现为「任务栏没图标」，很难往几何 bug 上想。
-    #[test]
-    fn icon_has_visible_pixels() {
-        let rgba = make_icon_rgba(32, [0x58, 0xa6, 0xff]);
-        assert_eq!(rgba.len(), 32 * 32 * 4, "RGBA 缓冲区大小必须匹配尺寸");
-        let opaque = rgba.chunks_exact(4).filter(|p| p[3] == 255).count();
-        // 圆角方块占据大部分面积，至少应有 50% 不透明像素
-        assert!(
-            opaque > 32 * 32 / 2,
-            "不透明像素太少（{opaque}），图标可能是空白的"
-        );
-    }
-
-    /// 圆角：四个角必须是透明的，否则就不是圆角方块。
-    #[test]
-    fn icon_corners_are_rounded() {
-        let size = 32;
-        let rgba = make_icon_rgba(size, [0x58, 0xa6, 0xff]);
-        let alpha_at = |x: usize, y: usize| rgba[(y * size + x) * 4 + 3];
-        assert_eq!(alpha_at(0, 0), 0, "左上角应透明（圆角）");
-        assert_eq!(alpha_at(size - 1, 0), 0, "右上角应透明（圆角）");
-        assert_eq!(alpha_at(0, size - 1), 0, "左下角应透明（圆角）");
-        assert_eq!(alpha_at(size - 1, size - 1), 0, "右下角应透明（圆角）");
-        // 中心必须不透明
-        assert_eq!(alpha_at(size / 2, size / 2), 255);
-    }
-
-    /// 强调色必须真正作用到图标上（否则「随强调色变色」就是假的功能）。
-    #[test]
-    fn icon_takes_accent_colour() {
-        let blue = make_icon_rgba(32, [0x58, 0xa6, 0xff]);
-        let green = make_icon_rgba(32, [0x3f, 0xb9, 0x50]);
-        assert_ne!(blue, green, "不同强调色必须生成不同图标");
-    }
-
-    /// 任意尺寸都要能画（托盘 32 / 任务栏 64 / 小图标 16）。
-    #[test]
-    fn icon_generates_at_multiple_sizes() {
-        for size in [16usize, 32, 64] {
-            let rgba = make_icon_rgba(size, [0x58, 0xa6, 0xff]);
-            assert_eq!(rgba.len(), size * size * 4);
-            let opaque = rgba.chunks_exact(4).filter(|p| p[3] == 255).count();
-            assert!(opaque > 0, "{size}px 图标不能是空白的");
-        }
-    }
-
-    /// 把生成的图标导出为 PNG，供人工确认造型（非断言式测试）。
-    ///
-    /// 跑法：`cargo test -p rclone-gui dump_icon_png -- --ignored --nocapture`
-    /// 产物在 `target/rcgui-icon-*.png`。
-    /// 注意不能写 `%TEMP%`：本机沙箱下它不可写（os error 5），
-    /// 项目里既有测试也因此统一把临时目录放在测试可执行文件旁。
-    #[test]
-    #[ignore]
-    fn dump_icon_png() {
-        let base = std::env::current_exe()
-            .ok()
-            .and_then(|e| e.parent().map(|d| d.to_path_buf()))
-            .unwrap_or_else(std::env::temp_dir);
-        for (size, name) in [(64usize, "64"), (32, "32")] {
-            let rgba = make_icon_rgba(size, [0x58, 0xa6, 0xff]);
-            let mut p = base.join(format!("rcgui-icon-{name}.png"));
-            let buf =
-                image::RgbaImage::from_raw(size as u32, size as u32, rgba).expect("RGBA 尺寸匹配");
-            // 失败时退到 CWD，避免整个测试因目录权限问题失败
-            if buf.save(&p).is_err() {
-                p = std::path::PathBuf::from(format!("rcgui-icon-{name}.png"));
-                buf.save(&p).expect("保存 PNG 失败");
-            }
-            eprintln!("wrote {}", p.display());
-        }
-    }
 
     #[test]
     fn accent_rgb_matches_theme_palette() {
@@ -13061,10 +12801,13 @@ mod tests {
     }
 
     /// 三条清单：默认的 Alias、插件类型的 K-Vault、内核的 S3。
+    ///
+    /// 这里用字面量 `"k-vault"` 而不是常量：主程序已经不再声明这个类型，
+    /// 留着它是为了覆盖「老版本存下的远程还带着这个类型名」的情形。
     fn sample_types() -> Vec<TypeChoice> {
         vec![
             tchoice("Alias for an existing remote", "alias", "alias"),
-            tchoice("K-Vault", kvault::TYPE, "webdav"),
+            tchoice("K-Vault", "k-vault", "webdav"),
             tchoice("S3", "s3", "s3"),
         ]
     }
@@ -13076,12 +12819,12 @@ mod tests {
     #[test]
     fn refilter_keeps_selection_when_it_survives() {
         let mut t = TypeChoices::default();
-        let idx = t.reset(sample_types(), Some(kvault::TYPE));
+        let idx = t.reset(sample_types(), Some("k-vault"));
         assert_eq!(idx, 1);
-        let r = t.refilter("vaul", Some(kvault::TYPE));
+        let r = t.refilter("vaul", Some("k-vault"));
         assert_eq!(r.idx, Some(0), "K-Vault 只剩一项，下标应指向它");
         assert!(!r.switched, "选中的类型还在，不能当成换了类型");
-        assert_eq!(t.visible_at(0).unwrap().id, kvault::TYPE);
+        assert_eq!(t.visible_at(0).unwrap().id, "k-vault");
     }
 
     /// 选中的类型被筛掉：界面必须知道「选中项变成别人了」，调用方要跟着换参数表。
@@ -13097,7 +12840,7 @@ mod tests {
         assert!(r.switched, "旧选中项被筛掉时必须报 switched");
         assert_eq!(
             t.visible_at(0).unwrap().id,
-            kvault::TYPE,
+            "k-vault",
             "下标 0 在新清单里是 K-Vault，参数表必须按它换"
         );
     }
@@ -13137,11 +12880,14 @@ mod tests {
         assert_eq!(t.selected(0).unwrap().id, "alias");
     }
 
-    /// K-Vault 是插件：参数表要按插件名取，不能按它落盘时的 webdav 取。
+    /// 插件类型只是个名字：参数表要按它真正落盘时的后端取。
+    ///
+    /// K-Vault 的远程在 rclone 里就是 webdav，插件额外要的键由插件声明的默认值补上，
+    /// 不是靠一张「k-vault 参数表」——主程序里已经没有这种表了。
     #[test]
-    fn form_fields_type_uses_plugin_name_for_kvault() {
-        let kv = tchoice("K-Vault", kvault::TYPE, "webdav");
-        assert_eq!(form_fields_type(&kv), kvault::TYPE);
+    fn form_fields_type_follows_the_backend_for_plugin_types() {
+        let kv = tchoice("K-Vault", "k-vault", "webdav");
+        assert_eq!(form_fields_type(&kv), "webdav");
         let s3 = tchoice("S3", "s3", "s3");
         assert_eq!(form_fields_type(&s3), "s3");
     }
@@ -13360,7 +13106,7 @@ mod tests {
         let out = build_type_choices(&providers_of(&["webdav"]), &[]);
         assert!(
             !out.iter()
-                .any(|c| c.id == kvault::TYPE || c.display.eq_ignore_ascii_case("k-vault")),
+                .any(|c| c.id == "k-vault" || c.display.eq_ignore_ascii_case("k-vault")),
             "没有插件声明时不能凭空出现 kvault 类型"
         );
         assert_eq!(out.len(), 1);
@@ -13379,7 +13125,7 @@ mod tests {
         assert_eq!(kv[0].backend, "webdav", "落盘必须写插件声明的 base_type");
         assert!(kv[0].derived);
         assert_eq!(
-            out.iter().filter(|c| c.id == kvault::TYPE).count(),
+            out.iter().filter(|c| c.id == "k-vault").count(),
             1,
             "插件声明的类型与内置类型同名，清单里只能出现一行"
         );
@@ -13396,20 +13142,198 @@ mod tests {
         assert_eq!(out[0].id, "k-vault");
     }
 
-    /// 已建好的旧 kvault 远程仍能编辑：编辑框里合成一项，后端仍是 webdav。
+    /// 老版本存下的 K-Vault 远程：有插件就显示成插件类型，没插件就退回 webdav。
     ///
-    /// 新建列表里不再有 kvault，但这些远程必须继续可改——它们的配置和数据都在本地，
-    /// 换掉的只是"能不能被重新打开"。
+    /// 无论哪种情况，它的配置与数据都在本地，用户始终能重新打开改地址、换令牌；
+    /// 换掉的只是「还叫不叫 K-Vault」和「站点写入功能在不在」。
     #[test]
-    fn legacy_kvault_remote_keeps_an_editable_choice() {
-        let c = edit_single_choice(kvault::TYPE, &[]);
-        assert_eq!(c.id, kvault::TYPE);
-        assert_eq!(
-            c.backend,
-            kvault::BACKEND,
-            "保存要写回 webdav，不能写成 kvault"
+    fn legacy_kvault_remote_shows_the_plugin_type_only_while_the_plugin_exists() {
+        let params =
+            serde_json::json!({"vendor": "other", "kvault": "1", "url": "https://kv.example"});
+        let stored = "webdav";
+
+        // 插件在：显示成插件声明的类型，落盘仍是 webdav。
+        let owner = [tderived("kvault", "K-Vault", "webdav")];
+        assert_eq!(display_type_of(&params, stored, &owner), "kvault");
+        let c = edit_single_choice(&display_type_of(&params, stored, &owner), &owner);
+        assert_eq!(c.backend, "webdav", "保存要写回真实后端");
+        assert!(c.derived);
+
+        // 插件不在：同一个远程退回 webdav，不再合成一个没人实现的类型。
+        assert_eq!(display_type_of(&params, stored, &[]), "webdav");
+
+        // 没有标记键的普通 WebDAV 永远不能被认成 K-Vault。
+        let plain = serde_json::json!({"vendor": "other", "url": "https://dav.example"});
+        assert_eq!(display_type_of(&plain, stored, &owner), "webdav");
+    }
+
+    /// 插件被停用/卸载后，带 K-Vault 标记的远程必须落进 `Orphan`，不能悄悄交给 rclone。
+    ///
+    /// 交给 rclone 的后果是站点 DAV 回一个 403「method not allowed」：用户既不知道
+    /// 发生了什么，也不知道装回插件就能解决。没有标记的普通 WebDAV 则永远走 `NotKv`。
+    #[test]
+    fn a_marked_remote_never_falls_through_to_the_dav_path() {
+        let params: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
+            serde_json::json!({"kvault": "1", "url": "https://kv.example/dav"}),
+        )
+        .unwrap();
+        let cfg = kvault::KvCfg::from_params(&params);
+
+        // 普通远程：插件在不在都与它无关。
+        assert!(matches!(kv_write_kind(None, true, "site"), KvWrite::NotKv));
+        assert!(matches!(kv_write_kind(None, false, "site"), KvWrite::NotKv));
+
+        // 带标记 + 插件在：走站点 API。
+        assert!(matches!(
+            kv_write_kind(Some(cfg.clone()), true, "site"),
+            KvWrite::Bridge(_)
+        ));
+
+        // 带标记 + 插件不在：拒绝，并且要点名是哪台远程、为什么、怎么办。
+        match kv_write_kind(Some(cfg), false, "site") {
+            KvWrite::Orphan(msg) => {
+                assert!(msg.contains("site"), "要说出是哪台远程：{}", msg);
+                assert!(msg.contains("插件"), "要说清是插件没启用：{}", msg);
+                assert!(msg.contains("启用"), "要告诉用户启用就能恢复：{}", msg);
+                assert!(msg.contains("还在"), "要说清数据没被动过：{}", msg);
+            }
+            KvWrite::NotKv => panic!("插件不在时不能落回 rclone 的 DAV 写"),
+            KvWrite::Bridge(_) => panic!("插件不在时没有站点 API 可走"),
+        }
+    }
+
+    /// 写路径不许再用 `kv_cfg_for`：它只回答「是不是 K-Vault」，插件不在时返回
+    /// `None` 就等于放行给 rclone（403 + 用户看不懂）。剩下的合法调用点只有两个：
+    /// 定义本身，和桥的读实现 `kv_list_rows`（**它前面已经有 `kv_access_blocked`
+    /// 挡着**，插件不在时根本走不到这里，见用例
+    /// `every_remote_entry_checks_the_plugin_gate`）。
+    #[test]
+    fn kv_cfg_for_is_only_used_by_the_bridge_read_path() {
+        // 只扫生产代码：用例自己也写着这个词，扫进来会把结果算多。
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            prod.len() > 1000,
+            "扫描基准不对（切分标记变了），先修这个用例"
         );
-        assert!(!c.derived);
+        let sites: Vec<&str> = prod
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| l.contains("kv_cfg_for("))
+            .collect();
+        assert_eq!(
+            sites.len(),
+            2,
+            "多出来的调用点会绕过写闸门，应改走 kv_write_target：{:?}",
+            sites
+        );
+        assert!(sites[0].starts_with("async fn kv_cfg_for("));
+        assert!(sites[1].starts_with("let cfg = kv_cfg_for(ctx, remote).await?;"));
+    }
+
+    /// 插件不在时，一条带标记的远程在**每个**入口都要被挡下来。
+    ///
+    /// 用源码扫描而不是逐个调用：这些入口都是 `Cmd` 分支里的长函数，要有 `Ctx` 和
+    /// 真的 rclone 才跑得起来，单元测试够不着。而漏掉一个入口的后果是「这里被拒、
+    /// 换个入口照样能读能挂」—— 这种缺口正是验收时被抓到的那一条。
+    ///
+    /// 有意不在这里的：`MountRemove`（卸载是退出动作）、`RemoteDelete`（挡住会把
+    /// 用户锁死在一条删不掉的远程上），它们的理由写在各自分支的注释里。
+    #[test]
+    fn every_remote_entry_checks_the_plugin_gate() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            prod.len() > 1000,
+            "扫描基准不对（切分标记变了），先修这个用例"
+        );
+
+        // 命令分支：从 `Cmd::X => {` 起，到下一个同级 `        Cmd::` 止
+        for marker in [
+            "Cmd::FilesRefresh { seq } => {",
+            "Cmd::FilesDownload { name, local } => {",
+            "Cmd::FilesDownloadToDir { name, dir, is_dir } => {",
+            "Cmd::FilesDownloadMany { items, dir } => {",
+            "Cmd::FilesMoveList { path, seq } => {",
+            "Cmd::MountAdd => {",
+            "Cmd::ServeAdd => {",
+            "Cmd::RemoteEditLoad { name } => {",
+            "Cmd::RemoteSave => {",
+        ] {
+            let start = match prod.find(marker) {
+                Some(i) => i + marker.len(),
+                None => panic!("找不到命令分支 {marker}，是不是改名了"),
+            };
+            let rest = &prod[start..];
+            let end = rest.find("\n        Cmd::").unwrap_or(rest.len());
+            assert!(
+                rest[..end].contains("kv_access_blocked("),
+                "{marker} 没有问 kv_access_blocked：插件不在时这个入口就是旁路"
+            );
+        }
+
+        // 独立函数：签名起，到下一个顶层项止
+        for sig in [
+            "async fn files_navigate(",
+            "async fn startup_flow(",
+            // 同步卡片的云端目录选择器：借它能把站点目录树翻一遍、还能把
+            // 打不开的远程选成同步目标
+            "async fn list_display_checked(",
+            // 档案导入：里面也会挂载和起服务
+            "async fn apply_bundle_to_rclone(",
+        ] {
+            let start = match prod.find(sig) {
+                Some(i) => i + sig.len(),
+                None => panic!("找不到函数 {sig}，是不是改名了"),
+            };
+            let rest = &prod[start..];
+            let end = ["\nfn ", "\nasync fn ", "\npub "]
+                .iter()
+                .filter_map(|p| rest.find(p))
+                .min()
+                .unwrap_or(rest.len());
+            assert!(
+                rest[..end].contains("kv_access_blocked("),
+                "{sig} 没有问 kv_access_blocked：插件不在时这个入口就是旁路"
+            );
+        }
+
+        // 自动恢复（挂载与服务）在另一个文件，那边同样是入口
+        let persist = include_str!("persist.rs").replace("\r\n", "\n");
+        assert_eq!(
+            persist.matches("crate::kv_access_blocked(").count(),
+            2,
+            "自动恢复的挂载与服务都要先问闸门"
+        );
+
+        // 用量列也走 about：插件不在时问出来的是个数，看起来像「能用」
+        let refresh = include_str!("refresh.rs").replace("\r\n", "\n");
+        assert_eq!(
+            refresh.matches("crate::kv_access_blocked(").count(),
+            1,
+            "用量抓取要先问闸门，别给打不开的远程填数字"
+        );
+
+        // 对账/自愈也是入口：它会把「档案里有、运行态没有」的挂载和服务重建，
+        // 但它自己拿不到插件清单，只能靠调用方传进去的那张表。
+        let rec = include_str!("reconcile.rs").replace("\r\n", "\n");
+        assert_eq!(
+            rec.matches("blocked.get(remote_of(fs))").count(),
+            2,
+            "对账的挂载与服务两臂都要查 blocked 表"
+        );
+        // 调用方必须把表真的递进去，否则上面那两处永远拿到空表
+        assert_eq!(
+            prod.matches("kv_blocked_map(ctx, &draft)").count(),
+            2,
+            "两处 reconcile 调用都要先算出 blocked 表"
+        );
     }
 
     /// 派生类型按插件显示名与 base_type 往返；内核自带后端原样透传。
@@ -13450,5 +13374,180 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 云端目录选完写回的值必须是「远程名:子路径」，而且来回折两遍不漂。
+    ///
+    /// 浏览窗走的是：字段值 → 显示路径 → 用户逐级点进 → 显示路径 → 字段值。
+    /// 这条链上任何一处边界对不上，落下来的要么是 rclone 认不出的 `root://…`，
+    /// 要么少一层子目录（同步就跑到上一级去）。四个纯函数就是这条链的全部换算。
+    #[test]
+    fn cloud_dir_value_survives_the_browse_round_trip() {
+        // 存下来的形状；`sync_tasks::split_remote` 靠冒号认远程名
+        let value = compose_fs("gdrive", "backup/photos");
+        assert_eq!(value, "gdrive:backup/photos");
+        assert_eq!(
+            crate::sync_tasks::split_remote(&value).unwrap(),
+            ("gdrive", "backup/photos")
+        );
+
+        // 弹窗里显示成 root://…
+        let shown = fs_to_display(&value);
+        assert_eq!(shown, "root://gdrive/backup/photos");
+
+        // 选中返回：拆出的 fs 带冒号，拼回去必须与进来时一模一样
+        let (fs, sub) = split_display(&shown).expect("非根路径必须拆得开");
+        assert_eq!(fs, "gdrive:");
+        assert_eq!(sub, "backup/photos");
+        assert_eq!(compose_fs(fs.trim_end_matches(':'), &sub), value);
+
+        // 选到远程根：`name:` 是合法值，空格子路径不能拼成 `name:/`
+        let root_value = compose_fs("gdrive", "");
+        assert_eq!(root_value, "gdrive:");
+        let root_shown = fs_to_display(&root_value);
+        let (fs, sub) = split_display(&root_shown).expect("远程根也是可以选的位置");
+        assert_eq!(compose_fs(fs.trim_end_matches(':'), &sub), root_value);
+        assert_eq!(crate::sync_tasks::split_remote(&root_value).unwrap().1, "");
+
+        // 停在列表根（没进任何远程）时点确定要算「没选」，不能落成 root://
+        assert!(split_display("root://").is_none());
+        assert!(split_display("root:///").is_none());
+        assert_eq!(display_parent("root://gdrive"), Some("root://".to_string()));
+    }
+
+    /// 两个「浏览…」按钮必须真的接到维护动作上，且列目录失败时不许写字段。
+    ///
+    /// 这些接线在无窗口的测试进程里跑不起来（`Ctx` 要插件宿、KV、tokio 全套），
+    /// 所以读源码断言调用点存在；被调用的函数各自有上面那条行为测试。
+    #[test]
+    fn sync_browse_pickers_are_wired_and_keep_the_old_value_on_failure() {
+        let maint = include_str!("maintenance.rs").replace("\r\n", "\n");
+        for arm in ["\"sync-pick-local\" =>", "\"sync-pick-remote\" =>"] {
+            assert!(maint.contains(arm), "maintenance::handle 少了分支 {arm}");
+        }
+
+        let local = crate::source_scan::function_body(&maint, "async fn sync_pick_local(")
+            .expect("sync_pick_local 必须存在");
+        assert!(local.contains("pick_folder()"), "本地目录要开系统选择框");
+        // `let Some(..) = … else { return }` 是「取消就一个字都不写」的写法：
+        // 改成 unwrap_or_default 之类就会把空串写进去，用户原来的路径就没了。
+        assert!(
+            local.contains("let Some(dir) = dlg.pick_folder() else {"),
+            "取消时不能写 sync_local"
+        );
+
+        let remote = crate::source_scan::function_body(&maint, "async fn sync_pick_remote(")
+            .expect("sync_pick_remote 必须存在");
+        assert!(
+            remote.contains("Cmd::BrowseOpen { scope: 2 }"),
+            "云端目录要走浏览窗那条路（scope 2），否则只有文件没有目录过滤"
+        );
+
+        let ui = include_str!("../ui/main.slint");
+        for hook in [
+            "maintenance-action(\"sync-pick-local\"",
+            "maintenance-action(\"sync-pick-remote\"",
+        ] {
+            assert!(ui.contains(hook), "同步卡片少了浏览按钮 {hook}");
+        }
+
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let ok = crate::source_scan::function_body(&src, "async fn browse_ok_sync(")
+            .expect("browse_ok_sync 必须存在");
+        assert!(
+            ok.contains("list_display_checked("),
+            "落值之前必须真去列一次目录，否则存的是打不开的位置"
+        );
+        assert_eq!(
+            ok.matches("set_sync_remote(").count(),
+            1,
+            "写云端目录只能有一条路径（列目录成功那条）；失败分支也写一次，用户手填的旧值就被冲掉了"
+        );
+    }
+
+    /// 本轮新增的界面文案必须在 `.po` 里有 msgid，否则英文界面会掉回中文。
+    ///
+    /// `crates/i18n/src/en.rs` 是生成文件（`_audit/gen_en.py`），这里只查 `.po`：
+    /// 它是仓库里唯一手写的翻译来源，缺一条就是缺一条。
+    #[test]
+    fn new_sync_picker_strings_have_a_po_entry() {
+        let po = include_str!("../ui/i18n/en/LC_MESSAGES/rclone-gui.po");
+        for msgid in [
+            "选择本地文件夹",
+            "打开系统窗口，选择本机的源文件夹",
+            "连到远程仓库，选一个已有的目录；打不开时会保留现在填的值",
+            "正在读取远程目录…",
+            "还没连上 rclone，等连上再选云端目录",
+            "已选择本地文件夹：{}",
+            "已选择云端目录：{}",
+            "没选远程，云端目录没有改动",
+            "这个位置现在打不开，云端目录保持原值：{}",
+            "打不开这个位置：{}",
+            "读不到远程列表：{}",
+            "看不懂这个路径：{}",
+            "列不出来：{}",
+        ] {
+            let entry = format!("msgid \"{msgid}\"");
+            assert!(
+                po.contains(entry.as_str()),
+                "`.po` 缺少 msgid「{msgid}」，英文界面会显示中文"
+            );
+        }
+    }
+
+    /// 用户挑过的文件授权必须在三条退出路径上一起失效：插件停用、插件卸载、程序退出。
+    ///
+    /// 少任何一条，后果都不是「多留一条记录」：停用的插件仍能把那个文件发出去，
+    /// 卸掉的 id 会在日后装回同名插件时变成一份来历不明的许可，退出前的那几秒
+    /// 也可能被某个远程动作捡起来用。这里按源码位置断言，因为三处都在
+    /// `handle_cmd` 的巨大 match 里，抽成函数反而会把「哪个命令清理什么」的关系藏起来。
+    #[test]
+    fn upload_grants_are_dropped_on_disable_uninstall_and_quit() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("文件里应当有测试模块");
+
+        let toggle = prod
+            .find("Cmd::PluginToggle { idx } => {")
+            .expect("应当有启用/停用分支");
+        let uninstall = prod
+            .find("Cmd::PluginUninstall { idx } => {")
+            .expect("应当有卸载分支");
+        let quit = prod.find("Cmd::Quit => {").expect("应当有退出分支");
+
+        let revokes: Vec<usize> = prod
+            .match_indices("plugin_host::upload::revoke_plugin(&id);")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            revokes.len(),
+            2,
+            "停用与卸载各要撤一次授权，实际找到 {} 处",
+            revokes.len()
+        );
+        assert!(
+            revokes[0] > toggle && revokes[0] < uninstall,
+            "第一处撤授权要在「停用」分支里（插件已经没有面板了）"
+        );
+        assert!(
+            revokes[1] > uninstall,
+            "第二处撤授权要在「卸载」分支里（这个 id 之后不存在了）"
+        );
+
+        let cancels: Vec<usize> = prod
+            .match_indices("plugin_host::upload::cancel_all();")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(cancels.len(), 1, "退出路径要撤掉所有还在进行的上传");
+        assert!(cancels[0] > quit, "cancel_all 要落在退出分支里");
+        let core_stop = prod
+            .find("ctx.maint.core.stop();")
+            .expect("退出分支里应当停内核");
+        assert!(
+            cancels[0] < core_stop,
+            "先撤上传授权再停内核：反过来的话，内核那一步卡住就没人撤了"
+        );
     }
 }

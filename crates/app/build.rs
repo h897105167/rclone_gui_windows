@@ -1,5 +1,10 @@
 use std::path::{Path, PathBuf};
 
+// 图标画法在 runtime 和 build script 之间共用同一份源码：两边各自读，
+// 就不会出现「exe 里的图标和托盘图标不是一张图」这种偏差。
+#[path = "src/icon_asset.rs"]
+mod icon_asset;
+
 fn main() {
     // 1) Slint UI 编译
     //
@@ -56,6 +61,124 @@ fn main() {
             "cargo:warning=assets/plugins 不存在：请先运行 scripts/fetch_plugins.ps1 拉取插件资产"
         );
     }
+
+    // 4) exe 图标资源
+    //
+    // 任务栏/资源管理器/快捷方式上的图标来自 exe 自己的图标资源，不是运行期画的。
+    // 没有这一步，exe 就没有图标资源，任务栏只能显示默认白纸图标（托盘却因为
+    // 运行期用 RGBA 现画而正常），正好是用户报的那个「托盘有、任务栏没有」。
+    embed_icon_resource();
+}
+
+/// 生成 `assets/rcgui.ico` 并把它编成 `.res` 链进 exe。
+///
+/// 失败只告警不中断：图标缺失不该让整个构建失败，测试环境也可能没有 rc.exe。
+fn embed_icon_resource() {
+    println!("cargo:rerun-if-changed=src/icon_asset.rs");
+
+    // 交叉编译到非 Windows 目标时没有资源这一说
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+        println!("cargo:warning=非 msvc 目标，跳过 exe 图标资源");
+        return;
+    }
+
+    // 只在内容变了才重写：不然每次构建都改文件时间，触发无谓的全量重编。
+    let ico = PathBuf::from("assets/rcgui.ico");
+    let bytes = icon_asset::ico_file(icon_asset::APP_ICON_SIZES, icon_asset::ICON_ACCENT);
+    let changed = std::fs::read(&ico).map(|old| old != bytes).unwrap_or(true);
+    if changed {
+        if let Some(dir) = ico.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(&ico, &bytes) {
+            println!("cargo:warning=写 assets/rcgui.ico 失败: {e}");
+            return;
+        }
+    }
+
+    let Some(rc_exe) = find_rc_exe() else {
+        println!("cargo:warning=找不到 rc.exe（Windows SDK 资源编译器），exe 将没有图标资源");
+        return;
+    };
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let rc_file = out_dir.join("rcgui.rc");
+    // .rc 里的路径用反斜杠、双写引号；这里只引用一个绝对路径，不依赖任何 include
+    let ico_abs = std::fs::canonicalize(&ico).unwrap_or_else(|_| ico.clone());
+    let rc_src = format!(
+        "1 ICON \"{}\"\n",
+        ico_abs.display().to_string().replace('\\', "\\\\")
+    );
+    if std::fs::write(&rc_file, rc_src).is_err() {
+        println!("cargo:warning=写 rcgui.rc 失败，exe 将没有图标资源");
+        return;
+    }
+    let res_file = out_dir.join("rcgui.res");
+    let out = std::process::Command::new(&rc_exe)
+        .arg("/nologo")
+        .arg(format!("/fo{}", res_file.display()))
+        .arg(&rc_file)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            println!("cargo:rustc-link-arg={}", res_file.display());
+        }
+        Ok(o) => println!(
+            "cargo:warning=rc.exe 失败（{:?}）：{}",
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => println!("cargo:warning=跑 rc.exe 失败: {e}"),
+    }
+}
+
+/// 定位 Windows SDK 的 `rc.exe`：先认 `RC` 环境变量，再找 PATH，最后扫 SDK 目录。
+///
+/// 扫 SDK 时取版本号最大的那个：机器上常同时装了多个 SDK，新的那个才有 x64 目录。
+fn find_rc_exe() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("RC") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let cand = dir.join("rc.exe");
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    let roots = [
+        std::env::var_os("ProgramFiles(x86)").map(PathBuf::from),
+        std::env::var_os("ProgramFiles").map(PathBuf::from),
+    ];
+    let mut best: Option<(Vec<u32>, PathBuf)> = None;
+    for root in roots.into_iter().flatten() {
+        let bin = root.join("Windows Kits").join("10").join("bin");
+        let Ok(entries) = std::fs::read_dir(&bin) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let cand = e.path().join("x64").join("rc.exe");
+            if !cand.is_file() {
+                continue;
+            }
+            let ver: Vec<u32> = e
+                .file_name()
+                .to_string_lossy()
+                .split('.')
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            if best.as_ref().map(|(v, _)| &ver > v).unwrap_or(true) {
+                best = Some((ver, cand));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// 从 `OUT_DIR`（`<target>/<profile>/build/<pkg>-<hash>/out`）上溯三级得到 `<target>/<profile>`。

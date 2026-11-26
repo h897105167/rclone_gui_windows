@@ -674,6 +674,17 @@ GitHub 的 windows 运行器预装了 Inno Setup 6，CI 上不需要额外安装
         Write-Host "    提示：没找到 ChineseSimplified.isl，安装程序界面用英文（程序自身界面不受影响）" -ForegroundColor Yellow
         Write-Host "          想装中文向导：把中文语言文件放到 packaging\languages\ChineseSimplified.isl 再打包" -ForegroundColor DarkGray
     }
+
+    # 安装向导的图标与 exe 图标同源：build.rs 从 crates\app\src\icon_asset.rs 画出这张 .ico
+    # 并嵌进 exe，这里把同一个文件交给 Inno。文件不在就整条 SetupIconFile 不生成
+    # （见 RCGUI.iss），安装包用 Inno 默认图标继续打——缺图标不该拦住发布。
+    $setupIcon = Join-Path $repoRoot "crates\app\assets\rcgui.ico"
+    if (Test-Path -LiteralPath $setupIcon) {
+        $isccArgs += "/DSetupIcon=$setupIcon"
+    } else {
+        Write-Host "    提示：没找到 crates\app\assets\rcgui.ico，安装包用 Inno 默认图标" -ForegroundColor Yellow
+        Write-Host "          （先跑一次 cargo build -p rclone-gui，build.rs 会生成它）" -ForegroundColor DarkGray
+    }
     $isccArgs += $iss
     Invoke-Native { & $iscc @isccArgs } "ISCC"
     if (-not (Test-Path -LiteralPath $setupPath)) {

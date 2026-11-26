@@ -137,8 +137,9 @@ export struct StoreRow {
     description: string,
     installed: bool,
     update: bool,
-    // 安装前给人看的权限清单，一行一条。空串表示插件没申报任何权限。
-    permissions: string,
+    // 安装前给人看的权限清单，一条一项。空表表示插件没申报任何权限。
+    // 用列表而不是拼好的多行字符串：界面要按项换行排版，读屏也要一项一项念。
+    permissions: [string],
 }
 
 /// 一个「文件夹同步」任务。方向由 `direction` 决定，周期以小时计（0 或负数不调度，
@@ -275,10 +276,12 @@ export global ToastG {
     in-out property <bool> error-panel: false;
 }
 
-// 远程路径浏览弹窗
+// 远程路径浏览弹窗。同一个弹窗给三处用，靠 scope 区分：选完的结果写回哪个字段、
+// 以及列目录时要不要只显示文件夹，都由它决定。
+// 弹窗里没有地方写错误信息，列目录失败的原因一律回到发起处的状态行里显示。
 export global BrowseG {
     in-out property <bool> show: false;
-    in-out property <int> scope: 0;      // 0 挂载 / 1 服务
+    in-out property <int> scope: 0;      // 0 挂载（可选文件）/ 1 服务（可选文件）/ 2 同步任务（只选目录）
     in-out property <string> path: "root://";
     in-out property <[PathItem]> entries: [];
     in-out property <int> sel: -1;       // 当前高亮选中行
@@ -501,31 +504,6 @@ export global RemotesG {
     in-out property <string> provider-desc: "";
     in-out property <bool> show-advanced: false;
     in-out property <bool> show-raw: false;  // 显示原始 key=value 编辑器
-    // ---------------- K-Vault（专用表单，选中 k-vault 类型时替换通用字段表） ----------------
-    /// 当前是 K-Vault 远程：通用字段表 / 高级 / 原始编辑器全部让位给下面的表单
-    in-out property <bool> kv-editor: false;
-    /// 站点地址，形如 https://kvault.example.org（不带 /dav 后缀）
-    in-out property <string> kv-base: "";
-    /// API 令牌（Bearer）；密码类字段，不回显
-    in-out property <string> kv-token: "";
-    /// 已保存过令牌（编辑现有远程时置位）：留空表示不修改
-    in-out property <bool> kv-token-set: false;
-    /// 未填令牌时用站点的 HTTP Basic 用户名/密码浏览（只读）
-    in-out property <string> kv-user: "";
-    in-out property <string> kv-pass: "";
-    in-out property <bool> kv-pass-set: false;
-    /// 上传目录（相对站点根，通常等于令牌的目录前缀）
-    in-out property <string> kv-folder: "";
-    /// 上传存储：只列出站点支持的存储名，默认 telegram
-    in-out property <[string]> kv-storages: ["telegram", "r2", "s3", "discord", "huggingface", "webdav", "github"];
-    in-out property <int> kv-storage-idx: 0;
-    /// 同名文件直接复用已有记录（服务端去重），而不是复制一份
-    in-out property <bool> kv-dedup: true;
-    /// 测试结果：一行说明，level 0 进行中 / 1 成功 / 2 失败
-    in-out property <string> kv-status: "";
-    in-out property <int> kv-status-level: 0;
-    in-out property <bool> kv-testing: false;
-    callback kv-test();
     // ---------------- 代理配置 ----------------
     /// 第 0 项固定是「不代理」，之后是已保存的配置
     in-out property <[string]> proxy-options: [@tr("不代理")];
@@ -584,11 +562,6 @@ export global TransfersG {
 }
 
 export global SettingsG {
-    in-out property <string> rc-user: "gui";
-    /// 启动时自动连接该 endpoint（只连 API，不启动 rclone 进程）
-    in-out property <bool> connect-on-start: true;
-    in-out property <string> rc-pass: "";
-    in-out property <string> rc-url: "http://127.0.0.1:5572";
     in-out property <[string]> themes: [@tr("跟随系统"), @tr("浅色"), @tr("深色")];
     in-out property <int> theme-idx: 0;
     in-out property <[string]> accents: [@tr("蓝色"), @tr("绿色"), @tr("紫色"), @tr("橙色")];
@@ -641,9 +614,6 @@ export global SettingsG {
     /// 导出含凭据时的确认弹窗开关（仅影响本次导出，不保存任何授权状态）
     in-out property <bool> conf-confirm-show: false;
     in-out property <string> conf-confirm-msg: "";
-    /// 恢复脚本预览（完整正文）与保存位置
-    in-out property <string> script-preview: "";
-    in-out property <string> script-path: "";
     /// 最近一次预览/应用的摘要文本（不含任何凭据内容）
     in-out property <string> conf-info: @tr("默认不含凭据（勾选后才写入）；导入需先预览，应用前自动备份当前档案。");
 }
@@ -653,9 +623,6 @@ export global SettingsG {
 /// 起停进程、推拉备份）全在内核侧完成；这里的状态文案由内核写入，界面不自己
 /// 编造进度。字段名与内核约定，改名会断掉绑定。
 export global MaintenanceG {
-    /// "managed" | "external"。managed 表示 RCGUI 自己起停 rclone 子进程并持有它的
-    /// 生命周期；external 表示只连一个别人已经起好的 RC 端点。
-    in-out property <string> core-mode: "managed";
     /// 内核可执行文件路径。留空表示用随包内置的那个；填了就用填的那个。
     in-out property <string> core-path: "";
     /// 下载渠道："extra" = 增强版（gulp79/rclone-extra，默认）/ "official" = 原版。
@@ -663,6 +630,9 @@ export global MaintenanceG {
     in-out property <string> core-flavor: "extra";
     /// 内核状态一行话：未检测 / 已停止 / 运行中 :5572 / 启动失败：<原因>
     in-out property <string> core-status: "";
+    /// 自动重启已经放弃（连续三次起不来）。只在值守停手之后为真，
+    /// 此时界面上出现「重试启动内核」——那是恢复手段，不是手动启停开关。
+    in-out property <bool> core-needs-retry: false;
     in-out property <string> update-status: "";
     in-out property <string> store-status: "";
     in-out property <string> backup-url: "";
@@ -2975,100 +2945,8 @@ component RemotesView inherits Rectangle {
                     color: ThemeG.text-dim;
                     wrap: word-wrap;
                 }
-                // K-Vault 专用表单：类型选 k-vault 时替代通用参数表。
-                //
-                // 它其实是一个 rclone webdav 远程（浏览/下载靠 rclone 只读 DAV），
-                // 写入走站点 HTTP API，所以这里收的是「上传要用的东西」：
-                // 站点地址、API 令牌、上传目录、存储位置。令牌/密码留空 = 不修改：
-                // rclone 里那份是混淆串，读不回明文，另行存了一份（见 kvault.rs）。
-                // 只在"编辑已有的 kvault 远程"时出现：新建入口已经交给插件
-                // （插件的 remote_types 提供派生类型），界面不再单列 k-vault。
-                if RemotesG.kv-editor && !RemotesG.edit-is-new : VerticalLayout {
-                    spacing: 10px;
-                    VerticalLayout {
-                        spacing: 3px;
-                        FieldLabel { text: @tr("站点地址（根地址，不要带 /dav）"); }
-                        LineEdit {
-                            accessible-label: @tr("站点地址");
-                            text <=> RemotesG.kv-base;
-                            placeholder-text: "https://kvault.example.com";
-                        }
-                    }
-                    VerticalLayout {
-                        spacing: 3px;
-                        FieldLabel { text: @tr("API 令牌（上传必填；留空 = 不修改已保存的令牌）"); }
-                        SafeLineEdit {
-                            a11y-label: @tr("站点 API 令牌");
-                            text <=> RemotesG.kv-token;
-                            input-type: InputType.password;
-                            placeholder-text: RemotesG.kv-token-set ? @tr("已设置（留空不修改）") : "kvault_xxxxxxxxxx_…";
-                        }
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        VerticalLayout {
-                            spacing: 3px;
-                            horizontal-stretch: 1;
-                            FieldLabel { text: @tr("上传目录（相对站点根；留空 = 令牌策略里的目录前缀）"); }
-                            LineEdit { accessible-label: @tr("上传目录"); text <=> RemotesG.kv-folder; }
-                        }
-                        VerticalLayout {
-                            spacing: 3px;
-                            width: 170px;
-                            FieldLabel { text: @tr("存储位置"); }
-                            ComboBox {
-                                accessible-label: @tr("存储位置");
-                                model: RemotesG.kv-storages;
-                                current-index <=> RemotesG.kv-storage-idx;
-                            }
-                        }
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        VerticalLayout {
-                            spacing: 3px;
-                            horizontal-stretch: 1;
-                            FieldLabel { text: @tr("用户名（可选，只影响浏览/下载）"); }
-                            LineEdit { accessible-label: @tr("用户名"); text <=> RemotesG.kv-user; }
-                        }
-                        VerticalLayout {
-                            spacing: 3px;
-                            horizontal-stretch: 1;
-                            FieldLabel { text: @tr("密码（可选；留空 = 不修改）"); }
-                            SafeLineEdit {
-                                a11y-label: @tr("站点密码");
-                                text <=> RemotesG.kv-pass;
-                                input-type: InputType.password;
-                            }
-                        }
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        height: 30px;
-                        CheckBox {
-                            text: @tr("内容去重（同一份文件只存一次，返回已有直链）");
-                            checked <=> RemotesG.kv-dedup;
-                        }
-                        Rectangle {}
-                        PillBtn {
-                            label: RemotesG.kv-testing ? @tr("测试中…") : @tr("测试连接");
-                            disabled: RemotesG.kv-testing;
-                            clicked => { RemotesG.kv-test(); }
-                        }
-                    }
-                    // 测试结果：0 中性 / 1 正常 / 2 警告（策略、作用域对不上）/ 3 失败
-                    if RemotesG.kv-status != "" : Text {
-                        text: RemotesG.kv-status;
-                        font-size: 12px;
-                        color: RemotesG.kv-status-level >= 3 ? ThemeG.err
-                             : RemotesG.kv-status-level == 2 ? ThemeG.warn
-                             : RemotesG.kv-status-level == 1 ? ThemeG.ok
-                             : ThemeG.text-dim;
-                        wrap: word-wrap;
-                    }
-                }
                 // 参数字段（模板驱动）
-                if RemotesG.edit-fields.length > 0 && !RemotesG.show-raw && !RemotesG.kv-editor : Rectangle {
+                if RemotesG.edit-fields.length > 0 && !RemotesG.show-raw : Rectangle {
                     border-radius: ThemeG.radius-s;
                     border-width: 1px;
                     border-color: ThemeG.border;
@@ -3153,11 +3031,7 @@ component RemotesView inherits Rectangle {
                     }
                 }
                 // 高级选项 + 原始编辑器切换
-                //
-                // K-Vault 表单下两者都藏起来：「高级选项」只对模板字段有意义，
-                // 而原始编辑器写的是 rclone 参数，保存路径会把它忽略掉 ——
-                // 留着只会让人以为改了原始参数就能生效。
-                if !RemotesG.kv-editor : HorizontalLayout {
+                HorizontalLayout {
                     spacing: 12px;
                     height: 28px;
                     if RemotesG.edit-fields.length > 0 : TouchArea {
@@ -3183,7 +3057,7 @@ component RemotesView inherits Rectangle {
                     }
                 }
                 // 原始 key=value 编辑器（保留给高级用户）
-                if (RemotesG.show-raw || RemotesG.edit-fields.length == 0) && !RemotesG.kv-editor : VerticalLayout {
+                if (RemotesG.show-raw || RemotesG.edit-fields.length == 0) : VerticalLayout {
                     spacing: 3px;
                     FieldLabel { text: @tr("参数（每行一个 key=value，保存时将覆盖已有同名参数）"); }
                     Rectangle {
@@ -4462,6 +4336,13 @@ component TransfersView inherits Rectangle {
                         text <=> MaintenanceG.sync-local;
                         placeholder-text: @tr("例如 D:\\照片");
                     }
+                    // 手填和浏览都行：填 UNC 路径、网络盘的人不少，输入框留着。
+                    PillBtn {
+                        label: @tr("浏览…");
+                        compact: true;
+                        hint: @tr("打开系统窗口，选择本机的源文件夹");
+                        clicked => { root.maintenance-action("sync-pick-local", ""); }
+                    }
                 }
                 HorizontalLayout {
                     height: 32px;
@@ -4473,6 +4354,20 @@ component TransfersView inherits Rectangle {
                         text <=> MaintenanceG.sync-remote;
                         placeholder-text: @tr("例如 remote:backup/photos（远端目录用冒号分隔）");
                     }
+                    PillBtn {
+                        label: @tr("浏览…");
+                        compact: true;
+                        hint: @tr("连到远程仓库，选一个已有的目录；打不开时会保留现在填的值");
+                        clicked => { root.maintenance-action("sync-pick-remote", ""); }
+                    }
+                }
+                // 状态单独占一行并换行：这里会出现「这个位置现在打不开：<rclone 的报错>」，
+                // 挤在按钮右边那 32px 里只能显示前十几个字，等于没说。
+                Text {
+                    text: MaintenanceG.sync-status == "" ? @tr("保存后按周期自动运行，也可以点「运行」马上跑一次。") : MaintenanceG.sync-status;
+                    font-size: 11px;
+                    color: ThemeG.text-dim;
+                    wrap: word-wrap;
                 }
                 HorizontalLayout {
                     height: 32px;
@@ -4484,14 +4379,7 @@ component TransfersView inherits Rectangle {
                         disabled: MaintenanceG.busy;
                         clicked => { root.maintenance-action("sync-save", ""); }
                     }
-                    Text {
-                        horizontal-stretch: 1;
-                        text: MaintenanceG.sync-status == "" ? @tr("保存后按周期自动运行，也可以点「运行」马上跑一次。") : MaintenanceG.sync-status;
-                        font-size: 11px;
-                        color: ThemeG.text-dim;
-                        vertical-alignment: center;
-                        overflow: elide;
-                    }
+                    Rectangle { horizontal-stretch: 1; }
                 }
             }
         }
@@ -4521,7 +4409,7 @@ component PluginsView inherits Rectangle {
     callback panel-pick(string, string);
     // 动作按钮：key 来自 config.json 的 action 控件 key
     callback panel-action(string);
-    // 卸载插件（会删插件目录与该插件的 kv 数据）
+    // 卸载插件（删插件目录与该插件的设置；kv 数据先备份，装回来时恢复）
     callback plugin-uninstall(int);
     // 恢复随软件安装的内置插件（上一步卸载过才会出现）
     callback plugin-restore(int);
@@ -5271,13 +5159,17 @@ component PluginsView inherits Rectangle {
                         color: ThemeG.text-dim;
                         wrap: word-wrap;
                     }
+                    // 行高不写死：权限条数和说明长短都随插件变，写死就会被裁掉。
+                    // 卡片自己不滚动——外层已经有一整页的 ScrollView，
+                    // 里面再套一层限高的滚动区会把卡片压扁（见本文件 3381 行的教训）。
                     for s in MaintenanceG.store-items : Rectangle {
-                        height: 62px;
                         background: ThemeG.panel-2;
                         border-radius: ThemeG.radius-s;
                         HorizontalLayout {
                             padding-left: 14px;
                             padding-right: 12px;
+                            padding-top: 10px;
+                            padding-bottom: 10px;
                             spacing: 12px;
                             VerticalLayout {
                                 alignment: center;
@@ -5293,14 +5185,24 @@ component PluginsView inherits Rectangle {
                                     text: s.description == "" ? s.id : s.description;
                                     font-size: 12px;
                                     color: ThemeG.text-dim;
-                                    overflow: elide;
+                                    wrap: word-wrap;
                                 }
                                 // 权限写在按钮前面：先看清这个插件要什么权限，再决定装不装
-                                if s.permissions != "" : Text {
-                                    text: @tr("权限：{}", s.permissions);
-                                    font-size: 11px;
-                                    color: ThemeG.warn;
-                                    overflow: elide;
+                                if s.permissions.length > 0 : VerticalLayout {
+                                    spacing: 2px;
+                                    Text {
+                                        text: @tr("需要的权限");
+                                        font-size: 11px;
+                                        font-weight: 600;
+                                        color: ThemeG.warn;
+                                    }
+                                    // 一条一项、各自换行：读屏逐条念得清，窄窗口也读得完
+                                    for p in s.permissions : Text {
+                                        text: "· " + p;
+                                        font-size: 11px;
+                                        color: ThemeG.warn;
+                                        wrap: word-wrap;
+                                    }
                                 }
                             }
                             if s.update : PillBtn {
@@ -5331,10 +5233,11 @@ component PluginsView inherits Rectangle {
     //
     // 用 PopupWindow 而不是页面内浮层：面板本身在 ScrollView 里，
     // 浮层会跟着内容一起滚走，弹窗才有稳定的居中位置。
-    // 卸载插件确认弹窗：卸载会删掉插件目录与该插件的 kv 数据，删了要重新添加
+    // 卸载插件确认弹窗：卸载会删掉插件目录与该插件的设置；插件的 kv 数据
+    // （K-Vault 站点地址、远程清单）会先备份到 plugins/_removed/ 下，装回来时自动恢复。
     up := ConfirmPop {
         title: @tr("卸载插件");
-        msg: @tr("确认卸载「{}」？插件目录与该插件的设置会一并删除。", root.cb-name);
+        msg: @tr("确认卸载「{}」？插件目录与该插件的设置会一并删除（插件的历史数据会另存备份，重新安装后自动恢复）。", root.cb-name);
         ok-label: @tr("卸载");
         x: root.pop-ax;
         y: root.pop-ay;
@@ -5348,18 +5251,12 @@ component SettingsView inherits Rectangle {
     callback test;
     callback pick-exe;
     callback options-save;
-    // 连接动作（阶段 3）：只影响 RC 连接，不启停 rclone 进程
-    callback conn-connect;
-    callback conn-disconnect;
-    callback conn-reconnect;
     // 档案导入导出（阶段 5A）
     callback conf-export;
     callback conf-import-preview;
     callback conf-import-apply;
     callback conf-export-confirmed;
     callback conf-export-cancelled;
-    callback script-generate;
-    callback script-copy;
     // 「以管理员身份运行」：复选框切换后由 Rust 判断是否需要重启并打开确认弹层
     callback admin-toggle;
     callback admin-restart;
@@ -5519,9 +5416,9 @@ component SettingsView inherits Rectangle {
                 }
             }
 
-            // 内核（rclone 本体）：托管 = RCGUI 下载并启停自己那份；外部 = 只连已经在跑的 rclone。
-            // 外部模式那份程序在别处，RCGUI 不碰它的进程，所以路径与启停动作整个收起来。
-            // 两种模式都不对「不是自己启动的进程」动手，因此这里没有任何 kill 类动作。
+            // 内核（rclone 本体）：RCGUI 自己下载、自己启停，跟应用一起起落。
+            // 这里没有开关键，也永远不对「不是自己启动的进程」动手——
+            // 所以整张卡里没有任何 kill / quit 类动作。
             if root.tab == 1 : Card {
                 title: @tr("内核（rclone 本体）");
                 VerticalLayout {
@@ -5529,28 +5426,17 @@ component SettingsView inherits Rectangle {
                     HorizontalLayout {
                         spacing: 8px;
                         height: 32px;
-                        FieldLabel { text: @tr("模式"); width: 70px; vertical-alignment: center; }
-                        PillBtn {
-                            label: @tr("托管内核");
-                            primary: MaintenanceG.core-mode == "managed";
-                            clicked => { MaintenanceG.core-mode = "managed"; }
-                        }
-                        PillBtn {
-                            label: @tr("外部 rclone");
-                            primary: MaintenanceG.core-mode == "external";
-                            clicked => { MaintenanceG.core-mode = "external"; }
-                        }
+                        FieldLabel { text: @tr("托管方式"); width: 70px; vertical-alignment: center; }
                         Text {
-                            text: MaintenanceG.core-mode == "managed" ? @tr("由 RCGUI 下载并启停，退出时一并关闭") : @tr("不下载、不启停，只连已经在跑的那个 rclone");
+                            text: @tr("由 RCGUI 自动启动与关闭：打开本应用时连上内核，退出时一并关闭。");
                             font-size: 12px;
                             color: ThemeG.text-dim;
                             vertical-alignment: center;
-                            overflow: elide;
+                            wrap: word-wrap;
+                            horizontal-stretch: 1;
                         }
-                        Rectangle {}
                     }
-                    // 路径与启停只属于托管模式
-                    if MaintenanceG.core-mode == "managed" : VerticalLayout {
+                    VerticalLayout {
                         spacing: 10px;
                         HorizontalLayout {
                             spacing: 8px;
@@ -5614,18 +5500,19 @@ component SettingsView inherits Rectangle {
                     Rectangle { height: 1px; background: ThemeG.border; }
                     HorizontalLayout {
                         spacing: 8px;
-                        height: 28px;
                         FieldLabel { text: @tr("状态"); width: 70px; vertical-alignment: center; }
+                        // 崩溃原因可能很长（退出码 + 路径），这里必须换行而不是省略：
+                        // 整条状态里唯一有用的是"为什么"，截掉就等于没说。
                         Text {
                             text: MaintenanceG.core-status == "" ? @tr("尚未检测") : MaintenanceG.core-status;
                             font-size: 13px;
                             color: ThemeG.text;
                             vertical-alignment: center;
-                            overflow: elide;
+                            wrap: word-wrap;
+                            horizontal-stretch: 1;
                         }
-                        Rectangle {}
                     }
-                    if MaintenanceG.core-mode == "managed" : HorizontalLayout {
+                    HorizontalLayout {
                         spacing: 8px;
                         height: 32px;
                         PillBtn { label: @tr("检测"); disabled: MaintenanceG.busy; clicked => { root.maintenance-action("core-detect", ""); } }
@@ -5640,12 +5527,17 @@ component SettingsView inherits Rectangle {
                             disabled: MaintenanceG.busy;
                             clicked => { root.maintenance-action("core-install", ""); }
                         }
-                        PillBtn { label: @tr("启动"); disabled: MaintenanceG.busy; clicked => { root.maintenance-action("core-start", ""); } }
-                        PillBtn { label: @tr("停止"); disabled: MaintenanceG.busy; clicked => { root.maintenance-action("core-stop", ""); } }
+                        // 只有值守放弃自动重试之后才出现。平时没有这个按钮：
+                        // 内核本来就跟应用一起启停，多一个开关只会让人以为需要手动管。
+                        if MaintenanceG.core-needs-retry : PillBtn {
+                            label: @tr("重试启动内核");
+                            disabled: MaintenanceG.busy;
+                            clicked => { root.maintenance-action("core-retry", ""); }
+                        }
                         Rectangle {}
                     }
                     Text {
-                        text: MaintenanceG.core-mode == "managed" ? @tr("「停止」只会关闭 RCGUI 自己启动的进程。") : @tr("外部模式不提供检测、安装、启动、停止；在下面连接卡里填那台 rclone 的 RC 地址即可。");
+                        text: @tr("内核随本应用一起启停，不需要手动开关。异常退出会在上面的状态里写明原因，并自动重试启动。");
                         font-size: 12px;
                         color: ThemeG.text-dim;
                         wrap: word-wrap;
@@ -5653,38 +5545,14 @@ component SettingsView inherits Rectangle {
                 }
             }
 
-            // 连接（RC API）：外部模式才让用户填地址与凭据；托管模式的凭据由 RCGUI 自己生成，
-            // 界面上只做只读展示，避免把临时随机口令变成可编辑字段。
+            // 连接（RC API）：地址与口令由 RCGUI 自己生成，界面上只做只读展示——
+            // 临时随机口令一旦变成可编辑字段，用户就会把它当成需要长期维护的东西。
             if root.tab == 1 : Card {
                 title: @tr("连接（rclone RC API）");
                 VerticalLayout {
                     spacing: 10px;
-                    if MaintenanceG.core-mode == "external" : VerticalLayout {
-                        spacing: 10px;
-                        HorizontalLayout {
-                            spacing: 8px;
-                            height: 32px;
-                            FieldLabel { text: @tr("RC 地址"); width: 70px; vertical-alignment: center; }
-                            LineEdit { accessible-label: @tr("RC 地址"); width: 300px; text <=> SettingsG.rc-url; placeholder-text: "http://127.0.0.1:5572"; }
-                            FieldLabel { text: @tr("RC 用户"); width: 56px; vertical-alignment: center; }
-                            LineEdit { accessible-label: @tr("RC 用户"); width: 150px; text <=> SettingsG.rc-user; }
-                            FieldLabel { text: @tr("RC 密码"); width: 56px; vertical-alignment: center; }
-                            SafeLineEdit { width: 150px; a11y-label: @tr("RC 密码"); text <=> SettingsG.rc-pass; input-type: InputType.password; }
-                        }
-                        HorizontalLayout {
-                            spacing: 12px;
-                            height: 26px;
-                            CheckBox {
-                                checked <=> SettingsG.connect-on-start;
-                                text: @tr("启动时连接该地址（只连 API，不启动 rclone）");
-                                toggled => { root.save(); }
-                            }
-                            Rectangle {}
-                        }
-                        Rectangle { height: 1px; background: ThemeG.border; }
-                    }
-                    if MaintenanceG.core-mode == "managed" : Text {
-                        text: @tr("托管模式的 RC 地址与口令由 RCGUI 自己生成，下面显示的是实际连上的端点。");
+                    Text {
+                        text: @tr("RC 地址与口令由 RCGUI 自己生成，下面显示的是实际连上的端点。");
                         font-size: 12px;
                         color: ThemeG.text-dim;
                         wrap: word-wrap;
@@ -5739,53 +5607,11 @@ component SettingsView inherits Rectangle {
                         color: ThemeG.err;
                         wrap: word-wrap;
                     }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        height: 32px;
-                        PillBtn { label: @tr("连接 / 握手"); primary: true; disabled: SettingsG.conn-busy; clicked => { root.conn-connect(); } }
-                        PillBtn { label: @tr("断开"); disabled: SettingsG.conn-busy || !SettingsG.conn-live; clicked => { root.conn-disconnect(); } }
-                        PillBtn { label: @tr("重新握手"); disabled: SettingsG.conn-busy; clicked => { root.conn-reconnect(); } }
-                        Text { text: SettingsG.conn-busy ? @tr("正在握手…") : ""; font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                    }
-                }
-            }
-
-            if root.tab == 1 : Card {
-                title: @tr("开机恢复脚本（PowerShell）");
-                VerticalLayout {
-                    spacing: 8px;
                     Text {
-                        text: @tr("只连接已运行且启用 RC 的 rclone：先健康检查，连不上就明确退出；不启动、不停止 rclone，不注册开机项，不内置 RC 密码。生成后不会自动执行。");
+                        text: SettingsG.conn-busy ? @tr("正在连接内核…") : @tr("连接由本程序自动建立：内核一起来就握手，链路断了自动重试，不需要手动连接或断开。");
                         font-size: 12px;
                         color: ThemeG.text-dim;
                         wrap: word-wrap;
-                    }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        height: 32px;
-                        PillBtn { label: @tr("生成恢复脚本"); primary: true; clicked => { root.script-generate(); } }
-                        PillBtn { label: @tr("复制脚本"); disabled: SettingsG.script-preview == ""; clicked => { root.script-copy(); } }
-                        Text {
-                            text: @tr("保存位置: {}", SettingsG.script-path);
-                            font-size: 12px;
-                            color: ThemeG.text-dim;
-                            vertical-alignment: center;
-                            overflow: elide;
-                            horizontal-stretch: 1;
-                        }
-                    }
-                    if SettingsG.script-preview != "" : Rectangle {
-                        height: 240px;
-                        border-radius: ThemeG.radius-s;
-                        border-width: 1px;
-                        border-color: ThemeG.border;
-                        background: ThemeG.panel-2;
-                        TextEdit {
-                            read-only: true;
-                            text: SettingsG.script-preview;
-                            font-size: 12px;
-                            wrap: no-wrap;
-                        }
                     }
                 }
             }
@@ -6037,14 +5863,16 @@ component SettingsView inherits Rectangle {
                         wrap: word-wrap;
                     }
                     // 权限在安装按钮之前露出：装进去的东西能读什么，得在点下去之前看见。
+                    // 行高不写死：这条列表以前是 56px 定高 + 单行省略，权限一多就被切掉，
+                    // 等于把"你要授权什么"这句话藏了起来。外层整页可滚，卡片自己不再滚。
                     for s in MaintenanceG.store-items : Rectangle {
-                        height: 56px;
                         background: transparent;
                         HorizontalLayout {
                             spacing: 10px;
                             VerticalLayout {
                                 alignment: start;
                                 spacing: 2px;
+                                horizontal-stretch: 1;
                                 HorizontalLayout {
                                     spacing: 6px;
                                     Text {
@@ -6066,18 +5894,25 @@ component SettingsView inherits Rectangle {
                                     text: s.description == "" ? s.id : s.description;
                                     font-size: 12px;
                                     color: ThemeG.text-dim;
-                                    overflow: elide;
+                                    wrap: word-wrap;
+                                }
+                                // 一条一项、各自换行：读屏逐条念得清，窄窗口也读得完
+                                if s.permissions.length > 0 : VerticalLayout {
+                                    spacing: 2px;
+                                    Text {
+                                        text: @tr("需要的权限");
+                                        font-size: 11px;
+                                        font-weight: 600;
+                                        color: ThemeG.text-dim;
+                                    }
+                                    for p in s.permissions : Text {
+                                        text: "· " + p;
+                                        font-size: 11px;
+                                        color: ThemeG.text-dim;
+                                        wrap: word-wrap;
+                                    }
                                 }
                             }
-                            if s.permissions != "" : Text {
-                                text: @tr("权限：{}", s.permissions);
-                                font-size: 11px;
-                                color: ThemeG.text-dim;
-                                vertical-alignment: center;
-                                overflow: elide;
-                                width: 180px;
-                            }
-                            Rectangle {}
                             if s.update : PillBtn {
                                 label: @tr("更新");
                                 primary: true;
@@ -6678,16 +6513,11 @@ export component MainWindow inherits Window {
     callback settings-test();
     callback pick-exe();
     callback options-save();
-    callback conn-connect();
-    callback conn-disconnect();
-    callback conn-reconnect();
     callback conf-export();
     callback conf-import-preview();
     callback conf-import-apply();
     callback conf-export-confirmed();
     callback conf-export-cancelled();
-    callback script-generate();
-    callback script-copy();
     // 以管理员身份运行的确认（页面内弹层，见 SettingsView）
     callback admin-toggle();
     callback admin-restart();
@@ -7082,16 +6912,11 @@ export component MainWindow inherits Window {
                     test => { root.settings-test(); }
                     pick-exe => { root.pick-exe(); }
                     options-save => { root.options-save(); }
-                    conn-connect => { root.conn-connect(); }
-                    conn-disconnect => { root.conn-disconnect(); }
-                    conn-reconnect => { root.conn-reconnect(); }
                     conf-export => { root.conf-export(); }
                     conf-import-preview => { root.conf-import-preview(); }
                     conf-import-apply => { root.conf-import-apply(); }
                     conf-export-confirmed => { root.conf-export-confirmed(); }
                     conf-export-cancelled => { root.conf-export-cancelled(); }
-                    script-generate => { root.script-generate(); }
-                    script-copy => { root.script-copy(); }
                     admin-toggle => { root.admin-toggle(); }
                     admin-restart => { root.admin-restart(); }
                     admin-cancel => { root.admin-cancel(); }

@@ -34,6 +34,22 @@ const DUE_TICK: Duration = Duration::from_secs(30);
 /// 运行中任务的状态查询间隔。比 `DUE_TICK` 密：任务的成败要跟界面贴得比较近。
 const POLL_TICK: Duration = Duration::from_secs(2);
 
+/// 托管内核连续起不来时的重试间隔。三次之后停手，等用户点「重试启动内核」。
+///
+/// 间隔递增：第一次多半是端口刚被别的东西占了一下，等两秒就够；连着三次失败通常是
+/// 路径错、被杀软拦下或配置写坏，再每 2 秒拉一次只会把日志刷满，还把真正的原因埋掉。
+const CORE_RETRY_GAPS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+];
+
+/// 内核活过这么久，才算"这一轮是好的"，此前的连续失败清零。
+///
+/// 没有这条，一个每天崩一次的坏配置会永远停在"第 3 次失败，已停止重试"上：
+/// 中间那 23 小时都白跑了。
+const CORE_HEALTHY_AFTER: Duration = Duration::from_secs(60);
+
 /// 通往界面命令队列的入口。
 ///
 /// 维护动作里有一件事只能由界面线程做：插件列表重扫（装完插件后要重新读磁盘）。
@@ -78,6 +94,24 @@ struct State {
     /// 最近一次查到的内核发行版信息（含校验值）。只存内存：查询结果会过期，
     /// 重启后必须重新问一次才能安装。
     core_release: Option<core::ReleaseInfo>,
+    /// 托管内核的值守状态。只存内存：程序重启就等于重新开始一轮。
+    core_watch: CoreWatch,
+}
+
+/// 托管内核的自动重启记账。
+///
+/// 内核现在跟程序同生共死（界面上的手动启停已经拿掉），起不来就没人管了，
+/// 所以这里要记三件事：失败了几次、下次什么时候再试、这一次起来了多久。
+#[derive(Default)]
+struct CoreWatch {
+    /// 连续失败次数。内核活过 `CORE_HEALTHY_AFTER` 之后清零。
+    failures: u32,
+    /// 下次允许尝试启动的时间。`None` = 现在就可以试。
+    next_try: Option<Instant>,
+    /// 当前这一轮内核是什么时候被看见"在跑"的，用来判断跑够了没有。
+    started_at: Option<Instant>,
+    /// 已经放弃自动重试，等用户点「重试启动内核」。
+    gave_up: bool,
 }
 
 impl Maintenance {
@@ -114,6 +148,16 @@ fn set_core_status(ui: &Weak<MainWindow>, text: impl Into<String>) {
     });
 }
 
+/// 是否显示「重试启动内核」。
+///
+/// 这不是把手动启停放回来：运维权仍在自动值守手里，这个按钮只在值守放弃之后出现，
+/// 用户可以换路径、插上 U 盘、关掉杀软之后再叫它试一次。
+fn set_core_retry_needed(ui: &Weak<MainWindow>, needed: bool) {
+    with_ui(ui, move |u| {
+        u.global::<MaintenanceG>().set_core_needs_retry(needed);
+    });
+}
+
 fn set_update_status(ui: &Weak<MainWindow>, text: impl Into<String>) {
     let text: String = text.into();
     with_ui(ui, move |u| {
@@ -143,7 +187,7 @@ fn set_diagnostics_status(ui: &Weak<MainWindow>, text: impl Into<String>) {
     });
 }
 
-fn set_sync_status(ui: &Weak<MainWindow>, text: impl Into<String>) {
+pub(crate) fn set_sync_status(ui: &Weak<MainWindow>, text: impl Into<String>) {
     let text: String = text.into();
     with_ui(ui, move |u| {
         u.global::<MaintenanceG>().set_sync_status(text.into());
@@ -159,10 +203,6 @@ fn set_busy(ui: &Weak<MainWindow>, busy: bool) {
 /// 把 `cfg` 里与维护页相关的设置灌进界面。启动时调一次，保存后不用再调。
 pub fn load_into_ui(ui: &MainWindow, cfg: &crate::config::AppConfig) {
     let g = ui.global::<MaintenanceG>();
-    g.set_core_mode(match cfg.core.normalized_mode() {
-        "external" => "external".into(),
-        _ => "managed".into(),
-    });
     g.set_core_path(cfg.core.path.clone().into());
     g.set_core_flavor(cfg.core.normalized_flavor().as_str().into());
     g.set_lightweight_enabled(cfg.light.enabled);
@@ -269,19 +309,27 @@ fn push_sync_rows(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
 fn push_store_rows(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let entries = ctx.maint.state().store_entries.clone();
     let installed = store::scan_installed(&plugins::plugins_dir(), &plugins::gui_version());
-    let rows: Vec<StoreRow> = store::rows(&entries, &installed)
-        .into_iter()
-        .map(|r| StoreRow {
-            id: r.id.into(),
-            name: r.name.into(),
-            version: r.version.into(),
-            description: r.description.into(),
-            installed: r.installed,
-            update: r.update,
-            permissions: r.permissions.into(),
-        })
-        .collect();
+    // 权限那一列是 `[string]`，对应的 Slint 模型内部是 `Rc`，不能跨线程。
+    // 所以先在后台把纯数据（String / Vec<String>，都是 Send）准备好，
+    // 模型留到 UI 线程的闭包里再建——顺序反过来就编译不过。
     with_ui(ui, move |u| {
+        let rows: Vec<StoreRow> = store::rows(&entries, &installed)
+            .into_iter()
+            .map(|r| StoreRow {
+                id: r.id.into(),
+                name: r.name.into(),
+                version: r.version.into(),
+                description: r.description.into(),
+                installed: r.installed,
+                update: r.update,
+                permissions: ModelRc::new(VecModel::from(
+                    r.permissions
+                        .into_iter()
+                        .map(slint::SharedString::from)
+                        .collect::<Vec<_>>(),
+                )),
+            })
+            .collect();
         u.global::<MaintenanceG>()
             .set_store_items(ModelRc::new(VecModel::from(rows)));
     });
@@ -343,10 +391,18 @@ pub fn core_status_text(ctx: &Arc<Ctx>) -> String {
         Ok(Some(located)) => {
             let version =
                 core::probe_version(&located.exe).unwrap_or_else(|_| t("版本未知").to_string());
-            f(
+            let found = f(
                 "已找到内核（{}）：{} · {}",
                 &[&located.source.label(), &located.exe.display(), &version],
-            )
+            );
+            // 找得到可执行文件不代表它跑起来了。之前这里直接返回"已找到内核"，
+            // 于是崩掉的内核在界面上看起来跟停着的一模一样——原因全丢了。
+            match phase {
+                core::Phase::Failed(_) | core::Phase::Exited(_) => {
+                    format!("{} — {}", phase.label(), found)
+                }
+                _ => found,
+            }
         }
         Ok(None) => format!(
             "{} — {}",
@@ -362,10 +418,13 @@ pub fn refresh_core_status(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     set_core_status(ui, text);
 }
 
-/// 按配置启动托管内核。返回 Some(说明) 表示真的起了进程。
+/// 按配置启动托管内核。
 ///
-/// 只在 `core.mode == "managed"` 且能找到内核时动手；找不到、起不来都只返回原因，
-/// 由调用方写进界面并继续用外部连接——启动失败不该把整个程序卡死。
+/// 返回的 `Some(说明)` **不代表进程起来了**：找不到内核、启动失败也都会返回一句
+/// 给用户看的原因。要判断成败只看 `ctx.maint.core.is_running()`（或 `restart_outcome`）。
+///
+/// 只在 `core.mode == "managed"` 且能找到内核时动手，失败不拦启动——
+/// 启动失败不该把整个程序卡死。
 pub async fn start_managed_core(ctx: &Arc<Ctx>) -> Option<String> {
     let cfg = ctx.cfg.lock().unwrap().clone();
     if cfg.core.normalized_mode() != "managed" {
@@ -445,6 +504,7 @@ pub async fn handle(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, action: &str, id: &st
         "core-install" => core_install(ctx, &ui).await,
         "core-start" => core_start(ctx, &ui).await,
         "core-stop" => core_stop(ctx, &ui).await,
+        "core-retry" => core_retry(ctx, &ui).await,
         "core-save" => core_save(ctx, &ui).await,
         "check-update" => check_update(ctx, &ui).await,
         "apply-update" => apply_update(ctx, &ui).await,
@@ -455,6 +515,8 @@ pub async fn handle(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, action: &str, id: &st
         "backup-push" => backup_push(ctx, &ui).await,
         "backup-pull" => backup_pull(ctx, &ui).await,
         "sync-save" => sync_save(ctx, &ui, id).await,
+        "sync-pick-local" => sync_pick_local(&ui).await,
+        "sync-pick-remote" => sync_pick_remote(ctx, &ui).await,
         "sync-run" => sync_run(ctx, &ui, id).await,
         "sync-toggle" => sync_toggle(ctx, &ui, id).await,
         "sync-delete" => sync_delete(ctx, &ui, id).await,
@@ -695,7 +757,6 @@ async fn core_adopt_managed(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     };
     with_ui(ui, |u| {
         let g = u.global::<MaintenanceG>();
-        g.set_core_mode("managed".into());
         g.set_core_path("".into());
     });
     match kept {
@@ -905,7 +966,6 @@ async fn core_install(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             }
             let channel = flavor.as_str();
             with_ui(ui, move |u| {
-                u.global::<MaintenanceG>().set_core_mode("managed".into());
                 u.global::<MaintenanceG>().set_core_flavor(channel.into());
             });
             crate::logging::event(
@@ -953,15 +1013,19 @@ async fn core_install(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
                                 &[&v, &endpoint],
                             ),
                         );
-                        crate::toast(ui, 2, t("新内核已启动，但自动连接失败；可点「连接」重试"));
+                        crate::toast(
+                            ui,
+                            2,
+                            t("新内核已启动，但没能连上；程序会自动重试，状态里会写明原因"),
+                        );
                     }
                     RestartOutcome::NotRunning(why) => {
                         set_core_status(ui, f("内核已安装（{}），但没能重新启动：{}", &[&v, &why]));
-                        crate::toast(ui, 2, t("内核已更新，但自动重启失败，请点「启动内核」"));
+                        crate::toast(ui, 2, t("内核已更新，但没能重新启动；程序会自动重试"));
                     }
                 }
             } else {
-                crate::toast(ui, 1, t("内核已安装，点「启动内核」开始使用"));
+                crate::toast(ui, 1, t("内核已安装，程序会自动启动它"));
             }
         }
         Err(e) => {
@@ -1083,22 +1147,13 @@ async fn core_stop(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
 
 async fn core_save(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let picked = crate::read_ui(ui, |u: MainWindow| {
-        (
-            u.global::<MaintenanceG>().get_core_mode().to_string(),
-            u.global::<MaintenanceG>().get_core_path().to_string(),
-        )
+        u.global::<MaintenanceG>().get_core_path().to_string()
     })
     .await;
-    let Some((mode, path)) = picked else {
+    let Some(path) = picked else {
         set_core_status(ui, t("读取界面设置失败"));
         return;
     };
-    let mode = if mode == "external" {
-        "external"
-    } else {
-        "managed"
-    }
-    .to_string();
     let path = path.trim().to_string();
     if !path.is_empty() {
         let p = Path::new(&path);
@@ -1115,7 +1170,9 @@ async fn core_save(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     }
     {
         let mut cfg = ctx.cfg.lock().unwrap();
-        cfg.core.mode = mode.clone();
+        // 严格按托管保存：界面上已经没有「外部 rclone」这个选项，任何残留的
+        // 旧值都在这里被纠正，不需要用户自己去找开关。
+        cfg.core.mode = "managed".to_string();
         cfg.core.path = path.clone();
     }
     let save_result = {
@@ -1123,21 +1180,7 @@ async fn core_save(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         crate::config::save(&cfg)
     };
     match save_result {
-        Ok(()) => {
-            let running = ctx.maint.core.is_running();
-            let mut msg = if mode == "managed" {
-                t("已保存：内核由本程序管理").to_string()
-            } else {
-                t("已保存：外部模式（只连接别人启动的 rclone，不会起停进程）").to_string()
-            };
-            if running && mode == "external" {
-                msg.push_str(&f(
-                    "　注意：本程序启动的内核还在运行（pid {}），需要的话点「停止内核」。",
-                    &[&ctx.maint.core.pid().unwrap_or(0)],
-                ));
-            }
-            set_core_status(ui, msg);
-        }
+        Ok(()) => set_core_status(ui, t("已保存：内核由本程序管理")),
         Err(e) => set_core_status(ui, f("保存内核设置失败：{}", &[&e])),
     }
     refresh_core_status(ctx, ui);
@@ -1683,6 +1726,46 @@ fn new_task_id() -> String {
     )
 }
 
+/// 挑本机的源目录，选中才写进「本地文件夹」。
+///
+/// 系统选择框会一直阻塞到用户点确定或取消，这段时间本任务收不了别的 Cmd——
+/// 这跟本机浏览页的「选择目录」是同一个做法，对话框挡住窗口时本来也点不到别的。
+/// 用户取消（返回 None）就什么都不写，保留原来填的值。
+async fn sync_pick_local(ui: &Weak<MainWindow>) {
+    let cur = crate::read_ui(ui, |u: MainWindow| {
+        u.global::<MaintenanceG>().get_sync_local().to_string()
+    })
+    .await
+    .unwrap_or_default();
+    let mut dlg = rfd::FileDialog::new().set_title(t("选择本地文件夹"));
+    let start = cur.trim();
+    if !start.is_empty() && Path::new(start).is_dir() {
+        dlg = dlg.set_directory(start);
+    }
+    let Some(dir) = dlg.pick_folder() else {
+        return;
+    };
+    let text = dir.display().to_string();
+    let shown = text.clone();
+    with_ui(ui, move |u| {
+        u.global::<MaintenanceG>().set_sync_local(shown.into());
+    });
+    set_sync_status(ui, f("已选择本地文件夹：{}", &[&text]));
+}
+
+/// 打开远程目录浏览窗，选出来的结果写回「云端目录」。
+///
+/// 列目录要真的走一遍网络，所以不在这里做：把带 scope 的 `Cmd::BrowseOpen` 交给
+/// 浏览窗那条路，它负责列、负责把失败原因写回来（`browse_ok_sync` 写字段）。
+async fn sync_pick_remote(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    if !ctx.rc.is_live() {
+        set_sync_status(ui, t("还没连上 rclone，等连上再选云端目录"));
+        return;
+    }
+    set_sync_status(ui, t("正在读取远程目录…"));
+    send(Cmd::BrowseOpen { scope: 2 });
+}
+
 async fn sync_save(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
     let picked = crate::read_ui(ui, |u: MainWindow| {
         let g = u.global::<MaintenanceG>();
@@ -1908,6 +1991,160 @@ async fn diagnostics(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     }
 }
 
+// ───────────────────────────── 内核值守 ─────────────────────────────
+
+/// 托管内核的值守：崩了拉起来，拉不动就说清原因、把决定权交回用户。
+///
+/// 每 2 秒一次（`tick` 里调）。三条边界：
+/// - 只碰自己起的进程。外部实例根本不进 `ctx.maint.core`，这里无从误伤；
+/// - 安装/更新进行中（`busy_core`）一律让路：那一步自己会重启内核，
+///   值守这时候插一手只会把它刚起的进程杀掉；
+/// - 连续三次起不来就停手，状态行留原因，界面上出现「重试启动内核」。
+async fn supervise_core(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    if ctx.cfg.lock().unwrap().core.normalized_mode() != "managed" {
+        return;
+    }
+
+    // 先收尸。哪怕这一轮马上要重启，用户也该先看到"它死了、退出码是多少"。
+    if let Some(reason) = ctx.maint.core.reap_dead() {
+        crate::logging::event("warn", "core", &reason);
+        // 只标记失效、保留上次快照：进程没了不等于数据没了。
+        ctx.rc.set_disconnected(Some(reason.clone())).await;
+        let ran_long = {
+            let mut st = ctx.maint.state();
+            let long = st
+                .core_watch
+                .started_at
+                .map(|t| t.elapsed() >= CORE_HEALTHY_AFTER)
+                .unwrap_or(false);
+            st.core_watch.started_at = None;
+            if long {
+                // 跑够久才崩的不算"起不来"，从零开始记。
+                st.core_watch.failures = 0;
+            }
+            if !st.core_watch.gave_up {
+                st.core_watch.next_try = Some(Instant::now() + CORE_RETRY_GAPS[0]);
+            }
+            long
+        };
+        if ran_long {
+            crate::logging::event("info", "core", "上一轮内核活得够久，失败计数已清零");
+        }
+        crate::toast(ui, 2, reason);
+    }
+
+    if ctx.maint.core.is_running() {
+        // 在跑：记下这一轮的起点；跑够时长就把失败计数清零。
+        let mut st = ctx.maint.state();
+        match st.core_watch.started_at {
+            None => st.core_watch.started_at = Some(Instant::now()),
+            Some(started) if started.elapsed() >= CORE_HEALTHY_AFTER => {
+                st.core_watch.failures = 0;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    let due = {
+        let st = ctx.maint.state();
+        if st.core_watch.gave_up || st.busy_core {
+            return;
+        }
+        let now = Instant::now();
+        st.core_watch.next_try.map(|t| now >= t).unwrap_or(true)
+    };
+    if !due {
+        return;
+    }
+    attempt_core_start(ctx, ui).await;
+}
+
+/// 试一次启动，并按"进程在不在 + 握手成不成"记账。
+///
+/// `start_managed_core` 返回的那句话**不参与判定**：它把"没找到内核""启动失败"
+/// 也包在 `Some` 里，照着 `Some` 报成功会把失败说成成功。
+async fn attempt_core_start(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    let started = start_managed_core(ctx).await;
+    let running = ctx.maint.core.is_running();
+    let live = if running {
+        crate::handshake_live(ctx).await
+    } else {
+        false
+    };
+    match restart_outcome(started.as_deref(), running, live) {
+        RestartOutcome::Connected => {
+            {
+                let mut st = ctx.maint.state();
+                st.core_watch = CoreWatch {
+                    started_at: Some(Instant::now()),
+                    ..CoreWatch::default()
+                };
+            }
+            set_core_retry_needed(ui, false);
+            refresh_core_status(ctx, ui);
+            crate::toast(ui, 1, t("内核已启动并连上。"));
+            // 内核换代了：上次记着的挂载/服务要重新下给新的那个进程。
+            crate::spawn_restore(ctx, ui);
+        }
+        RestartOutcome::RunningOffline => {
+            // 进程活着但连不上（端口没就绪、鉴权被拒、对端能力不足）。
+            // 不杀它，交给连接重试；这一轮仍算失败，否则永远卡在"未连接"也不报错。
+            crate::spawn_connect_retry(ctx, ui);
+            let why = t("内核进程在跑，但握手没成功").to_string();
+            note_core_failure(ctx, ui, &why);
+        }
+        RestartOutcome::NotRunning(why) => {
+            let why = why.to_string();
+            note_core_failure(ctx, ui, &why);
+        }
+    }
+}
+
+/// 记一次失败：递增计数、排下一次重试，第三次之后停手并交回用户。
+fn note_core_failure(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, why: &str) {
+    crate::logging::event("warn", "core", why);
+    let gave_up = {
+        let mut st = ctx.maint.state();
+        st.core_watch.failures = st.core_watch.failures.saturating_add(1);
+        let n = st.core_watch.failures as usize;
+        if n >= CORE_RETRY_GAPS.len() {
+            st.core_watch.gave_up = true;
+            st.core_watch.next_try = None;
+            true
+        } else {
+            st.core_watch.next_try = Some(Instant::now() + CORE_RETRY_GAPS[n - 1]);
+            false
+        }
+    };
+    refresh_core_status(ctx, ui);
+    if gave_up {
+        set_core_retry_needed(ui, true);
+        crate::toast(
+            ui,
+            2,
+            f(
+                "内核连续 {} 次没能启动，已停止自动重试：{}",
+                &[&CORE_RETRY_GAPS.len(), &why],
+            ),
+        );
+    }
+}
+
+/// 「重试启动内核」：清零值守记账，立刻再试一次。
+///
+/// 这不是把手动启停放回来——运维权仍在值守手里，这个按钮只在值守放弃之后出现，
+/// 让用户在换路径、插回移动硬盘、关掉杀软之后能叫它再试，而不必重开程序。
+async fn core_retry(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    {
+        let mut st = ctx.maint.state();
+        st.core_watch = CoreWatch::default();
+    }
+    set_core_retry_needed(ui, false);
+    set_core_status(ui, t("正在重试启动内核…"));
+    attempt_core_start(ctx, ui).await;
+}
+
 // ───────────────────────────── 同步调度 ─────────────────────────────
 
 /// 后台定时器：到点起任务、轮询在跑的 job、刷新列表。
@@ -1922,6 +2159,8 @@ pub async fn watch(ctx: Arc<Ctx>, ui: Weak<MainWindow>) {
 
 /// 一次调度采样。拆出来是为了能单独测"到点该不该起"。
 pub async fn tick(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    // 值守放在最前面：内核没了，后面这些轮询全都无从谈起。
+    supervise_core(ctx, ui).await;
     let now = Instant::now();
     let poll_due = {
         let st = ctx.maint.state();
@@ -2122,6 +2361,44 @@ pub fn migrate_oneclick(ctx: &Arc<Ctx>) -> Vec<String> {
             Err(e) => notes.push(f("清理 oneclick 钩子失败：{}", &[&e])),
         }
     }
+    for n in &notes {
+        crate::logging::event("info", "migrate", n);
+    }
+    notes
+}
+
+/// 旧的「外部 rclone」连法 → 托管内核。
+///
+/// 新界面不再让用户填 RC 地址和口令，也不再提供手动连接/断开：内核随本应用启停，
+/// 连接由程序自己建立。因此 `core.mode == "external"` 已经没有对应界面了——
+/// 留着它，程序启动时就会去连一个用户既看不见、也没法再改的地址，
+/// 而界面上会一直显示"没连上"却说不出原因。
+///
+/// **只改 `mode`，别的字段一个字节都不动。** `rclone.url/user/pass/connect_on_start`
+/// 原样留在配置里：用户当初填它是有原因的（那台机器上的 rclone 可能还跑着别的服务），
+/// 删掉等于替他决定以后不再用。`core.path`、`kept_paths`、`flavor` 同理。
+///
+/// 不需要另外记一个"已迁移"标志：迁移完 `mode` 就是 `"managed"`，
+/// 下次再进来这个函数直接返回，天然只做一次。
+pub fn migrate_external_to_managed(ctx: &Arc<Ctx>) -> Vec<String> {
+    let mut notes = Vec::new();
+    {
+        let cfg = ctx.cfg.lock().unwrap();
+        if cfg.core.normalized_mode() != "external" {
+            return notes;
+        }
+    }
+    let mut cfg = ctx.cfg.lock().unwrap();
+    let old_url = cfg.rclone.url.clone();
+    cfg.core.mode = "managed".to_string();
+    match crate::config::save(&cfg) {
+        Ok(()) => notes.push(f(
+            "原来的「外部 rclone」连接方式已改为托管内核；你填的地址仍然留在配置里（{}）",
+            &[&old_url],
+        )),
+        Err(e) => notes.push(f("已改用托管内核，但保存配置失败：{}", &[&e])),
+    }
+    drop(cfg);
     for n in &notes {
         crate::logging::event("info", "migrate", n);
     }

@@ -25,6 +25,11 @@ sha2 = { workspace = true }
 flate2 = { workspace = true }
 crc32fast = "1"
 semver = { workspace = true }
+# http.upload 的引擎在这里（而不是 app 里）：这个 crate 不带 slint，
+# `cargo test -p plugin_host upload` 几秒就能跑完。
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }

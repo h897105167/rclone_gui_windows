@@ -1,4 +1,10 @@
-//! K-Vault 远程类型（`k-vault`）：rclone 的只读 WebDAV 后端 + 站点 HTTP API 上传。
+//! K-Vault 远程的操作桥：rclone 的只读 WebDAV 后端 + 站点 HTTP API 上传。
+//!
+//! 远程**类型**（下拉框里那一项、编辑表单、旧设置迁移）由 kvault 插件声明，
+//! 主程序不再合成它：插件没装或没启用时，带 `kvault=1` 标记的远程就按普通
+//! webdav 显示，本模块的写入能力一并下线（见 `main.rs` 的 `kv_bridge_owns`）。
+//! 这里只剩「主程序才做得了的那部分」——把文件字节搬到站点 API。插件也能发
+//! HTTP，但只能发字符串，带二进制体的上传它搬不动。
 //!
 //! 为什么做成「webdav + 标记参数」而不是一个新的 rclone 后端：
 //! - RCGUI 不内嵌 rclone，也不能给用户已装好的 rclone.exe 装后端插件，
@@ -30,38 +36,77 @@ use serde_json::{json, Map, Value};
 use std::path::Path;
 use std::time::Duration;
 
-/// 下拉框里的类型名（对用户可见，也是 `k-vault` 远程的唯一识别名）。
-pub const TYPE: &str = "k-vault";
 /// 落盘时实际使用的 rclone 后端类型：浏览/下载要靠它现成的只读支持。
 pub const BACKEND: &str = "webdav";
 /// 远程参数里的标记键：有它才是本 GUI 创建的 K-Vault 远程。
 pub const MARKER: &str = "kvault";
-/// `storage` 的合法取值（与站点文档一致）。
-pub const STORAGES: [&str; 7] = [
-    "telegram",
-    "r2",
-    "s3",
-    "discord",
-    "huggingface",
-    "webdav",
-    "github",
-];
+/// `storage` 参数缺省时用的值（与站点默认一致）。
 pub const DEFAULT_STORAGE: &str = "telegram";
 /// 站点部署侧的单文件上限（100 MB）。超过就不读进内存，直接拒绝。
 ///
 /// 令牌策略可能更小（实测交接令牌 15 MB），那种情况由服务端返回
 /// `413 POLICY_SIZE_EXCEEDED`，提示里带的是策略值，比本地猜更可信。
 pub const MAX_UPLOAD: u64 = 100 * 1024 * 1024;
-/// GUI 侧明文令牌的命名空间（`<data>/plugins/kvault/kv.json`，键 = 远程名）。
+/// 旧版主程序写明文令牌的命名空间（`<data>/plugins/kvault/kv.json`，键 = 远程名）。
 ///
 /// 为什么令牌要另存一份明文：rclone 把 `bearer_token` 当密码，`config/dump`
 /// 只能读回 **obscured** 串（老版本也没有 `config/reveal`），而站点 API 要的是
 /// 明文。与其把 obscured 串当令牌发出去，不如在这里存一份；代价是它和
 /// `config.json` 里的 RC 口令一样是明文落盘（既有债务，不是本次新增的设计）。
+///
+/// 这个命名空间与插件目录同名：卸载 kvault 插件会把整个 `kv.json` 删掉，历史
+/// 令牌也跟着没了。所以它现在**只当旧数据来源**读，新写入一律进 [`TOKEN_NS`]，
+/// 启动时由 [`migrate_kvault_tokens`] 把老记录复制过去（复制，不搬走）。
 pub const STORE_NS: &str = "kvault";
+/// 主程序自己记明文令牌的命名空间（`<data>/plugins/kvault_tokens/kv.json`）。
+///
+/// 与插件目录分开，是为了让「卸载插件」不再等于「删掉用户存过的令牌」。插件不会
+/// 读写这里，它走自己的 `site.token`；这里只放主程序替用户留的按远程名那份。
+pub const TOKEN_NS: &str = "kvault_tokens";
 /// 远程参数里令牌/口令的键（「已设置则不回显」判定用）。
 pub const TOKEN_KEY: &str = "bearer_token";
 pub const PASS_KEY: &str = "pass";
+
+/// 把旧命名空间里的明文令牌复制到 [`TOKEN_NS`]，返回复制了哪些远程。
+///
+/// 只复制、不删除：迁移失败或用户回滚版本时，旧数据还在原处，读侧两个都查。
+/// 幂等：新命名空间里已经有非空令牌的远程直接跳过，重复启动不会覆盖用户后来
+/// 换过的令牌。`site` 这个键是插件存整站令牌用的，不是远程名，跳过它。
+/// 读不到旧数据（没装过、文件损坏）返回空表——这不是错误，正常运行也会走到。
+pub fn migrate_kvault_tokens(store: &crate::kv::KvStore) -> Vec<String> {
+    let old = store.get_all(STORE_NS);
+    let Some(entries) = old.as_object() else {
+        return Vec::new();
+    };
+    let fresh = store.get_all(TOKEN_NS);
+    let mut moved = Vec::new();
+    for (remote, value) in entries {
+        if remote == "site" {
+            continue;
+        }
+        let Some(token) = value.get("token").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if token.is_empty() {
+            continue;
+        }
+        let already = fresh
+            .get(remote)
+            .and_then(|v| v.get("token"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty());
+        if already {
+            continue;
+        }
+        if store
+            .set(TOKEN_NS, remote, json!({ "token": token }))
+            .is_ok()
+        {
+            moved.push(remote.clone());
+        }
+    }
+    moved
+}
 
 /// 一个 K-Vault 远程的配置视图（对应上面 `rclone config show` 的那组参数）。
 #[derive(Clone, Debug, Default)]
@@ -80,17 +125,6 @@ pub struct KvCfg {
     pub storage: String,
     /// 同名去重（`deduplicate=true`）
     pub dedup: bool,
-}
-
-/// `GET /api/v1/me` 里本模块关心的字段。
-#[derive(Clone, Debug, Default)]
-pub struct Probe {
-    pub id: String,
-    pub name: String,
-    pub scopes: Vec<String>,
-    pub storages: Vec<String>,
-    pub max_file: u64,
-    pub folder_prefix: String,
 }
 
 /// 一次上传成功后的关键结果。
@@ -242,109 +276,6 @@ fn http_client(timeout: Duration) -> Result<reqwest::Client, String> {
         .timeout(timeout)
         .build()
         .map_err(|e| rcgui_i18n::f("创建 HTTP 客户端失败: {}", &[&(e)]))
-}
-
-/// 探活 + 读令牌信息：`GET /api/health` 判站点是否在，`GET /api/v1/me` 判令牌与策略。
-///
-/// 两步分开的原因：站点不在和令牌不对是两种完全不同的故障，合成一句
-/// 「连接失败」会让用户去改令牌，实际是域名/网络的问题。
-pub async fn probe(base: &str, token: &str) -> Result<Probe, String> {
-    let base = normalize_base(base);
-    if base.is_empty() {
-        return Err(rcgui_i18n::t("站点地址不能为空").into());
-    }
-    if !(base.starts_with("http://") || base.starts_with("https://")) {
-        return Err(rcgui_i18n::t("站点地址要以 http:// 或 https:// 开头").into());
-    }
-    let http = http_client(Duration::from_secs(15))?;
-
-    let health = http
-        .get(format!("{base}/api/health"))
-        .send()
-        .await
-        .map_err(|e| rcgui_i18n::f("站点不可达: {}", &[&(e)]))?;
-    let status = health.status().as_u16();
-    let body = health.text().await.unwrap_or_default();
-    if status >= 400 {
-        return Err(rcgui_i18n::f(
-            "健康检查失败 · {}",
-            &[&(api_error(status, &body))],
-        ));
-    }
-
-    if token.trim().is_empty() {
-        // 没填令牌也能算「站点可用」：表单允许只配基本认证做浏览。
-        return Ok(Probe::default());
-    }
-    let me = http
-        .get(format!("{base}/api/v1/me"))
-        .bearer_auth(token.trim())
-        .send()
-        .await
-        .map_err(|e| rcgui_i18n::f("读取令牌信息失败: {}", &[&(e)]))?;
-    let status = me.status().as_u16();
-    let body = me.text().await.unwrap_or_default();
-    if status >= 400 {
-        return Err(rcgui_i18n::f(
-            "令牌不可用 · {}",
-            &[&(api_error(status, &body))],
-        ));
-    }
-    let v: Value = serde_json::from_str(&body)
-        .map_err(|e| rcgui_i18n::f("令牌信息不是 JSON（HTTP {}）: {}", &[&(status), &(e)]))?;
-    Ok(parse_me(&v))
-}
-
-/// 解析 `GET /api/v1/me`。
-///
-/// 站点实际返回的是 `{"success":true,"data":{"token":{…}}}`（2026-10-23 实测），
-/// 交接文档里另外写过平铺形式；三种位置都试一遍，免得取值路径不对又被当成「没填令牌」。
-fn parse_me(v: &Value) -> Probe {
-    let data = v.get("data").filter(|d| d.is_object());
-    let node = data
-        .and_then(|d| d.get("token"))
-        .or_else(|| v.get("token"))
-        .or(data)
-        .cloned()
-        .unwrap_or_else(|| v.clone());
-    let policies = node
-        .get("policies")
-        .or_else(|| data.and_then(|d| d.get("policies")))
-        .or_else(|| v.get("policies"))
-        .cloned()
-        .unwrap_or(json!({}));
-    let strings = |v: Option<&Value>| -> Vec<String> {
-        v.and_then(|x| x.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    Probe {
-        id: node
-            .get("id")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
-        name: node
-            .get("name")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
-        scopes: strings(node.get("scopes")),
-        storages: strings(policies.get("allowedStorages")),
-        max_file: policies
-            .get("maxFileSize")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0),
-        folder_prefix: policies
-            .get("folderPrefix")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
-    }
 }
 
 /// 上传一个文件到 `folder`，`name` 作为最终文件名（同名处理由调用方完成）。
@@ -1032,40 +963,6 @@ mod tests {
         assert_eq!(mime_for("noext"), "application/octet-stream");
     }
 
-    /// 站点真实返回（交接文档 2026-10-23 实测）：`data.token` 包一层。
-    /// 曾经只认平铺字段，导致填好令牌还提示「未填令牌」。
-    #[test]
-    fn me_is_read_from_data_token() {
-        let v: Value = serde_json::from_str(
-            r#"{"success":true,"data":{"token":{"id":"EVhBVOYTA6bP","name":"图床",
-            "scopes":["upload","read"],"enabled":true,
-            "policies":{"allowedStorages":["telegram"],"maxFileSize":15728640,
-            "folderPrefix":"image_bed"}}}}"#,
-        )
-        .unwrap();
-        let p = parse_me(&v);
-        assert_eq!(p.id, "EVhBVOYTA6bP");
-        assert_eq!(p.name, "图床");
-        assert_eq!(p.scopes, vec!["upload", "read"]);
-        assert_eq!(p.storages, vec!["telegram"]);
-        assert_eq!(p.max_file, 15728640);
-        assert_eq!(p.folder_prefix, "image_bed");
-    }
-
-    /// 平铺形式仍然要能读，免得站点回退旧格式时又坏掉。
-    #[test]
-    fn me_is_read_from_flat_body() {
-        let v: Value = serde_json::from_str(
-            r#"{"token":{"id":"abc","scopes":["read"]},
-                "policies":{"allowedStorages":["r2"],"maxFileSize":1024,"folderPrefix":""}}"#,
-        )
-        .unwrap();
-        let p = parse_me(&v);
-        assert_eq!(p.id, "abc");
-        assert!(p.folder_prefix.is_empty());
-        assert_eq!(p.max_file, 1024);
-    }
-
     #[test]
     fn files_page_is_parsed_with_cursor() {
         let v: Value = serde_json::from_str(
@@ -1188,5 +1085,89 @@ mod tests {
         assert_eq!(encode_id("tg:AgACAg"), "tg:AgACAg");
         assert_eq!(encode_id("r2:dir/a b.png"), "r2:dir/a%20b.png");
         assert_eq!(encode_id("tg:a#b"), "tg:a%23b");
+    }
+
+    /// 每个用例一个空目录：令牌迁移要真的读写磁盘，不能共用同一份数据。
+    fn tmp_store(tag: &str) -> crate::kv::KvStore {
+        let dir = std::env::temp_dir().join(format!(
+            "rcgui-kvault-test-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::kv::KvStore::new(dir)
+    }
+
+    /// 迁移只复制令牌，老记录一个字节都不动。
+    ///
+    /// 老记录里不只有令牌：站点地址、上传目录、去重开关都在同一份 kv.json 里，
+    /// 迁移把它删掉，用户重装插件后就只剩一个空令牌。
+    #[test]
+    fn token_migration_copies_without_deleting_the_old_record() {
+        let store = tmp_store("migrate-copy");
+        store
+            .set(STORE_NS, "myremote", json!({"token": "kvault_abc"}))
+            .unwrap();
+        let moved = migrate_kvault_tokens(&store);
+        assert_eq!(moved, vec!["myremote".to_string()]);
+        assert_eq!(
+            store
+                .get_all(TOKEN_NS)
+                .get("myremote")
+                .and_then(|v| v.get("token"))
+                .and_then(|v| v.as_str()),
+            Some("kvault_abc")
+        );
+        assert_eq!(
+            store
+                .get_all(STORE_NS)
+                .get("myremote")
+                .and_then(|v| v.get("token"))
+                .and_then(|v| v.as_str()),
+            Some("kvault_abc"),
+            "旧记录必须原样保留"
+        );
+    }
+
+    /// 跑两次不产生第二份数据，也不覆盖用户后来换过的令牌。
+    ///
+    /// 用户可以在插件里重新填一次令牌（写进新命名空间），那时的值才是对的；
+    /// 再拿旧记录盖回去等于把他的新令牌改回旧的，站点会直接 401。
+    #[test]
+    fn token_migration_never_overwrites_a_newer_token() {
+        let store = tmp_store("migrate-idem");
+        store.set(STORE_NS, "r1", json!({"token": "old"})).unwrap();
+        assert_eq!(migrate_kvault_tokens(&store).len(), 1);
+        store.set(TOKEN_NS, "r1", json!({"token": "new"})).unwrap();
+        assert!(
+            migrate_kvault_tokens(&store).is_empty(),
+            "新命名空间已有非空令牌时不该再复制"
+        );
+        assert_eq!(
+            store
+                .get_all(TOKEN_NS)
+                .get("r1")
+                .and_then(|v| v.get("token"))
+                .and_then(|v| v.as_str()),
+            Some("new")
+        );
+    }
+
+    /// `site` 是站点级设置（地址、目录、去重），不是某个远程的令牌，不能被当成远程搬走。
+    #[test]
+    fn token_migration_skips_the_site_record() {
+        let store = tmp_store("migrate-site");
+        store
+            .set(
+                STORE_NS,
+                "site",
+                json!({"token": "should_not_move", "base": "https://kv.example"}),
+            )
+            .unwrap();
+        assert!(migrate_kvault_tokens(&store).is_empty());
+        assert!(store.get_all(TOKEN_NS).get("site").is_none());
     }
 }

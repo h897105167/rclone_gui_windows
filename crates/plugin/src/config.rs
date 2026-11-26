@@ -67,7 +67,7 @@ pub fn cap_of_op(op: &str) -> Option<&'static str> {
         // 早期命名，保留兼容
         "fs.inspect_exe" | "fs.write_file" | "fs.remove_dir" => "fs",
 
-        "http.download" | "http.json" | "http.text" | "http.request" => "http",
+        "http.download" | "http.json" | "http.text" | "http.request" | "http.upload" => "http",
         "proc.start" | "proc.stop" | "proc.status" | "proc.run" => "proc",
         "net.port_open" => "net",
         "rclone.call" | "rclone.upload_file" | "rclone.cat" | "rclone.remotes" => "rclone",
@@ -1078,6 +1078,7 @@ mod tests {
         assert_eq!(cap_of_op("fs.pick_file"), Some("fs"));
         assert_eq!(cap_of_op("proc.start"), Some("proc"));
         assert_eq!(cap_of_op("http.download"), Some("http"));
+        assert_eq!(cap_of_op("http.upload"), Some("http"));
         assert_eq!(cap_of_op("rclone.call"), Some("rclone"));
         assert_eq!(cap_of_op("rm -rf"), None);
     }

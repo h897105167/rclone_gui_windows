@@ -189,6 +189,15 @@ pub async fn replay(ctx: &Arc<Ctx>, ui: &slint::Weak<crate::MainWindow>) {
             continue;
         }
         let fs = crate::compose_fs(&m.remote, &m.sub_path);
+        // 类型没有实现的远程不挂：挂上去只会立刻 403，还在资源管理器里留下一个
+        // 打不开的盘符。条目本身留在 `cfg.auto_mounts` 里，装回插件下次启动照旧恢复。
+        if let Some(msg) = crate::kv_access_blocked(ctx, &m.remote).await {
+            errs.push(rcgui_i18n::f(
+                "挂载 {} → {}: {}",
+                &[&(fs), &(point), &(msg)],
+            ));
+            continue;
+        }
         let opts = serde_json::json!({
             "vfs_cache_mode": m.cache,
             "read_only": m.ro,
@@ -211,6 +220,15 @@ pub async fn replay(ctx: &Arc<Ctx>, ui: &slint::Weak<crate::MainWindow>) {
             continue;
         }
         let fs = crate::compose_fs(&s.remote, &s.sub_path);
+        // 服务同样先跳过：它把站点内容重新暴露成一个局域网地址，插件不在时等于
+        // 绕开本程序的闸门。条目仍留在 `cfg.auto_serves` 里。
+        if let Some(msg) = crate::kv_access_blocked(ctx, &s.remote).await {
+            errs.push(rcgui_i18n::f(
+                "服务 {} {}: {}",
+                &[&(s.stype), &(s.addr), &(msg)],
+            ));
+            continue;
+        }
         match tokio::time::timeout(
             std::time::Duration::from_secs(20),
             client.serve_start(&s.stype, &fs, &s.addr, &s.user, &s.pass),
