@@ -46,7 +46,18 @@ impl Endpoint {
     /// 面向 UI 的安全展示串：只显示地址与用户名，绝不含密码。
     pub fn display(&self) -> String {
         match &self.user {
-            Some(u) if !u.is_empty() => rcgui_i18n::f("{}（用户 {}{}）", &[&(self.url), &(u), &(if self.has_pass { rcgui_i18n::t("，含密码") } else { "" })]),
+            Some(u) if !u.is_empty() => rcgui_i18n::f(
+                "{}（用户 {}{}）",
+                &[
+                    &(self.url),
+                    &(u),
+                    &(if self.has_pass {
+                        rcgui_i18n::t("，含密码")
+                    } else {
+                        ""
+                    }),
+                ],
+            ),
             _ => self.url.clone(),
         }
     }
@@ -187,7 +198,11 @@ mod tests {
     #[tokio::test]
     async fn connect_then_disconnect_keeps_client_as_stale() {
         let st = RcState::new();
-        let c = Arc::new(RcClient::new("http://127.0.0.1:6000", Some("u".into()), Some("p".into())));
+        let c = Arc::new(RcClient::new(
+            "http://127.0.0.1:6000",
+            Some("u".into()),
+            Some("p".into()),
+        ));
         st.set_connected(c.clone()).await;
         assert_eq!(st.status().await, ConnStatus::Connected);
         assert!(st.status().await.is_live());

@@ -18,15 +18,23 @@ pub fn generate(doc: &ProfileDoc, endpoint_hint: &str) -> String {
         doc.meta.name.clone()
     };
     let mut s = String::new();
-    s.push_str(rcgui_i18n::t("# RCGUI 恢复脚本（由 RCGUI 自动生成，请勿手工修改）\n"));
+    s.push_str(rcgui_i18n::t(
+        "# RCGUI 恢复脚本（由 RCGUI 自动生成，请勿手工修改）\n",
+    ));
     s.push_str(&rcgui_i18n::f("# 档案：{}\n", &[&(name)]));
     s.push_str(&rcgui_i18n::f("# 生成时间：{}\n", &[&(crate::now_iso())]));
     s.push_str("#\n");
-    s.push_str(rcgui_i18n::t("# 本脚本只连接**已经在运行**且启用了 RC 的 rclone：\n"));
+    s.push_str(rcgui_i18n::t(
+        "# 本脚本只连接**已经在运行**且启用了 RC 的 rclone：\n",
+    ));
     s.push_str(rcgui_i18n::t("#   * 不会启动、停止或重启 rclone；\n"));
     s.push_str(rcgui_i18n::t("#   * 不会创建开机启动项或计划任务；\n"));
-    s.push_str(rcgui_i18n::t("#   * 不内置 RC 密码（用 -RcUser / -RcPass 或环境变量 RCGUI_RC_USER / RCGUI_RC_PASS）；\n"));
-    s.push_str(rcgui_i18n::t("#   * serve 密码不内置（用 -ServePasses 传入，缺失则跳过该项并告警）。\n"));
+    s.push_str(rcgui_i18n::t(
+        "#   * 不内置 RC 密码（用 -RcUser / -RcPass 或环境变量 RCGUI_RC_USER / RCGUI_RC_PASS）；\n",
+    ));
+    s.push_str(rcgui_i18n::t(
+        "#   * serve 密码不内置（用 -ServePasses 传入，缺失则跳过该项并告警）。\n",
+    ));
     s.push_str("#\n");
     s.push_str(rcgui_i18n::t("# 用法示例：\n"));
     s.push_str(&format!(
@@ -47,11 +55,19 @@ pub fn generate(doc: &ProfileDoc, endpoint_hint: &str) -> String {
     s.push_str(HEADER_FUNCS);
 
     // ---- 挂载（保持保存顺序）----
-    s.push_str(rcgui_i18n::t("\n# ---------------- 挂载（按保存顺序） ----------------\n"));
+    s.push_str(rcgui_i18n::t(
+        "\n# ---------------- 挂载（按保存顺序） ----------------\n",
+    ));
     let mut any_mount = false;
     for m in &doc.mounts {
         if !m.enabled {
-            s.push_str(&rcgui_i18n::f("# 跳过（已停用）：{} -> {}\n", &[&(ps_comment(&compose_fs(&m.remote, &m.sub_path))), &(ps_comment(&m.point))]));
+            s.push_str(&rcgui_i18n::f(
+                "# 跳过（已停用）：{} -> {}\n",
+                &[
+                    &(ps_comment(&compose_fs(&m.remote, &m.sub_path))),
+                    &(ps_comment(&m.point)),
+                ],
+            ));
             continue;
         }
         any_mount = true;
@@ -62,11 +78,16 @@ pub fn generate(doc: &ProfileDoc, endpoint_hint: &str) -> String {
     }
 
     // ---- 服务 ----
-    s.push_str(rcgui_i18n::t("\n# ---------------- 服务（按保存顺序） ----------------\n"));
+    s.push_str(rcgui_i18n::t(
+        "\n# ---------------- 服务（按保存顺序） ----------------\n",
+    ));
     let mut any_serve = false;
     for sv in &doc.serves {
         if !sv.enabled {
-            s.push_str(&rcgui_i18n::f("# 跳过（已停用）：{} {}\n", &[&(ps_comment(&sv.stype)), &(ps_comment(&sv.addr))]));
+            s.push_str(&rcgui_i18n::f(
+                "# 跳过（已停用）：{} {}\n",
+                &[&(ps_comment(&sv.stype)), &(ps_comment(&sv.addr))],
+            ));
             continue;
         }
         any_serve = true;
@@ -77,7 +98,9 @@ pub fn generate(doc: &ProfileDoc, endpoint_hint: &str) -> String {
         s.push_str(rcgui_i18n::t("# （本档案没有启用的服务）\n"));
     }
 
-    s.push_str(rcgui_i18n::t("\nWrite-Host 'RCGUI 恢复完成（未启动/停止任何 rclone 进程）'\n"));
+    s.push_str(rcgui_i18n::t(
+        "\nWrite-Host 'RCGUI 恢复完成（未启动/停止任何 rclone 进程）'\n",
+    ));
     s
 }
 
@@ -265,10 +288,19 @@ mod tests {
             ..Default::default()
         });
         let s = generate(&d, "http://127.0.0.1:5572");
-        assert!(s.contains("serve/start"), "启用的服务必须生成 serve/start 调用");
+        assert!(
+            s.contains("serve/start"),
+            "启用的服务必须生成 serve/start 调用"
+        );
         assert!(s.contains("'webdav@127.0.0.1:8080'"));
-        assert!(s.contains("# 跳过（已停用）：sftp 127.0.0.1:2222"), "停用服务应只留注释");
-        assert!(!s.contains("'sftp@127.0.0.1:2222'"), "停用服务不应生成任何调用");
+        assert!(
+            s.contains("# 跳过（已停用）：sftp 127.0.0.1:2222"),
+            "停用服务应只留注释"
+        );
+        assert!(
+            !s.contains("'sftp@127.0.0.1:2222'"),
+            "停用服务不应生成任何调用"
+        );
     }
 
     #[test]
@@ -289,4 +321,5 @@ mod tests {
         ] {
             assert!(!s.contains(forbidden), "脚本不应包含 {forbidden}");
         }
-    }}
+    }
+}

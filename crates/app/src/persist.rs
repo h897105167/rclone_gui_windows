@@ -9,7 +9,7 @@
 //!
 //! 与 rclone 生命周期无关：只发 RC 请求，绝不启动/停止 rclone 进程。
 
-use crate::config::{self, AutoMount, AutoServe, AppConfig, ServeName};
+use crate::config::{self, AppConfig, AutoMount, AutoServe, ServeName};
 use crate::{mount_key, normalize_mount_point, Ctx};
 use anyhow::anyhow;
 use std::sync::Arc;
@@ -32,7 +32,11 @@ pub fn remember_mount(
         enabled: true,
     };
     let key = mount_key(&item.point);
-    match cfg.auto_mounts.iter().position(|m| mount_key(&m.point) == key) {
+    match cfg
+        .auto_mounts
+        .iter()
+        .position(|m| mount_key(&m.point) == key)
+    {
         Some(i) => cfg.auto_mounts[i] = item,
         None => cfg.auto_mounts.push(item),
     }
@@ -214,7 +218,10 @@ pub async fn replay(ctx: &Arc<Ctx>, ui: &slint::Weak<crate::MainWindow>) {
         .await
         {
             Ok(Ok(_)) => ok_s += 1,
-            Ok(Err(e)) => errs.push(rcgui_i18n::f("服务 {} {}: {}", &[&(s.stype), &(s.addr), &(e)])),
+            Ok(Err(e)) => errs.push(rcgui_i18n::f(
+                "服务 {} {}: {}",
+                &[&(s.stype), &(s.addr), &(e)],
+            )),
             Err(_) => errs.push(rcgui_i18n::f("服务 {} {}: 超时", &[&(s.stype), &(s.addr)])),
         }
     }
@@ -232,7 +239,10 @@ pub async fn replay(ctx: &Arc<Ctx>, ui: &slint::Weak<crate::MainWindow>) {
         crate::toast(
             ui,
             2,
-            rcgui_i18n::f("自动恢复有 {} 项失败：{}", &[&(errs.len()), &(errs.join("；"))]),
+            rcgui_i18n::f(
+                "自动恢复有 {} 项失败：{}",
+                &[&(errs.len()), &(errs.join("；"))],
+            ),
         );
     }
     let _ = stale;

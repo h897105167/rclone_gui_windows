@@ -1,0 +1,64 @@
+name: 发布商店页面
+
+# 这个 workflow 只做一件事：把 docs/ 目录发布到 GitHub Pages。
+# 商店页面在 docs/store/ 下，所以线上地址是 /<repo>/store/，
+# 索引在 https://h897105167.github.io/rclone_gui_windows/store/index.json。
+#
+# 页面是纯静态的：没有构建步骤，没有服务端，没有数据收集。
+# 所以这里不需要 node、不需要 npm install，只是把文件搬上去。
+#
+# 必须在仓库 Settings → Pages 里把 Source 选成 "GitHub Actions"，
+# 否则 deploy 步骤会失败并提示没有 Pages 站点。
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "docs/store/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# Pages 部署需要 write：token 要能创建部署记录。
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时刻只跑一个部署；后来的排在被取消的旧部署之后。
+# cancel-in-progress 为 false：已经上传的产物让它部署完，避免半个站点。
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: 部署到 Pages
+    runs-on: ubuntu-latest
+    # 部署是几十秒的事，留 15 分钟给 GitHub 排队和偶发的 Pages API 慢响应。
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      - name: 校验商店索引
+        # 页面坏掉最常见的原因不是样式，是索引里有个字段写错了。
+        # 部署前先跑一遍校验，宁可这次不发布，也不要发一个读不出内容的页面。
+        shell: pwsh
+        run: ./scripts/validate-store-index.ps1
+
+      - name: 配置 Pages
+        uses: actions/configure-pages@v5
+
+      - name: 打包站点
+        # 站点根就是 docs/：这样 /store/index.json 正好对上约定的公开地址。
+        # docs/ 里的其它 .md 也会被一起发布，它们本来就是公开文档，不含密钥。
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: 部署
+        id: deploy
+        uses: actions/deploy-pages@v4

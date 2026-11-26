@@ -394,10 +394,10 @@ impl ProxyProfile {
             );
         }
         if self.user.contains(':') {
-            return Err(
-                rcgui_i18n::t("ftp / sftp 的原生 socks_proxy 不支持用户名里的「:」：rclone 用它分隔用户名与密码")
-                    .into(),
-            );
+            return Err(rcgui_i18n::t(
+                "ftp / sftp 的原生 socks_proxy 不支持用户名里的「:」：rclone 用它分隔用户名与密码",
+            )
+            .into());
         }
         // IPv6 字面量在 host:port 里必须带方括号，否则 x/net/proxy 解析不了
         let host = self.host.trim();
@@ -654,7 +654,11 @@ fn footprint_of(b: &RemoteProxyBinding) -> Option<(ProxyKey, &str, Option<&str>)
         return None;
     }
     let key = b.applied_key()?;
-    Some((key, b.applied_value.as_str(), b.original_override.as_deref()))
+    Some((
+        key,
+        b.applied_value.as_str(),
+        b.original_override.as_deref(),
+    ))
 }
 
 /// 计算一次下发该做什么。**纯函数**，不碰网络也不碰文件。
@@ -930,7 +934,10 @@ mod tests {
         x.pass = "p@ss:w/rd?#% and space".into();
         let url = x.to_proxy_url().unwrap();
         // 原始字符不得出现在 userinfo 里造成歧义
-        assert!(!url.contains("alice@corp@"), "用户名里的 @ 必须被编码: {url}");
+        assert!(
+            !url.contains("alice@corp@"),
+            "用户名里的 @ 必须被编码: {url}"
+        );
         assert!(url.contains("%40"), "@ 应编码为 %40: {url}");
         assert!(url.contains("%25"), "% 应编码为 %25: {url}");
         assert!(!url.contains(' '), "空格必须编码: {url}");
@@ -962,7 +969,12 @@ mod tests {
         x.pass = "se:cr@t".into();
         let url = x.to_proxy_url().unwrap();
         assert_eq!(url, "socks5://bob:se%3Acr%40t@127.0.0.1:1080");
-        let userinfo = url.strip_prefix("socks5://").unwrap().split('@').next().unwrap();
+        let userinfo = url
+            .strip_prefix("socks5://")
+            .unwrap()
+            .split('@')
+            .next()
+            .unwrap();
         let (_, pw) = userinfo.split_once(':').unwrap();
         assert_eq!(percent_decode(pw), "se:cr@t");
     }
@@ -1036,7 +1048,10 @@ mod tests {
     #[test]
     fn protocol_parse_is_strict() {
         assert_eq!(ProxyProtocol::parse("HTTP"), Some(ProxyProtocol::Http));
-        assert_eq!(ProxyProtocol::parse(" socks5h "), Some(ProxyProtocol::Socks5h));
+        assert_eq!(
+            ProxyProtocol::parse(" socks5h "),
+            Some(ProxyProtocol::Socks5h)
+        );
         // 未知 scheme 不猜 —— 实测 rclone 会把未知 scheme 当 HTTP 代理静默使用
         assert_eq!(ProxyProtocol::parse("ftp-proxy"), None);
         assert_eq!(ProxyProtocol::parse(""), None);
@@ -1075,9 +1090,21 @@ mod tests {
         let b = ProxyProfile::duplicate_with_id(&a, "p2");
         let proxies = vec![a, b];
         let bindings = vec![
-            RemoteProxyBinding { remote: "r1".into(), proxy_id: "p1".into(), ..Default::default() },
-            RemoteProxyBinding { remote: "r2".into(), proxy_id: String::new(), ..Default::default() },
-            RemoteProxyBinding { remote: "r3".into(), proxy_id: "gone".into(), ..Default::default() },
+            RemoteProxyBinding {
+                remote: "r1".into(),
+                proxy_id: "p1".into(),
+                ..Default::default()
+            },
+            RemoteProxyBinding {
+                remote: "r2".into(),
+                proxy_id: String::new(),
+                ..Default::default()
+            },
+            RemoteProxyBinding {
+                remote: "r3".into(),
+                proxy_id: "gone".into(),
+                ..Default::default()
+            },
         ];
         let reg = ProxyRegistry::new(&proxies, &bindings);
         assert_eq!(reg.for_remote("r1").map(|p| p.id.as_str()), Some("p1"));
@@ -1120,7 +1147,11 @@ mod tests {
 
     #[test]
     fn binding_serde() {
-        let b = RemoteProxyBinding { remote: "r".into(), proxy_id: "p".into(), ..Default::default() };
+        let b = RemoteProxyBinding {
+            remote: "r".into(),
+            proxy_id: "p".into(),
+            ..Default::default()
+        };
         let s = serde_json::to_string(&b).unwrap();
         assert_eq!(serde_json::from_str::<RemoteProxyBinding>(&s).unwrap(), b);
         assert!(!b.is_direct());
@@ -1131,7 +1162,10 @@ mod tests {
         };
         assert!(!applied.needs_apply());
         // 「不代理」永远不需要下发
-        let direct = RemoteProxyBinding { proxy_id: String::new(), ..b };
+        let direct = RemoteProxyBinding {
+            proxy_id: String::new(),
+            ..b
+        };
         assert!(!direct.needs_apply());
     }
 
@@ -1146,7 +1180,11 @@ mod tests {
         assert_eq!(proxy_key_for("sftp", Socks5h), ProxyKey::NativeSocks);
         assert_eq!(proxy_key_for("ftp", Https), ProxyKey::NativeHttp);
         for t in ["s3", "webdav", "drive", "", "unknown", "alias"] {
-            assert_eq!(proxy_key_for(t, Socks5), ProxyKey::Override, "{t} 应走 override");
+            assert_eq!(
+                proxy_key_for(t, Socks5),
+                ProxyKey::Override,
+                "{t} 应走 override"
+            );
         }
         assert!(uses_native_keys("FTP"));
         assert!(!uses_native_keys("s3"));
@@ -1163,10 +1201,19 @@ mod tests {
     fn apply_value_selects_key_and_format() {
         let http = p(ProxyProtocol::Http, "h", 1);
         let socks = p(ProxyProtocol::Socks5, "h", 1);
-        assert_eq!(apply_value(&http, "ftp"), ("http_proxy", "http://h:1".into()));
-        assert_eq!(apply_value(&http, "s3"), ("override.http_proxy", "http://h:1".into()));
+        assert_eq!(
+            apply_value(&http, "ftp"),
+            ("http_proxy", "http://h:1".into())
+        );
+        assert_eq!(
+            apply_value(&http, "s3"),
+            ("override.http_proxy", "http://h:1".into())
+        );
         assert_eq!(apply_value(&socks, "ftp"), ("socks_proxy", "h:1".into()));
-        assert_eq!(apply_value(&socks, "s3"), ("override.http_proxy", "socks5://h:1".into()));
+        assert_eq!(
+            apply_value(&socks, "s3"),
+            ("override.http_proxy", "socks5://h:1".into())
+        );
     }
 
     /// 原生 socks_proxy 是**裸** host:port，不带 scheme，也不做 URL 编码。
@@ -1264,11 +1311,13 @@ mod tests {
     fn plain_backend_sets_override_and_remembers_original() {
         let prof = p(ProxyProtocol::Http, "rcgui", 1);
         let cur = vals(Some("http://user:3128"), None, None);
-        let (steps, commit, outcome) =
-            steps_of(plan_apply(Some(&prof), "s3", &cur, None).unwrap());
+        let (steps, commit, outcome) = steps_of(plan_apply(Some(&prof), "s3", &cur, None).unwrap());
         assert_eq!(
             steps,
-            vec![ProxyStep::Set { key: ProxyKey::Override, value: "http://rcgui:1".into() }]
+            vec![ProxyStep::Set {
+                key: ProxyKey::Override,
+                value: "http://rcgui:1".into()
+            }]
         );
         assert_eq!(commit.key, ProxyKey::Override);
         assert_eq!(commit.value, "http://rcgui:1");
@@ -1282,7 +1331,9 @@ mod tests {
         let cur = vals(Some("http://rcgui:1"), None, None);
         assert_eq!(
             plan_apply(Some(&prof), "s3", &cur, None).unwrap(),
-            ApplyPlan::Nothing { key: ProxyKey::Override },
+            ApplyPlan::Nothing {
+                key: ProxyKey::Override
+            },
             "值相同就不要重复调 config/update"
         );
     }
@@ -1292,10 +1343,16 @@ mod tests {
     fn same_value_with_footprint_is_nothing() {
         let prof = p(ProxyProtocol::Http, "rcgui", 1);
         let cur = vals(Some("http://rcgui:1"), None, None);
-        let b = binding("override.http_proxy", "http://rcgui:1", Some("http://user:3128"));
+        let b = binding(
+            "override.http_proxy",
+            "http://rcgui:1",
+            Some("http://user:3128"),
+        );
         assert_eq!(
             plan_apply(Some(&prof), "s3", &cur, Some(&b)).unwrap(),
-            ApplyPlan::Nothing { key: ProxyKey::Override }
+            ApplyPlan::Nothing {
+                key: ProxyKey::Override
+            }
         );
     }
 
@@ -1304,9 +1361,12 @@ mod tests {
     fn value_change_keeps_earliest_original() {
         let prof = p(ProxyProtocol::Http, "rcgui2", 2);
         let cur = vals(Some("http://rcgui:1"), None, None);
-        let b = binding("override.http_proxy", "http://rcgui:1", Some("http://user:3128"));
-        let (steps, commit, _) =
-            steps_of(plan_apply(Some(&prof), "s3", &cur, Some(&b)).unwrap());
+        let b = binding(
+            "override.http_proxy",
+            "http://rcgui:1",
+            Some("http://user:3128"),
+        );
+        let (steps, commit, _) = steps_of(plan_apply(Some(&prof), "s3", &cur, Some(&b)).unwrap());
         assert_eq!(steps.len(), 1);
         assert_eq!(commit.original.as_deref(), Some("http://user:3128"));
     }
@@ -1315,11 +1375,18 @@ mod tests {
     #[test]
     fn rollback_restores_original_and_clears_footprint() {
         let cur = vals(Some("http://rcgui:1"), None, None);
-        let b = binding("override.http_proxy", "http://rcgui:1", Some("http://user:3128"));
+        let b = binding(
+            "override.http_proxy",
+            "http://rcgui:1",
+            Some("http://user:3128"),
+        );
         let (steps, commit, outcome) = steps_of(plan_apply(None, "s3", &cur, Some(&b)).unwrap());
         assert_eq!(
             steps,
-            vec![ProxyStep::Restore { key: ProxyKey::Override, value: "http://user:3128".into() }]
+            vec![ProxyStep::Restore {
+                key: ProxyKey::Override,
+                value: "http://user:3128".into()
+            }]
         );
         assert_eq!(commit.value, "", "回滚后不再留脚印");
         assert_eq!(commit.original, None);
@@ -1341,7 +1408,12 @@ mod tests {
         let cur = vals(Some("http://rcgui:1"), None, None);
         let b = binding("override.http_proxy", "http://rcgui:1", None);
         let (steps, commit, outcome) = steps_of(plan_apply(None, "s3", &cur, Some(&b)).unwrap());
-        assert_eq!(steps, vec![ProxyStep::Unset { key: ProxyKey::Override }]);
+        assert_eq!(
+            steps,
+            vec![ProxyStep::Unset {
+                key: ProxyKey::Override
+            }]
+        );
         assert_eq!(commit.value, "");
         assert_eq!(outcome, PlanOutcome::Removed);
     }
@@ -1354,7 +1426,10 @@ mod tests {
         let (steps, _, outcome) = steps_of(plan_apply(None, "s3", &cur, Some(&b)).unwrap());
         assert_eq!(
             steps,
-            vec![ProxyStep::Restore { key: ProxyKey::Override, value: String::new() }]
+            vec![ProxyStep::Restore {
+                key: ProxyKey::Override,
+                value: String::new()
+            }]
         );
         assert_eq!(outcome, PlanOutcome::Restored(String::new()));
     }
@@ -1363,7 +1438,10 @@ mod tests {
     #[test]
     fn unmanaged_remote_is_left_alone() {
         let cur = vals(Some("http://user:3128"), None, None);
-        assert_eq!(plan_apply(None, "s3", &cur, None).unwrap(), ApplyPlan::Unmanaged);
+        assert_eq!(
+            plan_apply(None, "s3", &cur, None).unwrap(),
+            ApplyPlan::Unmanaged
+        );
         let empty = RemoteProxyBinding {
             remote: "r".into(),
             ..Default::default()
@@ -1404,7 +1482,10 @@ mod tests {
         let (steps, commit, _) = steps_of(plan_apply(Some(&prof), "ftp", &empty, None).unwrap());
         assert_eq!(
             steps,
-            vec![ProxyStep::Set { key: ProxyKey::NativeHttp, value: "http://rcgui:1".into() }]
+            vec![ProxyStep::Set {
+                key: ProxyKey::NativeHttp,
+                value: "http://rcgui:1".into()
+            }]
         );
         assert_eq!(commit.key, ProxyKey::NativeHttp);
         assert_eq!(commit.original, None, "原生键只补空缺：写入时它必然为空");
@@ -1433,13 +1514,17 @@ mod tests {
         let cur = vals(None, Some("http://user:3128"), None);
         assert_eq!(
             plan_apply(Some(&prof), "ftp", &cur, None).unwrap(),
-            ApplyPlan::RespectExisting { key: ProxyKey::NativeHttp }
+            ApplyPlan::RespectExisting {
+                key: ProxyKey::NativeHttp
+            }
         );
         // 值恰好相同 → 视为已满足，但不能接管（回滚时会误删用户的值）
         let same = vals(None, Some("http://rcgui:1"), None);
         assert_eq!(
             plan_apply(Some(&prof), "ftp", &same, None).unwrap(),
-            ApplyPlan::Nothing { key: ProxyKey::NativeHttp }
+            ApplyPlan::Nothing {
+                key: ProxyKey::NativeHttp
+            }
         );
         // 空值不算用户配置
         let empty_slot = vals(None, Some(""), None);
@@ -1456,7 +1541,9 @@ mod tests {
         let cur = vals(None, None, Some("user:pass@h:1080"));
         assert_eq!(
             plan_apply(Some(&prof), "ftp", &cur, None).unwrap(),
-            ApplyPlan::RespectExisting { key: ProxyKey::NativeSocks }
+            ApplyPlan::RespectExisting {
+                key: ProxyKey::NativeSocks
+            }
         );
     }
 
@@ -1471,8 +1558,13 @@ mod tests {
         assert_eq!(
             steps,
             vec![
-                ProxyStep::Unset { key: ProxyKey::NativeHttp },
-                ProxyStep::Set { key: ProxyKey::NativeSocks, value: "rcgui:1080".into() },
+                ProxyStep::Unset {
+                    key: ProxyKey::NativeHttp
+                },
+                ProxyStep::Set {
+                    key: ProxyKey::NativeSocks,
+                    value: "rcgui:1080".into()
+                },
             ]
         );
         assert_eq!(commit.key, ProxyKey::NativeSocks);
@@ -1487,7 +1579,10 @@ mod tests {
         let b = binding("http_proxy", "http://rcgui:1", None);
         assert!(matches!(
             plan_apply(Some(&prof), "ftp", &cur, Some(&b)).unwrap(),
-            ApplyPlan::Conflict { key: ProxyKey::NativeHttp, .. }
+            ApplyPlan::Conflict {
+                key: ProxyKey::NativeHttp,
+                ..
+            }
         ));
     }
 
@@ -1497,7 +1592,12 @@ mod tests {
         let cur = vals(Some("http://rcgui:1"), None, None);
         let b = binding("", "http://rcgui:1", None);
         let (steps, _, _) = steps_of(plan_apply(None, "ftp", &cur, Some(&b)).unwrap());
-        assert_eq!(steps, vec![ProxyStep::Unset { key: ProxyKey::Override }]);
+        assert_eq!(
+            steps,
+            vec![ProxyStep::Unset {
+                key: ProxyKey::Override
+            }]
+        );
     }
 
     /// 远程类型从 s3 改成 ftp：旧 override 先还原，再写原生键。
@@ -1508,14 +1608,23 @@ mod tests {
             override_http: Some("http://rcgui-old:1".into()),
             ..Default::default()
         };
-        let b = binding("override.http_proxy", "http://rcgui-old:1", Some("http://user:3128"));
-        let (steps, commit, _) =
-            steps_of(plan_apply(Some(&prof), "ftp", &cur, Some(&b)).unwrap());
+        let b = binding(
+            "override.http_proxy",
+            "http://rcgui-old:1",
+            Some("http://user:3128"),
+        );
+        let (steps, commit, _) = steps_of(plan_apply(Some(&prof), "ftp", &cur, Some(&b)).unwrap());
         assert_eq!(
             steps,
             vec![
-                ProxyStep::Restore { key: ProxyKey::Override, value: "http://user:3128".into() },
-                ProxyStep::Set { key: ProxyKey::NativeHttp, value: "http://rcgui:1".into() },
+                ProxyStep::Restore {
+                    key: ProxyKey::Override,
+                    value: "http://user:3128".into()
+                },
+                ProxyStep::Set {
+                    key: ProxyKey::NativeHttp,
+                    value: "http://rcgui:1".into()
+                },
             ]
         );
         assert_eq!(commit.key, ProxyKey::NativeHttp);
@@ -1533,7 +1642,12 @@ mod tests {
         let b = binding("socks_proxy", "10.0.0.9:1080", None);
         let (steps, commit, outcome) =
             steps_of(plan_apply(Some(&prof), "ftp", &cur, Some(&b)).unwrap());
-        assert_eq!(steps, vec![ProxyStep::Unset { key: ProxyKey::NativeSocks }]);
+        assert_eq!(
+            steps,
+            vec![ProxyStep::Unset {
+                key: ProxyKey::NativeSocks
+            }]
+        );
         assert_eq!(commit.value, "", "没有写入目标键，不能留脚印");
         assert_eq!(outcome, PlanOutcome::Respect(ProxyKey::NativeHttp));
     }

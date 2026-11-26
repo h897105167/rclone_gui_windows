@@ -98,11 +98,17 @@ myplugin/
   "builtin": false,                  // 可选。true 表示"随本体分发"，见 §6.4
   "http_entry": false,               // 可选。true 表示接管内嵌 HTTP 路由，见 §5.7
   "capabilities": ["kv", "ui"],      // 必填（可为空数组）。能力组，见 §5
+  "remote_types": [                  // 可选。在"新建远程"里加派生类型，见 §2.1.2
+    { "id": "my-type", "name": "我的类型", "base_type": "webdav", "defaults": { "vendor": "other" } }
+  ],
   "plugin_setting": {                // 可选。插件页的声明式界面，见 §4
     "version": 1,
     "summary": "一句话介绍这个插件能干什么。",
     "on_start": "get",               // 可选。打开插件页时自动执行的动作 key
     "on_exit": "exit",               // 可选。仅登记，不调用 WASM（见 §4.5）
+    "pages": [                       // 可选。把控件分页显示，见 §2.1.2
+      { "id": "basic", "label": "基础" }
+    ],
     "controls": [ /* 见 §4.1 */ ]
   }
 }
@@ -141,6 +147,62 @@ myplugin/
 - `plugin_setting.version: 2` 起选项支持 `{ value, label }`；仍为 1 的按纯字符串数组解析。
 - 插件**自身的文案**（wasm 里弹出的提示、错误信息）不归宿主管：宿主每轮调用都会带
   `params.lang`（`"zh"` / `"en"`），插件据此切自己的译文表（见 §5.2）。
+
+#### 2.1.2 纯元数据：`remote_types` 与 `plugin_setting.pages`
+
+这两样只描述界面结构，不执行任何代码，因此**不需要在 `capabilities` 里声明能力组**
+（宿主侧见 `crates/plugin/src/config.rs:692`）。它们属于 0.3.0 开发版新增的契约，
+0.3.0 尚未发布；旧插件不写这两个字段照旧解析。
+
+**`remote_types`——在"新建远程"里加一种类型**
+
+```jsonc
+"remote_types": [
+  {
+    "id": "my-type",              // 下拉框里显示的类型 id；同一插件内唯一
+    "name": "我的类型",            // 显示名（可多语言，规则同 §2.1.1）
+    "base_type": "webdav",        // 必填。真正的 rclone 后端类型，必须是宿主认识的后端
+    "defaults": { "vendor": "other" }   // 可选。建远程时写进去的默认参数
+  }
+]
+```
+
+规则（实现见 `crates/plugin/src/config.rs:695 validate_remote_types` 与
+`crates/app/src/remote_types.rs`）：
+
+- 一条插件最多 16 个派生类型，`id` 重复会被拒绝（`config.json 的 remote_types 过多`／
+  `remote_types 的 id 重复`）；
+- `base_type` 必须是宿主真实存在的后端（如 `webdav`、`s3`）；写一个不存在的后端，
+  加载时报错，不会悄悄降级；
+- 用户选中派生类型建远程时，**落盘的 `type` 是 `base_type`**，不是派生 id；派生 id
+  只在界面和 `defaults` 里体现（`crates/app/src/main.rs:2787`）；
+- 用户已经建好的远程不受影响：插件被停用或卸载后，那些远程仍然是 `base_type` 远程，
+  照样能用（`crates/plugin/src/config.rs:632`）。
+
+**`plugin_setting.pages`——把控件分页**
+
+`controls` 是平铺的；要给它们分组，就在 `plugin_setting.pages` 里按顺序列出页：
+
+```jsonc
+"plugin_setting": {
+  "version": 2,
+  "pages": [
+    { "id": "basic", "label": "基础" },
+    { "id": "advanced", "label": "高级" }
+  ],
+  "controls": [
+    { "kind": "text", "key": "host", "label": "地址", "page": "basic" },
+    { "kind": "text", "key": "proxy", "label": "代理", "page": "advanced" }
+  ]
+}
+```
+
+- 每页必须有 `id` 和 `label`（缺了报 `plugin_setting.pages[i] 缺少 id`／`… 缺少 label`），
+  `id` 不能重复（`plugin_setting.pages 的 id 重复`）；
+- 控件用 `page` 指定归属，值必须是已声明的页 id；写了一个没声明的页会在加载时被拒绝
+  （`… 的 page 未在 plugin_setting.pages 里声明`），不是悄悄忽略；
+- 不写 `page` 的控件归"默认页"（`Control::page` 保持空串），不写 `pages` 时行为与
+  老插件完全一致：一页平铺。
 
 ### 2.2 `check.sha256`
 
@@ -887,7 +949,94 @@ fn main() {
 
 ---
 
-## 11. 参考实现
+## 11. K-Vault：内置远程类型与 `kvault` 插件
+
+K-Vault 是"rclone 的只读 WebDAV 后端 + 站点自己的 HTTP API"。它现在有两条路，
+写文档时不要混为一谈：
+
+| 路径 | 状态 | 在哪 |
+|---|---|---|
+| 本体内置的 `k-vault` 远程类型（专用表单） | 代码在 HEAD，随 0.3.0 发布，未验收 | `crates/app/src/kvault.rs` |
+| `kvault` 插件（声明派生类型 + 自己管令牌） | 开发中，未发布、不在商店索引里 | `plugin_repos/rcgui-plugin-kvault/` |
+
+### 11.1 落盘形态：它就是 webdav
+
+用户在本体里选"K-Vault"建远程，`rclone config show` 里看到的 `type` 是 **`webdav`**，
+另有一组 `kvault*` 键做记号（`crates/app/src/kvault.rs:18-22`）：
+
+```
+type            = webdav
+url             = https://<站点>/dav
+bearer_token    = kvault_xxxxxxxxxx_yyyy   # 或用户名/密码基本认证
+kvault          = 1                        # 标记：本 GUI 的 K-Vault 远程
+kvault_folder   = image_bed                # 上传目录（folderPath）
+kvault_storage  = telegram                 # 上传后端（storage）
+kvault_dedup    = 1                        # 同名去重（deduplicate）
+```
+
+- `kvault*` 这几个键 rclone 不认识，但实测会原样保存、也不影响加载
+  （`crates/app/src/kvault.rs:25`）；
+- 建远程时还会写 `vendor = other`，关掉 rclone 对 ownCloud/Nextcloud 的私有探测
+  （`crates/app/src/kvault.rs:192`）——不写会让 webdav 后端按 vendor 走别的分支；
+- 判断一个远程是不是 K-Vault：看参数里有没有 `kvault=1`
+  （`KvCfg::is_marked`，`crates/app/src/kvault.rs:38`）。**不要按 `type` 判断**，它是 webdav。
+
+### 11.2 读写分工：浏览走 DAV，写走站点 API
+
+站点的 `/dav` 端点只放行读，所有写方法一律 403。所以：
+
+| 操作 | 走哪 | 说明 |
+|---|---|---|
+| 浏览 / 下载 | WebDAV（rclone 正常路径） | 无需改动，rclone 自己处理 |
+| 上传 | `POST /api/v1/upload` | 只在源或目标是 K-Vault 远程时改道（`crates/app/src/caps.rs:264`） |
+| 列目录 | `GET /api/v1/files` | 站点索引，见 `crates/app/src/main.rs:3250` |
+| 删除 | `DELETE /api/v1/file/<id>` | 要先按名字翻出 id（`crates/app/src/main.rs:3297`） |
+| 改名 / 移动 / 新建目录 | 不支持 | 站点只读 + API 没有这些端点，本体直接提示去站点网页端操作 |
+
+插件视角：`rclone.upload_file` 的目标如果是 K-Vault 远程，宿主会把它接到站点 API
+上并回 `{link,name,deduped}`——这是既有插件（图床等）不必改代码就能继续用的**兼容路径**
+（`crates/app/src/caps.rs:419-438`）。插件不需要、也不应该自己去调站点的上传接口。
+
+### 11.3 令牌从哪来
+
+三处，含义不同（`crates/app/src/main.rs:2860-2870`）：
+
+1. **rclone 远程参数里的 `bearer_token`**：`kvault` 插件新建远程时写这里，随配置一起走。
+2. **本体侧表 `<data>/plugins/kv.json`**：`kvault::STORE_NS`（`crates/app/src/kvault.rs:55-61`），
+   键是远程名，存明文令牌；远程被删时这份也一起清掉（`crates/app/src/main.rs:8083`）。
+3. **`kvault` 插件自己的 `site.token`**：整个站点一枚，不区分远程。
+
+注意 `KVAULT_PLUGIN_ID`（插件 id，字符串 `kvault`）和 `kvault::STORE_NS`（本体侧表的
+命名空间，也是 `kvault`）现在恰好同串但含义不同（`crates/app/src/main.rs:2863`）。
+改其中任何一个都要先想清楚另一个。
+
+### 11.4 `kvault` 插件怎么声明
+
+插件不重新实现上面的协议，只做两件事：声明派生类型、管好自己的令牌。
+
+```jsonc
+{
+  "id": "kvault",
+  "name": "K-Vault",
+  "version": "0.3.0",
+  "capabilities": ["kv", "ui"],
+  "remote_types": [
+    { "id": "kvault", "name": "K-Vault", "base_type": "webdav",
+      "defaults": { "vendor": "other" } }
+  ]
+}
+```
+
+- `remote_types` 是元数据，**不需要**在 `capabilities` 里写 `remote_types`（见 §2.1.2）；
+- `defaults.vendor = other` 与内置路径保持一致，否则 rclone 会走 ownCloud 探测；
+- 这个 `config.json` 必须能被宿主解析，宿主侧有专门的用例盯着
+  （`crates/plugin/src/config.rs:1174 real_kvault_config_parses`）——字段名写错就是用户装上
+  打不开；
+- 它**不在** `plugins/manifest.json` 里，也**不在**商店索引里：还没发布。
+
+---
+
+## 12. 参考实现
 
 | 插件 | 仓库 | 说明 |
 |---|---|---|
@@ -904,7 +1053,7 @@ fn main() {
 
 ---
 
-## 12. 变更记录
+## 13. 变更记录
 
 | 契约版本 | 变更 |
 |---|---|
@@ -915,3 +1064,4 @@ fn main() {
 | 1.4 | `select` 新增 `dynamic` 字段（候选项全由 `choices` 提供，`options` 可空）；新增 `rclone.remotes`（读本地 `rclone.conf`，绕开 RC 401）；面板加载失败时先清空行再显示错误，不再残留上一个插件的界面；`imagehost` v0.4.1 改用 `rclone.remotes`，v0.4.2 修掉首屏把已配置远程覆盖成候选列表第一个的毛病 |
 | 1.5 | 新增 `rclone.upload_file`（`fs` + `remote_path` + `filename` + `data_b64`，能当 `need` 用：站点型远程直接回 `{link,name,deduped}`，供插件上传后取直链，普通远程回 `{}`）；`rclone.cat`/`rclone.upload_file` 的 `fs` 都会补冒号，避免 `srcFs:"k-vault"` 被当成相对本地目录；RC 响应分类只把「方法缺失」判为不支持，其余 404 不再被当成 Unsupported 去回退；`status`/`group`/`hint` 控件同样必须写 `key`（否则插件卡片显示「校验失败」）；内置资产升到 `imagehost` v0.5.0、`rcgui-rc` 补测试 |
 | 1.6 | 新增 `field` 的 `multiline`（96 px 多行框）；`result.body` 新增 `hide`（按 `key` 整行隐藏，比 `enabled:false` 干净）与 `repeat`（让本体按 `interval_ms` 自动重跑同一动作，面板关闭即停）；`teldrive` v0.2.0 用它们做到登录前只显示登录控件、扫码后自动轮询、频道与机器人列表内联展示 |
+| 1.7（未发布，0.3.0 开发中） | 纯元数据声明补齐文档与实现：`config.json.remote_types`（在"新建远程"里加派生类型，不需要能力组）与 `plugin_setting.pages` + 控件 `page`（控制分页，写了未声明的页会被拒绝）。同时补齐 §11：K-Vault 的落盘形态（`type` 是 `webdav`，靠 `kvault=1` 认）、读写分工（浏览走 DAV，上传/列目录/删除走站点 API，改名移动不支持）、三条令牌来源，以及 `kvault` 插件的声明方式。**这些代码在开发分支里，尚未发布**，装到正式版上不会生效 |

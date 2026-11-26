@@ -5,20 +5,70 @@
 //! 架构：主线程跑 Slint UI；后台 std 线程内 tokio runtime 负责
 //! rclone 生命周期 / 内嵌 HTTP / 统计轮询 / UI 命令处理；托盘独立线程。
 
+mod backup;
 mod caps;
-mod config;
+mod cli;
 mod conf_io;
+mod config;
+mod core;
 mod http;
 mod kv;
 mod kvault;
+mod lightweight;
+mod logging;
+mod maintenance;
 mod persist;
 mod plugins;
 mod profiles;
 mod proxy;
 mod reconcile;
 mod refresh;
+mod remote_types;
 mod script;
 mod state;
+mod store;
+mod sync_tasks;
+mod update;
+
+/// 测试期独占界面语言。
+///
+/// 语言是进程级全局量（`rcgui_i18n::set_lang`）：一个用例切成英文时，同时在跑的
+/// 其他用例读到的文案就是英文，断言中文的用例会随机失败。这把锁把依赖语言的用例
+/// 串起来，并在作用域结束时恢复进入前的语言。
+#[cfg(test)]
+pub mod test_lang {
+    use rcgui_i18n::{lang, set_lang, Lang};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn gate() -> &'static Mutex<()> {
+        static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+        GATE.get_or_init(|| Mutex::new(()))
+    }
+
+    pub struct LangGuard {
+        held: Option<MutexGuard<'static, ()>>,
+        previous: Lang,
+    }
+
+    impl Drop for LangGuard {
+        fn drop(&mut self) {
+            // 先改回原语言再放锁，否则下一个用例可能拿到还没恢复的值。
+            set_lang(self.previous);
+            self.held.take();
+        }
+    }
+
+    /// 在作用域内把界面语言固定成 `choice`，Drop 时恢复原语言。
+    pub fn use_lang(choice: Lang) -> LangGuard {
+        let held = gate().lock().unwrap_or_else(|e| e.into_inner());
+        let previous = lang();
+        set_lang(choice);
+        LangGuard {
+            held: Some(held),
+            previous,
+        }
+    }
+}
 
 use anyhow::anyhow;
 use rcgui_rc::{ConnStatus, Handshake, ListEntry, RcState};
@@ -27,7 +77,7 @@ use serde_json::{json, Value};
 use slint::{ComponentHandle, Model, ModelRc, VecModel, Weak};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 slint::include_modules!();
@@ -39,16 +89,36 @@ enum Cmd {
     RefreshDashboard,
     FilesInit,
     /// 文件页刷新（seq: UI 请求序号，-1 表示总是应用结果）
-    FilesRefresh { seq: i32 },
+    FilesRefresh {
+        seq: i32,
+    },
     /// 进入子目录（成功后才更新路径，防止网络慢时拼出不存在的路径）
-    FilesEnter { name: String, seq: i32 },
+    FilesEnter {
+        name: String,
+        seq: i32,
+    },
     /// 返回上级目录
-    FilesUp { seq: i32 },
-    FilesDownload { name: String, local: PathBuf },
+    FilesUp {
+        seq: i32,
+    },
+    FilesDownload {
+        name: String,
+        local: PathBuf,
+    },
     FilesMkdir,
-    FilesDel { name: String, is_dir: bool },
-    FilesRename { from: String, to: String, is_dir: bool },
-    FilesCopy { name: String, is_dir: bool },
+    FilesDel {
+        name: String,
+        is_dir: bool,
+    },
+    FilesRename {
+        from: String,
+        to: String,
+        is_dir: bool,
+    },
+    FilesCopy {
+        name: String,
+        is_dir: bool,
+    },
     /// 上传本机文件到当前远程目录（同名自动加序号，不覆盖）
     /// dest 为 Some 时上传到指定远程目录（「上传到…」对话框），否则用当前目录
     FilesUpload {
@@ -56,40 +126,71 @@ enum Cmd {
         dest: Option<String>,
     },
     /// 多选模式勾选：shift 为真时从上次点击行到本行做范围勾选
-    FilesCheck { idx: i32, shift: bool },
+    FilesCheck {
+        idx: i32,
+        shift: bool,
+    },
     /// 多选模式批量选择：0=清空 1=全选 2=反选 3=进入/退出多选模式
-    FilesSelect { mode: i32 },
+    FilesSelect {
+        mode: i32,
+    },
     /// 排序（"name" / "size"）：同键再次点击切换升降序，然后重新列一次目录
-    FilesSort { key: String },
+    FilesSort {
+        key: String,
+    },
     /// 本机窗格列目录（path 为空 = 用当前路径 / 用户主目录）
-    LocalRefresh { path: Option<String> },
+    LocalRefresh {
+        path: Option<String>,
+    },
     /// 本机窗格进入子目录
-    LocalEnter { name: String },
+    LocalEnter {
+        name: String,
+    },
     /// 本机窗格返回上级
     LocalUp,
     /// 本机窗格换一个目录（资源管理器选择器）
     LocalChooseDir,
     /// 本机窗格的某一项上传到远程当前目录
-    LocalUpload { name: String, is_dir: bool },
+    LocalUpload {
+        name: String,
+        is_dir: bool,
+    },
     /// 本机多选勾选：shift 为真时从上次点击行到本行做范围勾选
-    LocalCheck { idx: i32, shift: bool },
+    LocalCheck {
+        idx: i32,
+        shift: bool,
+    },
     /// 本机多选批量选择：0=清空 1=全选 2=反选 3=进入/退出多选模式
-    LocalSelect { mode: i32 },
+    LocalSelect {
+        mode: i32,
+    },
     /// 本机排序（"name" / "size" / "mtime"）：同键再点切换升降序后重新列目录
-    LocalSort { key: String },
+    LocalSort {
+        key: String,
+    },
     /// 「上传到…」：列出远程目标目录下的子文件夹
-    LocalUploadToList { path: String, seq: i32 },
+    LocalUploadToList {
+        path: String,
+        seq: i32,
+    },
     /// 「上传到…」：把本机勾选项上传到指定远程目录
-    LocalUploadTo { dest: String },
+    LocalUploadTo {
+        dest: String,
+    },
     /// 批量下载到本机目录（勾选项）
     FilesDownloadMany {
         items: Vec<(String, bool)>,
         dir: PathBuf,
     },
     /// 批量删除（勾选项，已在界面上确认过）
-    FilesDelMany { items: Vec<(String, bool)> },
+    FilesDelMany {
+        items: Vec<(String, bool)>,
+    },
     /// 面包屑跳转：直接列出目标路径（成功后才更新界面）
-    FilesJump { path: String, seq: i32 },
+    FilesJump {
+        path: String,
+        seq: i32,
+    },
     /// 下载到用户选定的本地目录（文件同名自动加序号；文件夹递归复制）
     FilesDownloadToDir {
         name: String,
@@ -97,7 +198,10 @@ enum Cmd {
         is_dir: bool,
     },
     /// 「移动到…」：列出目标目录下的子文件夹
-    FilesMoveList { path: String, seq: i32 },
+    FilesMoveList {
+        path: String,
+        seq: i32,
+    },
     /// 「移动到…」：把当前项移到目标目录
     FilesMove {
         name: String,
@@ -110,73 +214,123 @@ enum Cmd {
     ///
     /// 单独一个命令而不是塞进 MountAdd：安装要走 winget 子进程（几十秒），
     /// 必须能在 UI 上显示「安装中…」并禁掉按钮，跟挂载表单的生命周期完全不同。
-    WinFspInstall { mirror: bool },
-    MountRemove { point: String },
+    WinFspInstall {
+        mirror: bool,
+    },
+    MountRemove {
+        point: String,
+    },
     /// 从历史记录里选择远程路径（scope: 0 挂载 / 1 服务）
-    HistPick { scope: i32, path: String },
-    BrowseOpen { scope: i32 },
-    BrowseGoto { name: String },
+    HistPick {
+        scope: i32,
+        path: String,
+    },
+    BrowseOpen {
+        scope: i32,
+    },
+    BrowseGoto {
+        name: String,
+    },
     BrowseOk,
     RemotesRefresh,
     /// 搜索文本变化（防抖后触发；scope: 0 远程 / 1 挂载 / 2 服务）
-    SearchApply { scope: i32 },
+    SearchApply {
+        scope: i32,
+    },
     RemoteAdd,
-    RemoteEditLoad { name: String },
-    RemoteDelete { name: String },
+    RemoteEditLoad {
+        name: String,
+    },
+    RemoteDelete {
+        name: String,
+    },
     RemoteSave,
     RemoteCancel,
     RemoteTypeChanged,
+    /// 类型下拉上方的搜索框：只过滤显示，不改变已选中的真实类型。
+    RemoteTypeSearch(String),
     /// 探测 K-Vault 站点与令牌（编辑器里的「测试连接」）
     KvTest,
     // ---------------- 代理（按 remote 分配） ----------------
     /// 打开/刷新代理配置列表（供远程页的「代理」列与配置卡片使用）
     ProxyListRefresh,
     /// 打开代理配置编辑器（`id` 为空 = 新建）
-    ProxyEditLoad { id: String },
+    ProxyEditLoad {
+        id: String,
+    },
     /// 保存代理配置编辑器内容
     ProxySave,
     /// 删除一条代理配置（UI 已确认关联影响）
-    ProxyDelete { id: String },
+    ProxyDelete {
+        id: String,
+    },
     /// 用户点「删除代理配置」：先算关联再弹确认（不真正删除）
-    ProxyDeleteAsk { id: String },
+    ProxyDeleteAsk {
+        id: String,
+    },
     /// 把某 remote 的代理设为第 `idx` 项（0 = 不代理，n = 第 n 条配置）
-    ProxyBind { remote: String, idx: i32 },
+    ProxyBind {
+        remote: String,
+        idx: i32,
+    },
     /// 编辑器取消
     ProxyCancel,
     ServesRefresh,
     ServeStart,
-    ServeStop { id: String },
+    ServeStop {
+        id: String,
+    },
     /// 传输页：进入 / 刷新
     TransfersEnter,
     HideDoneChanged,
     /// 应用全局限速（上传/下载）
     LimitApply,
-    JobStop { id: i64 },
+    JobStop {
+        id: i64,
+    },
     OptionsLoad,
     OptionsSave,
     PluginsRescan,
-    PluginToggle { idx: i32 },
+    PluginToggle {
+        idx: i32,
+    },
     /// 从文件（zip）或文件夹添加插件包
     PluginAddFromFile,
     PluginAddFromDir,
     /// 打开插件目录
     PluginOpenDir,
     /// 展开某个插件：拉取并合成它的通用设置面板
-    PluginPanelOpen { idx: i32 },
+    PluginPanelOpen {
+        idx: i32,
+    },
     /// 收起当前展开的面板
     PluginPanelClose,
     /// 面板里某个输入字段被改动
-    PluginPanelField { key: String, value: String },
+    PluginPanelField {
+        key: String,
+        value: String,
+    },
     /// 从面板的下拉里**选中**一项（写盘后必须重拉面板，否则输入框显示旧值）
-    PluginPanelPick { key: String, value: String },
+    PluginPanelPick {
+        key: String,
+        value: String,
+    },
     /// 面板里某个按钮被点击
-    PluginPanelAction { action: String },
+    PluginPanelAction {
+        action: String,
+    },
     /// 卸载插件（删目录 + 清启用记录；内置插件留墓碑）
-    PluginUninstall { idx: i32 },
+    PluginUninstall {
+        idx: i32,
+    },
     /// 恢复被卸载的内置插件
-    PluginRestore { idx: i32 },
+    PluginRestore {
+        idx: i32,
+    },
     /// 按 id 恢复被卸载的内置插件（卸载后列表里没有那一行，只能靠 id）
-    PluginRestoreById { id: String },
+    PluginRestoreById {
+        id: String,
+    },
     /// 插件列表检索词变化
     PluginSearch,
     SettingsSave,
@@ -188,9 +342,14 @@ enum Cmd {
     /// 重新握手：不动进程，仅重跑版本/配置路径/能力探测
     Reconnect,
     /// 导出 rcgui.conf 到指定路径
-    ConfExport { path: PathBuf, include_secrets: bool },
+    ConfExport {
+        path: PathBuf,
+        include_secrets: bool,
+    },
     /// 解析指定 rcgui.conf 并生成预览（不写盘）
-    ConfPreview { path: PathBuf },
+    ConfPreview {
+        path: PathBuf,
+    },
     /// 应用上一次预览过的导入（先备份当前档案）
     ConfApply,
     /// 生成恢复脚本并预览（只写文件，不执行、不注册启动项）
@@ -215,6 +374,11 @@ enum Cmd {
     CloseToTrayCancel,
     /// 首次关闭提示里选了「直接关闭」：取消勾选并退出
     CloseToTrayQuit,
+    /// 维护页上的按钮：`action` 是动作名，`id` 是它作用的条目（商店/同步任务），没有就是空串
+    Maint {
+        action: String,
+        id: String,
+    },
     Quit,
 }
 
@@ -276,6 +440,11 @@ struct Ctx {
     /// 上次完整重建时正在传的 (job, 文件名)。与当前集合不同就说明要重取 core/transferred；
     /// None = 还没建过快照（轮询第一跳 t=1 先进快路径，必须能区分「空任务」和「还没查过」）。
     tasks_live: Arc<std::sync::Mutex<Option<std::collections::HashSet<(String, String)>>>>,
+    /// 维护页的后端：rclone 内核自启、插件商店、备份、同步调度、应用更新
+    maint: Arc<maintenance::Maintenance>,
+    /// 新建远程时的类型清单。界面只拿到显示名，真实 id 与落盘用的 backend
+    /// 都在这张表里；`RemotesG.type-idx` 是 `visible` 的下标。
+    type_choices: Arc<std::sync::Mutex<TypeChoices>>,
 }
 
 /// 运行中的内嵌 HTTP 服务句柄
@@ -426,11 +595,34 @@ fn toast(ui: &Weak<MainWindow>, kind: i32, msg: impl Into<String>) {
     let _ = ui.upgrade_in_event_loop(move |ui| toast_ui(&ui, kind, msg));
 }
 
-/// 把主窗口藏到托盘（并同步 `visible` 标志，让轮询立刻停下）。
+/// 「用户希望窗口现在是显示着的」：由显式的显示/隐藏动作维护，不由窗口句柄反推。
+///
+/// 为什么不能从 winit 句柄反推可见性：本程序开了 `SLINT_DESTROY_WINDOW_ON_HIDE`
+/// （见 `init_destroy_on_hide`），隐藏会把原生窗口真正销毁，`with_winit_window`
+/// 于是返回 `None`；而启动早期「窗口还没建出来」同样是 `None`。两种情况的可见性
+/// 正好相反，用一个 `unwrap_or(true)` 去猜必然猜错一边——隐藏后仍被当成可见，
+/// 轻量模式永远进不去（后台照旧每秒取数），而窗口一旦真被销毁就再也唤不回来。
+static WINDOW_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// 让 Slint 在隐藏时销毁原生窗口（组件状态和窗口尺寸/位置仍保留）。
+///
+/// 必须在创建任何窗口**之前**调用：Slint 的 winit 后端在 `set_visibility(Hidden)`
+/// 那一刻读这个环境变量，之后再改就没用了。
+///
+/// 换来的东西是实打实的：software renderer 的 surface/context 和整个原生窗口都会
+/// 释放（`i-slint-backend-winit` 的 `suspend()`）；窗口再次显示时由后端的
+/// `ensure_window()` 用保存下来的 attributes 重建，因此不需要我们自己记尺寸。
+fn init_destroy_on_hide() {
+    // 显式写成 "1"：Slint 只判断变量在不在，值是什么无所谓，但写清楚更好审。
+    std::env::set_var("SLINT_DESTROY_WINDOW_ON_HIDE", "1");
+}
+
+/// 把主窗口藏到托盘（隐藏即销毁原生窗口，见 `init_destroy_on_hide`）。
 ///
 /// 用 `hide()` 而不是最小化：最小化会在任务栏留一个按钮，而「隐藏到托盘区」
 /// 的语义是任务栏里看不到它、只能从托盘图标唤起。
 fn hide_to_tray(ui: &Weak<MainWindow>) {
+    WINDOW_SHOWN.store(false, std::sync::atomic::Ordering::Relaxed);
     let _ = ui.upgrade_in_event_loop(|ui| {
         ui.hide().ok();
     });
@@ -574,11 +766,14 @@ fn apply_theme(ui: &MainWindow, mode: u8) {
 fn get_autostart() -> bool {
     use winreg::enums::{HKEY_CURRENT_USER, KEY_QUERY_VALUE};
     let hk = winreg::RegKey::predef(HKEY_CURRENT_USER);
-    hk.open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", KEY_QUERY_VALUE)
-        .ok()
-        .and_then(|k| k.get_value::<String, _>("RcloneGUI").ok())
-        .map(|v| v.contains("rclone-gui"))
-        .unwrap_or(false)
+    hk.open_subkey_with_flags(
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        KEY_QUERY_VALUE,
+    )
+    .ok()
+    .and_then(|k| k.get_value::<String, _>("RcloneGUI").ok())
+    .map(|v| v.contains("rclone-gui"))
+    .unwrap_or(false)
 }
 
 fn set_autostart(on: bool, silent: bool) {
@@ -634,7 +829,10 @@ fn winfsp_installed() -> (bool, String) {
     }
     (
         false,
-        rcgui_i18n::t("未检测到 WinFsp。挂载功能需要安装 WinFsp：https://winfsp.dev/rel/ 安装后重启本程序。").into(),
+        rcgui_i18n::t(
+            "未检测到 WinFsp。挂载功能需要安装 WinFsp：https://winfsp.dev/rel/ 安装后重启本程序。",
+        )
+        .into(),
     )
 }
 
@@ -705,7 +903,9 @@ async fn install_winfsp(ui: &Weak<MainWindow>, mirror: bool, mirror_source: Stri
         toast(
             ui,
             2,
-            rcgui_i18n::t("还没配置 winget 镜像源名：请到「设置 → winget 镜像源」填写，或改用官方源"),
+            rcgui_i18n::t(
+                "还没配置 winget 镜像源名：请到「设置 → winget 镜像源」填写，或改用官方源",
+            ),
         );
         return;
     }
@@ -723,7 +923,9 @@ async fn install_winfsp(ui: &Weak<MainWindow>, mirror: bool, mirror_source: Stri
     winfsp_banner(
         ui,
         true,
-        Some(rcgui_i18n::t("正在用 winget 安装 WinFsp，如弹出授权窗口请点「是」…")),
+        Some(rcgui_i18n::t(
+            "正在用 winget 安装 WinFsp，如弹出授权窗口请点「是」…",
+        )),
         None,
     );
 
@@ -767,13 +969,19 @@ async fn install_winfsp(ui: &Weak<MainWindow>, mirror: bool, mirror_source: Stri
                     Some(rcgui_i18n::t("WinFsp 已安装，重启本程序后生效")),
                     Some(true),
                 );
-                toast(ui, 1, rcgui_i18n::t("WinFsp 安装成功：重启本程序后即可使用挂载"));
+                toast(
+                    ui,
+                    1,
+                    rcgui_i18n::t("WinFsp 安装成功：重启本程序后即可使用挂载"),
+                );
             } else if out.status.success() {
                 // 退出码 0 但目录还是不在：常见于 winget 把它当「已是最新」跳过
                 winfsp_banner(
                     ui,
                     false,
-                    Some(rcgui_i18n::t("winget 报告成功，但仍未检测到 WinFsp；请重启本程序再试或手动安装")),
+                    Some(rcgui_i18n::t(
+                        "winget 报告成功，但仍未检测到 WinFsp；请重启本程序再试或手动安装",
+                    )),
                     None,
                 );
                 toast(ui, 2, rcgui_i18n::t("winget 结束了，但没检测到 WinFsp"));
@@ -783,10 +991,16 @@ async fn install_winfsp(ui: &Weak<MainWindow>, mirror: bool, mirror_source: Stri
                 winfsp_banner(
                     ui,
                     false,
-                    Some(rcgui_i18n::t("winget 认为已是最新版本，但没检测到 WinFsp；请重启本程序再试")),
+                    Some(rcgui_i18n::t(
+                        "winget 认为已是最新版本，但没检测到 WinFsp；请重启本程序再试",
+                    )),
                     None,
                 );
-                toast(ui, 2, rcgui_i18n::t("winget 认为已是最新，但没检测到 WinFsp"));
+                toast(
+                    ui,
+                    2,
+                    rcgui_i18n::t("winget 认为已是最新，但没检测到 WinFsp"),
+                );
             } else {
                 let why = tail_line(&out.stdout, &out.stderr);
                 winfsp_banner(
@@ -802,21 +1016,35 @@ async fn install_winfsp(ui: &Weak<MainWindow>, mirror: bool, mirror_source: Stri
             winfsp_banner(
                 ui,
                 false,
-                Some(rcgui_i18n::t("系统里找不到 winget（App Installer 未安装）：请手动下载安装 WinFsp")),
+                Some(rcgui_i18n::t(
+                    "系统里找不到 winget（App Installer 未安装）：请手动下载安装 WinFsp",
+                )),
                 None,
             );
             toast(
                 ui,
                 2,
-                rcgui_i18n::t("找不到 winget：请从 https://winfsp.dev/rel/ 手动安装，或先装「应用安装程序」"),
+                rcgui_i18n::t(
+                    "找不到 winget：请从 https://winfsp.dev/rel/ 手动安装，或先装「应用安装程序」",
+                ),
             );
         }
         Ok(Err(e)) => {
-            winfsp_banner(ui, false, Some(&rcgui_i18n::f("启动 winget 失败：{}", &[&(e)])), None);
+            winfsp_banner(
+                ui,
+                false,
+                Some(&rcgui_i18n::f("启动 winget 失败：{}", &[&(e)])),
+                None,
+            );
             toast(ui, 2, rcgui_i18n::f("启动 winget 失败：{}", &[&(e)]));
         }
         Err(e) => {
-            winfsp_banner(ui, false, Some(&rcgui_i18n::f("安装线程异常：{}", &[&(e)])), None);
+            winfsp_banner(
+                ui,
+                false,
+                Some(&rcgui_i18n::f("安装线程异常：{}", &[&(e)])),
+                None,
+            );
             toast(ui, 2, rcgui_i18n::f("安装线程异常：{}", &[&(e)]));
         }
     }
@@ -936,8 +1164,8 @@ fn fit_crumbs(all: &[CrumbRow], avail: f32) -> (Vec<CrumbRow>, Vec<CrumbRow>) {
     }
     // 路径框左右各 10px 内边距，再留 4px 给估算误差
     let budget = (avail - 24.0).max(40.0);
-    let total: f32 = all.iter().map(crumb_row_width).sum::<f32>()
-        + (all.len().saturating_sub(1) as f32) * 9.0;
+    let total: f32 =
+        all.iter().map(crumb_row_width).sum::<f32>() + (all.len().saturating_sub(1) as f32) * 9.0;
     if total <= budget {
         return (all.to_vec(), Vec::new());
     }
@@ -1097,7 +1325,9 @@ fn local_rows(dir: &Path, key: &str, desc: bool) -> anyhow::Result<Vec<FileRow>>
         let Ok(meta) = ent.metadata() else { continue };
         let is_dir = meta.is_dir();
         let size = if is_dir { 0 } else { meta.len() };
-        let mtime = meta.modified().unwrap_or_else(|_| std::time::SystemTime::now());
+        let mtime = meta
+            .modified()
+            .unwrap_or_else(|_| std::time::SystemTime::now());
         items.push((name, is_dir, size, mtime));
     }
     items.sort_by(|a, b| {
@@ -1145,6 +1375,11 @@ fn fmt_local_mtime(t: std::time::SystemTime) -> String {
 /// Slint 侧按 `FilesG.checked[i]` 索引取勾选态，两个数组长度必须一致，
 /// 否则越界取值。因此所有写 entries 的地方都走这个函数。
 fn set_file_entries(ui: &MainWindow, rows: Vec<FileRow>) {
+    // 轻量模式期间界面不在屏幕上，这时才回来的取数结果不写进模型：
+    // 写进去等于把刚清掉的几千行重新装回来，而用户根本看不到。
+    if crate::lightweight::suppress_rows(rows.len()) {
+        return;
+    }
     let g = ui.global::<FilesG>();
     let n = rows.len();
     g.set_checked(ModelRc::from(Rc::new(VecModel::from(vec![false; n]))));
@@ -1274,6 +1509,9 @@ async fn apply_remotes_filter(ui: &Weak<MainWindow>, full: &[(String, String, St
         })
         .collect();
     let _ = ui.upgrade_in_event_loop(move |ui| {
+        if crate::lightweight::suppress_rows(rows.len()) {
+            return;
+        }
         ui.global::<RemotesG>()
             .set_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
     });
@@ -1317,7 +1555,12 @@ async fn apply_proxy_column(ui: &Weak<MainWindow>) {
             };
             rows_state.insert(
                 b.remote.clone(),
-                (label, b.needs_apply(), !b.is_direct() && bound.is_none(), idx),
+                (
+                    label,
+                    b.needs_apply(),
+                    !b.is_direct() && bound.is_none(),
+                    idx,
+                ),
             );
         }
         (options, hints, rows_state)
@@ -1360,6 +1603,9 @@ async fn apply_mounts_filter(ui: &Weak<MainWindow>, full: &[MountRow]) {
         .cloned()
         .collect();
     let _ = ui.upgrade_in_event_loop(move |ui| {
+        if crate::lightweight::suppress_rows(rows.len()) {
+            return;
+        }
         ui.global::<MountsG>()
             .set_mounts(ModelRc::from(Rc::new(VecModel::from(rows))));
     });
@@ -1383,6 +1629,9 @@ async fn apply_serves_filter(ui: &Weak<MainWindow>, full: &[ServeRow]) {
         .cloned()
         .collect();
     let _ = ui.upgrade_in_event_loop(move |ui| {
+        if crate::lightweight::suppress_rows(rows.len()) {
+            return;
+        }
         ui.global::<ServesG>()
             .set_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
     });
@@ -1393,11 +1642,7 @@ fn remote_name_of(fs: &str) -> Option<String> {
     match fs.find(':') {
         Some(i) => {
             let name = &fs[..i];
-            if name.is_empty()
-                || name.len() == 1
-                || name.contains('/')
-                || name.contains('\\')
-            {
+            if name.is_empty() || name.len() == 1 || name.contains('/') || name.contains('\\') {
                 None
             } else {
                 Some(name.to_string())
@@ -1442,7 +1687,6 @@ fn job_id_of(group: &str) -> i32 {
 /// 限速单位索引 → 倍率：0=B 1=KB 2=MB 3=GB
 fn limit_unit_mul(u: i32) -> f64 {
     match u {
-
         0 => 1.0,
         1 => 1024.0,
         2 => 1024.0 * 1024.0,
@@ -1483,11 +1727,7 @@ fn byte_rate_str(v: Option<f64>) -> String {
 /// （`global_stats` 或 `job/N`），没有 serve 关联信息。因此这里只在能确证时打标签：
 /// 服务挂了**子路径**（`fs = teldrive:some/sub`）时，任务路径落在该前缀下才算命中；
 /// 根目录服务（`fs = teldrive:`）无法与普通传输区分，一律不标。
-fn match_serve_for_task(
-    serves: &[ServeRow],
-    src: &str,
-    dst: &str,
-) -> slint::SharedString {
+fn match_serve_for_task(serves: &[ServeRow], src: &str, dst: &str) -> slint::SharedString {
     // 只考虑带子路径的服务，并按子路径从长到短匹配（更具体的优先）
     let mut candidates: Vec<(&str, &str)> = serves
         .iter()
@@ -1664,13 +1904,33 @@ async fn build_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             .cloned()
             .unwrap_or_default();
         for it in arr {
-            let group = it.get("group").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let name = it.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let src = it.get("srcFs").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let dst = it.get("dstFs").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let group = it
+                .get("group")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = it
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let src = it
+                .get("srcFs")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let dst = it
+                .get("dstFs")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             let bytes = it.get("bytes").and_then(|x| x.as_f64()).unwrap_or(0.0);
             let size = it.get("size").and_then(|x| x.as_f64()).unwrap_or(0.0);
-            let what = it.get("what").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let what = it
+                .get("what")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             tmap.insert(
                 group,
                 TItem {
@@ -1835,6 +2095,9 @@ fn publish_task_rows(ui: &Weak<MainWindow>, hide_done: bool, filter: &str, mut r
     }
 
     let _ = ui.upgrade_in_event_loop(move |ui| {
+        if crate::lightweight::suppress_rows(rows.len()) {
+            return;
+        }
         ui.global::<TransfersG>()
             .set_tasks(ModelRc::from(Rc::new(VecModel::from(rows))));
     });
@@ -1917,7 +2180,16 @@ async fn apply_global_limit(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let disp = if up.is_none() && down.is_none() {
         String::new()
     } else {
-        rcgui_i18n::f("上传 {} · 下载 {}", &[&(up.map(fmt_bytes).unwrap_or_else(|| rcgui_i18n::t("不限").into())), &(down.map(fmt_bytes).unwrap_or_else(|| rcgui_i18n::t("不限").into()))])
+        rcgui_i18n::f(
+            "上传 {} · 下载 {}",
+            &[
+                &(up.map(fmt_bytes)
+                    .unwrap_or_else(|| rcgui_i18n::t("不限").into())),
+                &(down
+                    .map(fmt_bytes)
+                    .unwrap_or_else(|| rcgui_i18n::t("不限").into())),
+            ],
+        )
     };
     set_effective(ui, disp);
 }
@@ -2058,14 +2330,28 @@ fn build_fields_from_provider(providers: &Value, type_name: &str) -> (String, Ve
     };
     let mut fields = Vec::new();
     for opt in options {
-        let name = opt.get("Name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+        let name = opt
+            .get("Name")
+            .and_then(|n| n.as_str())
+            .unwrap_or_default()
+            .to_string();
         if name.is_empty() {
             continue;
         }
-        let help = opt.get("Help").and_then(|h| h.as_str()).unwrap_or_default().to_string();
+        let help = opt
+            .get("Help")
+            .and_then(|h| h.as_str())
+            .unwrap_or_default()
+            .to_string();
         let ty = opt.get("Type").and_then(|t| t.as_str()).unwrap_or("string");
-        let required = opt.get("Required").and_then(|r| r.as_bool()).unwrap_or(false);
-        let advanced = opt.get("Advanced").and_then(|a| a.as_bool()).unwrap_or(false);
+        let required = opt
+            .get("Required")
+            .and_then(|r| r.as_bool())
+            .unwrap_or(false);
+        let advanced = opt
+            .get("Advanced")
+            .and_then(|a| a.as_bool())
+            .unwrap_or(false);
         // 是否遮住输入只看 IsPassword。
         //
         // rclone 里两个标记互不蕴含：
@@ -2074,7 +2360,10 @@ fn build_fields_from_provider(providers: &Value, type_name: &str) -> (String, Ve
         // 之前用 `sensitive || ty == "password"` 判断，于是 webdav 的 `user`
         // （Sensitive=true、IsPassword=false）被当成密码遮住，而真正的 `pass`
         // （IsPassword=true、Sensitive=false）落成 "text" 明文显示 —— 掩码反了。
-        let is_password = opt.get("IsPassword").and_then(|s| s.as_bool()).unwrap_or(false);
+        let is_password = opt
+            .get("IsPassword")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false);
         // rclone 的 Default 对 Duration 是**纳秒数**、对 SizeSuffix 是**字节数**，
         // 直接 to_string 会得到 "10000000" / "10485760" 这种无单位裸数字，回写时
         // 被 rclone 按秒 / KiB 解析。这里先格式化成带单位的规范文本。
@@ -2226,6 +2515,131 @@ fn fields_to_params(fields: &[FieldRow]) -> Value {
     Value::Object(map)
 }
 
+/// 组装真正发给 rclone 的参数字典：先铺插件声明的默认值，再用用户填的覆盖。
+///
+/// 为什么需要这层：编辑器的字段表是按**内核的 provider 模板**渲染的，插件独有的
+/// 键（K-Vault 的 `kvault` / `kvault_storage` / `kvault_dedup` / `vendor`）不在
+/// 模板里，只按字段表组装时它们会被静默丢掉——远程建出来了，插件却认不出来。
+///
+/// 三条规则：
+/// - 只有**新建**的派生类型才铺默认值。改已有的远程时，用户删掉的键不该被复活。
+/// - `type` 不从默认值里带出来：调用方按选中的类型单独传 `rtype`，两边不打架。
+/// - 用户填的值优先；但**用户留空的键不覆盖默认值**，否则「没填」会把插件的默认
+///   参数擦成空串。
+fn params_for_save(
+    choice: &TypeChoice,
+    derived: &[remote_types::Derived],
+    user: serde_json::Map<String, Value>,
+    is_new: bool,
+) -> Value {
+    let mut out = serde_json::Map::new();
+    if is_new && choice.derived {
+        if let Some(d) = remote_types::find(derived, &choice.id) {
+            for (k, v) in d.initial_params() {
+                if k == "type" || v.trim().is_empty() {
+                    continue;
+                }
+                out.insert(k, Value::String(v));
+            }
+        }
+    }
+    for (k, v) in user {
+        if k == "type" {
+            continue;
+        }
+        // 用户把这个键留空 = 没填。默认值已经在里面了，就别用空串盖掉它。
+        if is_blank_param(&v) && out.contains_key(&k) {
+            continue;
+        }
+        out.insert(k, v);
+    }
+    Value::Object(out)
+}
+
+/// 参数空值判断：空串和 null 都算「用户没填这个键」。
+fn is_blank_param(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::String(s) => s.trim().is_empty(),
+        _ => false,
+    }
+}
+
+/// 把派生类型的默认参数补进「每行一个 key=value」的原始文本，已有同名键的不动。
+///
+/// 返回补好之后的整段文本；没有任何一项可补时返回 `None`（调用方就别写回界面，
+/// 免得把用户正在编辑的光标位置搅乱）。
+fn seed_derived_defaults(
+    choice: &TypeChoice,
+    derived: &[remote_types::Derived],
+    current: &str,
+) -> Option<String> {
+    if !choice.derived {
+        return None;
+    }
+    let d = remote_types::find(derived, &choice.id)?;
+    let existing = parse_kv_lines(current);
+    let missing: Vec<String> = d
+        .initial_params()
+        .into_iter()
+        .filter(|(k, _)| k != "type")
+        .filter(|(_, v)| !v.trim().is_empty())
+        .filter(|(k, _)| !existing.contains_key(k.as_str()))
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(
+        format!("{current}\n{}", missing.join("\n"))
+            .trim()
+            .to_string(),
+    )
+}
+
+/// 保存时要发给 rclone 的那一次请求。
+///
+/// 单独拎出来是为了让「新建远程究竟带哪些参数、发到哪个接口」能被测试盯住。
+/// 这段逻辑原先埋在 UI 回调里，接错线（比如直接用字段表拼参数）只有真的
+/// 保存一次才看得出来，插件默认参数就是这么丢的。
+enum SaveRequest {
+    Create {
+        name: String,
+        rtype: String,
+        params: Value,
+    },
+    Update {
+        name: String,
+        params: Value,
+    },
+}
+
+/// 按「新建还是改已有的」决定接口，并把插件默认值铺进参数。
+///
+/// `rtype` 一律取选中项的 `backend`：插件派生类型落盘的是它的 `base_type`，
+/// 不从参数里读 `type`，免得两个来源打架。
+fn build_save_request(
+    name: &str,
+    choice: &TypeChoice,
+    derived: &[remote_types::Derived],
+    user: serde_json::Map<String, Value>,
+    is_new: bool,
+) -> SaveRequest {
+    let params = params_for_save(choice, derived, user, is_new);
+    if is_new {
+        SaveRequest::Create {
+            name: name.to_string(),
+            rtype: choice.backend.clone(),
+            params,
+        }
+    } else {
+        SaveRequest::Update {
+            name: name.to_string(),
+            params,
+        }
+    }
+}
+
 /// 用现有远程参数值填充 FieldRow 列表
 ///
 /// 密码字段（IsPassword）特殊处理：rclone 在配置里存的是**混淆后的密文**，
@@ -2279,9 +2693,12 @@ where
     F: FnOnce(MainWindow) -> T + Send + 'static,
 {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    if ui.upgrade_in_event_loop(move |u| {
-        let _ = tx.send(f(u));
-    }).is_err() {
+    if ui
+        .upgrade_in_event_loop(move |u| {
+            let _ = tx.send(f(u));
+        })
+        .is_err()
+    {
         return None;
     }
     rx.await.ok()
@@ -2368,7 +2785,10 @@ fn compose_fs(remote: &str, sub_path: &str) -> String {
 /// rclone fs（"name:sub"）→ （远程名, 子路径）
 fn split_fs_str(fs: &str) -> (String, String) {
     match fs.find(':') {
-        Some(i) => (fs[..i].to_string(), fs[i + 1..].trim_matches('/').to_string()),
+        Some(i) => (
+            fs[..i].to_string(),
+            fs[i + 1..].trim_matches('/').to_string(),
+        ),
         None => (fs.trim_end_matches(':').to_string(), String::new()),
     }
 }
@@ -2414,7 +2834,8 @@ fn normalize_mount_point(p: &str) -> String {
     if b.len() == 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
         return format!("{}:\\", b[0].to_ascii_uppercase() as char);
     }
-    if b.len() == 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') && b[0].is_ascii_alphabetic() {
+    if b.len() == 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') && b[0].is_ascii_alphabetic()
+    {
         return format!("{}:\\", b[0].to_ascii_uppercase() as char);
     }
     t.to_string()
@@ -2422,9 +2843,16 @@ fn normalize_mount_point(p: &str) -> String {
 
 /// 列出显示路径的内容；dirs_only=true 只保留文件夹
 /// 根路径 "root://" 列出所有仓库名
-async fn list_display(ctx: &Arc<Ctx>, display: &str, dirs_only: bool) -> (Vec<(String, bool)>, String) {
+async fn list_display(
+    ctx: &Arc<Ctx>,
+    display: &str,
+    dirs_only: bool,
+) -> (Vec<(String, bool)>, String) {
     let d = display.trim();
-    let rest = d.trim_end_matches('/').strip_prefix("root://").unwrap_or("");
+    let rest = d
+        .trim_end_matches('/')
+        .strip_prefix("root://")
+        .unwrap_or("");
     if rest.is_empty() {
         // 根：列出仓库
         let client = ctx.rc.client().await;
@@ -2440,13 +2868,20 @@ async fn list_display(ctx: &Arc<Ctx>, display: &str, dirs_only: bool) -> (Vec<(S
         } else {
             names
         };
-        return (names.into_iter().map(|n| (n, true)).collect(), "root://".into());
+        return (
+            names.into_iter().map(|n| (n, true)).collect(),
+            "root://".into(),
+        );
     }
     let Some((fs, remote)) = split_display(d) else {
         return (vec![], "root://".into());
     };
     let client = ctx.rc.client().await;
-    let r = if remote.is_empty() { "".to_string() } else { remote.clone() };
+    let r = if remote.is_empty() {
+        "".to_string()
+    } else {
+        remote.clone()
+    };
     match client.list(&fs, &r, None).await {
         Ok(entries) => {
             let items: Vec<(String, bool)> = entries
@@ -2511,19 +2946,13 @@ fn providers_cache_path() -> std::path::PathBuf {
     config::data_dir().join("providers_cache.json")
 }
 
-/// 连不上 rclone、也没有磁盘缓存时的兜底类型列表。
-///
-/// 目的只有一个：**不要让「新建远程」死在一个空下拉框上**。这些类型名
-/// 与 rclone 的 backend 名一致；选中后参数表单为空，用户可以用编辑器里的
-/// 「切换到原始模式」直接写参数 JSON，或连上 rclone 后重新选择该类型。
-const FALLBACK_REMOTE_TYPES: &[&str] = &[
-    "alias", "azureblob", "b2", "crypt", "drive", "ftp", "gcs", "http", "local",
-    "onedrive", "s3", "sftp", "smb", "union", "webdav",
-];
-
 /// 把 provider 列表存盘（仅用于离线兜底；失败不影响主流程）。
 fn save_providers_cache(v: &Value) {
-    if v.get("providers").and_then(|p| p.as_array()).map(|a| a.is_empty()).unwrap_or(true) {
+    if v.get("providers")
+        .and_then(|p| p.as_array())
+        .map(|a| a.is_empty())
+        .unwrap_or(true)
+    {
         return; // 空结果不值得覆盖掉一份好的缓存
     }
     let _ = std::fs::write(providers_cache_path(), v.to_string());
@@ -2532,12 +2961,265 @@ fn save_providers_cache(v: &Value) {
 fn load_providers_cache() -> Option<Value> {
     let text = std::fs::read_to_string(providers_cache_path()).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
-    if v.get("providers").and_then(|p| p.as_array()).map(|a| a.is_empty()).unwrap_or(true) {
+    if v.get("providers")
+        .and_then(|p| p.as_array())
+        .map(|a| a.is_empty())
+        .unwrap_or(true)
+    {
         return None;
     }
     Some(v)
 }
 
+// ---------------- 新建远程的类型下拉 ----------------
+//
+// 下拉框里只有一列字符串（`RemotesG.types`），但背后是两类东西：rclone 的
+// 真实 backend 名，和插件声明的派生类型（例如 kvault 基于 webdav）。派生类型
+// 写进配置时必须是 `base_type`，否则 rclone 会当成未知后端拒收；而界面要显示
+// 插件给的名字（可能带中文）。所以这里维护一张平行表：`types` 只放显示名，
+// 真实 id 和落盘用的 backend 都只在这张表里，绝不用显示名当 id。
+
+/// 类型下拉里的一项。
+#[derive(Clone, Debug)]
+struct TypeChoice {
+    /// 界面上显示的名字；插件可以给中文名
+    display: String,
+    /// 派生类型在插件清单里的 id；普通类型就是 backend 名
+    id: String,
+    /// 落进 rclone 配置的 `type` 字段。普通类型等于 `id`，派生类型等于 base_type
+    backend: String,
+    /// 是插件声明的派生类型时为真，决定要不要预铺插件给的 defaults
+    derived: bool,
+}
+
+impl TypeChoice {
+    /// 关键字是否命中这一项。大小写不敏感地比对显示名、id、backend：
+    /// 用户可能记得插件名、也可能记得 rclone 的后端名。
+    ///
+    /// 两头都先去掉空格、连字符、下划线：显示名是「K-Vault」时，用户按习惯敲
+    /// `kvault` 也得能搜到——这条搜索框存在的意义就是省得去猜连字符。
+    fn matches(&self, query_lower: &str) -> bool {
+        squeeze(&self.display.to_lowercase()).contains(query_lower)
+            || squeeze(&self.id.to_lowercase()).contains(query_lower)
+            || squeeze(&self.backend.to_lowercase()).contains(query_lower)
+    }
+}
+
+/// 一次过滤之后，界面该怎么摆。
+///
+/// `idx` 是 `RemotesG.type-idx` 该写成的值；`None` 表示过滤后一项都没有，界面用
+/// `-1` 表示「没有选中项」，此时保存会被拒。
+///
+/// `switched` 为真表示用户原来选中的那个类型被搜索词筛掉了，`idx` 指向的是另一个
+/// 类型。调用方必须把参数表一起换成新类型的，否则选中的是 A、填的是 B 的字段，
+/// 一保存就把参数写到别的后端上。
+/// 把搜索词和候选名字压成同一种形状：去掉空格、连字符、下划线。
+///
+/// 「K-Vault」「k_vault」「kvault」应当是同一次搜索；只压低大小写不够，
+/// 用户不会替我们记住连字符长在哪里。
+fn squeeze(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '-' | '_' | ' '))
+        .collect()
+}
+
+/// 一次过滤的结果：`idx` 是界面该写的 `type-idx`，`switched` 表示选中项被换掉了。
+struct FilterResult {
+    idx: Option<usize>,
+    switched: bool,
+}
+
+/// 类型下拉的当前状态。
+#[derive(Default)]
+struct TypeChoices {
+    /// 全部可选类型。顺序在搜索时不重排，这样清空搜索词能回到原样
+    all: Vec<TypeChoice>,
+    /// 按当前搜索词过滤后的那份；`RemotesG.type-idx` 指的是这一份的下标
+    visible: Vec<TypeChoice>,
+}
+
+impl TypeChoices {
+    /// 用一份新清单替换，返回 `select` 指定的那一项的下标（找不到或为空为 0）。
+    fn reset(&mut self, all: Vec<TypeChoice>, select: Option<&str>) -> usize {
+        self.all = all;
+        self.visible = self.all.clone();
+        select
+            .and_then(|id| self.visible.iter().position(|c| c.id == id))
+            .unwrap_or(0)
+    }
+
+    /// 按关键字重新过滤。
+    ///
+    /// 返回的这一份同时告诉调用方「选中项还成立吗」：搜索把用户已选中的类型筛掉时，
+    /// 界面上的下标会落到别的类型上，下面那张参数表必须跟着换——否则选中的是新类型、
+    /// 填的是旧类型的字段，一保存就写错后端（搜 `kvault` 只剩 K-Vault 却仍显示 Alias
+    /// 表单就是这个）。
+    ///
+    /// 选中项仍在时一律不动它：用户先选好类型、再回头改搜索词，不该被悄悄换成第一项，
+    /// 已经填了一半的参数也不能重铺。
+    fn refilter(&mut self, query: &str, keep_id: Option<&str>) -> FilterResult {
+        let q = squeeze(query.trim().to_lowercase().as_str());
+        self.visible = if q.is_empty() {
+            self.all.clone()
+        } else {
+            self.all.iter().filter(|c| c.matches(&q)).cloned().collect()
+        };
+        if self.visible.is_empty() {
+            // 一条都不剩：没有「默认第一项」可退，界面下标置 -1，保存时会被拒。
+            return FilterResult {
+                idx: None,
+                switched: false,
+            };
+        }
+        match keep_id.and_then(|id| self.visible.iter().position(|c| c.id == id)) {
+            Some(i) => FilterResult {
+                idx: Some(i),
+                switched: false,
+            },
+            // 没有旧选中项（刚打开编辑器）时下标 0 就是表单已经对应的那一项，不算切换。
+            None => FilterResult {
+                idx: Some(0),
+                switched: keep_id.is_some(),
+            },
+        }
+    }
+
+    /// 取 `visible[idx]` 的副本。越界或表空返回 None，调用方必须处理。
+    fn visible_at(&self, idx: usize) -> Option<TypeChoice> {
+        self.visible.get(idx).cloned()
+    }
+
+    /// 当前选中项，按 `type-idx` 取。
+    ///
+    /// `-1` 表示「当前搜索词下一项都没有」：此时没有合法类型，返回 None 让保存被拒，
+    /// 绝不能退回第 0 项——那会把另一套参数写到别的后端上。
+    fn selected(&self, idx: i32) -> Option<TypeChoice> {
+        if idx < 0 {
+            return None;
+        }
+        self.visible_at(idx as usize)
+    }
+}
+
+/// 组装一张完整的类型清单：内核报的后端 + 启用插件声明的派生类型。
+///
+/// 清单里只放真实存在的东西：`providers` 为空（内核没连上、也没有上次成功的缓存）
+/// 就一项都不列，界面据此显示「连接内核后再选类型」。以前这里塞过一份内置类型表
+/// 和内置 `k-vault`，结果是界面上同时出现 `K-Vault` 与 `k-vault` 两项、还能选中
+/// 一个内核根本不认识的后端——用户明确要求类型只来自 rclone。
+fn build_type_choices(providers: &Value, derived: &[remote_types::Derived]) -> Vec<TypeChoice> {
+    let mut out: Vec<TypeChoice> = Vec::new();
+    let names: Vec<String> = providers
+        .get("providers")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.get("Name").and_then(|n| n.as_str()))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    for n in names {
+        out.push(TypeChoice {
+            display: n.clone(),
+            id: n.clone(),
+            backend: n,
+            derived: false,
+        });
+    }
+    for d in derived {
+        // 插件给的 id 若与已有后端同名，说明它想覆盖那个后端：保留插件项，
+        // 因为插件项带着 defaults，用户点了能拿到可用的初始参数。
+        out.retain(|c| c.id != d.id);
+        out.push(TypeChoice {
+            display: d.name.clone(),
+            id: d.id.clone(),
+            backend: d.base_type.clone(),
+            derived: true,
+        });
+    }
+    // 按显示名排序：中英文混排时 ASCII 在前，顺序稳定即可，不比拼音。
+    out.sort_by(|a, b| a.display.to_lowercase().cmp(&b.display.to_lowercase()));
+    out
+}
+
+/// 编辑一个**已经存在**的远程时，下拉里唯一那一项。
+///
+/// 分三种情况，都与「新建」共用同一套类型表：
+/// - `ty` 是 legacy 的 `kvault`：老用户本地建的 k-vault 远程后端写的是 webdav，
+///   但内核不认识 `kvault` 这个类型名。这里给它合成一项，只出现在这条远程的编辑框里，
+///   保存时仍写回 `kvault::BACKEND`，旧数据与上传桥都不动。
+/// - `ty` 是某个已启用插件声明的 id：用插件的显示名与 base_type。
+/// - 其余（内核自带后端）：原名原样往返。
+fn edit_single_choice(ty: &str, derived: &[remote_types::Derived]) -> TypeChoice {
+    if ty == kvault::TYPE {
+        return TypeChoice {
+            display: kvault::TYPE.to_string(),
+            id: kvault::TYPE.to_string(),
+            backend: kvault::BACKEND.to_string(),
+            derived: false,
+        };
+    }
+    match remote_types::find(derived, ty) {
+        Some(d) => TypeChoice {
+            display: d.name.clone(),
+            id: d.id.clone(),
+            backend: d.base_type.clone(),
+            derived: true,
+        },
+        None => TypeChoice {
+            display: ty.to_string(),
+            id: ty.to_string(),
+            backend: ty.to_string(),
+            derived: false,
+        },
+    }
+}
+
+/// 把一张清单推给界面：`types` 放显示名，`type-idx` 指向选中的下标。
+fn push_type_choices(ui: &MainWindow, choices: &[TypeChoice], idx: usize) {
+    push_type_selection(ui, choices, Some(idx));
+}
+
+/// 同上，但允许「没有选中项」。
+///
+/// 过滤后一项都不剩时必须传 `None`：界面写成 `-1`，保存路径拿到 `None` 就会拒绝，
+/// 不会拿另一套参数去建别的后端。
+fn push_type_selection(ui: &MainWindow, choices: &[TypeChoice], idx: Option<usize>) {
+    let g = ui.global::<RemotesG>();
+    let names: Vec<slint::SharedString> = choices
+        .iter()
+        .map(|c| slint::SharedString::from(c.display.as_str()))
+        .collect();
+    g.set_types(ModelRc::from(Rc::new(VecModel::from(names))));
+    g.set_type_idx(match idx {
+        Some(i) => i as i32,
+        None => -1,
+    });
+}
+
+/// 这个类型该用哪张参数表：k-vault 是插件，参数表按插件名（`kvault`）取，
+/// 其余按 rclone 的 backend 名取。
+fn form_fields_type(choice: &TypeChoice) -> String {
+    if choice.id == kvault::TYPE {
+        kvault::TYPE.to_string()
+    } else {
+        choice.backend.clone()
+    }
+}
+
+/// 派生类型的初始参数，写成「原始参数」框里的那种一行一个 `k=v`。
+///
+/// `type` 一律不写：真正落盘的类型是 `base_type`（例如 kvault 存成 webdav），
+/// 由保存路径按 parallel 表决定，用户在这里写反而会被覆盖或写错。
+fn derived_params_text(d: &remote_types::Derived) -> String {
+    d.initial_params()
+        .into_iter()
+        .filter(|(k, _)| k != "type")
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// 更新编辑器字段列表和描述
 fn update_editor_fields(ui: &Weak<MainWindow>, providers: &Value, type_name: &str) {
@@ -2546,7 +3228,9 @@ fn update_editor_fields(ui: &Weak<MainWindow>, providers: &Value, type_name: &st
     if type_name == kvault::TYPE {
         let _ = ui.upgrade_in_event_loop(|ui| {
             let g = ui.global::<RemotesG>();
-            g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(Vec::<FieldRow>::new()))));
+            g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(
+                Vec::<FieldRow>::new(),
+            ))));
             g.set_provider_desc(kv_desc().into());
             g.set_kv_editor(true);
         });
@@ -2572,8 +3256,10 @@ fn update_editor_fields(ui: &Weak<MainWindow>, providers: &Value, type_name: &st
 
 /// 选中 `k-vault` 类型时显示在类型下拉框下方的说明。
 fn kv_desc() -> &'static str {
-    rcgui_i18n::t("K-Vault 站点：浏览/下载走只读 WebDAV，上传走站点 API。\
-令牌在站点的「API 令牌」页创建（需要 upload 权限）；只填用户名/密码时只能浏览。")
+    rcgui_i18n::t(
+        "K-Vault 站点：浏览/下载走只读 WebDAV，上传走站点 API。\
+令牌在站点的「API 令牌」页创建（需要 upload 权限）；只填用户名/密码时只能浏览。",
+    )
 }
 
 /// 读一个远程的参数，判断它是不是 K-Vault 远程；是则返回配置（含明文令牌）。
@@ -2597,8 +3283,71 @@ pub async fn kv_cfg_lookup(
         return None;
     }
     let mut cfg = kvault::KvCfg::from_params(&params);
-    cfg.token = kv_token_in(store, remote);
+    cfg.token = kv_token_resolve(client, store, remote, &params).await;
     Some(cfg)
+}
+
+/// 插件的 id。它和 [`kvault::STORE_NS`] 现在同一个字符串，但含义不同：
+/// 这里是「插件目录名 / KV 命名空间」，那边是「旧版主程序存令牌的键空间」。
+/// 分开写是为了以后改名时不会顺手改错另一边。
+const KVAULT_PLUGIN_ID: &str = "kvault";
+
+/// 找出一枚能直接发 HTTP 的明文令牌。
+///
+/// 历史原因同一枚令牌有三处来源，优先级从旧到新：
+/// 1. 旧版主程序按远程名存下的明文（[`kv_token_put`] 写的）；
+/// 2. rclone 远程参数里的 `bearer_token`——kvault 插件新建远程时写这里；
+/// 3. kvault 插件自己存的 `site.token`（整个站点一枚，不区分远程）。
+///
+/// 三处都空才返回空串；调用方据此判定「没令牌，只能浏览」，不要在这里猜一个。
+async fn kv_token_resolve(
+    client: &rclone_client::RcClient,
+    store: &crate::kv::KvStore,
+    remote: &str,
+    params: &serde_json::Map<String, Value>,
+) -> String {
+    let legacy = kv_token_in(store, remote);
+    if !legacy.is_empty() {
+        return legacy;
+    }
+    if let Some(raw) = params.get(kvault::TOKEN_KEY).and_then(|v| v.as_str()) {
+        let token = kv_reveal(client, raw).await;
+        if !token.is_empty() {
+            return token;
+        }
+    }
+    store
+        .get_all(KVAULT_PLUGIN_ID)
+        .get("site")
+        .and_then(|v| v.get("token"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// 把 rclone 存下的 `bearer_token` 还原成明文。
+///
+/// rclone 对 webdav 的 `bearer_token` 做 obscure 后存储——那是可逆编码，不是加密，
+/// 但直接拿去发请求会被站点拒绝。手工写进配置文件的明文令牌不是合法 obscure 串，
+/// `config/reveal` 会失败，这时原文就是明文，原样使用。
+///
+/// 失败一律当明文：宁可发出一个错的令牌让用户看见 401，也不要静默变成「没有凭据」。
+async fn kv_reveal(client: &rclone_client::RcClient, raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    match client.call("config/reveal", &json!({ "value": raw })).await {
+        Ok(v) => {
+            let plain = v.get("value").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if plain.is_empty() {
+                raw.to_string()
+            } else {
+                plain.to_string()
+            }
+        }
+        Err(_) => raw.to_string(),
+    }
 }
 
 async fn kv_cfg_for(ctx: &Arc<Ctx>, remote: &str) -> Option<kvault::KvCfg> {
@@ -2607,8 +3356,14 @@ async fn kv_cfg_for(ctx: &Arc<Ctx>, remote: &str) -> Option<kvault::KvCfg> {
 }
 
 /// 明文令牌（rclone 里那份是 obscured 的，API 用不了）。
-fn kv_token_get(ctx: &Arc<Ctx>, remote: &str) -> String {
-    kv_token_in(&ctx.store, remote)
+///
+/// 和上传/删除走同一套回落顺序（[`kv_token_resolve`]）：否则「界面说有令牌、
+/// 上传时却说没有凭据」，用户只能看到一句莫名其妙的 401。
+async fn kv_token_get(ctx: &Arc<Ctx>, remote: &str) -> String {
+    match kv_cfg_for(ctx, remote).await {
+        Some(cfg) => cfg.token,
+        None => kv_token_in(&ctx.store, remote),
+    }
 }
 
 fn kv_token_in(store: &crate::kv::KvStore, remote: &str) -> String {
@@ -2708,8 +3463,7 @@ async fn read_kv_form(ui: &Weak<MainWindow>) -> KvForm {
 fn apply_kv_form(ui: &MainWindow, cfg: &kvault::KvCfg, token_set: bool, pass_set: bool) {
     let g = ui.global::<RemotesG>();
     // 存储下拉框以 Rust 侧常量为准（.slint 里的默认值只是首帧占位）
-    let storages: Vec<slint::SharedString> =
-        kvault::STORAGES.iter().map(|s| (*s).into()).collect();
+    let storages: Vec<slint::SharedString> = kvault::STORAGES.iter().map(|s| (*s).into()).collect();
     g.set_kv_storages(ModelRc::from(Rc::new(VecModel::from(storages))));
     g.set_kv_base(cfg.base.clone().into());
     g.set_kv_token("".into());
@@ -2738,8 +3492,7 @@ fn apply_kv_form(ui: &MainWindow, cfg: &kvault::KvCfg, token_set: bool, pass_set
 /// 新建远程 / 从别的类型切过来时的表单初值。
 fn reset_kv_form(ui: &MainWindow, base: &str) {
     let g = ui.global::<RemotesG>();
-    let storages: Vec<slint::SharedString> =
-        kvault::STORAGES.iter().map(|s| (*s).into()).collect();
+    let storages: Vec<slint::SharedString> = kvault::STORAGES.iter().map(|s| (*s).into()).collect();
     g.set_kv_storages(ModelRc::from(Rc::new(VecModel::from(storages))));
     g.set_kv_base(base.into());
     g.set_kv_token("".into());
@@ -2847,7 +3600,8 @@ async fn kv_upload_paths(cfg: &kvault::KvCfg, folder: &str, paths: &[PathBuf]) -
         if p.is_dir() {
             let files = kv_walk(p);
             if files.is_empty() {
-                out.failed.push(rcgui_i18n::f("{}: 目录里没有文件", &[&(name)]));
+                out.failed
+                    .push(rcgui_i18n::f("{}: 目录里没有文件", &[&(name)]));
                 continue;
             }
             let base_dir = join_path(folder, &name);
@@ -2898,15 +3652,29 @@ fn kv_upload_report(up: &KvUpload, where_: &str) -> (i32, String) {
     if up.failed.is_empty() {
         let mut msg = rcgui_i18n::f("已上传 {} 个文件到 {}", &[&(up.ok), &(place)]);
         if up.dedup > 0 {
-            msg.push_str(&rcgui_i18n::f("；其中 {} 个站点已有同一份内容，直接复用了直链", &[&(up.dedup)]));
+            msg.push_str(&rcgui_i18n::f(
+                "；其中 {} 个站点已有同一份内容，直接复用了直链",
+                &[&(up.dedup)],
+            ));
         }
         return (1, msg);
     }
     // 失败项只列前 3 条：toast 是一行字，全塞进去就看不清了。
     let shown: Vec<String> = up.failed.iter().take(3).cloned().collect();
-    let mut msg = rcgui_i18n::f("上传完成 {}/{}，失败 {}：{}", &[&(up.ok), &(up.total), &(up.failed.len()), &(shown.join("；"))]);
+    let mut msg = rcgui_i18n::f(
+        "上传完成 {}/{}，失败 {}：{}",
+        &[
+            &(up.ok),
+            &(up.total),
+            &(up.failed.len()),
+            &(shown.join("；")),
+        ],
+    );
     if up.failed.len() > shown.len() {
-        msg.push_str(&rcgui_i18n::f("（另有 {} 条未列出）", &[&(up.failed.len() - shown.len())]));
+        msg.push_str(&rcgui_i18n::f(
+            "（另有 {} 条未列出）",
+            &[&(up.failed.len() - shown.len())],
+        ));
     }
     (2, msg)
 }
@@ -2916,9 +3684,11 @@ fn kv_upload_report(up: &KvUpload, where_: &str) -> (i32, String) {
 /// 原因，而不是让 rclone 回一个干巴巴的 403。
 async fn kv_write_blocked(ctx: &Arc<Ctx>, remote: &str) -> Option<String> {
     kv_cfg_for(ctx, remote).await.map(|_| {
-        rcgui_i18n::t("K-Vault 远程不支持改名/移动/新建目录：站点只读（WebDAV 写方法一律 403），\
-API 也只开放上传、列表、删除。要在站点上调整目录，请到站点网页端操作。")
-            .to_string()
+        rcgui_i18n::t(
+            "K-Vault 远程不支持改名/移动/新建目录：站点只读（WebDAV 写方法一律 403），\
+API 也只开放上传、列表、删除。要在站点上调整目录，请到站点网页端操作。",
+        )
+        .to_string()
     })
 }
 
@@ -3011,7 +3781,10 @@ async fn kv_delete_into(
         // 站点允许同一目录里同名文件共存（靠主键区分）。删哪一条都不是用户在
         // GUI 里看到的「那一条」，所以宁可不删，把话说明白。
         if !*is_dir && ids.len() > 1 {
-            failed.push(rcgui_i18n::f("{}: 站点有 {} 个同名文件，请到站点网页端处理", &[&(name), &(ids.len())]));
+            failed.push(rcgui_i18n::f(
+                "{}: 站点有 {} 个同名文件，请到站点网页端处理",
+                &[&(name), &(ids.len())],
+            ));
             continue;
         }
         let mut err: Option<String> = None;
@@ -3033,14 +3806,22 @@ async fn kv_delete_into(
     }
     let mut msg = rcgui_i18n::f("已删除 {} 项", &[&(gone.len())]);
     if !gone.is_empty() {
-        msg.push_str(rcgui_i18n::t("（站点目录树有 5 分钟缓存，其它视图可能还会显示一会儿）"));
+        msg.push_str(rcgui_i18n::t(
+            "（站点目录树有 5 分钟缓存，其它视图可能还会显示一会儿）",
+        ));
     }
     if !missing.is_empty() {
-        msg.push_str(&rcgui_i18n::f("；{} 项在站点索引里找不到（可能已被删或改过名）", &[&(missing.len())]));
+        msg.push_str(&rcgui_i18n::f(
+            "；{} 项在站点索引里找不到（可能已被删或改过名）",
+            &[&(missing.len())],
+        ));
     }
     if !failed.is_empty() {
         let shown: Vec<String> = failed.iter().take(2).cloned().collect();
-        msg.push_str(&rcgui_i18n::f("；失败 {}：{}", &[&(failed.len()), &(shown.join("；"))]));
+        msg.push_str(&rcgui_i18n::f(
+            "；失败 {}：{}",
+            &[&(failed.len()), &(shown.join("；"))],
+        ));
     }
     let level = if failed.is_empty() && missing.is_empty() {
         1
@@ -3113,7 +3894,6 @@ async fn kv_upload_into(
     false
 }
 
-
 fn fmt_mtime(mod_time: &str) -> String {
     // rclone 返回 RFC3339（如 2026-01-01T12:34:56.789Z）→ 截断到分钟
     if mod_time.len() >= 16 {
@@ -3124,7 +3904,6 @@ fn fmt_mtime(mod_time: &str) -> String {
 }
 
 /// build.rs 生成：真正嵌入可执行文件的内置 rclone 字节（未内置时为空切片）
-
 
 /// 后台 tokio runtime 的 worker 栈大小。
 ///
@@ -3194,6 +3973,23 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let silent_flag = args.iter().any(|a| a == "--silent");
 
+    // 装上 panic 钩子：崩了至少留一行日志，否则用户只会看到窗口消失。
+    // 这里装（而不是更早）是因为它要解析日志路径；用日志的都不在它之前。
+    logging::install_panic_hook();
+
+    // 无界面命令（--version / --diagnostics / --validate-config / --list-plugins /
+    // --export-accessibility-tree）必须在任何窗口相关初始化之前处理：这些命令要能在
+    // 没有 display 的环境里跑，也不能因为单实例互斥量或 UI 编译产物退出去。
+    //
+    // 带参数时先依附父进程的控制台：发布版是 GUI 子系统，从 cmd/PowerShell 启动时
+    // 进程本身没有 stdout，不依附的话这些命令的输出没人收得到。
+    if args.len() > 1 {
+        attach_parent_console();
+    }
+    if let Some(code) = cli::run() {
+        std::process::exit(code);
+    }
+
     // 单实例：命名互斥量；重复启动时通过本地端口通知已有实例弹出窗口
     if !acquire_single_instance() {
         notify_show();
@@ -3212,24 +4008,40 @@ fn main() {
     rcgui_i18n::set_lang(lang);
 
     // Slint UI
+    //
+    // 在这之前定下「隐藏即销毁原生窗口」的策略：隐藏到托盘、隐藏进轻量模式时，
+    // 图形资源（software renderer 的 surface/context、原生窗口）真的会被释放，
+    // 而不是只从屏幕上消失。见 init_destroy_on_hide 的注释。
+    init_destroy_on_hide();
     let ui = MainWindow::new().expect(rcgui_i18n::t("UI 初始化失败"));
+    // 窗口标题和左上角的自绘文字都读这个属性。带上版本号是为了让人一眼分清
+    // 当前跑的是哪一版：排查时出现过「看到旧窗口，以为新构建没生效」的情况
+    // （旧 exe 还在跑，唤起的其实是旧实例）。
+    ui.set_window_label(format!("RCGUI {}", env!("CARGO_PKG_VERSION")).into());
     apply_slint_language(lang);
     apply_theme(&ui, cfg.theme_mode);
-    ui.global::<SettingsG>().set_rc_user(cfg.rclone.user.clone().into());
-    ui.global::<SettingsG>().set_rc_pass(cfg.rclone.pass.clone().into());
-    ui.global::<SettingsG>().set_rc_url(cfg.rclone.url.clone().into());
+    ui.global::<SettingsG>()
+        .set_rc_user(cfg.rclone.user.clone().into());
+    ui.global::<SettingsG>()
+        .set_rc_pass(cfg.rclone.pass.clone().into());
+    ui.global::<SettingsG>()
+        .set_rc_url(cfg.rclone.url.clone().into());
     ui.global::<SettingsG>()
         .set_connect_on_start(cfg.rclone.connect_on_start);
-    ui.global::<SettingsG>().set_theme_idx(cfg.theme_mode as i32);
+    ui.global::<SettingsG>()
+        .set_theme_idx(cfg.theme_mode as i32);
     ui.global::<SettingsG>()
         .set_language_idx(tag_to_lang_idx(&cfg.language));
     ui.global::<ThemeG>().set_accent_idx(cfg.accent_idx as i32);
-    ui.global::<SettingsG>().set_accent_idx(cfg.accent_idx as i32);
+    ui.global::<SettingsG>()
+        .set_accent_idx(cfg.accent_idx as i32);
     ui.global::<SettingsG>().set_autostart(get_autostart());
     ui.global::<SettingsG>().set_silent(cfg.silent_start);
-    ui.global::<SettingsG>().set_close_to_tray(cfg.close_to_tray);
+    ui.global::<SettingsG>()
+        .set_close_to_tray(cfg.close_to_tray);
     ui.global::<SettingsG>().set_http_enabled(cfg.http.enabled);
-    ui.global::<SettingsG>().set_http_port(cfg.http.port.to_string().into());
+    ui.global::<SettingsG>()
+        .set_http_port(cfg.http.port.to_string().into());
     ui.global::<SettingsG>()
         .set_winget_mirror_source(cfg.winget_mirror_source.clone().into());
     ui.global::<SettingsG>()
@@ -3237,7 +4049,8 @@ fn main() {
     // 复选框反映**当前进程真实权限**，而不是记忆的偏好：重启后状态自然对齐
     ui.global::<SettingsG>().set_run_as_admin(is_elevated());
     ui.global::<MountsG>().set_winfsp_ok(winfsp_installed().0);
-    ui.global::<MountsG>().set_winfsp_msg(winfsp_installed().1.into());
+    ui.global::<MountsG>()
+        .set_winfsp_msg(winfsp_installed().1.into());
     // 远程路径历史
     set_history(&ui.as_weak(), &cfg.path_history);
 
@@ -3247,7 +4060,8 @@ fn main() {
     }
 
     // 插件宿主
-    let host = Arc::new(plugin_host::PluginHost::new().expect(rcgui_i18n::t("wasm 引擎初始化失败")));
+    let host =
+        Arc::new(plugin_host::PluginHost::new().expect(rcgui_i18n::t("wasm 引擎初始化失败")));
     let store = Arc::new(kv::KvStore::new(config::data_dir().join("plugins")));
 
     // 命令通道
@@ -3287,7 +4101,18 @@ fn main() {
         op_hints: Arc::new(std::sync::Mutex::new(OpHints::default())),
         tasks_done: Arc::new(std::sync::Mutex::new(Vec::new())),
         tasks_live: Arc::new(std::sync::Mutex::new(None)),
+        maint: Arc::new(maintenance::Maintenance::new()),
+        // 类型清单在第一次打开「新建远程」时才填满；没有它时保存会提示重开编辑器。
+        type_choices: Arc::new(std::sync::Mutex::new(TypeChoices::default())),
     });
+
+    // 轻量模式的唤醒通道：隐藏够久之后要能主动把界面清空，而清理动作只能由
+    // 事件循环线程执行，所以后台循环需要一条通往 `Cmd` 队列的入口。
+    lightweight::install_tx(tx.clone());
+    maintenance::install_tx(tx.clone());
+
+    // 维护页的初值必须在 `wire_callbacks` 之前灌：那一步会把 `ctx` move 进回调闭包。
+    maintenance::load_into_ui(&ui, &cfg);
 
     // 调试开关：`RCGUI_PANEL_DUMP=<插件 id>` 只打印该插件面板的行然后退出。
     //
@@ -3313,19 +4138,9 @@ fn main() {
                 .expect(rcgui_i18n::t("tokio runtime 启动失败"));
             match rt.block_on(plugins::build_panel(&ctx, &id)) {
                 Ok(rows) => {
-                    for r in &rows {
-                        let buttons: Vec<String> = r
-                            .buttons
-                            .iter()
-                            .map(|b| format!("{}/{}", b.label, b.action))
-                            .collect();
-                        println!("[{}] key={} label={:?} value={:?}", r.kind, r.key, r.label, r.value);
-                        println!("    text={:?}", r.text);
-                        println!("    field={} options={:?} sel={}", r.field_kind, r.options, r.selected_index);
-                        println!("    buttons={:?} enabled={} lamp={} ok={} warn={}",
-                            buttons, r.enabled, r.lamp, r.ok, r.warning);
-                    }
-                    println!("-- total {} rows", rows.len());
+                    // 打印前统一脱敏：这个分支的原始输出经常被整段贴进 issue，
+                    // 而表单里就有密码框和 token 字段（脱敏规则在 dump_rows_text 里）。
+                    print!("{}", plugins::dump_rows_text(&rows));
                 }
                 Err(e) => println!("PANEL ERROR: {e:#}"),
             }
@@ -3384,17 +4199,26 @@ fn main() {
             std::time::Duration::from_millis(500),
             move || {
                 use slint::winit_030::WinitWindowAccessor;
-                let shown = ui_weak
-                    .upgrade()
-                    .and_then(|u| {
-                        u.window()
-                            .with_winit_window(|w| {
-                                w.is_visible().unwrap_or(true) && !w.is_minimized().unwrap_or(false)
-                            })
-                    })
-                    // 取不到窗口状态时按「可见」处理：宁可多轮询，也不要让界面停更
-                    .unwrap_or(true);
+                // 可见性以「用户要它显示吗」为准（`WINDOW_SHOWN`），只有窗口确实
+                // 存在时才顺带问一句是否被最小化——最小化的窗口虽然还占着图形资源，
+                // 但用户看不见，按后台处理。
+                //
+                // 反过来读 `is_visible()` 是不行的：隐藏会销毁原生窗口，句柄为 None，
+                // 而 None 在启动早期同样成立，两者语义相反（详见 WINDOW_SHOWN 的注释）。
+                let asked = WINDOW_SHOWN.load(std::sync::atomic::Ordering::Relaxed);
+                let shown = asked
+                    && ui_weak
+                        .upgrade()
+                        .and_then(|u| {
+                            u.window()
+                                .with_winit_window(|w| !w.is_minimized().unwrap_or(false))
+                        })
+                        // 刚 show 完、窗口正在重建：按可见算，宁可多轮询一拍
+                        .unwrap_or(true);
                 vis.store(shown, std::sync::atomic::Ordering::Relaxed);
+                // 隐藏计时也在这里记：轻量模式看的是「窗口藏了多久」，
+                // 后台线程不能自己问 winit，只能读这个时刻。
+                lightweight::note_visible(shown);
                 if shown && !was_shown {
                     // 回到前台：马上对齐一次（轮询会在之后继续，不重复发）
                     let _ = tx_fg.send(Cmd::Foregrounded);
@@ -3430,7 +4254,9 @@ fn main() {
                 let wait = std::time::Duration::from_millis(300);
                 for scope in 0..5 {
                     if db.due(scope, wait) {
-                        let _ = tx_db.send(Cmd::SearchApply { scope: scope as i32 });
+                        let _ = tx_db.send(Cmd::SearchApply {
+                            scope: scope as i32,
+                        });
                     }
                 }
             },
@@ -3442,7 +4268,13 @@ fn main() {
     spawn_tray(ui.as_weak(), tx.clone());
 
     if !silent_flag && !cfg.silent_start {
+        WINDOW_SHOWN.store(true, std::sync::atomic::Ordering::Relaxed);
         ui.show().expect(rcgui_i18n::t("窗口显示失败"));
+    } else {
+        // 静默启动（`--silent` 或设置里勾了「启动时不显示窗口」）：窗口从来没有
+        // 建出来过，而 `WINDOW_SHOWN` 的初值是 true。不翻过来的话，后台会以为
+        // 用户正看着界面，一直按前台节奏取数，轻量模式也永远进不去。
+        WINDOW_SHOWN.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     // 窗口 / 任务栏图标。
@@ -3466,7 +4298,8 @@ fn main() {
             },
         );
     }
-    slint::run_event_loop_until_quit().expect(rcgui_i18n::t("事件循环启动失败"));}
+    slint::run_event_loop_until_quit().expect(rcgui_i18n::t("事件循环启动失败"));
+}
 
 /// 取主窗口的 HWND。
 ///
@@ -3569,7 +4402,7 @@ fn set_window_icon(ui: &MainWindow, cfg: &crate::config::AppConfig) {
             write_icon_log("set_window_icon: hwnd not ready\n");
             return;
         };
-        let h = windows::Win32::Foundation::HWND(v as *mut core::ffi::c_void);
+        let h = windows::Win32::Foundation::HWND(v as *mut ::core::ffi::c_void);
 
         let accent = accent_rgb(cfg);
         // 同时设置大小两个尺寸：SMALL 用于标题栏/任务栏小图标，
@@ -3578,9 +4411,7 @@ fn set_window_icon(ui: &MainWindow, cfg: &crate::config::AppConfig) {
         // 尺寸按**系统当前 DPI**下期望的值生成，而不是硬编码：
         // 在高 DPI（如 175%）时 SM_CXICON 会是 56 而不是 32，
         // 给错尺寸虽然会被系统缩放，但会糊。
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetSystemMetrics, SM_CXICON, SM_CXSMICON,
-        };
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXICON, SM_CXSMICON};
         for (default, metric, which) in [
             (32usize, SM_CXICON, ICON_BIG),
             (16usize, SM_CXSMICON, ICON_SMALL),
@@ -3635,7 +4466,11 @@ fn write_icon_log(msg: &str) {
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     p.push("rcgui-icon-debug.log");
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p)
+    {
         let _ = f.write_all(msg.as_bytes());
         let _ = f.flush();
     }
@@ -3666,7 +4501,7 @@ fn rgba_to_hicon(
             size as i32,
             1,
             32,
-            Some(bgra.as_ptr() as *const core::ffi::c_void),
+            Some(bgra.as_ptr() as *const ::core::ffi::c_void),
         );
         if color.is_invalid() {
             return None;
@@ -3678,7 +4513,7 @@ fn rgba_to_hicon(
             size as i32,
             1,
             1,
-            Some(mask_bytes.as_ptr() as *const core::ffi::c_void),
+            Some(mask_bytes.as_ptr() as *const ::core::ffi::c_void),
         );
         if mask.is_invalid() {
             let _ = DeleteObject(HGDIOBJ(color.0));
@@ -3705,7 +4540,33 @@ fn rgba_to_hicon(
 }
 // ---------------- 单实例 ----------------
 
-const IPC_PORT: u16 = 52799;
+/// 把本进程挂到父进程的控制台上，让命令行开关的输出真的能被终端收到。
+///
+/// 发布版二进制是 GUI 子系统（见文件头的 `windows_subsystem`），从 cmd/PowerShell
+/// 启动时进程没有 stdout 句柄：`--diagnostics` 的 JSON 会写进一个无效句柄，
+/// 直接被丢掉。AttachConsole 会在句柄无效时补上标准句柄；调试版本来就带着控制台，
+/// 这一次调用会以 ERROR_ACCESS_DENIED 失败，忽略即可。
+fn attach_parent_console() {
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    // 没有可依附的父控制台（从资源管理器双击、计划任务）时同样失败：没有输出目的地，
+    // 这时候安静放弃是对的——不能为了"打印一句话"凭空开一个控制台窗口。
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+/// 唤醒通道（第二个实例 → 已有实例「把窗口拿出来」）用的回环端口。
+///
+/// 由数据目录派生，所以便携版与 `RCGUI_DATA_DIR` 的验收实例各有各的端口，
+/// 不会把对方当成自己。范围取 52800..=54799：**52799 留给老版本**，
+/// 新实例不要去占那个号，也不要试图唤醒老实例——它用的是用户真实配置，
+/// 被一个隔离实例弹到前台只会干扰验收。
+fn ipc_port() -> u16 {
+    let scope = config::data_dir_scope();
+    let head = scope.get(0..4).unwrap_or("0");
+    let v = u16::from_str_radix(head, 16).unwrap_or(0);
+    52800 + (v % 2000)
+}
 
 /// 单实例互斥量句柄。
 ///
@@ -3714,18 +4575,19 @@ const IPC_PORT: u16 = 52799;
 static SINGLETON: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 fn acquire_single_instance() -> bool {
+    use windows::core::HSTRING;
     use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
-    use windows::core::HSTRING;
-    // 互斥量名字允许用 RCGUI_SINGLETON 覆盖。
+    // 互斥量名字跟着数据目录走（见 config::data_dir_scope），允许用 RCGUI_SINGLETON 覆盖。
     //
-    // 用途：同一台机器上临时跑「第二个实例」做对比或自动化验证（本机已有实例在跑时，
-    // 默认名字会被占用而直接退出）。两个实例必须各自使用**独立数据目录**
-    // （exe 旁放 `portable` 文件即可），否则会互相覆盖 config.json。
+    // 早先这里是个固定名字 "rclone-gui-singleton"，于是「另一个数据目录的实例」会被
+    // 当成同一个程序：第二个进程直接退出，把 show 请求发给了配置完全不同的那个实例。
+    // 覆盖变量保留给需要两个同目录实例的调试场景（此时两个实例会互相覆盖 config.json，
+    // 要对比就各自用独立数据目录）。
     let name = std::env::var("RCGUI_SINGLETON")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "rclone-gui-singleton".to_string());
+        .unwrap_or_else(|| format!("rclone-gui-singleton-{}", config::data_dir_scope()));
     unsafe {
         match CreateMutexW(None, false, &HSTRING::from(name.as_str())) {
             Ok(h) => {
@@ -3749,7 +4611,7 @@ fn release_single_instance() {
     let v = SINGLETON.swap(0, std::sync::atomic::Ordering::SeqCst);
     if v != 0 {
         unsafe {
-            let _ = CloseHandle(HANDLE(v as *mut core::ffi::c_void));
+            let _ = CloseHandle(HANDLE(v as *mut ::core::ffi::c_void));
         }
     }
 }
@@ -3771,7 +4633,7 @@ fn is_elevated() -> bool {
         let ok = GetTokenInformation(
             token,
             TokenElevation,
-            Some(&mut elevation as *mut _ as *mut core::ffi::c_void),
+            Some(&mut elevation as *mut _ as *mut ::core::ffi::c_void),
             std::mem::size_of::<TOKEN_ELEVATION>() as u32,
             &mut ret_len,
         )
@@ -3805,7 +4667,7 @@ fn integrity_rid() -> Option<u32> {
             && GetTokenInformation(
                 token,
                 TokenIntegrityLevel,
-                Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+                Some(buf.as_mut_ptr() as *mut ::core::ffi::c_void),
                 needed,
                 &mut needed,
             )
@@ -3886,7 +4748,13 @@ fn relaunch_self(elevate: bool) -> anyhow::Result<()> {
             ShellExecuteW(None, &verb, &file, &params, PCWSTR::null(), SW_SHOWNORMAL).0 as isize
         };
         if code <= 32 {
-            anyhow::bail!("{}", rcgui_i18n::f("以管理员身份重启失败（错误码 {}，可能是取消了 UAC 提示）", &[&(code)]));
+            anyhow::bail!(
+                "{}",
+                rcgui_i18n::f(
+                    "以管理员身份重启失败（错误码 {}，可能是取消了 UAC 提示）",
+                    &[&(code)]
+                )
+            );
         }
     } else {
         std::process::Command::new("explorer.exe")
@@ -3899,7 +4767,7 @@ fn relaunch_self(elevate: bool) -> anyhow::Result<()> {
 }
 
 fn notify_show() {
-    if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", IPC_PORT)) {
+    if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", ipc_port())) {
         use std::io::Write as _;
         let _ = s.write_all(b"show");
     }
@@ -4000,11 +4868,8 @@ async fn handshake_only(ctx: &Arc<Ctx>) -> ConnOutcome {
             *ctx.providers_cache.lock().unwrap() = None;
             *ctx.providers_err.lock().unwrap() = None;
             // 顺手预取一次：让「拿不到类型」这件事在连接时就暴露，而不是等建远程
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(8),
-                get_providers(ctx),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(8), get_providers(ctx)).await;
             // 重连后必须重新下发限速：对端可能是新实例，或状态已被重置
             ctx.last_bwlimit.lock().unwrap().clear();
             let mut view = snapshot_view(ctx).await;
@@ -4052,6 +4917,24 @@ async fn handshake_only(ctx: &Arc<Ctx>) -> ConnOutcome {
 /// 连不上就是离线模式（保留本地档案与上次快照），不回退、不兜底启动进程。
 async fn connect_report(ctx: &Arc<Ctx>) -> ConnOutcome {
     let cfg = ctx.cfg.lock().unwrap().clone();
+    // 自己管理的内核优先：它的端口与凭据每次启动都是新的，只存在于内存里，
+    // 配置文件里的外部地址此时是过期的。
+    let managed = ctx.maint.core.endpoint();
+    if let Some((url, user, pass)) = managed {
+        let attempt = ctx.mgr.attach(&url, Some(user), Some(pass)).await;
+        return match attempt {
+            Ok(_) => handshake_only(ctx).await,
+            Err(e) => {
+                let mut view = snapshot_view(ctx).await;
+                view.error = e.to_string();
+                view.last_refresh = now_hms();
+                ConnOutcome {
+                    view,
+                    version: None,
+                }
+            }
+        };
+    }
     // 只要设置了用户名就带上 Authorization（密码可以为空）。
     //
     // 为什么不等密码非空才带：`rclone rcd --rc-user gui`（不带 --rc-pass）确实会
@@ -4145,7 +5028,10 @@ pub(crate) fn spawn_restore(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let ctx2 = ctx.clone();
     let ui2 = ui.clone();
     std::thread::spawn(move || {
-        match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
             Ok(rt) => rt.block_on(async move {
                 replay_pending_proxies(&ctx2, &ui2).await;
                 persist::replay(&ctx2, &ui2).await;
@@ -4167,7 +5053,10 @@ pub(crate) fn spawn_connect_retry(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let ctx2 = ctx.clone();
     let ui2 = ui.clone();
     std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
             return;
         };
         rt.block_on(async move {
@@ -4198,7 +5087,10 @@ async fn replay_pending_proxies(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         cfg.proxy_bindings
             .iter()
             .filter(|b| b.needs_apply())
-            .filter_map(|b| reg.for_remote(&b.remote).map(|p| (b.remote.clone(), p.clone())))
+            .filter_map(|b| {
+                reg.for_remote(&b.remote)
+                    .map(|p| (b.remote.clone(), p.clone()))
+            })
             .collect()
     };
     if pending.is_empty() {
@@ -4254,7 +5146,10 @@ async fn replay_pending_proxies(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         toast(
             ui,
             1,
-            rcgui_i18n::f("已应用 {} 条代理配置。{}", &[&(changed), &(proxy::restart_hint())]),
+            rcgui_i18n::f(
+                "已应用 {} 条代理配置。{}",
+                &[&(changed), &(proxy::restart_hint())],
+            ),
         );
     }
     if !skipped.is_empty() {
@@ -4331,14 +5226,18 @@ async fn delete_proxy_now(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
     let msg = if affected.is_empty() {
         rcgui_i18n::f("已删除代理配置「{}」", &[&(name)])
     } else {
-        rcgui_i18n::f("已删除代理配置「{}」，{} 个远程已回落到「不代理」（{}）", &[&(name), &(affected.len()), &(affected.join("、"))])
+        rcgui_i18n::f(
+            "已删除代理配置「{}」，{} 个远程已回落到「不代理」（{}）",
+            &[&(name), &(affected.len()), &(affected.join("、"))],
+        )
     };
     toast(ui, 1, msg);
     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ProxyListRefresh)).await;
 }
 
 /// 断开连接：**不终止 rclone 进程**，只停止使用该端点并保留上次快照。
-async fn disconnect_now(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {    ctx.rc.set_disconnected(None).await;
+async fn disconnect_now(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    ctx.rc.set_disconnected(None).await;
     let v = snapshot_view(ctx).await;
     apply_conn_view(ui, v);
     toast(ui, 0, rcgui_i18n::t("已断开连接（界面保留上次快照）"));
@@ -4369,6 +5268,8 @@ async fn export_conf(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, path: PathBuf, inclu
     };
     let cfg = ctx.cfg.lock().unwrap().clone();
     let providers = get_providers(ctx).await;
+    // 插件身份/版本/来源/启用/设置一并带出去，但不带二进制（导入端按 source+url 重装）
+    let plugin_refs = plugins::bundle_refs(ctx);
     let conf = conf_io::build_bundle(
         &cfg,
         dump.as_ref(),
@@ -4376,16 +5277,31 @@ async fn export_conf(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, path: PathBuf, inclu
         Some(&providers),
         &live_serves,
         &live_mounts,
+        &plugin_refs,
     );
     let summary = conf.summary();
     match conf_io::write_bundle(&path, &conf) {
         Ok(()) => {
-            let mut msg = rcgui_i18n::f("已导出 {}（远程 {} · 挂载 {} · 服务 {}）", &[&(path.display()), &(summary.remote_count), &(summary.mount_count), &(summary.serve_count)]);
+            let mut msg = rcgui_i18n::f(
+                "已导出 {}（远程 {} · 挂载 {} · 服务 {}）",
+                &[
+                    &(path.display()),
+                    &(summary.remote_count),
+                    &(summary.mount_count),
+                    &(summary.serve_count),
+                ],
+            );
             if summary.sensitive {
-                msg.push_str(&rcgui_i18n::f("；⚠ 含 {} 个远程的凭据，请妥善保管", &[&(summary.sensitives)]));
+                msg.push_str(&rcgui_i18n::f(
+                    "；⚠ 含 {} 个远程的凭据，请妥善保管",
+                    &[&(summary.sensitives)],
+                ));
             }
             if summary.needs_auth > 0 {
-                msg.push_str(&rcgui_i18n::f("；{} 个远程的凭据未随包导出（可能需要重新认证）", &[&(summary.needs_auth)]));
+                msg.push_str(&rcgui_i18n::f(
+                    "；{} 个远程的凭据未随包导出（可能需要重新认证）",
+                    &[&(summary.needs_auth)],
+                ));
             }
             toast(ui, if summary.sensitive { 2 } else { 1 }, msg);
         }
@@ -4396,9 +5312,25 @@ async fn export_conf(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, path: PathBuf, inclu
 // ---------------- 后台主循环 ----------------
 
 async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::UnboundedReceiver<Cmd>) {
+    // 0) 一次性的旧配置迁移：内置「一键 rclone」插件退出历史舞台，它记下的
+    //    自定义内核路径要接着用（用户可能专门换成了带 teldrive 等后端的 fork）。
+    for note in maintenance::migrate_oneclick(&ctx) {
+        toast(&ui, 1, note);
+    }
+
+    // 0.5) 托管内核：random 端口 + random 凭据，只活在本进程里。
+    //      失败不拦启动，界面照旧能连外部实例，维护页会显示原因。
+    if let Some(note) = maintenance::start_managed_core(&ctx).await {
+        toast(&ui, 1, note);
+    }
+
+    // 后台的两个常驻循环：同步任务调度（轻量模式也照跑）与轻量模式自身的进出。
+    tokio::spawn(maintenance::watch(ctx.clone(), ui.clone()));
+    tokio::spawn(lightweight::watch(ctx.clone(), ui.clone()));
+
     // 1) 启动时连接已保存的 endpoint（仅当用户开启「启动时连接」）。
     //    连接失败 → 离线模式；**不会**回退成启动 rclone 进程。
-    let conn = if ctx.cfg.lock().unwrap().rclone.connect_on_start {
+    let conn = if ctx.maint.core.is_running() || ctx.cfg.lock().unwrap().rclone.connect_on_start {
         connect_report(&ctx).await
     } else {
         let mut v = snapshot_view(&ctx).await;
@@ -4424,20 +5356,20 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
         toast(&ui, 2, rcgui_i18n::f("未连接：{}", &[&(conn.view.error)]));
     }
     {
-        let managed = false; // RCGUI 已无「托管模式」：永远连接外部实例
+        // 托管与否由内核实际状态决定：自己起的那个进程在跑才算托管，
+        // 连的是别人已有的实例就还是外部。
+        let managed = ctx.maint.core.is_running();
         let vi = conn.version.unwrap_or_default();
         let version = vi.version;
         let os_info = format!("{} / {}", vi.os, vi.arch);
         let url = conn.view.endpoint_url;
-        let _ = ui.upgrade_in_event_loop(
-            move |ui| {
-                let g = ui.global::<DashboardG>();
-                g.set_version(version.into());
-                g.set_os_info(os_info.into());
-                g.set_managed(managed);
-                g.set_url(url.into());
-            },
-        );
+        let _ = ui.upgrade_in_event_loop(move |ui| {
+            let g = ui.global::<DashboardG>();
+            g.set_version(version.into());
+            g.set_os_info(os_info.into());
+            g.set_managed(managed);
+            g.set_url(url.into());
+        });
     }
 
     // 1.35) 释放内置插件：它们在 assets/plugins 里随程序发布，但装到用户数据目录后
@@ -4502,18 +5434,18 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
     {
         let ui = ui.clone();
         tokio::spawn(async move {
-            if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", IPC_PORT)).await {
+            let port = ipc_port();
+            if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
                 loop {
                     if let Ok((mut sock, _)) = listener.accept().await {
                         use tokio::io::AsyncReadExt as _;
                         let mut buf = [0u8; 16];
                         if sock.read(&mut buf).await.is_ok() {
-                            let _ = ui.upgrade_in_event_loop(
-                                |ui| {
-                                    ui.show().ok();
-                                    ui.window().set_minimized(false);
-                                },
-                            );
+                            // 走同一个「显示并置前」入口：它会记账 WINDOW_SHOWN、
+                            // 取消最小化、并在窗口刚重建时补一次置前。
+                            let _ = ui.upgrade_in_event_loop(|ui| {
+                                show_main_window(&ui);
+                            });
                         }
                     }
                 }
@@ -4572,11 +5504,7 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
                             match plugins::build_panel(&ctx2, &rid).await {
                                 Ok(rows) => {
                                     let _ = ui2.upgrade_in_event_loop(move |u| {
-                                        let g = u.global::<PluginsG>();
-                                        let list = plugins::panel_to_slint(&rows);
-                                        g.set_panel_rows(ModelRc::from(Rc::new(
-                                            VecModel::from(list),
-                                        )));
+                                        plugins::apply_panel(&u, &rows);
                                     });
                                 }
                                 Err(e) => eprintln!("面板定时刷新失败: {e:#}"),
@@ -4686,13 +5614,10 @@ async fn startup_flow(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             let _permit = sem.acquire().await;
             // 1) 连接校验（失败 → 该预设流程终止）。8s 超时，防止慢后端把整个启动流程拖死
             let fs = format!("{name}:");
-            let ok = tokio::time::timeout(
-                std::time::Duration::from_secs(8),
-                client.about(&fs),
-            )
-            .await
-            .map(|r| r.is_ok())
-            .unwrap_or(false);
+            let ok = tokio::time::timeout(std::time::Duration::from_secs(8), client.about(&fs))
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false);
             if !ok {
                 return; // 预热失败静默跳过（不打扰用户）
             }
@@ -4712,7 +5637,6 @@ async fn startup_flow(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             if cur_remote == name {
                 let _ = Box::pin(handle_cmd(&ctx2, &ui2, Cmd::FilesRefresh { seq: -1 })).await;
             }
-
         }));
     }
     // 兜底：只等「连接校验」阶段
@@ -4871,7 +5795,11 @@ async fn wait_mount_ready_rc(
 async fn report_mount_not_visible(ui: &Weak<MainWindow>, fs: &str, point: &str) {
     let (ok, msg) = winfsp_installed();
     if !ok {
-        toast(ui, 2, rcgui_i18n::f("挂载 {} 失败：{}", &[&(point), &(msg)]));
+        toast(
+            ui,
+            2,
+            rcgui_i18n::f("挂载 {} 失败：{}", &[&(point), &(msg)]),
+        );
         return;
     }
     let hint = if mount_point_ready(point) {
@@ -4879,7 +5807,11 @@ async fn report_mount_not_visible(ui: &Weak<MainWindow>, fs: &str, point: &str) 
     } else {
         rcgui_i18n::t("WinFsp 正常，但盘符未出现（网盘首次挂载可能较慢；也可能是盘符被占用或隐藏）")
     };
-    toast(ui, 2, rcgui_i18n::f("挂载 {} 到 {} 未生效：{}", &[&(fs), &(point), &(hint)]));
+    toast(
+        ui,
+        2,
+        rcgui_i18n::f("挂载 {} 到 {} 未生效：{}", &[&(fs), &(point), &(hint)]),
+    );
 }
 
 /// 启动（或重启）内嵌 HTTP 服务。
@@ -4901,7 +5833,14 @@ async fn spawn_http(ctx: &Arc<Ctx>, port: u16, ui: Weak<MainWindow>) {
             } else {
                 rcgui_i18n::t("请检查端口设置")
             };
-            toast(&ui, 2, rcgui_i18n::f("HTTP 服务启动失败（端口 {}）：{}；{}", &[&(port), &(e), &(hint)]));
+            toast(
+                &ui,
+                2,
+                rcgui_i18n::f(
+                    "HTTP 服务启动失败（端口 {}）：{}；{}",
+                    &[&(port), &(e), &(hint)],
+                ),
+            );
             return;
         }
     };
@@ -4917,7 +5856,10 @@ async fn spawn_http(ctx: &Arc<Ctx>, port: u16, ui: Weak<MainWindow>) {
             eprintln!("[http] 服务异常退出（端口 {port}）: {e}");
         }
     });
-    *ctx.http_server.lock().await = Some(HttpServer { shutdown: tx_shutdown, handle });
+    *ctx.http_server.lock().await = Some(HttpServer {
+        shutdown: tx_shutdown,
+        handle,
+    });
 }
 
 /// 停止内嵌 HTTP 服务并等待端口释放。未运行时为空操作。
@@ -4934,7 +5876,6 @@ async fn stop_http(ctx: &Arc<Ctx>) {
         eprintln!("[http] 旧实例关闭超时，端口可能仍被占用");
     }
 }
-
 
 /// 把导入的配置真正应用到**当前连接的本地 rclone**：
 /// - 远程：`config/create`（不存在）或 `config/update`（已存在）；
@@ -5055,7 +5996,13 @@ async fn apply_bundle_to_rclone(
         {
             let mut cfg = ctx.cfg.lock().unwrap();
             if let Err(e) = persist::remember_serve(
-                &mut cfg, &s.stype, &s.remote, &s.sub_path, &s.addr, &s.user, &s.pass,
+                &mut cfg,
+                &s.stype,
+                &s.remote,
+                &s.sub_path,
+                &s.addr,
+                &s.user,
+                &s.pass,
             ) {
                 errs.push(rcgui_i18n::f("记录服务 {}: {}", &[&(s.addr), &(e)]));
             }
@@ -5080,7 +6027,10 @@ async fn apply_bundle_to_rclone(
             .await
         {
             Ok(_) => ok_serves += 1,
-            Err(e) => errs.push(rcgui_i18n::f("服务 {} {}: {}", &[&(s.stype), &(s.addr), &(e)])),
+            Err(e) => errs.push(rcgui_i18n::f(
+                "服务 {} {}: {}",
+                &[&(s.stype), &(s.addr), &(e)],
+            )),
         }
     }
 
@@ -5201,6 +6151,12 @@ impl Cmd {
 
 async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bool {
     match cmd {
+        Cmd::Maint { action, id } => {
+            // 维护页的按钮全部落到 `maintenance::handle`。返回值表示"要不要退出"，
+            // 这里的动作都不会退出程序。
+            let _ = crate::maintenance::handle(ctx, ui, &action, &id).await;
+            false
+        }
         Cmd::Quit => {
             // 关闭 GUI 只做三件事：停止轮询、释放连接、退出事件循环。
             // **不**调用 core/quit、**不**杀 rclone、**不**卸载挂载、**不**停止 serve：
@@ -5223,6 +6179,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 std::process::exit(0);
             });
             caps::stop_plugin_procs_on_exit();
+            // 自己起的 rclone 内核跟着退出。只可能结束本进程亲手 spawn 的那个 child
+            // （`core::Core` 里只保存自己启动的句柄）；连外部实例时这里是空操作，
+            // 用户的 rclone 一个字都不会被动到。
+            ctx.maint.core.stop();
             let ctx2 = ctx.clone();
             let ui2 = ui.clone();
             std::thread::spawn(move || {
@@ -5261,7 +6221,14 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             false
         }
         Cmd::Foregrounded => {
-            // 回到前台的第一件事：用 rclone 的真实状态覆盖界面（后台期间它可能变了）
+            // 窗口从隐藏回到前台：先退出轻量模式，再刷新。
+            //
+            // 顺序不能反。轻量模式里 `suppress_rows` 会挡住列表回填，而 `ENTERED`
+            // 要等 `lightweight::watch` 下一个 30 秒的 tick 才会自己清掉——先刷新的话，
+            // 这一次刷回来的数据会被整片丢掉，用户看到的是空白页，最长等到半分钟。
+            // 这里直接调 `leave`，等于把「窗口回来了」当成立刻可用的信号。
+            crate::lightweight::leave(ctx, ui);
+            // 回到前台的第二件事：用 rclone 的真实状态覆盖界面（后台期间它可能变了）
             refresh::refresh_state(ctx, ui, true).await;
             false
         }
@@ -5281,6 +6248,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if close_to_tray {
                 hide_to_tray(ui);
             } else {
+                // 这次是真的退出：先记账再隐藏，免得那半秒里后台还以为窗口在前台。
+                WINDOW_SHOWN.store(false, std::sync::atomic::Ordering::Relaxed);
                 let _ = ui.upgrade_in_event_loop(|ui| {
                     ui.hide().ok();
                 });
@@ -5318,6 +6287,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 cfg.close_prompt_done = true;
                 let _ = config::save(&cfg);
             }
+            WINDOW_SHOWN.store(false, std::sync::atomic::Ordering::Relaxed);
             let _ = ui.upgrade_in_event_loop(|ui| {
                 ui.global::<SettingsG>().set_close_to_tray(false);
                 ui.global::<SettingsG>().set_close_prompt_show(false);
@@ -5328,17 +6298,16 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         Cmd::FilesInit => {
             let client = ctx.rc.client().await;
             let remotes = client.list_remotes().await.unwrap_or_default();
-            let _ = ui.upgrade_in_event_loop(
-                move |ui| {
-                    ui.global::<FilesG>().set_remotes(ModelRc::from(Rc::new(VecModel::from(
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                ui.global::<FilesG>()
+                    .set_remotes(ModelRc::from(Rc::new(VecModel::from(
                         remotes
                             .iter()
                             .map(|r| r.clone().into())
                             .collect::<Vec<slint::SharedString>>(),
                     ))));
-                    ui.global::<FilesG>().set_remote_idx(0);
-                },
-            );
+                ui.global::<FilesG>().set_remote_idx(0);
+            });
             // 给事件循环留时间完成 remotes 设置，避免 FilesRefresh 读到空 remote
             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
@@ -5368,8 +6337,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     .await
                     .unwrap_or(-2);
                 if seq >= 0 && cur_seq != seq {
-                    let _ =
-                        ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
+                    let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
                     return false;
                 }
                 let _ = ui.upgrade_in_event_loop(move |ui| {
@@ -5411,36 +6379,36 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 }
             }
             // 请求期间用户可能已发起更新操作（seq 变化），丢弃过期结果
-            let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq()).await.unwrap_or(-2);
+            let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq())
+                .await
+                .unwrap_or(-2);
             if seq >= 0 && cur_seq != seq {
                 let _ = ui.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
                 return false;
             }
-            let _ = ui.upgrade_in_event_loop(
-                move |ui| {
-                    let g = ui.global::<FilesG>();
-                    match res {
-                        Ok(entries) => {
-                            let key = g.get_sort_key().to_string();
-                            let desc = g.get_sort_desc();
-                            // 走 set_file_entries：勾选数组与 entries 必须等长
-                            set_file_entries(&ui, file_rows(&entries, &key, desc));
-                        }
-                        Err(e) => {
-                            set_file_entries(&ui, Vec::<FileRow>::new());
-                            let msg = crate::proxy::annotate_error(
-                                &rcgui_i18n::f("列目录失败: {}", &[&(e)]),
-                                proxy_ep.as_deref(),
-                            );
-                            toast_ui(&ui, 2, msg);
-                        }
+            let _ = ui.upgrade_in_event_loop(move |ui| {
+                let g = ui.global::<FilesG>();
+                match res {
+                    Ok(entries) => {
+                        let key = g.get_sort_key().to_string();
+                        let desc = g.get_sort_desc();
+                        // 走 set_file_entries：勾选数组与 entries 必须等长
+                        set_file_entries(&ui, file_rows(&entries, &key, desc));
                     }
-                    // 切换远程时 Slint 会把 path 清空，这里按当前值重建面包屑
-                    apply_crumbs(&ui, file_crumbs(&remote, &path));
-                    g.set_sel(-1);
-                    g.set_loading(false);
-                },
-            );
+                    Err(e) => {
+                        set_file_entries(&ui, Vec::<FileRow>::new());
+                        let msg = crate::proxy::annotate_error(
+                            &rcgui_i18n::f("列目录失败: {}", &[&(e)]),
+                            proxy_ep.as_deref(),
+                        );
+                        toast_ui(&ui, 2, msg);
+                    }
+                }
+                // 切换远程时 Slint 会把 path 清空，这里按当前值重建面包屑
+                apply_crumbs(&ui, file_crumbs(&remote, &path));
+                g.set_sel(-1);
+                g.set_loading(false);
+            });
             false
         }
         Cmd::FilesEnter { name, seq } => {
@@ -5456,7 +6424,14 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
         }
         Cmd::FilesUp { seq } => {
             let (_, path) = ui_files_pos(ui).await;
-            files_navigate(ctx, ui, parent_path(&path), seq, rcgui_i18n::t("返回上级失败").into()).await;
+            files_navigate(
+                ctx,
+                ui,
+                parent_path(&path),
+                seq,
+                rcgui_i18n::t("返回上级失败").into(),
+            )
+            .await;
             false
         }
         Cmd::FilesDownload { name, local } => {
@@ -5491,7 +6466,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 // 文件夹：递归复制到「所选目录/文件夹名」；同名时另起带序号的目录
                 let target = unique_local_dir(&dir, &name);
                 if let Err(e) = std::fs::create_dir_all(&target) {
-                    toast(ui, 2, rcgui_i18n::f("无法创建本地目录 {}: {}", &[&(target.display()), &(e)]));
+                    toast(
+                        ui,
+                        2,
+                        rcgui_i18n::f("无法创建本地目录 {}: {}", &[&(target.display()), &(e)]),
+                    );
                     return false;
                 }
                 let src_fs = format!("{remote}:{}", join_path(&path, &name));
@@ -5511,7 +6490,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     rt.block_on(async move {
                         let client = ctx2.rc.client().await;
                         match client.sync_copy(&src_fs, &dst_fs, true).await {
-                            Ok(_) => toast(&ui2, 1, rcgui_i18n::f("已下载到 {}", &[&(target.display())])),
+                            Ok(_) => toast(
+                                &ui2,
+                                1,
+                                rcgui_i18n::f("已下载到 {}", &[&(target.display())]),
+                            ),
                             Err(e) => toast(&ui2, 2, rcgui_i18n::f("下载失败: {}", &[&(e)])),
                         }
                     });
@@ -5582,11 +6565,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             });
             false
         }
-        Cmd::FilesMove {
-            name,
-            is_dir,
-            dest,
-        } => {
+        Cmd::FilesMove { name, is_dir, dest } => {
             let (remote, path) = ui_files_pos(ui).await;
             if remote.is_empty() || name.is_empty() {
                 return false;
@@ -5601,7 +6580,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 return false;
             }
             if is_dir && is_same_or_inside(&dest, &src) {
-                toast(ui, 2, rcgui_i18n::t("不能把文件夹移动到它自己或它的子目录里"));
+                toast(
+                    ui,
+                    2,
+                    rcgui_i18n::t("不能把文件夹移动到它自己或它的子目录里"),
+                );
                 return false;
             }
             let client = ctx.rc.client().await;
@@ -5613,7 +6596,14 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         toast(
                             ui,
                             2,
-                            rcgui_i18n::f("目标目录已有同名{}，请先改名或换一个目录", &[&(if is_dir { rcgui_i18n::t("文件夹") } else { rcgui_i18n::t("文件") })]),
+                            rcgui_i18n::f(
+                                "目标目录已有同名{}，请先改名或换一个目录",
+                                &[&(if is_dir {
+                                    rcgui_i18n::t("文件夹")
+                                } else {
+                                    rcgui_i18n::t("文件")
+                                })],
+                            ),
                         );
                         return false;
                     }
@@ -5638,7 +6628,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let src_fs = format!("{remote}:{src}");
                 let dst_fs = format!("{remote}:{dst}");
                 // 先登记再动手：core/transferred 分不清目录改名与目录移动（见 OpHints）
-                ctx.op_hints.lock().unwrap().put(&fs, &src, rcgui_i18n::t("移动"));
+                ctx.op_hints
+                    .lock()
+                    .unwrap()
+                    .put(&fs, &src, rcgui_i18n::t("移动"));
                 // 用「独立线程 + current_thread runtime」而不是 tokio::spawn：
                 // 目录移动完成后要复用 `handle_cmd` 刷新列表，而它整体不是 Send。
                 std::thread::spawn(move || {
@@ -5652,8 +6645,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     rt.block_on(async move {
                         let client = ctx2.rc.client().await;
                         let res = client.sync_move(&src_fs, &dst_fs, true, true).await;
-                        let _ =
-                            ui2.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
+                        let _ = ui2
+                            .upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
                         match res {
                             Ok(_) => {
                                 let _ = Box::pin(handle_cmd(
@@ -5671,7 +6664,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 return false;
             }
             // 先登记再动手：同一 root 下的改名与移动在记账里同形（见 OpHints）
-            ctx.op_hints.lock().unwrap().put(&fs, &src, rcgui_i18n::t("移动"));
+            ctx.op_hints
+                .lock()
+                .unwrap()
+                .put(&fs, &src, rcgui_i18n::t("移动"));
             // 文件移动通常很快，直接等待，失败可立即提示
             let res = tokio::time::timeout(
                 std::time::Duration::from_secs(120),
@@ -5718,13 +6714,15 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             match res {
                 Ok(_) => {
                     let chosen = name.clone();
-                    let _ = ui.upgrade_in_event_loop(
-                        move |ui| {
-                            ui.global::<FilesG>().set_rename_name(chosen.into());
-                        },
-                    );
+                    let _ = ui.upgrade_in_event_loop(move |ui| {
+                        ui.global::<FilesG>().set_rename_name(chosen.into());
+                    });
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
-                    toast(ui, 1, rcgui_i18n::f("文件夹已创建：{}（选中后可重命名）", &[&(name)]));
+                    toast(
+                        ui,
+                        1,
+                        rcgui_i18n::f("文件夹已创建：{}（选中后可重命名）", &[&(name)]),
+                    );
                 }
                 Err(e) => toast(ui, 2, rcgui_i18n::f("创建失败: {}", &[&(e)])),
             }
@@ -5794,10 +6792,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let src_fs = format!("{remote}:{}", join_path(&path, &from));
                 let dst_fs = format!("{remote}:{}", join_path(&path, &to));
                 // 先登记再动手：core/transferred 分不清目录改名与目录移动（见 OpHints）
-                ctx.op_hints
-                    .lock()
-                    .unwrap()
-                    .put(&fs, &join_path(&path, &from), rcgui_i18n::t("重命名"));
+                ctx.op_hints.lock().unwrap().put(
+                    &fs,
+                    &join_path(&path, &from),
+                    rcgui_i18n::t("重命名"),
+                );
                 // 与目录移动同样的理由：可能很久，放后台线程，
                 // 用 current_thread runtime 复用 `handle_cmd`（它不是 Send）。
                 std::thread::spawn(move || {
@@ -5811,8 +6810,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     rt.block_on(async move {
                         let client = ctx2.rc.client().await;
                         let res = client.sync_move(&src_fs, &dst_fs, true, true).await;
-                        let _ =
-                            ui2.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
+                        let _ = ui2
+                            .upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
                         match res {
                             Ok(_) => {
                                 let _ = ui2.upgrade_in_event_loop(|ui| {
@@ -5833,20 +6832,19 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 return false;
             }
             // 先登记再动手：同一 root 下的改名与移动在记账里同形（见 OpHints）
-            ctx.op_hints
-                .lock()
-                .unwrap()
-                .put(&fs, &join_path(&path, &from), rcgui_i18n::t("重命名"));
+            ctx.op_hints.lock().unwrap().put(
+                &fs,
+                &join_path(&path, &from),
+                rcgui_i18n::t("重命名"),
+            );
             let res = client
                 .movefile(&fs, &join_path(&path, &from), &fs, &join_path(&path, &to))
                 .await;
             match res {
                 Ok(_) => {
-                    let _ = ui.upgrade_in_event_loop(
-                        |ui| {
-                            ui.global::<FilesG>().set_sel(-1);
-                        },
-                    );
+                    let _ = ui.upgrade_in_event_loop(|ui| {
+                        ui.global::<FilesG>().set_sel(-1);
+                    });
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
                     toast(ui, 1, rcgui_i18n::t("重命名完成"));
                 }
@@ -5880,8 +6878,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     rt.block_on(async move {
                         let client = ctx2.rc.client().await;
                         let res = client.sync_copy(&src_fs, &dst_fs, true).await;
-                        let _ =
-                            ui2.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
+                        let _ = ui2
+                            .upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_loading(false));
                         match res {
                             Ok(_) => {
                                 let _ = Box::pin(handle_cmd(
@@ -6020,12 +7018,22 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 } else {
                     String::new()
                 };
-                toast(ui, 1, rcgui_i18n::f("已上传 {}/{} 项到 {}{}", &[&(ok), &(total), &(where_), &(extra)]));
+                toast(
+                    ui,
+                    1,
+                    rcgui_i18n::f(
+                        "已上传 {}/{} 项到 {}{}",
+                        &[&(ok), &(total), &(where_), &(extra)],
+                    ),
+                );
             } else {
                 toast(
                     ui,
                     2,
-                    rcgui_i18n::f("上传完成 {}/{}，失败 {}：{}", &[&(ok), &(total), &(failed.len()), &(failed.join("；"))]),
+                    rcgui_i18n::f(
+                        "上传完成 {}/{}，失败 {}：{}",
+                        &[&(ok), &(total), &(failed.len()), &(failed.join("；"))],
+                    ),
                 );
             }
             false
@@ -6136,7 +7144,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         let res = if *is_dir {
                             let target = unique_local_dir(&dir, name);
                             if let Err(e) = std::fs::create_dir_all(&target) {
-                                failed.push(rcgui_i18n::f("{}: 无法创建本地目录 {}", &[&(name), &(e)]));
+                                failed.push(rcgui_i18n::f(
+                                    "{}: 无法创建本地目录 {}",
+                                    &[&(name), &(e)],
+                                ));
                                 continue;
                             }
                             toast(&ui2, 0, rcgui_i18n::f("正在下载文件夹 {}…", &[&(name)]));
@@ -6165,12 +7176,22 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     }
                     let _ = ui2.upgrade_in_event_loop(|ui| ui.global::<FilesG>().set_busy(false));
                     if failed.is_empty() {
-                        toast(&ui2, 1, rcgui_i18n::f("已下载 {}/{} 项到 {}", &[&(ok), &(total), &(dir.display())]));
+                        toast(
+                            &ui2,
+                            1,
+                            rcgui_i18n::f(
+                                "已下载 {}/{} 项到 {}",
+                                &[&(ok), &(total), &(dir.display())],
+                            ),
+                        );
                     } else {
                         toast(
                             &ui2,
                             2,
-                            rcgui_i18n::f("下载完成 {}/{}，失败 {}：{}", &[&(ok), &(total), &(failed.len()), &(failed.join("；"))]),
+                            rcgui_i18n::f(
+                                "下载完成 {}/{}，失败 {}：{}",
+                                &[&(ok), &(total), &(failed.len()), &(failed.join("；"))],
+                            ),
                         );
                     }
                 });
@@ -6217,7 +7238,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 toast(
                     ui,
                     2,
-                    rcgui_i18n::f("删除完成 {}/{}，失败 {}：{}", &[&(ok), &(total), &(failed.len()), &(failed.join("；"))]),
+                    rcgui_i18n::f(
+                        "删除完成 {}/{}，失败 {}：{}",
+                        &[&(ok), &(total), &(failed.len()), &(failed.join("；"))],
+                    ),
                 );
             }
             false
@@ -6249,6 +7273,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let _ = ui.upgrade_in_event_loop(move |ui| {
                 let g = ui.global::<LocalG>();
                 match res {
+                    // 轻量模式期间不写本地列表：界面不在屏幕上，写进去只是把刚清掉的
+                    // 行重新装回内存；退出轻量模式时 `LocalRefresh` 会重取一遍。
+                    Ok(rows) if crate::lightweight::suppress_rows(rows.len()) => {}
                     Ok(rows) => {
                         g.set_path(cur.clone().into());
                         // 与远程侧同理：勾选数组按行数重建，否则 Slint 的 checked[i] 越界
@@ -6293,12 +7320,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or(cur);
-            let _ = Box::pin(handle_cmd(
-                ctx,
-                ui,
-                Cmd::LocalRefresh { path: Some(up) },
-            ))
-            .await;
+            let _ = Box::pin(handle_cmd(ctx, ui, Cmd::LocalRefresh { path: Some(up) })).await;
             false
         }
         Cmd::LocalChooseDir => {
@@ -6333,7 +7355,14 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let src = Path::new(&cur).join(&name);
             // K-Vault 远程：写入走站点 API，不经 rclone 的 DAV 通道（只读）。
             if let Some(cfg) = kv_cfg_for(&ctx, &remote).await {
-                return Box::pin(kv_upload_into(ctx.clone(), ui.clone(), cfg, vec![src], &path)).await;
+                return Box::pin(kv_upload_into(
+                    ctx.clone(),
+                    ui.clone(),
+                    cfg,
+                    vec![src],
+                    &path,
+                ))
+                .await;
             }
             let client = ctx.rc.client().await;
             let fs = format!("{remote}:");
@@ -6386,7 +7415,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             match res {
                 Ok(_) => {
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
-                    let extra = if cand != name { rcgui_i18n::t("（同名已自动改名）") } else { "" };
+                    let extra = if cand != name {
+                        rcgui_i18n::t("（同名已自动改名）")
+                    } else {
+                        ""
+                    };
                     toast(ui, 1, rcgui_i18n::f("已上传 {}{}", &[&(cand), &(extra)]));
                 }
                 Err(e) => toast(ui, 2, rcgui_i18n::f("上传失败: {}", &[&(e)])),
@@ -6481,12 +7514,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 g.set_sort_key(key.into());
                 g.set_sort_desc(new_desc);
             });
-            let _ = Box::pin(handle_cmd(
-                ctx,
-                ui,
-                Cmd::LocalRefresh { path: None },
-            ))
-            .await;
+            let _ = Box::pin(handle_cmd(ctx, ui, Cmd::LocalRefresh { path: None })).await;
             false
         }
         Cmd::LocalUploadToList { path, seq } => {
@@ -6523,9 +7551,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                             })
                             .collect();
                         let mut dirs = dirs;
-                        dirs.sort_by(|a, b| {
-                            a.name.to_lowercase().cmp(&b.name.to_lowercase())
-                        });
+                        dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
                         g.set_up_dirs(ModelRc::from(Rc::new(VecModel::from(dirs))));
                         g.set_up_path(path.clone().into());
                     }
@@ -6567,7 +7593,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if let Some(cfg) = kv_cfg_for(&ctx, &remote).await {
                 let paths: Vec<PathBuf> =
                     items.iter().map(|(n, _)| Path::new(&cur).join(n)).collect();
-                let ret = Box::pin(kv_upload_into(ctx.clone(), ui.clone(), cfg, paths, &dest)).await;
+                let ret =
+                    Box::pin(kv_upload_into(ctx.clone(), ui.clone(), cfg, paths, &dest)).await;
                 // 传完退出多选并清空勾选（与下面 rclone 分支的处理一致）
                 let _ = ui.upgrade_in_event_loop(|ui| {
                     let g = ui.global::<LocalG>();
@@ -6623,12 +7650,19 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             });
             let _ = Box::pin(handle_cmd(ctx, ui, Cmd::FilesRefresh { seq: -1 })).await;
             if failed.is_empty() {
-                toast(ui, 1, rcgui_i18n::f("已上传 {}/{} 项到 {}", &[&(ok), &(total), &(dest)]));
+                toast(
+                    ui,
+                    1,
+                    rcgui_i18n::f("已上传 {}/{} 项到 {}", &[&(ok), &(total), &(dest)]),
+                );
             } else {
                 toast(
                     ui,
                     2,
-                    rcgui_i18n::f("上传完成 {}/{}，失败 {}：{}", &[&(ok), &(total), &(failed.len()), &(failed.join("；"))]),
+                    rcgui_i18n::f(
+                        "上传完成 {}/{}，失败 {}：{}",
+                        &[&(ok), &(total), &(failed.len()), &(failed.join("；"))],
+                    ),
                 );
             }
             false
@@ -6661,13 +7695,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     .row_data(m.get_cache_idx().max(0) as usize)
                     .unwrap_or("minimal".into())
                     .to_string();
-                (
-                    remote,
-                    m.get_sub_path().to_string(),
-                    point,
-                    ro,
-                    cache,
-                )
+                (remote, m.get_sub_path().to_string(), point, ro, cache)
             })
             .await
             .unwrap_or_default();
@@ -6688,7 +7716,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     .iter()
                     .any(|r| mount_key(&r.mount_point) == mount_key(&point));
                 if dup {
-                    toast(ui, 2, rcgui_i18n::f("挂载点 {} 已被占用，请修改盘符", &[&(point)]));
+                    toast(
+                        ui,
+                        2,
+                        rcgui_i18n::f("挂载点 {} 已被占用，请修改盘符", &[&(point)]),
+                    );
                     return false;
                 }
             }
@@ -6698,7 +7730,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 "read_only": ro,
             });
             // 立即在“活动挂载”里插入一条 pending（spinner + 高亮）
-            ctx.pending_mounts.lock().unwrap().push((fs.clone(), point.clone()));
+            ctx.pending_mounts
+                .lock()
+                .unwrap()
+                .push((fs.clone(), point.clone()));
             // 每次新的挂载尝试都要清掉该盘符的「已取消」标记，
             // 否则上一次卸载留下的标记会让本次等待循环直接静默退出
             ctx.cancelled_mounts
@@ -6711,13 +7746,21 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // 给足时间：RC 调用会阻塞到挂载完成（网盘首次挂载可能 15~30s 甚至更久）
             let res = tokio::time::timeout(MOUNT_RC_TIMEOUT, client.mount(&fs, &point, opts))
                 .await
-                .map_err(|_| anyhow!("{}", rcgui_i18n::f("挂载超时（{}s）", &[&(MOUNT_RC_TIMEOUT.as_secs())])))
+                .map_err(|_| {
+                    anyhow!(
+                        "{}",
+                        rcgui_i18n::f("挂载超时（{}s）", &[&(MOUNT_RC_TIMEOUT.as_secs())])
+                    )
+                })
                 .and_then(|r| r.map_err(anyhow::Error::from));
             // 无论成败都先摘掉 pending，并立刻重绘一次：
             // 活动挂载列表是靠 `pending` 渲染 spinner 的，只从 ctx.pending_mounts 里删掉
             // 而不刷新 UI，界面就会一直停在那行 spinner 上
             // （切到别的页面再切回来之所以正常，是因为切换本身会再发一次 MountsRefresh）。
-            ctx.pending_mounts.lock().unwrap().retain(|(_, p)| p != &point);
+            ctx.pending_mounts
+                .lock()
+                .unwrap()
+                .retain(|(_, p)| p != &point);
             let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
             // rclone 的 mount/mount 返回成功只代表「已受理」，WinFsp 真正挂上盘符是异步的。
             // 必须确认挂载点真的出现，否则会出现「提示挂载成功但资源管理器里没有盘」。
@@ -6744,8 +7787,13 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 }
                 Err(e) => {
                     // 报错但盘符其实已经挂上：按成功处理，避免误导
-                    if wait_mount_ready_rc(&client, &point, MOUNT_READY_TIMEOUT, &ctx.cancelled_mounts)
-                        .await
+                    if wait_mount_ready_rc(
+                        &client,
+                        &point,
+                        MOUNT_READY_TIMEOUT,
+                        &ctx.cancelled_mounts,
+                    )
+                    .await
                     {
                         Ok(point.clone())
                     } else {
@@ -6759,12 +7807,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     {
                         let mut cfg = ctx.cfg.lock().unwrap();
                         if let Err(e) = persist::remember_mount(
-                            &mut cfg,
-                            &remote,
-                            &sub_path,
-                            &actual,
-                            ro,
-                            &cache,
+                            &mut cfg, &remote, &sub_path, &actual, ro, &cache,
                         ) {
                             toast(ui, 2, format!("{e}"));
                         }
@@ -6882,11 +7925,18 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             })
             .await
             .unwrap_or_default();
-            let start = if cur.trim().is_empty() { "root://".to_string() } else { cur };
+            let start = if cur.trim().is_empty() {
+                "root://".to_string()
+            } else {
+                cur
+            };
             let (items, disp) = list_display(ctx, &start, false).await;
             let rows: Vec<PathItem> = items
                 .into_iter()
-                .map(|(n, d)| PathItem { name: n.into(), is_dir: d })
+                .map(|(n, d)| PathItem {
+                    name: n.into(),
+                    is_dir: d,
+                })
                 .collect();
             let _ = ui.upgrade_in_event_loop(move |ui| {
                 let g = ui.global::<BrowseG>();
@@ -6916,7 +7966,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let (items, disp) = list_display(ctx, &target, false).await;
             let rows: Vec<PathItem> = items
                 .into_iter()
-                .map(|(n, d)| PathItem { name: n.into(), is_dir: d })
+                .map(|(n, d)| PathItem {
+                    name: n.into(),
+                    is_dir: d,
+                })
                 .collect();
             let _ = ui.upgrade_in_event_loop(move |ui| {
                 let g = ui.global::<BrowseG>();
@@ -6936,13 +7989,22 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         entries.push((e.name.to_string(), e.is_dir));
                     }
                 }
-                (g.get_scope(), g.get_path().to_string(), g.get_sel(), entries)
+                (
+                    g.get_scope(),
+                    g.get_path().to_string(),
+                    g.get_sel(),
+                    entries,
+                )
             })
             .await
             .unwrap_or_default();
             let base = path.trim().trim_end_matches('/');
             let is_root = base == "root:" || base == "root://" || base == "root" || base.is_empty();
-            let picked = if sel >= 0 { entries.get(sel as usize) } else { None };
+            let picked = if sel >= 0 {
+                entries.get(sel as usize)
+            } else {
+                None
+            };
             let final_disp = match picked {
                 Some((n, _)) => {
                     if is_root {
@@ -7022,13 +8084,15 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             false
         }
         Cmd::RemoteAdd => {
-            // 先显示编辑器，再异步加载 providers
+            // 先显示编辑器，再异步加载 providers。
+            // `type-idx` 先写 -1：类型表还没拿到，此刻没有任何合法类型；
+            // 写 0 会让保存路径把清单第 0 项当成用户的选择。
             let _ = ui.upgrade_in_event_loop(move |ui| {
                 let g = ui.global::<RemotesG>();
                 g.set_edit_is_new(true);
                 g.set_edit_name("".into());
                 g.set_edit_params("".into());
-                g.set_type_idx(0);
+                g.set_type_idx(-1);
                 g.set_show_advanced(false);
                 g.set_show_raw(false);
                 g.set_show_editor(true);
@@ -7038,34 +8102,41 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let ctx2 = ctx.clone();
             tokio::spawn(async move {
                 let providers = get_providers(&ctx2).await;
-                // 更新类型列表
-                let list = providers.get("providers").and_then(|p| p.as_array()).cloned().unwrap_or_default();
-                let mut names: Vec<String> = list.iter()
-                    .filter_map(|p| p.get("Name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-                    .collect();
-                names.sort();
-                // 拿不到 provider 列表时不能只给一个空下拉框（实测用户会卡在
-                // 「类型没有选项，无法新建远程」）。用内置常见类型兜底，
-                // 并把失败原因说清楚；有磁盘缓存时上面已经回落到缓存了。
-                let from_fallback = names.is_empty();
-                if from_fallback {
-                    names = FALLBACK_REMOTE_TYPES.iter().map(|s| s.to_string()).collect();
-                }
-                // `k-vault` 不是 rclone 的后端类型（GUI 里映射成 webdav 远程），
-                // rclone 的 provider 列表里永远没有它，得自己补进去才选得到。
-                if !names.iter().any(|n| n == kvault::TYPE) {
-                    names.push(kvault::TYPE.to_string());
-                    names.sort();
-                }
-                let first_type = names.first().cloned().unwrap_or_default();
+                // 类型清单 = 内核报的后端 + 启用插件声明的派生类型。
+                // 界面只拿显示名，真实 id 与落盘用的 backend 留在平行表里。
+                let derived = remote_types::collect(&ctx2);
+                let choices = build_type_choices(&providers, &derived);
+                // 一项都没有 = 内核没连上、也没有上次成功的缓存、还没有插件声明类型。
+                // 这时下拉留空、保存被拒，并说明怎么恢复；不塞任何编造的类型。
+                let empty = choices.is_empty();
+                let first = choices.first().cloned();
+                let idx = match ctx2.type_choices.lock() {
+                    Ok(mut t) => t.reset(choices.clone(), None),
+                    Err(_) => 0,
+                };
+                // 派生类型带着插件给的初始参数：直接铺进「原始参数」，用户
+                // 不用自己敲已知的键。`type` 不写进文本，保存时按 backend 落盘。
+                let seed = first
+                    .as_ref()
+                    .filter(|c| c.derived)
+                    .and_then(|c| remote_types::find(&derived, &c.id))
+                    .map(derived_params_text)
+                    .unwrap_or_default();
+                // k-vault 走专用表单，字段按它的语义渲染；其它派生类型按
+                // base_type 的选项渲染（rclone 认识的是 base_type）。
+                let fields_type = first.as_ref().map(form_fields_type).unwrap_or_default();
+                let shown = choices.clone();
+                // 空清单必须传 `None`：界面写 -1，保存路径据此拒绝，而不是
+                // 悄悄用第 0 项建一个别的后端。
+                let pick = if empty { None } else { Some(idx) };
                 let _ = ui2.upgrade_in_event_loop(move |ui| {
-                    let g = ui.global::<RemotesG>();
-                    g.set_types(ModelRc::from(Rc::new(VecModel::from(
-                        names.iter().map(|s| s.as_str().into()).collect::<Vec<slint::SharedString>>()
-                    ))));
-                    g.set_type_idx(0);
+                    push_type_selection(&ui, &shown, pick);
+                    if !seed.is_empty() {
+                        ui.global::<RemotesG>()
+                            .set_edit_params(seed.as_str().into());
+                    }
                 });
-                if from_fallback {
+                if empty {
                     let why = ctx2
                         .providers_err
                         .lock()
@@ -7074,7 +8145,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         .unwrap_or_else(|| rcgui_i18n::t("rclone 未返回后端类型列表").to_string());
                     // rclone 对 config/* 这类敏感接口要求配置 RC 认证；只连上
                     // core/version 并不代表能读配置（实测踩过）。给一句能照做的指引。
-                    let auth_hint = if why.to_ascii_lowercase().contains("authentication must be set up") {
+                    let auth_hint = if why
+                        .to_ascii_lowercase()
+                        .contains("authentication must be set up")
+                    {
                         rcgui_i18n::t("rclone 没有启用 RC 认证：请加 --rc-user/--rc-pass（与「设置」里的一致）或 --rc-no-auth 后重启 rclone，再点「重新握手」。")
                     } else {
                         rcgui_i18n::t("请到「设置」点「连接/握手」或「重新握手」。")
@@ -7082,25 +8156,65 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     toast(
                         &ui2,
                         2,
-                        rcgui_i18n::f("无法从 rclone 获取远程类型（{}），已先列出常见类型；\
-                             参数表单需要连接后才能加载。{}", &[&(why), &(auth_hint)]),
+                        rcgui_i18n::f(
+                            "连接内核后再选类型（{}）：现在没有可用的远程类型。{}",
+                            &[&(why), &(auth_hint)],
+                        ),
                     );
                 }
-                update_editor_fields(&ui2, &providers, &first_type);
+                update_editor_fields(&ui2, &providers, &fields_type);
             });
             false
         }
         Cmd::RemoteTypeChanged => {
-            let type_name = read_ui(ui, |ui| {
-                let g = ui.global::<RemotesG>();
-                let ti = g.get_type_idx().max(0) as usize;
-                g.get_types().row_data(ti).unwrap_or_default().to_string()
-            })
-            .await
-            .unwrap_or_default();
+            // 下拉里选中第几项 → 平行表里的真实 id 与 backend。
+            // 显示名可能被插件改措辞（甚至中文化），绝不能拿它当类型名。
+            let picked_idx = read_ui(ui, |ui| ui.global::<RemotesG>().get_type_idx())
+                .await
+                .unwrap_or(0);
+            let choice = match ctx.type_choices.lock() {
+                Ok(t) => t.selected(picked_idx),
+                Err(_) => None,
+            };
             let providers = get_providers(&ctx).await;
-            update_editor_fields(ui, &providers, &type_name);
-            if type_name == kvault::TYPE {
+            let Some(choice) = choice else {
+                // 平行表还没建（启动后没打开过新建对话框）或下标越界：
+                // 按空类型渲染，至少不要把上一个类型的字段留在界面上。
+                update_editor_fields(ui, &providers, "");
+                return false;
+            };
+            let fields_type = form_fields_type(&choice);
+            update_editor_fields(ui, &providers, &fields_type);
+            // 派生类型需要的内核后端可能不存在（例如 teldrive 只在 fork 里）。
+            // 这里只说事实，不去替用户启动第二个 rclone。
+            let mut lack_note: Option<String> = None;
+            if choice.derived {
+                if let Some(false) = remote_types::backend_available(&providers, &choice.backend) {
+                    lack_note = Some(rcgui_i18n::f(
+                        "当前连接的内核没有 {} 后端，选这个类型建远程会失败（它需要 {} 后端）。请换用带该后端的内核（维护 → 内核 → 自定义路径），再试一次。",
+                        &[&choice.backend, &choice.backend],
+                    ));
+                }
+            }
+            if let Some(note) = lack_note {
+                toast(ui, 2, note);
+            }
+            // 派生类型的 defaults 预铺：只补用户还没写的键，不覆盖他已填的值。
+            if choice.derived {
+                let current = read_ui(ui, |ui| {
+                    ui.global::<RemotesG>().get_edit_params().to_string()
+                })
+                .await
+                .unwrap_or_default();
+                if let Some(seeded) =
+                    seed_derived_defaults(&choice, &remote_types::collect(ctx), &current)
+                {
+                    let _ = ui.upgrade_in_event_loop(move |ui| {
+                        ui.global::<RemotesG>().set_edit_params(seeded.into());
+                    });
+                }
+            }
+            if choice.id == kvault::TYPE {
                 // 切到 k-vault：表单给初值。改的是已有远程（比如用户自己建的
                 // webdav 远程）时，把他填过的站点地址/用户名带过来，别让他重打。
                 let adopt = read_ui(ui, |ui| {
@@ -7113,8 +8227,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     .map(|u| kvault::base_from_url(&u))
                     .filter(|b| !b.is_empty());
                 let user = kv_param_of(&adopt.1, "user").unwrap_or_default();
-                let token_set = !adopt.0 && kv_param_of(&adopt.1, "bearer_token").is_some_and(|t| !t.is_empty());
-                let pass_set = !adopt.0 && kv_param_of(&adopt.1, "pass").is_some_and(|p| !p.is_empty());
+                let token_set = !adopt.0
+                    && kv_param_of(&adopt.1, "bearer_token").is_some_and(|t| !t.is_empty());
+                let pass_set =
+                    !adopt.0 && kv_param_of(&adopt.1, "pass").is_some_and(|p| !p.is_empty());
                 let _ = ui.upgrade_in_event_loop(move |ui| {
                     // 站点地址不预填：用户自己粘自己的站点，别给一个看起来像默认值的示例。
                     reset_kv_form(&ui, base.as_deref().unwrap_or(""));
@@ -7126,6 +8242,68 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     g.set_kv_pass_set(pass_set);
                 });
             }
+            false
+        }
+        Cmd::RemoteTypeSearch(query) => {
+            // 过滤只改可选清单，但有个必须处理的副作用：搜索把用户当前选中的类型
+            // 筛掉时，界面上的选中项就落到别的类型上了（比如搜 `kvault` 只剩
+            // K-Vault），这时候参数表必须一起换，否则选中的是新类型、填的是旧类型
+            // 的字段，一保存就把参数写到另一个后端上。
+            //
+            // 反过来，选中项还在清单里就一律不动它：用户改搜索词不该被悄悄改成
+            // 第一项，已经填了一半的参数也不能重铺。
+            let picked = read_ui(ui, |ui| ui.global::<RemotesG>().get_type_idx())
+                .await
+                .unwrap_or(0);
+            let keep = match ctx.type_choices.lock() {
+                Ok(t) => t.selected(picked).map(|c| c.id),
+                Err(_) => None,
+            };
+            let (shown, result) = match ctx.type_choices.lock() {
+                Ok(mut t) => {
+                    let result = t.refilter(&query, keep.as_deref());
+                    (t.visible.clone(), result)
+                }
+                Err(_) => return false,
+            };
+            // 只有真的换了类型才需要换表单。
+            let switched_to = if result.switched {
+                result.idx.and_then(|i| shown.get(i)).cloned()
+            } else {
+                None
+            };
+            if let Some(choice) = switched_to.clone() {
+                let providers = get_providers(&ctx).await;
+                update_editor_fields(ui, &providers, &form_fields_type(&choice));
+                // 搜到派生类型时同样要把插件默认参数铺上：这条路径（输入搜索词就
+                // 换了类型）以前不铺，用户看到的原始文本和实际保存的内容不一致。
+                let current = read_ui(ui, |ui| {
+                    ui.global::<RemotesG>().get_edit_params().to_string()
+                })
+                .await
+                .unwrap_or_default();
+                if let Some(seeded) =
+                    seed_derived_defaults(&choice, &remote_types::collect(&ctx), &current)
+                {
+                    let _ = ui.upgrade_in_event_loop(move |ui| {
+                        ui.global::<RemotesG>().set_edit_params(seeded.into());
+                    });
+                }
+            }
+            let note: Option<String> = match (result.idx.is_some(), switched_to.as_ref()) {
+                // 一条都不剩：界面写成 -1，保存会被拒，所以要让用户知道该改搜索词。
+                (false, _) => Some(rcgui_i18n::t("没有匹配的类型，换个搜索词再选类型").to_string()),
+                (true, Some(c)) => Some(rcgui_i18n::f(
+                    "搜索把原来的类型筛掉了，已切到 {}，下面的参数按它显示",
+                    &[&c.display as &dyn std::fmt::Display],
+                )),
+                _ => None,
+            };
+            if let Some(note) = note {
+                toast(ui, 2, note);
+            }
+            let idx = result.idx;
+            let _ = ui.upgrade_in_event_loop(move |ui| push_type_selection(&ui, &shown, idx));
             false
         }
         Cmd::KvTest => {
@@ -7148,7 +8326,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // 令牌框留空时用已存的那份：点「测试连接」多半就是想验证现有配置。
             let mut token = form.token.clone();
             if token.is_empty() && !form.name.is_empty() {
-                token = kv_token_get(&ctx, &form.name);
+                token = kv_token_get(&ctx, &form.name).await;
             }
             let base = form.base.clone();
             let res = kvault::probe(&base, &token).await;
@@ -7253,33 +8431,37 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let (ty, kv_token_set, kv_pass_set) = match kv_cfg {
                 Some(ref c) => (
                     kvault::TYPE.to_string(),
-                    !kv_token_get(&ctx, &name).is_empty() || kvault::KvCfg::has_secret(&existing_params, kvault::TOKEN_KEY),
-                    kvault::KvCfg::has_secret(&existing_params, kvault::PASS_KEY) || !c.user.is_empty(),
+                    !kv_token_get(&ctx, &name).await.is_empty()
+                        || kvault::KvCfg::has_secret(&existing_params, kvault::TOKEN_KEY),
+                    kvault::KvCfg::has_secret(&existing_params, kvault::PASS_KEY)
+                        || !c.user.is_empty(),
                 ),
                 None => (ty, false, false),
             };
             let providers = get_providers(&ctx).await;
             let (desc, mut fields) = build_fields_from_provider(&providers, &ty);
             fill_fields_with_existing(&mut fields, &existing_params);
+            // 既有远程的类型下拉是只读的，只显示当前这一项。平行表也重置成这一项：
+            // 保存时要靠它拿回同一个真实类型（派生类型落 base_type，不能让显示名
+            // 参与往返，否则插件改一次措辞就会把 type 写坏）。
+            let choice = edit_single_choice(&ty, &remote_types::collect(ctx));
+            let choice_idx = match ctx.type_choices.lock() {
+                Ok(mut t) => t.reset(vec![choice.clone()], Some(&choice.id)),
+                Err(_) => 0,
+            };
             let _ = ui.upgrade_in_event_loop(move |ui| {
                 let g = ui.global::<RemotesG>();
-                // 确保类型列表包含当前类型
-                let mut types: Vec<slint::SharedString> =
-                    (0..g.get_types().row_count()).filter_map(|i| g.get_types().row_data(i)).collect();
-                let idx = types.iter().position(|t| t.as_str() == ty);
-                if idx.is_none() {
-                    types.push(ty.clone().into());
-                }
-                g.set_types(ModelRc::from(Rc::new(VecModel::from(types.clone()))));
-                let new_idx = idx.unwrap_or(types.len() - 1) as i32;
-                g.set_type_idx(new_idx);
+                let one = std::slice::from_ref(&choice);
+                push_type_choices(&ui, one, choice_idx);
                 g.set_edit_is_new(false);
                 g.set_edit_name(name.into());
                 g.set_edit_params(params_text.into());
                 match kv_cfg {
                     Some(cfg) => {
                         g.set_provider_desc(kv_desc().into());
-                        g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(Vec::<FieldRow>::new()))));
+                        g.set_edit_fields(ModelRc::from(Rc::new(VecModel::from(
+                            Vec::<FieldRow>::new(),
+                        ))));
                         apply_kv_form(&ui, &cfg, kv_token_set, kv_pass_set);
                     }
                     None => {
@@ -7295,13 +8477,12 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             false
         }
         Cmd::RemoteSave => {
-            let (name, type_str, params_text, is_new, show_raw) = read_ui(ui, |ui| {
+            let (name, picked_idx, params_text, is_new, show_raw) = read_ui(ui, |ui| {
                 let g = ui.global::<RemotesG>();
-                let ti = g.get_type_idx().max(0) as usize;
-                let ty = g.get_types().row_data(ti).unwrap_or_default().to_string();
+                // 下拉里只有显示名；真实类型要查平行表（插件可以改显示措辞）。
                 (
                     g.get_edit_name().to_string(),
-                    ty,
+                    g.get_type_idx(),
                     g.get_edit_params().to_string(),
                     g.get_edit_is_new(),
                     g.get_show_raw(),
@@ -7313,15 +8494,50 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 toast(ui, 2, rcgui_i18n::t("名称不能为空，且不能包含空格或冒号"));
                 return false;
             }
+            let choice = match ctx.type_choices.lock() {
+                Ok(t) => t.selected(picked_idx),
+                Err(_) => None,
+            };
+            let Some(choice) = choice else {
+                // 两种来源：类型清单还没建好（启动后没打开过新建对话框），或者当前
+                // 搜索词把选中项筛掉了（`type-idx` 是 -1）。无论哪种，都不能退回
+                // 第 0 项去保存——那会拿另一套参数建别的后端。
+                toast(
+                    ui,
+                    2,
+                    rcgui_i18n::t("先选一个远程类型再保存（当前搜索词下没有选中项）"),
+                );
+                return false;
+            };
+            // 派生类型真正落盘的是 base_type；这里先确认内核有这个后端，
+            // 否则 rclone 会抛一句用户看不懂的错（常见于 teldrive 只在 fork 里）。
+            if choice.derived {
+                let providers = get_providers(ctx).await;
+                if let Some(false) = remote_types::backend_available(&providers, &choice.backend) {
+                    toast(
+                        ui,
+                        2,
+                        rcgui_i18n::f(
+                            "这个内核没有 {} 后端，{} 保存不了。请换用带该后端的内核（维护 → 内核 → 自定义路径）后再试。",
+                            &[&choice.backend, &choice.id],
+                        ),
+                    );
+                    return false;
+                }
+            }
             // K-Vault 走专用表单：下拉框里是 k-vault，落盘的是 webdav + `kvault=1` 标记。
             let kv_form = read_kv_form(ui).await;
-            if kv_form.editor && type_str == kvault::TYPE {
+            if kv_form.editor && choice.id == kvault::TYPE {
                 let cfg = kv_form.to_cfg();
                 if cfg.base.trim().is_empty() {
                     toast(ui, 2, rcgui_i18n::t("站点地址不能为空"));
                     return false;
                 }
-                if cfg.token.is_empty() && cfg.user.is_empty() && !kv_form.token_set && !kv_form.pass_set {
+                if cfg.token.is_empty()
+                    && cfg.user.is_empty()
+                    && !kv_form.token_set
+                    && !kv_form.pass_set
+                {
                     toast(
                         ui,
                         2,
@@ -7332,11 +8548,18 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let mut params = cfg.params(!cfg.token.is_empty());
                 let client = ctx.rc.client().await;
                 let res = if is_new {
-                    client.config_create(&name, kvault::BACKEND, serde_json::Value::Object(params)).await
+                    client
+                        .config_create(&name, kvault::BACKEND, serde_json::Value::Object(params))
+                        .await
                 } else {
                     // 更新时显式带 type：用户可能是把一个已有的远程改成 k-vault
-                    params.insert("type".to_string(), serde_json::Value::String(kvault::BACKEND.to_string()));
-                    client.config_update(&name, serde_json::Value::Object(params)).await
+                    params.insert(
+                        "type".to_string(),
+                        serde_json::Value::String(kvault::BACKEND.to_string()),
+                    );
+                    client
+                        .config_update(&name, serde_json::Value::Object(params))
+                        .await
                 };
                 return match res {
                     Ok(()) => {
@@ -7358,7 +8581,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 };
             }
             // 优先使用模板字段，原始模式或字段为空时用 key=value
-            let params = if !show_raw {
+            let user = if !show_raw {
                 let fields = read_fields_from_ui(ui).await;
                 if !fields.is_empty() {
                     fields_to_params(&fields)
@@ -7368,11 +8591,25 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             } else {
                 serde_json::Value::Object(parse_kv_lines(&params_text))
             };
-            let client = ctx.rc.client().await;
-            let res = if is_new {
-                client.config_create(&name, &type_str, params).await
+            // 字段表里没有插件独有的键，直接从它组装会把插件的默认参数弄丢，
+            // 所以先铺插件的默认值，再让用户填的值盖上去。
+            let user = match user {
+                serde_json::Value::Object(m) => m,
+                _ => serde_json::Map::new(),
+            };
+            let derived = if choice.derived {
+                remote_types::collect(ctx)
             } else {
-                client.config_update(&name, params).await
+                Vec::new()
+            };
+            let client = ctx.rc.client().await;
+            let res = match build_save_request(&name, &choice, &derived, user, is_new) {
+                SaveRequest::Create {
+                    name,
+                    rtype,
+                    params,
+                } => client.config_create(&name, &rtype, params).await,
+                SaveRequest::Update { name, params } => client.config_update(&name, params).await,
             };
             match res {
                 Ok(()) => {
@@ -7509,12 +8746,22 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::RemotesRefresh)).await;
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ServesRefresh)).await;
-                    let mut msg = rcgui_i18n::f("已删除 {}（停止服务 {} 个、卸载挂载 {} 个）", &[&(name), &(live_serves.len()), &(points_to_unmount.len())]);
+                    let mut msg = rcgui_i18n::f(
+                        "已删除 {}（停止服务 {} 个、卸载挂载 {} 个）",
+                        &[&(name), &(live_serves.len()), &(points_to_unmount.len())],
+                    );
                     if had_proxy {
                         msg.push_str(rcgui_i18n::t("，代理绑定已清除"));
                     }
                     if !errs.is_empty() {
-                        toast(ui, 2, rcgui_i18n::f("{}；但有 {} 项清理失败：{}", &[&(msg), &(errs.len()), &(errs.join("；"))]));
+                        toast(
+                            ui,
+                            2,
+                            rcgui_i18n::f(
+                                "{}；但有 {} 项清理失败：{}",
+                                &[&(msg), &(errs.len()), &(errs.join("；"))],
+                            ),
+                        );
                     } else {
                         toast(ui, 1, msg);
                     }
@@ -7542,7 +8789,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                             name: p.name.clone().into(),
                             protocol: p.protocol.label().into(),
                             target: p.display_target().into(),
-                            auth: if p.has_auth() { rcgui_i18n::t("有凭据").into() } else { rcgui_i18n::t("无").into() },
+                            auth: if p.has_auth() {
+                                rcgui_i18n::t("有凭据").into()
+                            } else {
+                                rcgui_i18n::t("无").into()
+                            },
                             used_by: if used.is_empty() {
                                 "—".into()
                             } else {
@@ -7566,7 +8817,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 toast(
                     ui,
                     2,
-                    rcgui_i18n::f("以下远程引用的代理配置已不存在，请重新选择：{}", &[&(dangling.join("、"))]),
+                    rcgui_i18n::f(
+                        "以下远程引用的代理配置已不存在，请重新选择：{}",
+                        &[&(dangling.join("、"))],
+                    ),
                 );
             }
             apply_proxy_column(ui).await;
@@ -7663,10 +8917,19 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // 编辑时排除自己的 id，这样只改端口/地址不会被自己名字挡住。
             {
                 let cfg = ctx.cfg.lock().unwrap();
-                let exclude = if edit_id_is_new { "" } else { profile.id.as_str() };
-                if let Some(dup) = proxy::proxy_name_conflict(&cfg.proxies, &profile.name, exclude) {
+                let exclude = if edit_id_is_new {
+                    ""
+                } else {
+                    profile.id.as_str()
+                };
+                if let Some(dup) = proxy::proxy_name_conflict(&cfg.proxies, &profile.name, exclude)
+                {
                     drop(cfg);
-                    toast(ui, 2, rcgui_i18n::f("已存在同名代理配置「{}」，请换一个名称", &[&(dup)]));
+                    toast(
+                        ui,
+                        2,
+                        rcgui_i18n::f("已存在同名代理配置「{}」，请换一个名称", &[&(dup)]),
+                    );
                     return false;
                 }
             }
@@ -7679,7 +8942,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let affected: Vec<String> = {
                 let mut cfg = ctx.cfg.lock().unwrap();
                 let is_new = !cfg.proxies.iter().any(|p| p.id == profile.id);
-                let label = if is_new { rcgui_i18n::t("已新增") } else { rcgui_i18n::t("已更新") };
+                let label = if is_new {
+                    rcgui_i18n::t("已新增")
+                } else {
+                    rcgui_i18n::t("已更新")
+                };
                 cfg.proxies.retain(|p| p.id != profile.id);
                 cfg.proxies.push(profile.clone());
                 // 改动配置内容后，用它的 remote 都标记为「待应用」，由下面的
@@ -7701,7 +8968,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     toast(ui, 2, rcgui_i18n::f("保存代理配置失败: {}", &[&(e)]));
                     return false;
                 }
-                toast(ui, 1, rcgui_i18n::f("代理配置「{}」{}", &[&(profile.name), &(label)]));
+                toast(
+                    ui,
+                    1,
+                    rcgui_i18n::f("代理配置「{}」{}", &[&(profile.name), &(label)]),
+                );
                 affected
             };
             {
@@ -7740,7 +9011,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 toast(
                     ui,
                     0,
-                    rcgui_i18n::f("代理配置已保存，{} 个远程标记为待应用（连接后将自动下发）", &[&(affected.len())]),
+                    rcgui_i18n::f(
+                        "代理配置已保存，{} 个远程标记为待应用（连接后将自动下发）",
+                        &[&(affected.len())],
+                    ),
                 );
             }
             let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ProxyListRefresh)).await;
@@ -7872,7 +9146,14 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 toast(
                     ui,
                     0,
-                    rcgui_i18n::f("{} 的代理已保存，当前未连接 rclone，将在连接后自动应用。{}{}", &[&(remote), &(proxy::restart_hint()), &(native_hint.unwrap_or(""))]),
+                    rcgui_i18n::f(
+                        "{} 的代理已保存，当前未连接 rclone，将在连接后自动应用。{}{}",
+                        &[
+                            &(remote),
+                            &(proxy::restart_hint()),
+                            &(native_hint.unwrap_or("")),
+                        ],
+                    ),
                 );
             }
             let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ProxyListRefresh)).await;
@@ -7884,31 +9165,30 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             false
         }
         Cmd::ServeStart => {
-            let (stype, remote, sub_path, addr, user, pass, svc_name) =
-                read_ui(ui, |ui| {
-                    let g = ui.global::<ServesG>();
-                    let ty = g
-                        .get_types()
-                        .row_data(g.get_type_idx().max(0) as usize)
-                        .unwrap_or_default()
-                        .to_string();
-                    let remote = g
-                        .get_remotes()
-                        .row_data(g.get_remote_idx().max(0) as usize)
-                        .unwrap_or_default()
-                        .to_string();
-                    (
-                        ty,
-                        remote,
-                        g.get_sub_path().to_string(),
-                        g.get_addr().to_string(),
-                        g.get_user().to_string(),
-                        g.get_pass().to_string(),
-                        g.get_svc_name().to_string(),
-                    )
-                })
-                .await
-                .unwrap_or_default();
+            let (stype, remote, sub_path, addr, user, pass, svc_name) = read_ui(ui, |ui| {
+                let g = ui.global::<ServesG>();
+                let ty = g
+                    .get_types()
+                    .row_data(g.get_type_idx().max(0) as usize)
+                    .unwrap_or_default()
+                    .to_string();
+                let remote = g
+                    .get_remotes()
+                    .row_data(g.get_remote_idx().max(0) as usize)
+                    .unwrap_or_default()
+                    .to_string();
+                (
+                    ty,
+                    remote,
+                    g.get_sub_path().to_string(),
+                    g.get_addr().to_string(),
+                    g.get_user().to_string(),
+                    g.get_pass().to_string(),
+                    g.get_svc_name().to_string(),
+                )
+            })
+            .await
+            .unwrap_or_default();
             if remote.is_empty() {
                 toast(ui, 2, rcgui_i18n::t("请先在「远程」页添加仓库，再选择仓库"));
                 return false;
@@ -7926,9 +9206,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 let svc = svc_name.trim().to_string();
                 if !svc.is_empty() {
                     let cfg = ctx.cfg.lock().unwrap();
-                    if let Some(dup) =
-                        proxy::serve_name_conflict(&cfg.serve_names, &svc, &addr_t)
-                    {
+                    if let Some(dup) = proxy::serve_name_conflict(&cfg.serve_names, &svc, &addr_t) {
                         drop(cfg);
                         toast(
                             ui,
@@ -7942,9 +9220,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             // busy 由守卫托管：任何返回路径都会复位
             let _busy = BusyGuard::new(ui, BusyKind::Serves);
             let client = ctx.rc.client().await;
-            let res = client
-                .serve_start(&stype, &fs, &addr_t, &user, &pass)
-                .await;
+            let res = client.serve_start(&stype, &fs, &addr_t, &user, &pass).await;
             match res {
                 Ok(id) => {
                     let mut saved_err = None;
@@ -7964,12 +9240,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                             next_serve_name(&cfg)
                         };
                         persist::remember_serve_name(
-                            &mut cfg,
-                            &stype,
-                            &remote,
-                            &sub_path,
-                            &addr_t,
-                            &name,
+                            &mut cfg, &stype, &remote, &sub_path, &addr_t, &name,
                         );
                         // 记住这次服务：下次连接成功会自动重建（rclone 自己不持久化 serve）
                         if let Err(e) = persist::remember_serve(
@@ -8083,9 +9354,21 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             match client.options_get().await {
                 Ok(v) => {
                     let main = v.get("main").cloned().unwrap_or(json!({}));
-                    let transfers = main.get("Transfers").and_then(|x| x.as_i64()).map(|n| n.to_string()).unwrap_or_default();
-                    let checkers = main.get("Checkers").and_then(|x| x.as_i64()).map(|n| n.to_string()).unwrap_or_default();
-                    let tps = main.get("TPSLimit").and_then(|x| x.as_f64()).map(|n| format!("{:.1}", n)).unwrap_or_default();
+                    let transfers = main
+                        .get("Transfers")
+                        .and_then(|x| x.as_i64())
+                        .map(|n| n.to_string())
+                        .unwrap_or_default();
+                    let checkers = main
+                        .get("Checkers")
+                        .and_then(|x| x.as_i64())
+                        .map(|n| n.to_string())
+                        .unwrap_or_default();
+                    let tps = main
+                        .get("TPSLimit")
+                        .and_then(|x| x.as_f64())
+                        .map(|n| format!("{:.1}", n))
+                        .unwrap_or_default();
                     let log = main
                         .get("LogLevel")
                         .and_then(|x| x.as_str())
@@ -8114,7 +9397,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let (transfers, checkers, tps, log_level) = read_ui(ui, |ui| {
                 let g = ui.global::<SettingsG>();
                 let li = g.get_log_level_idx() as usize;
-                let lv = g.get_log_levels().row_data(li).unwrap_or_default().to_string();
+                let lv = g
+                    .get_log_levels()
+                    .row_data(li)
+                    .unwrap_or_default()
+                    .to_string();
                 (
                     g.get_opt_transfers().to_string(),
                     g.get_opt_checkers().to_string(),
@@ -8158,7 +9445,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let d = plugins_dir();
             let _ = std::fs::create_dir_all(&d);
             // explorer.exe 打不开时退 cmd start；两者都失败才报错，并总是回显路径便于排查
-            let mut opened = std::process::Command::new("explorer.exe").arg(&d).spawn().is_ok();
+            let mut opened = std::process::Command::new("explorer.exe")
+                .arg(&d)
+                .spawn()
+                .is_ok();
             if !opened {
                 opened = std::process::Command::new("cmd.exe")
                     .args(["/c", "start", "", d.to_string_lossy().as_ref()])
@@ -8168,7 +9458,17 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             toast(
                 ui,
                 if opened { 1 } else { 2 },
-                rcgui_i18n::f("{}插件目录：{}", &[&(if opened { rcgui_i18n::t("已请求打开") } else { rcgui_i18n::t("无法打开") }), &(d.display())]),
+                rcgui_i18n::f(
+                    "{}插件目录：{}",
+                    &[
+                        &(if opened {
+                            rcgui_i18n::t("已请求打开")
+                        } else {
+                            rcgui_i18n::t("无法打开")
+                        }),
+                        &(d.display()),
+                    ],
+                ),
             );
             false
         }
@@ -8192,7 +9492,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             if let Some((id, old_enabled, _kind, verified, path)) = row {
                 // 未通过完整性校验的插件一律不允许启用
                 if !old_enabled && !verified {
-                    toast(ui, 2, rcgui_i18n::f("插件 {} 未通过完整性校验，无法启用", &[&(id)]));
+                    toast(
+                        ui,
+                        2,
+                        rcgui_i18n::f("插件 {} 未通过完整性校验，无法启用", &[&(id)]),
+                    );
                     return false;
                 }
                 let enabled = !old_enabled;
@@ -8209,35 +9513,72 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                                 if let Err(e) =
                                     plugin_host::package::load_from_dir(&dir, &gui_version())
                                 {
-                                    toast(ui, 2, rcgui_i18n::f("插件 {} 校验失败: {}", &[&(id), &(format!("{:#}", e))]));
+                                    toast(
+                                        ui,
+                                        2,
+                                        rcgui_i18n::f(
+                                            "插件 {} 校验失败: {}",
+                                            &[&(id), &(format!("{:#}", e))],
+                                        ),
+                                    );
                                     return false;
                                 }
-                                toast(ui, 1, rcgui_i18n::f("正在执行插件 {} 的入口文件…", &[&(id)]));
+                                toast(
+                                    ui,
+                                    1,
+                                    rcgui_i18n::f("正在执行插件 {} 的入口文件…", &[&(id)]),
+                                );
                                 let r = tokio::task::spawn_blocking(move || {
                                     plugin_host::package::run_entry_file(&dir, &meta)
                                 })
                                 .await;
                                 match r {
-                                    Ok(Ok(0)) => {
-                                        toast(ui, 1, rcgui_i18n::f("插件 {} 已启用（入口文件执行成功）", &[&(id)]))
-                                    }
+                                    Ok(Ok(0)) => toast(
+                                        ui,
+                                        1,
+                                        rcgui_i18n::f(
+                                            "插件 {} 已启用（入口文件执行成功）",
+                                            &[&(id)],
+                                        ),
+                                    ),
                                     Ok(Ok(code)) => toast(
                                         ui,
                                         2,
-                                        rcgui_i18n::f("插件 {} 入口文件退出码 {}（可能未成功，请检查）", &[&(id), &(code)]),
+                                        rcgui_i18n::f(
+                                            "插件 {} 入口文件退出码 {}（可能未成功，请检查）",
+                                            &[&(id), &(code)],
+                                        ),
                                     ),
                                     Ok(Err(e)) => {
-                                        toast(ui, 2, rcgui_i18n::f("插件 {} 启动失败: {}", &[&(id), &(format!("{:#}", e))]));
+                                        toast(
+                                            ui,
+                                            2,
+                                            rcgui_i18n::f(
+                                                "插件 {} 启动失败: {}",
+                                                &[&(id), &(format!("{:#}", e))],
+                                            ),
+                                        );
                                         return false; // 执行失败不记录为已启用
                                     }
                                     Err(e) => {
-                                        toast(ui, 2, rcgui_i18n::f("插件 {} 执行线程异常: {}", &[&(id), &(e)]));
+                                        toast(
+                                            ui,
+                                            2,
+                                            rcgui_i18n::f(
+                                                "插件 {} 执行线程异常: {}",
+                                                &[&(id), &(e)],
+                                            ),
+                                        );
                                         return false;
                                     }
                                 }
                             }
                             None => {
-                                toast(ui, 2, rcgui_i18n::f("插件 {} 的 plugin.json 无法读取", &[&(id)]));
+                                toast(
+                                    ui,
+                                    2,
+                                    rcgui_i18n::f("插件 {} 的 plugin.json 无法读取", &[&(id)]),
+                                );
                                 return false;
                             }
                         }
@@ -8259,7 +9600,17 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     toast_ui(
                         &ui,
                         1,
-                        rcgui_i18n::f("插件 {} 已{}", &[&(id), &(if enabled { rcgui_i18n::t("启用") } else { rcgui_i18n::t("停用") })]),
+                        rcgui_i18n::f(
+                            "插件 {} 已{}",
+                            &[
+                                &(id),
+                                &(if enabled {
+                                    rcgui_i18n::t("启用")
+                                } else {
+                                    rcgui_i18n::t("停用")
+                                }),
+                            ],
+                        ),
                     );
                 });
             }
@@ -8295,14 +9646,24 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     rcgui_i18n::f("插件未通过完整性校验：{}", &[&(status)])
                 };
                 let fail_ui = fail.clone();
+                // 清空面板会把 `panel-page` 抹成空串，之后就没法知道用户原来停在哪一页。
+                // 所以在清空之前，先在 UI 线程上把"当前是哪个插件、停在哪一页"记下来，
+                // 行建好之后交给 `apply_panel_reopened` 判断该不该回到原来那页。
+                let before: Arc<Mutex<Option<plugins::PanelReopen>>> = Arc::new(Mutex::new(None));
+                let before_ui = Arc::clone(&before);
                 let _ = ui.upgrade_in_event_loop(move |ui| {
                     let g = ui.global::<PluginsG>();
+                    // 先记，再清：清空会把 `panel-page` 抹成空串，那时再读就没得救了。
+                    if let Ok(mut w) = before_ui.lock() {
+                        *w = Some(plugins::PanelReopen::capture(
+                            g.get_panel_plugin().as_str(),
+                            g.get_panel_page().as_str(),
+                        ));
+                    }
                     g.set_panel_plugin(panel_id.as_str().into());
                     g.set_panel_loading(has_panel && fail_ui.is_empty());
                     g.set_panel_error(fail_ui.as_str().into());
-                    g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(Vec::<
-                        crate::PanelRow,
-                    >::new()))));
+                    plugins::clear_panel(&ui);
                 });
                 if !verified {
                     toast(ui, 2, fail.as_str());
@@ -8311,11 +9672,15 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 if has_panel {
                     match plugins::build_panel(ctx, &id).await {
                         Ok(rows) => {
+                            let before = before
+                                .lock()
+                                .map(|w| w.clone())
+                                .unwrap_or_else(|e| e.into_inner().clone())
+                                .unwrap_or_else(|| plugins::PanelReopen::capture("", ""));
+                            let opened = id.clone();
                             let _ = ui.upgrade_in_event_loop(move |ui| {
-                                let g = ui.global::<PluginsG>();
-                                let list = plugins::panel_to_slint(&rows);
-                                g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(list))));
-                                g.set_panel_loading(false);
+                                plugins::apply_panel_reopened(&ui, &rows, &opened, &before);
+                                ui.global::<PluginsG>().set_panel_loading(false);
                             });
                         }
                         Err(e) => {
@@ -8337,9 +9702,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             let _ = ui.upgrade_in_event_loop(|ui| {
                 let g = ui.global::<PluginsG>();
                 g.set_panel_plugin("".into());
-                g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(Vec::<
-                    crate::PanelRow,
-                >::new()))));
+                plugins::clear_panel(&ui);
                 g.set_panel_error("".into());
             });
             false
@@ -8370,10 +9733,8 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             plugins::set_form_field(&ctx.store, &id, &key, &value);
             if let Ok(rows) = plugins::build_panel(ctx, &id).await {
                 let _ = ui.upgrade_in_event_loop(move |ui| {
-                    let g = ui.global::<PluginsG>();
-                    let list = plugins::panel_to_slint(&rows);
-                    g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(list))));
-                    g.set_panel_loading(false);
+                    plugins::apply_panel(&ui, &rows);
+                    ui.global::<PluginsG>().set_panel_loading(false);
                 });
             }
             false
@@ -8418,8 +9779,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         Ok(rows) => {
                             let _ = ui.upgrade_in_event_loop(move |ui| {
                                 let g = ui.global::<PluginsG>();
-                                let list = plugins::panel_to_slint(&rows);
-                                g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(list))));
+                                plugins::apply_panel(&ui, &rows);
                                 g.set_panel_loading(false);
                                 g.set_panel_busy_action("".into());
                                 g.set_panel_busy_label("".into());
@@ -8474,7 +9834,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     Ok(removed) => {
                         let recoverable = plugins::ships_with_app(&id);
                         let msg = if recoverable {
-                            rcgui_i18n::f("已卸载「{}」；如需再次使用，可在插件页点「恢复内置」", &[&(name)])
+                            rcgui_i18n::f(
+                                "已卸载「{}」；如需再次使用，可在插件页点「恢复内置」",
+                                &[&(name)],
+                            )
                         } else {
                             rcgui_i18n::f("已卸载「{}」", &[&(name)])
                         };
@@ -8491,9 +9854,7 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                             let g = ui.global::<PluginsG>();
                             g.set_panel_plugin("".into());
                             g.set_expanded(-1);
-                            g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(
-                                Vec::<crate::PanelRow>::new(),
-                            ))));
+                            plugins::clear_panel(&ui);
                             remove_plugin_row(&ui, &drop_id);
                             // 卡片一走，挂在卡片上的「恢复内置」按钮也跟着没了，
                             // 顶部那条已卸载提示必须同时出现，否则用户没有回头路。
@@ -8504,7 +9865,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         // 再按磁盘真相重扫一次（校准条数、已卸载入口、图床面板等）
                         rescan_plugins(ctx, ui).await;
                     }
-                    Err(e) => toast(ui, 2, rcgui_i18n::f("卸载失败: {}", &[&(format!("{:#}", e))])),
+                    Err(e) => toast(
+                        ui,
+                        2,
+                        rcgui_i18n::f("卸载失败: {}", &[&(format!("{:#}", e))]),
+                    ),
                 }
             }
             false
@@ -8529,7 +9894,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         });
                         rescan_plugins(ctx, ui).await;
                     }
-                    Err(e) => toast(ui, 2, rcgui_i18n::f("恢复失败: {}", &[&(format!("{:#}", e))])),
+                    Err(e) => toast(
+                        ui,
+                        2,
+                        rcgui_i18n::f("恢复失败: {}", &[&(format!("{:#}", e))]),
+                    ),
                 }
             }
             false
@@ -8549,7 +9918,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     });
                     rescan_plugins(ctx, ui).await;
                 }
-                Err(e) => toast(ui, 2, rcgui_i18n::f("恢复失败: {}", &[&(format!("{:#}", e))])),
+                Err(e) => toast(
+                    ui,
+                    2,
+                    rcgui_i18n::f("恢复失败: {}", &[&(format!("{:#}", e))]),
+                ),
             }
             false
         }
@@ -8612,7 +9985,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 // 在工作线程里调只会拿到 `NoTranslationsBundled`（GLOBAL_CONTEXT 不在
                 // 这个线程上），界面一动不动。这条命令由 tokio 派生在工作线程执行，
                 // 所以必须投回界面线程。刷新命令不依赖它完成，不用等回执。
-                if let Err(e) = slint::invoke_from_event_loop(move || apply_slint_language(want_lang)) {
+                if let Err(e) =
+                    slint::invoke_from_event_loop(move || apply_slint_language(want_lang))
+                {
                     eprintln!("界面语言切换无法投递到界面线程: {e}");
                 }
                 // 托盘菜单是宿主用 `t()` 在创建时定下的文字，重建不了图标，只能通知
@@ -8706,7 +10081,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             conn_action(ctx, ui, ConnAction::Handshake).await;
             false
         }
-        Cmd::ConfExport { path, include_secrets } => {
+        Cmd::ConfExport {
+            path,
+            include_secrets,
+        } => {
             // include_secrets 来自点击时捕获的值（true 只可能来自确认后的回调）
             export_conf(ctx, ui, path, include_secrets).await;
             false
@@ -8749,7 +10127,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         g.set_script_path(p.into());
                         g.set_script_preview(b.into());
                     });
-                    toast(ui, 1, rcgui_i18n::f("已生成恢复脚本（未执行）：{}", &[&(path.display())]));
+                    toast(
+                        ui,
+                        1,
+                        rcgui_i18n::f("已生成恢复脚本（未执行）：{}", &[&(path.display())]),
+                    );
                 }
                 Err(e) => toast(ui, 2, rcgui_i18n::f("生成恢复脚本失败: {}", &[&(e)])),
             }
@@ -8762,7 +10144,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             .await
             .unwrap_or_default();
             if text.is_empty() {
-                toast(ui, 0, rcgui_i18n::t("还没有可复制的脚本，请先「生成恢复脚本」"));
+                toast(
+                    ui,
+                    0,
+                    rcgui_i18n::t("还没有可复制的脚本，请先「生成恢复脚本」"),
+                );
             } else {
                 clipboard_copy(&text);
                 toast(ui, 1, rcgui_i18n::t("脚本已复制到剪贴板"));
@@ -8848,6 +10234,17 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             match conf_io::apply(&conf, &mut cfg) {
                 Ok(bak) => {
                     *ctx.cfg.lock().unwrap() = cfg.clone();
+                    // 包里带的插件设置（含已保存的表单）写回 kv。不写的话导入会显示
+                    // "成功"，插件却还跑旧配置；脱敏导出缺的键一律保留本机值。
+                    let plugin_touched =
+                        crate::plugins::apply_imported_settings(&ctx.store, &conf.plugins);
+                    if !plugin_touched.is_empty() {
+                        crate::logging::event(
+                            "info",
+                            "import",
+                            &format!("plugin settings restored: {}", plugin_touched.join(",")),
+                        );
+                    }
                     // 写入档案后，再通过 RC 把远程/挂载/服务真正应用到本地 rclone。
                     // 这一步可能很慢（逐条建远程、挂载、起服务），因此全程显示 spinner，
                     // 让用户知道「正在做什么」而不是点完没反应。
@@ -8858,9 +10255,22 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::RemotesRefresh)).await;
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::MountsRefresh)).await;
                     let _ = Box::pin(handle_cmd(ctx, ui, Cmd::ServesRefresh)).await;
-                    let mut info = rcgui_i18n::f("已应用到本地 rclone：远程 {} / 挂载 {} / 服务 {}；原档案备份在 {}", &[&(ok_r), &(ok_m), &(ok_s), &(bak.display())]);
+                    let mut info = rcgui_i18n::f(
+                        "已应用到本地 rclone：远程 {} / 挂载 {} / 服务 {}；原档案备份在 {}",
+                        &[&(ok_r), &(ok_m), &(ok_s), &(bak.display())],
+                    );
+                    if !plugin_touched.is_empty() {
+                        // 说了"应用成功"就得让用户知道插件配置也被换了，否则他去改插件设置会看到意料之外的值。
+                        info.push_str(&rcgui_i18n::f(
+                            "；插件设置已恢复 {} 项",
+                            &[&(plugin_touched.len())],
+                        ));
+                    }
                     if !errs.is_empty() {
-                        info.push_str(&rcgui_i18n::f("；失败 {} 项：{}", &[&(errs.len()), &(errs.join("；"))]));
+                        info.push_str(&rcgui_i18n::f(
+                            "；失败 {} 项：{}",
+                            &[&(errs.len()), &(errs.join("；"))],
+                        ));
                     }
                     let info2 = info.clone();
                     let _ = ui.upgrade_in_event_loop(move |ui| {
@@ -8873,7 +10283,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 Err(e) => {
                     // 失败时放回待应用状态，允许用户处理后重试
                     *ctx.pending_import.lock().unwrap() = Some(conf);
-                    toast(ui, 2, rcgui_i18n::f("应用导入失败（数据未改动）: {}", &[&(e)]));
+                    toast(
+                        ui,
+                        2,
+                        rcgui_i18n::f("应用导入失败（数据未改动）: {}", &[&(e)]),
+                    );
                 }
             }
             false
@@ -9005,7 +10419,11 @@ async fn plugin_add_from_file(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             toast(ui, 1, outcome.message());
             rescan_plugins(ctx, ui).await;
         }
-        Ok(Err(e)) => toast(ui, 2, rcgui_i18n::f("添加插件失败: {}", &[&(format!("{:#}", e))])),
+        Ok(Err(e)) => toast(
+            ui,
+            2,
+            rcgui_i18n::f("添加插件失败: {}", &[&(format!("{:#}", e))]),
+        ),
         Err(e) => toast(ui, 2, rcgui_i18n::f("安装线程异常: {}", &[&(e)])),
     }
 }
@@ -9037,29 +10455,16 @@ async fn plugin_add_from_dir(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             toast(ui, 1, outcome.message());
             rescan_plugins(ctx, ui).await;
         }
-        Ok(Err(e)) => toast(ui, 2, rcgui_i18n::f("添加插件失败: {}", &[&(format!("{:#}", e))])),
+        Ok(Err(e)) => toast(
+            ui,
+            2,
+            rcgui_i18n::f("添加插件失败: {}", &[&(format!("{:#}", e))]),
+        ),
         Err(e) => toast(ui, 2, rcgui_i18n::f("安装线程异常: {}", &[&(e)])),
     }
 }
 
-
 // ---------------------------------------------------------------- 图床面板
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // ---------------- UI 读取辅助 ----------------
 
@@ -9086,6 +10491,17 @@ fn wire_callbacks(
     tx: mpsc::UnboundedSender<Cmd>,
     debounce: SearchDebounce,
 ) {
+    // 维护页的所有按钮都只发这一个回调：第一个参数是动作名，第二个是它作用的条目
+    // （商店插件 id / 同步任务 id），没有就是空串。真正的分派在 `maintenance::handle`。
+    ui.on_maintenance_action({
+        let tx = tx.clone();
+        move |action, id| {
+            let _ = tx.send(Cmd::Maint {
+                action: action.to_string(),
+                id: id.to_string(),
+            });
+        }
+    });
     ui.on_refresh_dashboard({
         let tx = tx.clone();
         move || {
@@ -9222,7 +10638,9 @@ fn wire_callbacks(
     ui.on_files_sort_by({
         let tx = tx.clone();
         move |key| {
-            let _ = tx.send(Cmd::FilesSort { key: key.to_string() });
+            let _ = tx.send(Cmd::FilesSort {
+                key: key.to_string(),
+            });
         }
     });
     ui.on_files_multi_toggle({
@@ -9259,7 +10677,10 @@ fn wire_callbacks(
                 return;
             }
             // 与单行「下载到…」一致：选目录，不选文件名
-            if let Some(dir) = rfd::FileDialog::new().set_title(rcgui_i18n::t("选择下载目录")).pick_folder() {
+            if let Some(dir) = rfd::FileDialog::new()
+                .set_title(rcgui_i18n::t("选择下载目录"))
+                .pick_folder()
+            {
                 let _ = tx.send(Cmd::FilesDownloadMany { items, dir });
             }
         }
@@ -9515,7 +10936,9 @@ fn wire_callbacks(
     ui.on_local_sort_by({
         let tx = tx.clone();
         move |key| {
-            let _ = tx.send(Cmd::LocalSort { key: key.to_string() });
+            let _ = tx.send(Cmd::LocalSort {
+                key: key.to_string(),
+            });
         }
     });
     // 本机多选「上传」：勾选项一次性传到远程当前目录
@@ -9530,10 +10953,7 @@ fn wire_callbacks(
             }
             // 复用「上传到当前远程目录」：拼成本机绝对路径交给 FilesUpload
             let cur = PathBuf::from(ui.global::<LocalG>().get_path().to_string());
-            let paths: Vec<PathBuf> = items
-                .iter()
-                .map(|(name, _)| cur.join(name))
-                .collect();
+            let paths: Vec<PathBuf> = items.iter().map(|(name, _)| cur.join(name)).collect();
             let _ = tx.send(Cmd::FilesUpload { paths, dest: None });
         }
     });
@@ -9581,7 +11001,9 @@ fn wire_callbacks(
             }
             let count = lg.get_checked_count().max(1);
             lg.set_up_count(count);
-            lg.set_up_dirs(ModelRc::from(Rc::new(VecModel::from(Vec::<MoveDir>::new()))));
+            lg.set_up_dirs(ModelRc::from(Rc::new(
+                VecModel::from(Vec::<MoveDir>::new()),
+            )));
             lg.set_up_path("".into());
             // 从远程根开始浏览
             up_go(String::new());
@@ -9755,19 +11177,27 @@ fn wire_callbacks(
     ui.on_mount_remove({
         let tx = tx.clone();
         move |point| {
-            let _ = tx.send(Cmd::MountRemove { point: point.to_string() });
+            let _ = tx.send(Cmd::MountRemove {
+                point: point.to_string(),
+            });
         }
     });
     ui.on_mount_path_nav({
         let tx = tx.clone();
         move |name| {
-            let _ = tx.send(Cmd::HistPick { scope: 0, path: name.to_string() });
+            let _ = tx.send(Cmd::HistPick {
+                scope: 0,
+                path: name.to_string(),
+            });
         }
     });
     ui.on_serve_path_nav({
         let tx = tx.clone();
         move |name| {
-            let _ = tx.send(Cmd::HistPick { scope: 1, path: name.to_string() });
+            let _ = tx.send(Cmd::HistPick {
+                scope: 1,
+                path: name.to_string(),
+            });
         }
     });
     ui.on_mounts_search({
@@ -9791,7 +11221,9 @@ fn wire_callbacks(
     ui.on_browse_goto({
         let tx = tx.clone();
         move |name| {
-            let _ = tx.send(Cmd::BrowseGoto { name: name.to_string() });
+            let _ = tx.send(Cmd::BrowseGoto {
+                name: name.to_string(),
+            });
         }
     });
     ui.on_browse_ok({
@@ -9804,17 +11236,29 @@ fn wire_callbacks(
         let tx = tx.clone();
         move |i| {
             match i {
-                0 => { let _ = tx.send(Cmd::RefreshDashboard); }
+                0 => {
+                    let _ = tx.send(Cmd::RefreshDashboard);
+                }
                 1 => {
                     let _ = tx.send(Cmd::FilesInit);
                     // 双栏左半（本机）也要有一次初始列目录
                     let _ = tx.send(Cmd::LocalRefresh { path: None });
                 }
-                2 => { let _ = tx.send(Cmd::RemotesRefresh); }
-                3 => { let _ = tx.send(Cmd::MountsRefresh); }
-                4 => { let _ = tx.send(Cmd::ServesRefresh); }
-                5 => { let _ = tx.send(Cmd::TransfersEnter); }
-                7 => { let _ = tx.send(Cmd::OptionsLoad); }
+                2 => {
+                    let _ = tx.send(Cmd::RemotesRefresh);
+                }
+                3 => {
+                    let _ = tx.send(Cmd::MountsRefresh);
+                }
+                4 => {
+                    let _ = tx.send(Cmd::ServesRefresh);
+                }
+                5 => {
+                    let _ = tx.send(Cmd::TransfersEnter);
+                }
+                7 => {
+                    let _ = tx.send(Cmd::OptionsLoad);
+                }
                 _ => {}
             }
         }
@@ -9879,6 +11323,12 @@ fn wire_callbacks(
             let _ = tx.send(Cmd::RemoteTypeChanged);
         }
     });
+    ui.on_remote_type_search({
+        let tx = tx.clone();
+        move |q: slint::SharedString| {
+            let _ = tx.send(Cmd::RemoteTypeSearch(q.to_string()));
+        }
+    });
     // K-Vault 表单里的「测试连接」（回调挂在 RemotesG 上，因为表单在 global 里）
     ui.global::<RemotesG>().on_kv_test({
         let tx = tx.clone();
@@ -9899,9 +11349,7 @@ fn wire_callbacks(
     ui.on_proxy_add({
         let tx = tx.clone();
         move || {
-            let _ = tx.send(Cmd::ProxyEditLoad {
-                id: String::new(),
-            });
+            let _ = tx.send(Cmd::ProxyEditLoad { id: String::new() });
         }
     });
     ui.on_proxy_edit({
@@ -10189,7 +11637,10 @@ fn wire_callbacks(
                 })
                 .save_file()
             {
-                let _ = tx.send(Cmd::ConfExport { path, include_secrets });
+                let _ = tx.send(Cmd::ConfExport {
+                    path,
+                    include_secrets,
+                });
             }
         }
     });
@@ -10221,7 +11672,10 @@ fn wire_callbacks(
                 .set_title(rcgui_i18n::t("导出 rcgui.conf（含凭据）"))
                 .save_file()
             {
-                let _ = tx.send(Cmd::ConfExport { path, include_secrets: true });
+                let _ = tx.send(Cmd::ConfExport {
+                    path,
+                    include_secrets: true,
+                });
             }
         }
     });
@@ -10262,7 +11716,7 @@ fn wire_callbacks(
         move || {
             let _ = tx.send(Cmd::AdminCancel);
         }
-    });    // 「选择 rclone.exe」已移除：RCGUI 不再启动 rclone，不需要它的路径。
+    }); // 「选择 rclone.exe」已移除：RCGUI 不再启动 rclone，不需要它的路径。
 
     // 初始加载
     let _ = tx.send(Cmd::RefreshDashboard);
@@ -10359,10 +11813,13 @@ fn spawn_tray(ui: Weak<MainWindow>, tx: mpsc::UnboundedSender<Cmd>) {
                     // 放在 Low 目录下必失败；进程自身 IL 也随之是 0x1000。
                     // 注意 `Shell_NotifyIconW` 失败时并不保证刷新 last error，
                     // 所以 `os error 5` 只是「最可能」而非「必然」的取值。
-                    let msg = rcgui_i18n::f("托盘图标注册失败（{}）。若系统托盘里没有 RCGUI：\
+                    let msg = rcgui_i18n::f(
+                        "托盘图标注册失败（{}）。若系统托盘里没有 RCGUI：\
                          通常是程序所在文件/目录被标记为低完整性（Low），\
                          或程序以受限权限运行。已尝试把文件与目录完整性调回普通级别，\
-                         若提示里出现「成功」，请**退出并重新启动本程序**后托盘才会出现。", &[&(e)]);
+                         若提示里出现「成功」，请**退出并重新启动本程序**后托盘才会出现。",
+                        &[&(e)],
+                    );
                     tray_log(&format!("tray: build FAILED: {e}"));
                     // 自愈：exe 与目录都调回 Medium。
                     //
@@ -10429,9 +11886,7 @@ fn spawn_tray(ui: Weak<MainWindow>, tx: mpsc::UnboundedSender<Cmd>) {
                 // 表现为「点了要等很久才响应」。
                 let mut msg = MSG::default();
                 loop {
-                    let has = unsafe {
-                        PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool()
-                    };
+                    let has = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() };
                     if !has {
                         break;
                     }
@@ -10495,36 +11950,68 @@ fn spawn_tray(ui: Weak<MainWindow>, tx: mpsc::UnboundedSender<Cmd>) {
     });
 }
 
-/// 显示主窗口并置前（从托盘唤起时用）。
+thread_local! {
+    /// 窗口重建后补一次置前用的定时器。复用一个，别每次唤起都漏一个 `Timer`。
+    static BRING_FRONT_TIMER: slint::Timer = slint::Timer::default();
+}
+
+/// 显示主窗口并置前（托盘「打开」、双击托盘图标、第二个实例要求显示时用）。
+///
+/// 隐藏时原生窗口是被销毁的（见 `init_destroy_on_hide`），所以 `show()` 之后
+/// 那一帧 `with_winit_window` 还是 `None`：HWND 取不到，置前会静默失败。
+/// 因此先试一次，取不到就用一次性定时器补一次——和启动时设图标同样的处理。
 fn show_main_window(ui: &MainWindow) {
+    WINDOW_SHOWN.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = ui.show();
     ui.window().set_minimized(false);
-    // 置前：否则窗口可能被其他程序盖住，用户以为点了没反应。
-    #[cfg(windows)]
-    {
-        use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        use slint::winit_030::WinitWindowAccessor;
-        // Window::window_handle 需要经 with_winit_window 访问
-        let hwnd: Option<isize> = ui
-            .window()
-            .with_winit_window(|w| {
-                w.window_handle().ok().and_then(|h| match h.as_raw() {
-                    RawWindowHandle::Win32(h) => Some(h.hwnd.get() as isize),
-                    _ => None,
-                })
-            })
-            .flatten();
-        if let Some(v) = hwnd {
-            let h = windows::Win32::Foundation::HWND(v as *mut core::ffi::c_void);
-            unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
-                    h,
-                    windows::Win32::UI::WindowsAndMessaging::SW_RESTORE,
-                );
-                let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(h);
-            }
-        }
+    if !bring_to_front(ui) {
+        let ui_weak = ui.as_weak();
+        BRING_FRONT_TIMER.with(|timer| {
+            timer.start(
+                slint::TimerMode::SingleShot,
+                std::time::Duration::from_millis(120),
+                move || {
+                    if let Some(u) = ui_weak.upgrade() {
+                        let _ = bring_to_front(&u);
+                    }
+                },
+            );
+        });
     }
+}
+
+/// 拿 HWND 把窗口恢复并拉到前台。窗口还没建出来时返回 false（调用方稍后重试）。
+#[cfg(windows)]
+fn bring_to_front(ui: &MainWindow) -> bool {
+    use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use slint::winit_030::WinitWindowAccessor;
+    // Window::window_handle 需要经 with_winit_window 访问
+    let hwnd: Option<isize> = ui
+        .window()
+        .with_winit_window(|w| {
+            w.window_handle().ok().and_then(|h| match h.as_raw() {
+                RawWindowHandle::Win32(h) => Some(h.hwnd.get() as isize),
+                _ => None,
+            })
+        })
+        .flatten();
+    let Some(v) = hwnd else {
+        return false;
+    };
+    let h = windows::Win32::Foundation::HWND(v as *mut ::core::ffi::c_void);
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+            h,
+            windows::Win32::UI::WindowsAndMessaging::SW_RESTORE,
+        );
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(h);
+    }
+    true
+}
+
+#[cfg(not(windows))]
+fn bring_to_front(_ui: &MainWindow) -> bool {
+    true
 }
 
 /// 程序化生成应用图标（RGBA，用于托盘与窗口/任务栏）。
@@ -10572,10 +12059,7 @@ fn make_icon_rgba(size: usize, accent: [u8; 3]) -> Vec<u8> {
         if x < x0 || x > x0 + w || y < y0 || y > y0 + h {
             return false;
         }
-        let (cx, cy) = (
-            x.clamp(x0 + r, x0 + w - r),
-            y.clamp(y0 + r, y0 + h - r),
-        );
+        let (cx, cy) = (x.clamp(x0 + r, x0 + w - r), y.clamp(y0 + r, y0 + h - r));
         let dx = x - cx;
         let dy = y - cy;
         dx * dx + dy * dy <= r * r
@@ -10585,12 +12069,10 @@ fn make_icon_rgba(size: usize, accent: [u8; 3]) -> Vec<u8> {
     // 终端里的 ">_"：用斜线 + 横线近似，小尺寸下也能看出是命令行
     let in_chevron = |x: f32, y: f32| -> bool {
         let (bx, by) = (s * 0.355, s * 0.585); // 尖角位置
-        // 上斜边：从左上到尖角
-        let up = (y >= by - s * 0.075 && y <= by)
-            && (x - (bx - (by - y) * 0.9)).abs() <= s * 0.035;
+                                               // 上斜边：从左上到尖角
+        let up = (y >= by - s * 0.075 && y <= by) && (x - (bx - (by - y) * 0.9)).abs() <= s * 0.035;
         // 下斜边：从尖角到左下
-        let dn = (y >= by && y <= by + s * 0.075)
-            && (x - (bx - (y - by) * 0.9)).abs() <= s * 0.035;
+        let dn = (y >= by && y <= by + s * 0.075) && (x - (bx - (y - by) * 0.9)).abs() <= s * 0.035;
         up || dn
     };
     let in_underscore = |x: f32, y: f32| -> bool {
@@ -10719,8 +12201,8 @@ mod tests {
         for (size, name) in [(64usize, "64"), (32, "32")] {
             let rgba = make_icon_rgba(size, [0x58, 0xa6, 0xff]);
             let mut p = base.join(format!("rcgui-icon-{name}.png"));
-            let buf = image::RgbaImage::from_raw(size as u32, size as u32, rgba)
-                .expect("RGBA 尺寸匹配");
+            let buf =
+                image::RgbaImage::from_raw(size as u32, size as u32, rgba).expect("RGBA 尺寸匹配");
             // 失败时退到 CWD，避免整个测试因目录权限问题失败
             if buf.save(&p).is_err() {
                 p = std::path::PathBuf::from(format!("rcgui-icon-{name}.png"));
@@ -10729,7 +12211,6 @@ mod tests {
             eprintln!("wrote {}", p.display());
         }
     }
-
 
     #[test]
     fn accent_rgb_matches_theme_palette() {
@@ -11080,7 +12561,11 @@ mod tests {
     #[test]
     fn float_number_is_emitted_as_number() {
         let out = fields_to_params(&[field("ratio", "number", "1.5", false)]);
-        assert!(out["ratio"].is_number(), "expected number, got {}", out["ratio"]);
+        assert!(
+            out["ratio"].is_number(),
+            "expected number, got {}",
+            out["ratio"]
+        );
     }
 
     /// rclone 特有的 "10M"/"1h30m" 写法按字符串传递。
@@ -11121,7 +12606,11 @@ mod tests {
             field("pass", "password", "", true),
             field("pass2", "password", "   ", false),
         ]);
-        assert!(out.get("pass").is_none(), "空密码不该发送，实际 {}", out["pass"]);
+        assert!(
+            out.get("pass").is_none(),
+            "空密码不该发送，实际 {}",
+            out["pass"]
+        );
         assert!(out.get("pass2").is_none());
     }
 
@@ -11215,7 +12704,10 @@ mod tests {
         let (_desc, fields) = build_fields_from_provider(&providers, "webdav");
         let get = |n: &str| fields.iter().find(|f| f.name.as_str() == n).cloned();
         assert_eq!(get("pacer_min_sleep").unwrap().kind.to_string(), "duration");
-        assert_eq!(get("nextcloud_chunk_size").unwrap().kind.to_string(), "size");
+        assert_eq!(
+            get("nextcloud_chunk_size").unwrap().kind.to_string(),
+            "size"
+        );
         assert_eq!(get("page_size").unwrap().kind.to_string(), "number");
         assert_eq!(get("ratio").unwrap().kind.to_string(), "number");
     }
@@ -11492,10 +12984,7 @@ mod tests {
         std::fs::create_dir_all(&first).unwrap();
 
         let second = unique_local_dir(&dir, "photos");
-        assert_eq!(
-            second.file_name().unwrap().to_string_lossy(),
-            "photos (1)"
-        );
+        assert_eq!(second.file_name().unwrap().to_string_lossy(), "photos (1)");
 
         // 同名的普通文件也算占用
         std::fs::write(dir.join("notes"), b"x").unwrap();
@@ -11545,5 +13034,383 @@ mod tests {
     fn drop_row_handles_empty_list() {
         let kept: Vec<PluginRow> = drop_row_by_id(Vec::new(), "onerclone");
         assert!(kept.is_empty());
+    }
+
+    // ---------------- 远程类型搜索 ----------------
+
+    fn tchoice(display: &str, id: &str, backend: &str) -> TypeChoice {
+        TypeChoice {
+            display: display.to_string(),
+            id: id.to_string(),
+            backend: backend.to_string(),
+            derived: false,
+        }
+    }
+
+    /// 三条清单：默认的 Alias、插件类型的 K-Vault、内核的 S3。
+    fn sample_types() -> Vec<TypeChoice> {
+        vec![
+            tchoice("Alias for an existing remote", "alias", "alias"),
+            tchoice("K-Vault", kvault::TYPE, "webdav"),
+            tchoice("S3", "s3", "s3"),
+        ]
+    }
+
+    /// 选中的类型还在过滤结果里：下标要落在同一项上，并且不能报「换类型了」。
+    ///
+    /// 这条守的是「改搜索词把用户已选好的类型偷偷换掉」——换了类型，参数表却按旧
+    /// 类型渲染，用户看到的是自己没选过的东西。
+    #[test]
+    fn refilter_keeps_selection_when_it_survives() {
+        let mut t = TypeChoices::default();
+        let idx = t.reset(sample_types(), Some(kvault::TYPE));
+        assert_eq!(idx, 1);
+        let r = t.refilter("vaul", Some(kvault::TYPE));
+        assert_eq!(r.idx, Some(0), "K-Vault 只剩一项，下标应指向它");
+        assert!(!r.switched, "选中的类型还在，不能当成换了类型");
+        assert_eq!(t.visible_at(0).unwrap().id, kvault::TYPE);
+    }
+
+    /// 选中的类型被筛掉：界面必须知道「选中项变成别人了」，调用方要跟着换参数表。
+    ///
+    /// 这是父会话实测到的原始缺陷：搜 kvault 后列表只剩 K-Vault，下面却还是
+    /// Alias 的 Remote/path 字段，点保存会把参数写到 webdav 上。
+    #[test]
+    fn refilter_reports_switch_when_selection_is_filtered_away() {
+        let mut t = TypeChoices::default();
+        t.reset(sample_types(), Some("alias"));
+        let r = t.refilter("kvault", Some("alias"));
+        assert_eq!(r.idx, Some(0));
+        assert!(r.switched, "旧选中项被筛掉时必须报 switched");
+        assert_eq!(
+            t.visible_at(0).unwrap().id,
+            kvault::TYPE,
+            "下标 0 在新清单里是 K-Vault，参数表必须按它换"
+        );
+    }
+
+    /// 一条都匹配不上：不选中任何项，保存路径据此拒绝，而不是退回第 0 项。
+    #[test]
+    fn refilter_with_no_match_clears_selection() {
+        let mut t = TypeChoices::default();
+        t.reset(sample_types(), Some("s3"));
+        let r = t.refilter("zzz", Some("s3"));
+        assert_eq!(r.idx, None, "没有匹配项时不能假装选中了第 0 项");
+        assert!(!r.switched);
+        assert!(t.visible.is_empty());
+        assert!(t.selected(-1).is_none(), "界面写 -1 时保存必须拿不到类型");
+    }
+
+    /// 之前根本没有选中项（刚打开下拉）：保留原来的第 0 项语义，不算换类型。
+    ///
+    /// 表单在打开对话框时就是按第 0 项铺的，所以这里不重铺也不会出现
+    /// 「选中 A、表单是 B」。
+    #[test]
+    fn refilter_without_previous_selection_keeps_row_zero() {
+        let mut t = TypeChoices::default();
+        t.reset(sample_types(), None);
+        let r = t.refilter("s3", None);
+        assert_eq!(r.idx, Some(0));
+        assert!(!r.switched);
+        assert_eq!(t.selected(0).unwrap().id, "s3");
+    }
+
+    /// 负下标（界面上的「没有选中项」）一律当作没选，不能 `max(0)` 回落到第一项。
+    #[test]
+    fn selected_rejects_negative_index() {
+        let mut t = TypeChoices::default();
+        t.reset(sample_types(), None);
+        assert!(t.selected(-1).is_none());
+        assert_eq!(t.selected(0).unwrap().id, "alias");
+    }
+
+    /// K-Vault 是插件：参数表要按插件名取，不能按它落盘时的 webdav 取。
+    #[test]
+    fn form_fields_type_uses_plugin_name_for_kvault() {
+        let kv = tchoice("K-Vault", kvault::TYPE, "webdav");
+        assert_eq!(form_fields_type(&kv), kvault::TYPE);
+        let s3 = tchoice("S3", "s3", "s3");
+        assert_eq!(form_fields_type(&s3), "s3");
+    }
+
+    // ---------------- 保存时插件默认参数不能丢 ----------------
+
+    /// kvault 的 manifest（`../plugin_repos/rcgui-plugin-kvault/config.json`）声明的
+    /// 默认参数。那个目录不在本仓库里，所以照抄一份，测试不依赖它。
+    fn kvault_derived() -> remote_types::Derived {
+        let mut d = tderived("kvault", "K-Vault", "webdav");
+        d.defaults.insert("vendor".to_string(), "other".to_string());
+        d.defaults.insert("kvault".to_string(), "1".to_string());
+        d.defaults
+            .insert("kvault_storage".to_string(), "telegram".to_string());
+        d.defaults
+            .insert("kvault_dedup".to_string(), "1".to_string());
+        d
+    }
+
+    /// 向导里选到插件类型、只填了 URL 就保存：插件的默认参数必须一起写进配置。
+    ///
+    /// 这里故意走字段表那条路——webdav 模板只渲染 url/vendor，插件的键根本不在表里，
+    /// 正是这样丢失的。
+    #[test]
+    fn new_remote_save_keeps_plugin_defaults() {
+        let mut choice = tchoice("K-Vault", "kvault", "webdav");
+        choice.derived = true;
+        let fields = vec![
+            field("url", "text", "http://127.0.0.1:49389/dav", true),
+            field("vendor", "text", "other", false),
+        ];
+        let user = match fields_to_params(&fields) {
+            Value::Object(m) => m,
+            other => panic!("fields_to_params 应该给对象，实际 {other}"),
+        };
+        let params = params_for_save(&choice, &[kvault_derived()], user, true);
+        let obj = params.as_object().expect("参数得是对象");
+        assert_eq!(
+            obj.get("url").and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:49389/dav")
+        );
+        assert_eq!(obj.get("kvault").and_then(|v| v.as_str()), Some("1"));
+        assert_eq!(
+            obj.get("kvault_storage").and_then(|v| v.as_str()),
+            Some("telegram")
+        );
+        assert_eq!(obj.get("kvault_dedup").and_then(|v| v.as_str()), Some("1"));
+        assert_eq!(obj.get("vendor").and_then(|v| v.as_str()), Some("other"));
+        // type 由调用方按选中的类型单独传，参数里再出现一份会和它打架。
+        assert!(!obj.contains_key("type"));
+    }
+
+    /// 用户把某个键留空等于没填：不能拿空串把插件的默认值擦掉。
+    #[test]
+    fn blank_user_field_does_not_erase_plugin_default() {
+        let mut choice = tchoice("K-Vault", "kvault", "webdav");
+        choice.derived = true;
+        let user = parse_kv_lines("url = https://kv.example.com/dav\nkvault_storage = \n");
+        let params = params_for_save(&choice, &[kvault_derived()], user, true);
+        let obj = params.as_object().unwrap();
+        assert_eq!(
+            obj.get("kvault_storage").and_then(|v| v.as_str()),
+            Some("telegram"),
+            "留空的字段是「没填」，不是「清空」"
+        );
+    }
+
+    /// 改已有远程时不铺默认值：用户删掉的键不该被复活。
+    #[test]
+    fn editing_an_existing_remote_does_not_add_defaults() {
+        let mut choice = tchoice("K-Vault", "kvault", "webdav");
+        choice.derived = true;
+        let user = parse_kv_lines("url = https://kv.example.com/dav\n");
+        let params = params_for_save(&choice, &[kvault_derived()], user, false);
+        let obj = params.as_object().unwrap();
+        assert_eq!(obj.len(), 1);
+        assert!(obj.get("url").is_some());
+    }
+
+    /// 普通后端（直接来自内核）不受影响：不会凭空多出别的键。
+    #[test]
+    fn plain_backend_save_adds_nothing() {
+        let choice = tchoice("s3", "s3", "s3");
+        let user = parse_kv_lines("provider = AWS\n");
+        let params = params_for_save(&choice, &[kvault_derived()], user, true);
+        let obj = params.as_object().unwrap();
+        assert_eq!(obj.len(), 1);
+        assert_eq!(obj.get("provider").and_then(|v| v.as_str()), Some("AWS"));
+    }
+
+    /// 界面上的原始文本也要跟着铺：用户看到的和真正保存的必须一致。
+    #[test]
+    fn raw_text_gets_missing_defaults_without_touching_user_values() {
+        let mut choice = tchoice("K-Vault", "kvault", "webdav");
+        choice.derived = true;
+        let current = "url = http://127.0.0.1:49389/dav\nvendor = own";
+        let seeded =
+            seed_derived_defaults(&choice, &[kvault_derived()], current).expect("该补默认值");
+        assert!(seeded.contains("kvault=1"));
+        assert!(seeded.contains("kvault_storage=telegram"));
+        assert!(seeded.contains("kvault_dedup=1"));
+        assert_eq!(
+            seeded.matches("vendor").count(),
+            1,
+            "用户自己写的 vendor 不能被默认值覆盖：{seeded}"
+        );
+        // 补过之后再补一次就没什么可补的了。
+        assert!(seed_derived_defaults(&choice, &[kvault_derived()], &seeded).is_none());
+    }
+
+    /// 新建远程真正发出去的那一次请求：走 create，类型是 `base_type`，参数带插件默认值。
+    ///
+    /// 这条盯的是接线而不只是组装：`build_save_request` 就是保存回调用的那个函数，
+    /// 内核算出来的 conf 里缺 `kvault`/`vendor` 时它会先红。
+    #[test]
+    fn create_request_keeps_plugin_defaults_and_uses_base_type() {
+        let mut choice = tchoice("K-Vault", "kvault", "webdav");
+        choice.derived = true;
+        let mut user = serde_json::Map::new();
+        user.insert(
+            "url".to_string(),
+            Value::String("http://127.0.0.1:49389/dav".to_string()),
+        );
+        match build_save_request("qa_plugin_vault", &choice, &[kvault_derived()], user, true) {
+            SaveRequest::Create {
+                name,
+                rtype,
+                params,
+            } => {
+                assert_eq!(name, "qa_plugin_vault");
+                assert_eq!(rtype, "webdav", "插件派生类型落盘的是 base_type");
+                let obj = params.as_object().expect("参数应当是对象");
+                assert_eq!(obj.get("kvault").and_then(|v| v.as_str()), Some("1"));
+                assert_eq!(obj.get("vendor").and_then(|v| v.as_str()), Some("other"));
+                assert_eq!(
+                    obj.get("kvault_storage").and_then(|v| v.as_str()),
+                    Some("telegram")
+                );
+                assert_eq!(
+                    obj.get("url").and_then(|v| v.as_str()),
+                    Some("http://127.0.0.1:49389/dav")
+                );
+            }
+            SaveRequest::Update { .. } => panic!("新建远程必须走 config/create"),
+        }
+    }
+
+    /// 改已有远程走 update：`config/update` 没有类型这一位，参数里也不该多出默认值。
+    #[test]
+    fn update_request_omits_type_and_defaults() {
+        let mut choice = tchoice("K-Vault", "kvault", "webdav");
+        choice.derived = true;
+        let mut user = serde_json::Map::new();
+        user.insert(
+            "url".to_string(),
+            Value::String("http://127.0.0.1:1/dav".to_string()),
+        );
+        match build_save_request("qa_plugin_vault", &choice, &[kvault_derived()], user, false) {
+            SaveRequest::Update { name, params } => {
+                assert_eq!(name, "qa_plugin_vault");
+                let obj = params.as_object().expect("参数应当是对象");
+                assert!(!obj.contains_key("type"));
+                assert!(!obj.contains_key("kvault"), "改已有远程不补默认值");
+            }
+            SaveRequest::Create { .. } => panic!("改已有远程不该走 config/create"),
+        }
+    }
+
+    // ---------------- 类型清单只来自内核与插件 ----------------
+
+    /// 插件声明的派生类型，只填清单测试要用到的字段。
+    fn tderived(id: &str, name: &str, base: &str) -> remote_types::Derived {
+        remote_types::Derived {
+            name: name.to_string(),
+            id: id.to_string(),
+            base_type: base.to_string(),
+            defaults: std::collections::BTreeMap::new(),
+            plugin: "kvault".to_string(),
+        }
+    }
+
+    /// 内核 `config/providers` 的应答形状（这里只要 `Name`）。
+    fn providers_of(names: &[&str]) -> serde_json::Value {
+        let arr: Vec<serde_json::Value> = names
+            .iter()
+            .map(|n| serde_json::json!({ "Name": n }))
+            .collect();
+        serde_json::json!({ "providers": arr })
+    }
+
+    /// 内核没连上、没有上次成功的缓存、也没有插件声明类型：一项都不列。
+    ///
+    /// 这里以前会塞进 15 个内置类型，用户选中后保存必然失败——那份"兜底"比空下拉框更糟，
+    /// 因为它把「连接内核」这个真问题藏了起来。
+    #[test]
+    fn no_providers_and_no_plugin_lists_nothing() {
+        assert!(build_type_choices(&serde_json::json!({}), &[]).is_empty());
+        assert!(build_type_choices(&serde_json::json!({ "providers": [] }), &[]).is_empty());
+    }
+
+    /// 类型名与后端名都来自内核的 providers，按显示名排序。
+    #[test]
+    fn choices_come_from_kernel_providers() {
+        let out = build_type_choices(&providers_of(&["s3", "alias"]), &[]);
+        let ids: Vec<&str> = out.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["alias", "s3"]);
+        assert!(out.iter().all(|c| !c.derived && c.backend == c.id));
+    }
+
+    /// 没装或没启用 kvault 插件时，清单里不许出现 K-Vault 一类凭空的行。
+    ///
+    /// 父会话在 Release 上看到 `K-Vault` 与 `k-vault` 两行，就是内置注入造成的：
+    /// 其中一行是内核根本不认识的后端，选中必然失败。
+    #[test]
+    fn no_builtin_kvault_row_without_plugin() {
+        let out = build_type_choices(&providers_of(&["webdav"]), &[]);
+        assert!(
+            !out.iter()
+                .any(|c| c.id == kvault::TYPE || c.display.eq_ignore_ascii_case("k-vault")),
+            "没有插件声明时不能凭空出现 kvault 类型"
+        );
+        assert_eq!(out.len(), 1);
+    }
+
+    /// 启用插件后只多出它声明的那一项，落盘 backend 用 base_type。
+    #[test]
+    fn enabled_plugin_adds_exactly_one_row() {
+        let out = build_type_choices(
+            &providers_of(&["webdav"]),
+            &[tderived("k-vault", "K-Vault", "webdav")],
+        );
+        let kv: Vec<&TypeChoice> = out.iter().filter(|c| c.id == "k-vault").collect();
+        assert_eq!(kv.len(), 1, "插件声明的类型只能出现一次");
+        assert_eq!(kv[0].display, "K-Vault");
+        assert_eq!(kv[0].backend, "webdav", "落盘必须写插件声明的 base_type");
+        assert!(kv[0].derived);
+        assert_eq!(
+            out.iter().filter(|c| c.id == kvault::TYPE).count(),
+            1,
+            "插件声明的类型与内置类型同名，清单里只能出现一行"
+        );
+    }
+
+    /// 只有插件、内核 provider 清单为空时，清单里只剩插件项，不补任何后端。
+    #[test]
+    fn plugin_only_list_has_no_fabricated_backends() {
+        let out = build_type_choices(
+            &serde_json::json!({}),
+            &[tderived("k-vault", "K-Vault", "webdav")],
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "k-vault");
+    }
+
+    /// 已建好的旧 kvault 远程仍能编辑：编辑框里合成一项，后端仍是 webdav。
+    ///
+    /// 新建列表里不再有 kvault，但这些远程必须继续可改——它们的配置和数据都在本地，
+    /// 换掉的只是"能不能被重新打开"。
+    #[test]
+    fn legacy_kvault_remote_keeps_an_editable_choice() {
+        let c = edit_single_choice(kvault::TYPE, &[]);
+        assert_eq!(c.id, kvault::TYPE);
+        assert_eq!(
+            c.backend,
+            kvault::BACKEND,
+            "保存要写回 webdav，不能写成 kvault"
+        );
+        assert!(!c.derived);
+    }
+
+    /// 派生类型按插件显示名与 base_type 往返；内核自带后端原样透传。
+    #[test]
+    fn edit_choice_follows_plugin_and_passthrough_backends() {
+        let d = edit_single_choice(
+            "kdrive-lite",
+            &[tderived("kdrive-lite", "KDrive Lite", "kdrive")],
+        );
+        assert_eq!(d.display, "KDrive Lite");
+        assert_eq!(d.backend, "kdrive");
+        assert!(d.derived);
+        let p = edit_single_choice("s3", &[]);
+        assert_eq!(p.backend, "s3");
+        assert!(!p.derived);
     }
 }

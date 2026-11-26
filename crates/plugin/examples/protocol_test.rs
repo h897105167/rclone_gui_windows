@@ -24,13 +24,27 @@ impl CapProvider for FakeCaps {
         }
         Ok(Value::Null)
     }
-    async fn upload_file(&self, fs: String, remote_path: String, _filename: String, _data_b64: String) -> Result<Value> {
+    async fn upload_file(
+        &self,
+        fs: String,
+        remote_path: String,
+        _filename: String,
+        _data_b64: String,
+    ) -> Result<Value> {
         self.uploads.lock().unwrap().push((fs, remote_path));
         Ok(json!({}))
     }
     async fn kv_get_all(&self, plugin_id: &str) -> Result<Value> {
         Ok(Value::Object(
-            self.kv.lock().unwrap().get(plugin_id).cloned().unwrap_or(json!({})).as_object().cloned().unwrap_or_default(),
+            self.kv
+                .lock()
+                .unwrap()
+                .get(plugin_id)
+                .cloned()
+                .unwrap_or(json!({}))
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
         ))
     }
     async fn kv_set(&self, plugin_id: &str, key: String, value: Value) -> Result<()> {
@@ -69,13 +83,20 @@ fn wasm_path() -> PathBuf {
 #[tokio::main]
 async fn main() -> Result<()> {
     let wasm = wasm_path();
-    assert!(wasm.exists(), "{}", rcgui_i18n::f("缺少 wasm：{}", &[&(wasm.display())]));
+    assert!(
+        wasm.exists(),
+        "{}",
+        rcgui_i18n::f("缺少 wasm：{}", &[&(wasm.display())])
+    );
     let host = PluginHost::new()?;
 
     // 1) manifest
     let m = host.load_manifest(&wasm).await?;
     assert_eq!(m.id, "imagehost");
-    println!("[test] manifest ok: {} {} ({})", m.name, m.version, m.description);
+    println!(
+        "[test] manifest ok: {} {} ({})",
+        m.name, m.version, m.description
+    );
 
     let caps = Arc::new(FakeCaps {
         list_entries: vec![
@@ -95,7 +116,15 @@ async fn main() -> Result<()> {
             "now": now(), "req_id": "deadbeefdeadbeefdeadbeef",
         })
     };
-    let r = host.invoke(&wasm, "request", http("GET", "/config", json!({}), None), Some(caps.clone()), "imagehost").await?;
+    let r = host
+        .invoke(
+            &wasm,
+            "request",
+            http("GET", "/config", json!({}), None),
+            Some(caps.clone()),
+            "imagehost",
+        )
+        .await?;
     assert_eq!(r["status"], 200);
     assert!(r["body"]["roots"].as_array().unwrap().len() >= 1);
     println!("[test] GET /config ok");
@@ -106,12 +135,33 @@ async fn main() -> Result<()> {
         "fields": {"subPath": "wallpaper"},
         "files": [{"filename": "cat.png", "dataB64": base64_of(png)}],
     });
-    let r = host.invoke(&wasm, "request", http("POST", "/upload", json!({}), Some(mp)), Some(caps.clone()), "imagehost").await?;
-    assert_eq!(r["status"], 200, "{}", rcgui_i18n::f("upload 响应: {}", &[&(r)]));
+    let r = host
+        .invoke(
+            &wasm,
+            "request",
+            http("POST", "/upload", json!({}), Some(mp)),
+            Some(caps.clone()),
+            "imagehost",
+        )
+        .await?;
+    assert_eq!(
+        r["status"],
+        200,
+        "{}",
+        rcgui_i18n::f("upload 响应: {}", &[&(r)])
+    );
     let item = &r["body"]["items"][0];
-    assert_eq!(item["name"], "20261015213000123.png", "{}", rcgui_i18n::f("实际: {}", &[&(item)]));
+    assert_eq!(
+        item["name"],
+        "20261015213000123.png",
+        "{}",
+        rcgui_i18n::f("实际: {}", &[&(item)])
+    );
     assert_eq!(item["storedPath"], "wallpaper/20261015213000123.png");
-    assert_eq!(item["url"], "http://127.0.0.1:5273/i/default/wallpaper/20261015213000123.png");
+    assert_eq!(
+        item["url"],
+        "http://127.0.0.1:5273/i/default/wallpaper/20261015213000123.png"
+    );
     assert_eq!(item["deduped"], false);
     assert_eq!(caps.uploads.lock().unwrap().len(), 1);
     println!("[test] upload timestamp ok");
@@ -121,9 +171,27 @@ async fn main() -> Result<()> {
         "fields": {"subPath": "wallpaper"},
         "files": [{"filename": "again.png", "dataB64": base64_of(png)}],
     });
-    let r = host.invoke(&wasm, "request", http("POST", "/upload", json!({}), Some(mp)), Some(caps.clone()), "imagehost").await?;
-    assert_eq!(r["body"]["items"][0]["deduped"], true, "{}", rcgui_i18n::f("实际: {}", &[&(r)]));
-    assert_eq!(caps.uploads.lock().unwrap().len(), 1, "{}", rcgui_i18n::t("去重后不应再上传"));
+    let r = host
+        .invoke(
+            &wasm,
+            "request",
+            http("POST", "/upload", json!({}), Some(mp)),
+            Some(caps.clone()),
+            "imagehost",
+        )
+        .await?;
+    assert_eq!(
+        r["body"]["items"][0]["deduped"],
+        true,
+        "{}",
+        rcgui_i18n::f("实际: {}", &[&(r)])
+    );
+    assert_eq!(
+        caps.uploads.lock().unwrap().len(),
+        1,
+        "{}",
+        rcgui_i18n::t("去重后不应再上传")
+    );
     println!("[test] dedupe ok");
 
     // 5) seq 命名：目录已有 001.png → 002.png
@@ -131,8 +199,21 @@ async fn main() -> Result<()> {
         "fields": {"subPath": "", "naming": "seq", "seqPad": "3"},
         "files": [{"filename": "x.png", "dataB64": base64_of(b"other-bytes")}],
     });
-    let r = host.invoke(&wasm, "request", http("POST", "/upload", json!({}), Some(mp)), Some(caps.clone()), "imagehost").await?;
-    assert_eq!(r["body"]["items"][0]["name"], "002.png", "{}", rcgui_i18n::f("实际: {}", &[&(r)]));
+    let r = host
+        .invoke(
+            &wasm,
+            "request",
+            http("POST", "/upload", json!({}), Some(mp)),
+            Some(caps.clone()),
+            "imagehost",
+        )
+        .await?;
+    assert_eq!(
+        r["body"]["items"][0]["name"],
+        "002.png",
+        "{}",
+        rcgui_i18n::f("实际: {}", &[&(r)])
+    );
     println!("[test] seq naming ok");
 
     // 6) obsidian 布局：app=obsidian, vault=MyVault, notePath=日记/2026/abc.md, layout=note
@@ -141,34 +222,82 @@ async fn main() -> Result<()> {
         "fields": {"app": "obsidian", "vault": "MyVault", "notePath": "日记/2026/abc.md"},
         "files": [{"filename": "shot.png", "dataB64": base64_of(b"shot-bytes")}],
     });
-    let r = host.invoke(&wasm, "request", http("POST", "/upload", json!({}), Some(mp)), Some(caps.clone()), "imagehost").await?;
-    assert_eq!(r["body"]["items"][0]["storedPath"], "obsidian/MyVault/日记/2026/20261015213000123.png", "{}", rcgui_i18n::f("实际: {}", &[&(r)]));
+    let r = host
+        .invoke(
+            &wasm,
+            "request",
+            http("POST", "/upload", json!({}), Some(mp)),
+            Some(caps.clone()),
+            "imagehost",
+        )
+        .await?;
+    assert_eq!(
+        r["body"]["items"][0]["storedPath"],
+        "obsidian/MyVault/日记/2026/20261015213000123.png",
+        "{}",
+        rcgui_i18n::f("实际: {}", &[&(r)])
+    );
     println!("[test] obsidian layout ok");
 
     // 7) raw body 模式（Obsidian 插件路径）
     let mut params = http("POST", "/upload", json!({}), None);
-    params["http"]["query"] = json!({"filename": "raw.png", "app": "obsidian", "vault": "V", "notePath": "n.md"});
+    params["http"]["query"] =
+        json!({"filename": "raw.png", "app": "obsidian", "vault": "V", "notePath": "n.md"});
     params["http"]["bodyB64"] = Value::String(base64_of(b"raw-body"));
-    let r = host.invoke(&wasm, "request", params, Some(caps.clone()), "imagehost").await?;
+    let r = host
+        .invoke(&wasm, "request", params, Some(caps.clone()), "imagehost")
+        .await?;
     assert_eq!(r["status"], 200, "{}", rcgui_i18n::f("实际: {}", &[&(r)]));
     println!("[test] raw body upload ok");
 
     // 8) token 流程
-    let r = host.invoke(&wasm, "request", http("POST", "/token", json!({"name": "obsidian"}), None), Some(caps.clone()), "imagehost").await?;
+    let r = host
+        .invoke(
+            &wasm,
+            "request",
+            http("POST", "/token", json!({"name": "obsidian"}), None),
+            Some(caps.clone()),
+            "imagehost",
+        )
+        .await?;
     assert_eq!(r["status"], 200);
     let token = r["body"]["token"].as_str().unwrap();
     assert_eq!(token.len(), 24);
     println!("[test] token gen ok: {token}");
 
     // 9) /files 与 /stats
-    let r = host.invoke(&wasm, "request", http("GET", "/files", json!({}), None), Some(caps.clone()), "imagehost").await?;
+    let r = host
+        .invoke(
+            &wasm,
+            "request",
+            http("GET", "/files", json!({}), None),
+            Some(caps.clone()),
+            "imagehost",
+        )
+        .await?;
     assert!(r["body"]["total"].as_u64().unwrap() >= 3);
-    let r = host.invoke(&wasm, "request", http("GET", "/stats", json!({}), None), Some(caps.clone()), "imagehost").await?;
+    let r = host
+        .invoke(
+            &wasm,
+            "request",
+            http("GET", "/stats", json!({}), None),
+            Some(caps.clone()),
+            "imagehost",
+        )
+        .await?;
     assert!(r["body"]["count"].as_u64().unwrap() >= 3);
     println!("[test] files/stats ok");
 
     // 10) PUT /config 校验：空 roots → 400
-    let r = host.invoke(&wasm, "request", http("PUT", "/config", json!({"roots": []}), None), Some(caps.clone()), "imagehost").await?;
+    let r = host
+        .invoke(
+            &wasm,
+            "request",
+            http("PUT", "/config", json!({"roots": []}), None),
+            Some(caps.clone()),
+            "imagehost",
+        )
+        .await?;
     assert_eq!(r["status"], 400);
     println!("[test] config validation ok");
 

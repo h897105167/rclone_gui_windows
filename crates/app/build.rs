@@ -71,7 +71,11 @@ fn target_profile_dir() -> Option<PathBuf> {
     let dir = up(&out, 3)?;
     // 只接受确实以 profile 名结尾的路径，避免把资产复制到意料之外的位置
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
-    if dir.file_name().map(|n| n == profile.as_str()).unwrap_or(false) {
+    if dir
+        .file_name()
+        .map(|n| n == profile.as_str())
+        .unwrap_or(false)
+    {
         Some(dir)
     } else {
         None

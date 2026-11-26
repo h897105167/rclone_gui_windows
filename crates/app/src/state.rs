@@ -480,12 +480,18 @@ pub fn hint_text(endpoint_url: &str, listed: &[MountState], drives: &[String]) -
     if !listed.is_empty() || drives.is_empty() {
         return String::new();
     }
-    rcgui_i18n::f("本机存在 rclone 挂载盘 {}，但当前连接的 {} 报告没有挂载。该盘属于另一个 rclone 实例；\
-         界面只反映当前端点的状态。", &[&(drives.join("、")), &(if endpoint_url.is_empty() {
-            rcgui_i18n::t("端点")
-        } else {
-            endpoint_url
-        })])
+    rcgui_i18n::f(
+        "本机存在 rclone 挂载盘 {}，但当前连接的 {} 报告没有挂载。该盘属于另一个 rclone 实例；\
+         界面只反映当前端点的状态。",
+        &[
+            &(drives.join("、")),
+            &(if endpoint_url.is_empty() {
+                rcgui_i18n::t("端点")
+            } else {
+                endpoint_url
+            }),
+        ],
+    )
 }
 
 #[cfg(test)]
@@ -541,7 +547,10 @@ mod tests {
         let hub = std::sync::Arc::new(Hub::new());
         let a = hub.begin_fetch();
         hub.begin_user_op();
-        assert!(!a.commit(), "取数期间用户开始操作 → 数据可能早于操作，不可用");
+        assert!(
+            !a.commit(),
+            "取数期间用户开始操作 → 数据可能早于操作，不可用"
+        );
         hub.end_user_op();
         let b = hub.begin_fetch();
         assert!(b.commit(), "操作结束后重新取的数据可以提交");
@@ -566,7 +575,11 @@ mod tests {
             let _op = UserOpGuard::begin(&hub);
             assert_eq!(hub.status(true, true), PollStatus::UserBusy);
         }
-        assert_eq!(hub.status(true, true), PollStatus::Running, "守卫 Drop 后必须恢复");
+        assert_eq!(
+            hub.status(true, true),
+            PollStatus::Running,
+            "守卫 Drop 后必须恢复"
+        );
     }
 
     #[test]
@@ -634,16 +647,24 @@ mod tests {
 
     #[test]
     fn hint_text_names_endpoint_and_drive() {
+        // 断言里有中文文案，先独占语言，别被并行的英文用例带跑
+        let _lang = crate::test_lang::use_lang(rcgui_i18n::Lang::Zh);
         let drives = vec!["T:".to_string()];
         let hint = hint_text("http://127.0.0.1:5572", &[], &drives);
         assert!(hint.contains("T:"), "必须说出是哪个盘：{hint}");
         assert!(hint.contains("127.0.0.1:5572"), "必须说出当前端点：{hint}");
-        assert!(hint.contains("另一个 rclone 实例"), "要解释清楚归属：{hint}");
+        assert!(
+            hint.contains("另一个 rclone 实例"),
+            "要解释清楚归属：{hint}"
+        );
     }
 
     #[test]
     fn hint_text_empty_without_evidence() {
-        assert!(hint_text("http://x", &[], &[]).is_empty(), "没有盘符就不提示");
+        assert!(
+            hint_text("http://x", &[], &[]).is_empty(),
+            "没有盘符就不提示"
+        );
         assert!(
             hint_text("http://x", &snap_with(1).mounts, &["T:".into()]).is_empty(),
             "当前端点明明有挂载时不该提示"

@@ -1,26 +1,56 @@
+# 持续集成：格式、编译检查、单元测试，外加一次“打包流程冒烟”。
+#
+# 这里不判断界面好不好用。Slint 窗口、拖拽、和真实 rclone 的交互在云上跑不了，
+# 那部分由人工在本机验收（见 CONTRIBUTING.md 的审查门槛）。
+# 真正出发布件的流程在 release.yml，只有打 tag 或人工触发才会跑。
 name: ci
 
-# 会话 18 的「本地 ↔ GitHub Actions」通信实验：
-# 云端 runner 只做「构建 + 单元测试 + 产物上传」，本机用 gh 拉日志/产物回来看。
-# 图形界面（Slint 弹窗、拖拽、真实 rclone 交互）无法在无头 runner 上验证，仍在本机做。
 on:
   push:
-    branches:
-      - 'session-*'
+    branches: [main, master]
+  pull_request:
   workflow_dispatch:
 
+# 默认只读：CI 只需要读代码，写权限只给 release.yml。
+permissions:
+  contents: read
+
+# 同一分支连推多次时，取消上一次还没跑完的检查。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  build-and-test:
-    runs-on: windows-latest
-    timeout-minutes: 60
+  fmt:
+    name: 格式
+    runs-on: ubuntu-latest
+    # 只跑 cargo fmt，正常十几秒；给 10 分钟是防止排队后偶发的工具链下载卡住。
+    timeout-minutes: 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
 
-      - name: Rust toolchain (stable)
-        uses: dtolnay/rust-toolchain@stable
+  test:
+    name: 编译与测试
+    runs-on: windows-latest
+    # 冷缓存下 check + test 大约 10 分钟；45 分钟是给依赖全量重编留的余量。
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Cache cargo
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # 插件宿主按 wasm32-wasip1 编译插件，测试里会用到这个 target。
+          targets: wasm32-wasip1
+
+      # 依赖没变就直接命中缓存，测试从几分钟降到几十秒。
+      - name: 缓存
         uses: actions/cache@v4
         with:
           path: |
@@ -32,33 +62,63 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # 插件不在本仓库：按 plugins/manifest.json 从各插件仓库的 Release 下载 zip，
-      # 校验 sha256 后解到 crates/app/assets/plugins/。这一步失败通常意味着
-      # 插件仓库的 Release 被删了，或 manifest 里的 tag/sha256 过期。
-      - name: Fetch plugin assets
-        shell: pwsh
+      # 插件不在本仓库里：按 plugins/manifest.json 拉各自 Release 的 zip 并校验 sha256。
+      # 这一步失败，通常是 Release 被删了，或者 manifest 里的 tag/sha256 过期了。
+      - name: 取插件
         run: ./scripts/fetch_plugins.ps1
 
-      - name: Unit tests
-        shell: pwsh
-        run: |
-          cargo test --workspace --no-fail-fast 2>&1 | Tee-Object -FilePath test-log.txt
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: cargo check
+        run: cargo check --workspace --all-targets
 
-      - name: Release build (app)
-        shell: pwsh
-        run: |
-          ./scripts/build.ps1 -Release -SkipPlugins 2>&1 | Tee-Object -FilePath build-log.txt
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: cargo test
+        run: cargo test --workspace --no-fail-fast
 
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
+  package-smoke:
+    name: 打包流程冒烟
+    needs: test
+    runs-on: windows-latest
+    # 复用 test 已经构建好的 target，正常情况下几分钟内结束。
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 缓存
+        uses: actions/cache@v4
         with:
-          name: rclone-gui-windows-release
           path: |
-            target/release/rclone-gui.exe
-            target/release/assets/plugins/**
-            test-log.txt
-            build-log.txt
-          if-no-files-found: warn
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: 取插件（哈希不符即失败）
+        run: ./scripts/fetch_plugins.ps1
+
+      # 这里必须真的取内核：打包脚本要求 core\rclone.exe 与它的许可证同时在包里，
+      # 缺了就中止。CI 跑一遍才能证明"按清单下载 + 校验"这条路是通的。
+      - name: 构建 release（含内核）
+        run: ./scripts/build.ps1 -Release
+
+      # 只验证"整理目录 → 查绝对路径与凭据 → 打 zip → 写 SHA256SUMS"这条链能跑通。
+      # 安装包需要 Inno Setup，留给 release.yml：那里才有真正的发布上下文。
+      - name: 打包（不含安装包）
+        run: ./scripts/build-release.ps1 -SkipBuild -SkipInstaller
+
+      - name: 展示产物
+        run: |
+          Get-Content dist\SHA256SUMS
+          Get-ChildItem dist | Select-Object Name, Length
+          Get-ChildItem dist\RCGUI-*-windows-x64-portable\assets\plugins | Select-Object Name
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-smoke
+          # 注意：这个 zip 里没有安装包，不能当发布件用；内核与插件是完整校验过的。
+          path: |
+            dist/RCGUI-*-windows-x64-portable.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7

@@ -184,7 +184,10 @@ mod tests {
     fn resource_errors_are_api_not_unsupported() {
         assert_eq!(classify_response(404, "object not found"), RcErrorKind::Api);
         assert_eq!(classify_response(500, "no such remote"), RcErrorKind::Api);
-        assert_eq!(classify_response(404, "directory not found"), RcErrorKind::Api);
+        assert_eq!(
+            classify_response(404, "directory not found"),
+            RcErrorKind::Api
+        );
     }
 
     #[test]
@@ -218,7 +221,11 @@ mod tests {
         assert!(!bad_creds.is_auth_not_configured());
 
         // 其它类别的错误即使文案撞上了也不算
-        let other = RcError::new(RcErrorKind::Api, "rc/noopauth", "authentication must be set up");
+        let other = RcError::new(
+            RcErrorKind::Api,
+            "rc/noopauth",
+            "authentication must be set up",
+        );
         assert!(!other.is_auth_not_configured());
     }
 }

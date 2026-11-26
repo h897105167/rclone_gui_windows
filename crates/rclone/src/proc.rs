@@ -20,7 +20,8 @@ pub fn extract_windows_path(line: &str) -> Option<String> {
         return None;
     }
     for i in 0..b.len() - 2 {
-        if b[i].is_ascii_alphabetic() && b[i + 1] == b':' && (b[i + 2] == b'\\' || b[i + 2] == b'/') {
+        if b[i].is_ascii_alphabetic() && b[i + 1] == b':' && (b[i + 2] == b'\\' || b[i + 2] == b'/')
+        {
             return Some(line[i..].trim().trim_matches(['"', '\'']).to_string());
         }
     }
@@ -71,7 +72,10 @@ pub fn discover_exe(custom: Option<&str>) -> anyhow::Result<PathBuf> {
             return Ok(p);
         }
     }
-    Err(anyhow!("{}", rcgui_i18n::t("未找到 rclone.exe，请确认已安装并加入 PATH")))
+    Err(anyhow!(
+        "{}",
+        rcgui_i18n::t("未找到 rclone.exe，请确认已安装并加入 PATH")
+    ))
 }
 
 /// 连接发布器：只负责「把可用的客户端放到共享连接状态里」。
@@ -105,7 +109,10 @@ impl RcloneManager {
             Ok(v) => v,
             Err(e) => {
                 self.rc.set_disconnected(Some(e.describe())).await;
-                return Err(anyhow!("{}", rcgui_i18n::f("连接已有 rclone 失败: {}", &[&(e)])));
+                return Err(anyhow!(
+                    "{}",
+                    rcgui_i18n::f("连接已有 rclone 失败: {}", &[&(e)])
+                ));
             }
         };
         self.rc.set_connected(client).await;
@@ -148,7 +155,12 @@ mod tests {
         let all = include_str!("proc.rs");
         // 只检查测试模块之前的实现代码，避免匹配到本测试自身的字符串字面量
         let src = &all[..all.find("#[cfg(test)]").unwrap_or(all.len())];
-        for banned in ["Command::new", "std::process::Command", "tokio::process", "child.kill"] {
+        for banned in [
+            "Command::new",
+            "std::process::Command",
+            "tokio::process",
+            "child.kill",
+        ] {
             assert!(
                 !src.contains(banned),
                 "rclone_client 不应包含进程管理代码：{banned}"

@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 620" width="920" height="620" role="img" aria-labelledby="t d">
+  <title id="t">RCGUI 分层结构</title>
+  <desc id="d">五层结构：Shell/UI、Core Manager、RC Transport、Plugin Sandbox、Services。依赖方向自上而下。</desc>
+  <defs>
+    <style>
+      .box{fill:#ffffff;stroke:#1f2937;stroke-width:1.5;rx:10}
+      .hdr{fill:#1f2937}
+      .name{font:600 17px "Segoe UI","Microsoft YaHei",sans-serif;fill:#111827}
+      .name-inv{font:600 17px "Segoe UI","Microsoft YaHei",sans-serif;fill:#f9fafb}
+      .sub{font:400 12.5px "Segoe UI","Microsoft YaHei",sans-serif;fill:#4b5563}
+      .sub-inv{font:400 12.5px "Segoe UI","Microsoft YaHei",sans-serif;fill:#d1d5db}
+      .tag{font:600 11px "Segoe UI",sans-serif;fill:#6b7280;letter-spacing:.06em}
+      .tag-ok{font:600 11px "Segoe UI",sans-serif;fill:#047857;letter-spacing:.06em}
+      .tag-part{font:600 11px "Segoe UI",sans-serif;fill:#b45309;letter-spacing:.06em}
+      .tag-plan{font:600 11px "Segoe UI",sans-serif;fill:#7c3aed;letter-spacing:.06em}
+      .arrow{stroke:#1f2937;stroke-width:1.5;fill:none;marker-end:url(#a)}
+      .note{font:400 12px "Segoe UI","Microsoft YaHei",sans-serif;fill:#6b7280}
+      .cap{font:600 13px "Segoe UI","Microsoft YaHei",sans-serif;fill:#374151}
+    </style>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#1f2937"/>
+    </marker>
+  </defs>
+
+  <rect width="920" height="620" fill="#f8fafc"/>
+  <text class="cap" x="32" y="40">RCGUI 分层（箭头表示允许的依赖方向，不可反向）</text>
+  <text class="note" x="32" y="62">0.3.0 开发版 · 与 docs/ARCHITECTURE.md 第 2 节一致</text>
+
+  <!-- Shell / UI -->
+  <rect class="box" x="32" y="88" width="856" height="76" rx="10"/>
+  <text class="name" x="52" y="118">Shell / UI　Slint 视图 + 视图模型 + i18n</text>
+  <text class="sub" x="52" y="140">只渲染快照：不做网络请求，不读写配置，不启停进程</text>
+  <text class="tag-ok" x="700" y="118">已有</text>
+
+  <!-- Core Manager -->
+  <rect class="box" x="32" y="188" width="856" height="76" rx="10"/>
+  <text class="name" x="52" y="218">Core Manager　托管进程 / 外部端点 / 端口 / 退出清理</text>
+  <text class="sub" x="52" y="240">唯一有权写「核心状态」的层；stop() 只对自有子进程存在</text>
+  <text class="tag-part" x="700" y="218">部分 · 0.3.0 补齐</text>
+
+  <!-- RC Transport -->
+  <rect class="box" x="32" y="288" width="856" height="76" rx="10"/>
+  <text class="name" x="52" y="318">RC Transport　HTTP + 鉴权 + 超时 + 错误分类</text>
+  <text class="sub" x="52" y="340">不认识界面，不知道进程；错误是枚举，不是字符串</text>
+  <text class="tag-ok" x="700" y="318">已有</text>
+
+  <!-- Plugin Sandbox -->
+  <rect class="box" x="32" y="388" width="856" height="76" rx="10"/>
+  <text class="name" x="52" y="418">Plugin Sandbox　WASI 宿主 + 能力白名单 + kv + HTTP 入口</text>
+  <text class="sub" x="52" y="440">插件崩溃/死循环只影响自己那次调用，不带走主进程</text>
+  <text class="tag-ok" x="700" y="418">已有</text>
+
+  <!-- Services -->
+  <rect class="box" x="32" y="488" width="856" height="76" rx="10"/>
+  <text class="name" x="52" y="518">Services　update · store · backup · sync · diagnostics</text>
+  <text class="sub" x="52" y="540">后台任务，可取消，可单独诊断；只做 check 的就不写「自动更新」</text>
+  <text class="tag-plan" x="700" y="518">规划</text>
+
+  <!-- dependency arrows -->
+  <line class="arrow" x1="460" y1="164" x2="460" y2="186"/>
+  <line class="arrow" x1="460" y1="264" x2="460" y2="286"/>
+  <line class="arrow" x1="460" y1="364" x2="460" y2="386"/>
+  <line class="arrow" x1="180" y1="486" x2="180" y2="412"/>
+  <line class="arrow" x1="240" y1="486" x2="240" y2="366"/>
+
+  <text class="note" x="32" y="592">纵向：UI → Core Manager → RC Transport。Services 依赖 Transport 与 Core Manager，反向不允许。</text>
+  <text class="note" x="32" y="610">图仅表达依赖规则，不表示现有目录已经这样拆分。</text>
+</svg>

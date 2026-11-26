@@ -34,6 +34,11 @@ pub const LEGACY_MANIFEST: &str = "manifest.sha256";
 ///
 /// 单条能力（如 `fs.pick_file`）由 [`cap_of_op`] 映射到所属组，
 /// 这样配置文件里写的是人话，校验时又能精确到具体操作。
+///
+/// 这张表**只放能被执行的东西**：一次能力组对应一组插件可发起的操作。
+/// 像 `remote_types`（在"新建远程"里加派生类型）这类纯元数据声明不进这里
+/// ——它描述的是配置内容，不是插件能调用的 API，要求它"申请权限"会让插件
+/// 作者以为派生类型需要授权，而实际权限边界在内核能否支持 base_type 上。
 pub const CAP_GROUPS: &[&str] = &[
     "kv",     // 插件私有键值存储
     "ui",     // toast / 确认框
@@ -56,9 +61,9 @@ pub fn cap_of_op(op: &str) -> Option<&'static str> {
         "ui.toast" | "ui.confirm" | "ui.copy" => "ui",
 
         "fs.meta" | "fs.sha256" | "fs.read_text" | "fs.read_b64" | "fs.write_text"
-        | "fs.write_b64" | "fs.copy"
-        | "fs.mkdir" | "fs.remove" | "fs.list_dir" | "fs.find" | "fs.unzip" | "fs.pick_file"
-        | "fs.pick_dir" | "fs.open_dir" | "fs.pe_info" | "fs.signature" | "fs.search_exe" => "fs",
+        | "fs.write_b64" | "fs.copy" | "fs.mkdir" | "fs.remove" | "fs.list_dir" | "fs.find"
+        | "fs.unzip" | "fs.pick_file" | "fs.pick_dir" | "fs.open_dir" | "fs.pe_info"
+        | "fs.signature" | "fs.search_exe" => "fs",
         // 早期命名，保留兼容
         "fs.inspect_exe" | "fs.write_file" | "fs.remove_dir" => "fs",
 
@@ -420,6 +425,9 @@ pub struct Control {
     /// 选项由插件运行时下发（`body.choices`）——此时 `select` 允许 `options` 为空
     #[serde(default)]
     pub dynamic: bool,
+    /// 所属分页 id（对应 `plugin_setting.pages[].id`）。空 = 归到默认页。
+    #[serde(default)]
+    pub page: String,
 }
 
 impl Default for Control {
@@ -441,6 +449,7 @@ impl Default for Control {
             default: String::new(),
             enabled: true,
             dynamic: false,
+            page: String::new(),
         }
     }
 }
@@ -457,6 +466,17 @@ impl Control {
     }
 }
 
+/// 设置界面的一个分页标签。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct Page {
+    /// 稳定 id；[`Control::page`] 引用它
+    #[serde(default)]
+    pub id: String,
+    /// 标签文字（支持语言映射）；界面直接显示它
+    #[serde(default, deserialize_with = "de_localized")]
+    pub label: String,
+}
+
 /// `plugin_setting`：把界面写成配置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct PluginSetting {
@@ -466,6 +486,9 @@ pub struct PluginSetting {
     /// 折叠行右侧显示的摘要（可选文案，支持语言映射）
     #[serde(default, deserialize_with = "de_localized")]
     pub summary: String,
+    /// 分页声明。空 = 不分页，所有控件同屏显示（旧插件的行为）。
+    #[serde(default)]
+    pub pages: Vec<Page>,
     #[serde(default)]
     pub controls: Vec<Control>,
     /// 启动时自动执行的动作（如 `auto_start`）。空则不执行。
@@ -485,23 +508,67 @@ impl PluginSetting {
     /// `controls` 允许为空：插件可以只是一个"运行入口"，不提供设置界面
     /// （旧格式 `plugin.json` 升级上来的插件就属于这一类）。
     pub fn validate(&self) -> Result<()> {
+        let mut page_ids = BTreeSet::new();
+        for (i, p) in self.pages.iter().enumerate() {
+            if p.id.trim().is_empty() {
+                bail!(
+                    "{}",
+                    rcgui_i18n::f("plugin_setting.pages[{}] 缺少 id", &[&(i)])
+                );
+            }
+            if p.label.trim().is_empty() {
+                bail!(
+                    "{}",
+                    rcgui_i18n::f("plugin_setting.pages[{}]（{}）缺少 label", &[&(i), &(p.id)])
+                );
+            }
+            if !page_ids.insert(p.id.clone()) {
+                bail!(
+                    "{}",
+                    rcgui_i18n::f("plugin_setting.pages 的 id 重复：{}", &[&(p.id)])
+                );
+            }
+        }
         let mut keys = BTreeSet::new();
         for (i, c) in self.controls.iter().enumerate() {
             let at = format!("plugin_setting.controls[{i}]");
-            let kind = c.kind_enum().with_context(|| rcgui_i18n::f("{}.kind 不合法", &[&(at)]))?;
+            let kind = c
+                .kind_enum()
+                .with_context(|| rcgui_i18n::f("{}.kind 不合法", &[&(at)]))?;
+            // 声明了分页就必须存在：写错 id 会让控件凭空消失，比报错更难查。
+            if !c.page.trim().is_empty() && !page_ids.contains(&c.page) {
+                bail!(
+                    "{}",
+                    rcgui_i18n::f(
+                        "{} 的 page 未在 plugin_setting.pages 里声明：{}",
+                        &[&(at), &(c.page)]
+                    )
+                );
+            }
             match kind {
                 ControlKind::Divider => continue,
                 _ => {
                     if c.key.trim().is_empty() {
-                        bail!("{}", rcgui_i18n::f("{} 缺少 key（{} 控件必须能按 key 取值/回调）", &[&(at), &(format!("{:?}", kind))]));
+                        bail!(
+                            "{}",
+                            rcgui_i18n::f(
+                                "{} 缺少 key（{} 控件必须能按 key 取值/回调）",
+                                &[&(at), &(format!("{:?}", kind))]
+                            )
+                        );
                     }
                     if !keys.insert(c.key.clone()) {
-                        bail!("{}", rcgui_i18n::f("{} 的 key 重复：{}", &[&(at), &(c.key)]));
+                        bail!(
+                            "{}",
+                            rcgui_i18n::f("{} 的 key 重复：{}", &[&(at), &(c.key)])
+                        );
                     }
                 }
             }
             if kind == ControlKind::Field {
-                let fk = c.field_enum().with_context(|| rcgui_i18n::f("{}.field 不合法", &[&(at)]))?;
+                let fk = c
+                    .field_enum()
+                    .with_context(|| rcgui_i18n::f("{}.field 不合法", &[&(at)]))?;
                 if fk == FieldKind::Select && c.options.is_empty() && !c.dynamic {
                     bail!("{}", rcgui_i18n::f("{} 是下拉框但没有 options（选项由插件运行时下发时请写 \"dynamic\": true）", &[&(at)]));
                 }
@@ -515,6 +582,28 @@ impl PluginSetting {
 }
 
 // ---------------- 插件本体 ----------------
+
+/// 插件声明的一个派生远程类型。
+///
+/// 插件不能新增后端实现（真正的后端在 rclone 里），只能"预设参数"：
+/// 用户新建 `id` 时，宿主按 `base_type` 创建配置，把 `defaults` 填进去。
+/// 例：`id="k-vault"`, `base_type="webdav"`, `defaults={"vendor":"other"}`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct RemoteType {
+    /// 新建远程时写进 `config` 的 `type` 值；必须全局唯一
+    #[serde(default)]
+    pub id: String,
+    /// 新建类型下拉框里显示的文字（支持语言映射）；它只是显示名，不是 id
+    #[serde(default, deserialize_with = "de_localized")]
+    pub name: String,
+    /// 底层 rclone 后端类型（如 `webdav`）；`defaults` 的参数名由它决定
+    #[serde(default)]
+    pub base_type: String,
+    /// 预填参数。值只能是字符串：rclone 的配置项都是字符串，数字/布尔会被
+    /// 它按自己的规则解析，宿主不做类型推断。
+    #[serde(default)]
+    pub defaults: std::collections::BTreeMap<String, String>,
+}
 
 /// `config.json` 的内容。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -565,6 +654,13 @@ pub struct PluginConfig {
     /// 路由、鉴权、响应格式全部由插件自己决定；宿主只负责转发与超时。
     #[serde(default)]
     pub http_entry: bool,
+    /// 派生远程类型：插件可以把"预设好参数的 rclone 后端"注册成新建类型。
+    ///
+    /// 只有插件处于启用状态时宿主才会把这些类型列进新建下拉框（见
+    /// `crates/app/src/remote_types.rs`）；插件被停用或卸载后，用户已经
+    /// 建好的远程配置仍然留在 rclone 的 `config` 里，不会丢数据。
+    #[serde(default)]
+    pub remote_types: Vec<RemoteType>,
 }
 
 impl PluginConfig {
@@ -574,7 +670,13 @@ impl PluginConfig {
             bail!("{}", rcgui_i18n::t("config.json 缺少 id"));
         }
         if !valid_id(&self.id) {
-            bail!("{}", rcgui_i18n::f("config.json 的 id 不合法（只能用字母、数字、`.`、`-`、`_`，2–64 个字符）：{}", &[&(self.id)]));
+            bail!(
+                "{}",
+                rcgui_i18n::f(
+                    "config.json 的 id 不合法（只能用字母、数字、`.`、`-`、`_`，2–64 个字符）：{}",
+                    &[&(self.id)]
+                )
+            );
         }
         if self.name.trim().is_empty() {
             bail!("{}", rcgui_i18n::t("config.json 缺少 name"));
@@ -582,24 +684,43 @@ impl PluginConfig {
         if self.version.trim().is_empty() {
             bail!("{}", rcgui_i18n::t("config.json 缺少 version"));
         }
-        semver::Version::parse(self.version.trim())
-            .with_context(|| rcgui_i18n::f("config.json 的 version 不是合法语义化版本：{}", &[&(self.version)]))?;
+        semver::Version::parse(self.version.trim()).with_context(|| {
+            rcgui_i18n::f(
+                "config.json 的 version 不是合法语义化版本：{}",
+                &[&(self.version)],
+            )
+        })?;
         if !self.min_gui_version.trim().is_empty() {
             semver::Version::parse(self.min_gui_version.trim()).with_context(|| {
-                rcgui_i18n::f("config.json 的 min_gui_version 不是合法语义化版本：{}", &[&(self.min_gui_version)])
+                rcgui_i18n::f(
+                    "config.json 的 min_gui_version 不是合法语义化版本：{}",
+                    &[&(self.min_gui_version)],
+                )
             })?;
         }
         if self.entry.trim().is_empty() {
-            bail!("{}", rcgui_i18n::t("config.json 缺少 entry（一般是 main.wasm）"));
+            bail!(
+                "{}",
+                rcgui_i18n::t("config.json 缺少 entry（一般是 main.wasm）")
+            );
         }
         // `platform` 只用来挡「明显不是这台机器的插件」。宿主本身是 Windows 应用，
         // 而插件跑在 WASI 沙箱里：`any`（或不填）与 `windows` 都能跑，其余拒绝。
         let platform = self.platform.trim();
         if !platform.is_empty() && platform != "windows" && platform != "any" {
-            bail!("{}", rcgui_i18n::f("插件声明的平台不受支持：{}（仅支持 windows / any）", &[&(platform)]));
+            bail!(
+                "{}",
+                rcgui_i18n::f(
+                    "插件声明的平台不受支持：{}（仅支持 windows / any）",
+                    &[&(platform)]
+                )
+            );
         }
         if self.tags.len() > 32 {
-            bail!("{}", rcgui_i18n::f("config.json 的 tags 过多（{} > 32）", &[&(self.tags.len())]));
+            bail!(
+                "{}",
+                rcgui_i18n::f("config.json 的 tags 过多（{} > 32）", &[&(self.tags.len())])
+            );
         }
         for t in &self.tags {
             if t.trim().is_empty() {
@@ -611,10 +732,109 @@ impl PluginConfig {
         }
         for c in &self.capabilities {
             if !CAP_GROUPS.contains(&c.as_str()) {
-                bail!("{}", rcgui_i18n::f("config.json 声明了宿主不认识的能力组：{}（可用：{}）", &[&(c), &(CAP_GROUPS.join(" / "))]));
+                bail!(
+                    "{}",
+                    rcgui_i18n::f(
+                        "config.json 声明了宿主不认识的能力组：{}（可用：{}）",
+                        &[&(c), &(CAP_GROUPS.join(" / "))]
+                    )
+                );
             }
         }
         self.plugin_setting.validate()?;
+        self.validate_remote_types()?;
+        Ok(())
+    }
+
+    /// 校验派生远程类型声明。
+    ///
+    /// 这里**不要求插件申请任何能力组**：`remote_types` 是元数据（描述"用户新建远程时
+    /// 可以选这个派生类型、它落在哪个 rclone 后端上"），不是插件能发起的操作。
+    /// 真正的权限边界在内核是否支持 `base_type` 那个后端，以及插件本身是否启用。
+    fn validate_remote_types(&self) -> Result<()> {
+        if self.remote_types.is_empty() {
+            return Ok(());
+        }
+        if self.remote_types.len() > 16 {
+            bail!(
+                "{}",
+                rcgui_i18n::f(
+                    "config.json 的 remote_types 过多（{} > 16）",
+                    &[&(self.remote_types.len())]
+                )
+            );
+        }
+        let mut ids = BTreeSet::new();
+        for (i, rt) in self.remote_types.iter().enumerate() {
+            let at = format!("remote_types[{i}]");
+            if !valid_id(&rt.id) {
+                bail!(
+                    "{}",
+                    rcgui_i18n::f(
+                        "{} 的 id 不合法（只能用字母、数字、`.`、`-`、`_`，2–64 个字符）：{}",
+                        &[&(at), &(rt.id)]
+                    )
+                );
+            }
+            if !ids.insert(rt.id.clone()) {
+                bail!(
+                    "{}",
+                    rcgui_i18n::f("remote_types 的 id 重复：{}", &[&(rt.id)])
+                );
+            }
+            if rt.name.trim().is_empty() {
+                bail!(
+                    "{}",
+                    rcgui_i18n::f("{} 缺少 name（新建类型下拉框要显示它）", &[&(at)])
+                );
+            }
+            // base_type 必须是 rclone 自己的后端名：它会被原样写进 config 的 type 字段，
+            // 写错了要到真正连远程时才会报错，所以这里只放行后端名的形状。
+            let base = rt.base_type.trim();
+            if base.is_empty() {
+                bail!(
+                    "{}",
+                    rcgui_i18n::f("{} 缺少 base_type（如 webdav）", &[&(at)])
+                );
+            }
+            // 先判自引用：派生类型的 id 通常带 `-`（如 `k-vault`），若先做字符形状检查，
+            // 这种最常见的写错方式只会得到"不是合法的后端名"，看不出真正的问题。
+            if base == rt.id {
+                bail!(
+                    "{}",
+                    rcgui_i18n::f("{} 的 base_type 不能等于自己的 id（会绕过去重）", &[&(at)])
+                );
+            }
+            if !base
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            {
+                bail!(
+                    "{}",
+                    rcgui_i18n::f("{} 的 base_type 不是合法的后端名：{}", &[&(at), &(base)])
+                );
+            }
+            for (k, v) in &rt.defaults {
+                if k.trim().is_empty() {
+                    bail!("{}", rcgui_i18n::f("{} 的 defaults 里有空参数名", &[&(at)]));
+                }
+                if k == "type" {
+                    bail!(
+                        "{}",
+                        rcgui_i18n::f(
+                            "{} 的 defaults 不能设置 type（由 base_type 决定）",
+                            &[&(at)]
+                        )
+                    );
+                }
+                if v.len() > 4096 {
+                    bail!(
+                        "{}",
+                        rcgui_i18n::f("{} 的参数 {} 过长（> 4096 字节）", &[&(at), &(k)])
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -627,7 +847,13 @@ impl PluginConfig {
         let have = semver::Version::parse(gui_version.trim())
             .with_context(|| rcgui_i18n::f("宿主版本号无法解析：{}", &[&(gui_version)]))?;
         if have < need {
-            bail!("{}", rcgui_i18n::f("插件需要宿主版本 >= {}，当前为 {}", &[&(self.min_gui_version), &(gui_version)]));
+            bail!(
+                "{}",
+                rcgui_i18n::f(
+                    "插件需要宿主版本 >= {}，当前为 {}",
+                    &[&(self.min_gui_version), &(gui_version)]
+                )
+            );
         }
         Ok(())
     }
@@ -653,7 +879,13 @@ impl PluginConfig {
 
     /// 合并成用于搜索的一行小写文本（名称 + id + 标签 + 描述）。
     pub fn search_blob(&self) -> String {
-        let mut s = format!("{} {} {} {}", self.name, self.id, self.tags.join(" "), self.description);
+        let mut s = format!(
+            "{} {} {} {}",
+            self.name,
+            self.id,
+            self.tags.join(" "),
+            self.description
+        );
         s = s.to_lowercase();
         s
     }
@@ -753,7 +985,15 @@ mod tests {
 
     #[test]
     fn rejects_bad_ids() {
-        for bad in ["", "a", "with space", "../evil", ".hidden", "-lead", "中文id"] {
+        for bad in [
+            "",
+            "a",
+            "with space",
+            "../evil",
+            ".hidden",
+            "-lead",
+            "中文id",
+        ] {
             let mut c = sample();
             c.id = bad.into();
             assert!(c.validate().is_err(), "id 应该被拒绝: {bad}");
@@ -762,7 +1002,8 @@ mod tests {
         for ok in ["com.example.p", "one_click", "one-click", "a1"] {
             let mut c = sample();
             c.id = ok.into();
-            c.validate().unwrap_or_else(|e| panic!("id 应通过: {ok} -> {e}"));
+            c.validate()
+                .unwrap_or_else(|e| panic!("id 应通过: {ok} -> {e}"));
         }
     }
 
@@ -936,5 +1177,197 @@ mod tests {
         // 默认界面语言是中文
         assert_eq!(localized.tags, vec!["进程".to_string()]);
         assert!(localized.search_blob().contains("进程"));
+    }
+
+    /// 分页声明合法时，控件可以带 page。
+    #[test]
+    fn pages_accept_controls_with_declared_page() {
+        let c: PluginConfig = serde_json::from_value(json!({
+            "id": "com.example.paged", "name": "分页插件", "version": "1.0.0",
+            "entry": "main.wasm",
+            "plugin_setting": {
+                "pages": [
+                    {"id": "basic", "label": "基础"},
+                    {"id": "advanced", "label": {"zh": "高级", "en": "Advanced"}}
+                ],
+                "controls": [
+                    {"kind": "field", "key": "exe", "label": "路径", "field": "path", "page": "basic"},
+                    {"kind": "field", "key": "port", "label": "端口", "field": "number", "page": "advanced"},
+                    {"kind": "status", "key": "conn", "label": "状态"}
+                ]
+            }
+        }))
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.plugin_setting.pages.len(), 2);
+        assert_eq!(c.plugin_setting.pages[1].label, "高级");
+        // 不声明 page 的控件归默认页，page 保持空串
+        assert!(c.plugin_setting.controls[2].page.is_empty());
+    }
+
+    /// 控件引用了没声明的分页要报错：否则控件会在界面上凭空消失。
+    #[test]
+    fn control_with_unknown_page_is_rejected() {
+        let c: PluginConfig = serde_json::from_value(json!({
+            "id": "com.example.paged", "name": "分页插件", "version": "1.0.0",
+            "entry": "main.wasm",
+            "plugin_setting": {
+                "pages": [{"id": "basic", "label": "基础"}],
+                "controls": [{"kind": "status", "key": "conn", "label": "状态", "page": "nope"}]
+            }
+        }))
+        .unwrap();
+        let e = c.validate().unwrap_err().to_string();
+        assert!(e.contains("未在 plugin_setting.pages 里声明"), "{e}");
+    }
+
+    /// 分页 id 重复 / 缺 label 都算插件作者的错。
+    #[test]
+    fn broken_page_declarations_are_rejected() {
+        let dup: PluginConfig = serde_json::from_value(json!({
+            "id": "com.example.paged", "name": "分页插件", "version": "1.0.0",
+            "entry": "main.wasm",
+            "plugin_setting": {"pages": [{"id": "a", "label": "A"}, {"id": "a", "label": "B"}]}
+        }))
+        .unwrap();
+        assert!(dup.validate().unwrap_err().to_string().contains("id 重复"));
+
+        let no_label: PluginConfig = serde_json::from_value(json!({
+            "id": "com.example.paged", "name": "分页插件", "version": "1.0.0",
+            "entry": "main.wasm",
+            "plugin_setting": {"pages": [{"id": "a"}]}
+        }))
+        .unwrap();
+        assert!(no_label
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("缺少 label"));
+    }
+
+    /// 派生远程类型：合法声明通过，并且保留 base_type / defaults。
+    ///
+    /// `capabilities` 里**不需要**写 `remote_types`：派生类型是元数据，不是可执行操作
+    /// （见 [`CAP_GROUPS`]）。这里只申请真正会调用的 `kv`。
+    #[test]
+    fn remote_types_parse_and_validate() {
+        let c: PluginConfig = serde_json::from_value(json!({
+            "id": "com.example.kvault", "name": "K-Vault", "version": "1.0.0",
+            "entry": "main.wasm",
+            "capabilities": ["kv"],
+            "remote_types": [{
+                "id": "k-vault",
+                "name": "K-Vault（WebDAV）",
+                "base_type": "webdav",
+                "defaults": {"vendor": "other", "url": "https://example.invalid"}
+            }]
+        }))
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.remote_types.len(), 1);
+        assert_eq!(c.remote_types[0].id, "k-vault");
+        assert_eq!(c.remote_types[0].base_type, "webdav");
+        assert_eq!(
+            c.remote_types[0].defaults.get("vendor").map(|s| s.as_str()),
+            Some("other")
+        );
+    }
+
+    /// 没有任何能力组的插件也能声明派生类型（元数据不需要授权）。
+    #[test]
+    fn remote_types_need_no_capability_group() {
+        let c: PluginConfig = serde_json::from_value(json!({
+            "id": "com.example.kvault", "name": "K-Vault", "version": "1.0.0",
+            "entry": "main.wasm",
+            "capabilities": [],
+            "remote_types": [{"id": "k-vault", "name": "K-Vault", "base_type": "webdav"}]
+        }))
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.remote_types.len(), 1);
+    }
+
+    /// 真实插件 `kvault` 的 config.json 必须能被宿主解析。
+    ///
+    /// 这条检查跨仓库契约：插件仓库独立发版，字段形状（本地化的 `name` 对象、
+    /// `plugin_setting.pages`、`remote_types`）一旦和宿主解析器对不上，用户装上的
+    /// 就是"看得见、加载不了"的插件。仓库不在时跳过——别的 checkout 或 CI 里
+    /// 没有 `plugin_repos/` 目录不能因此变红。
+    #[test]
+    fn real_kvault_config_parses() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugin_repos/rcgui-plugin-kvault/config.json");
+        let Ok(raw) = std::fs::read(&path) else {
+            eprintln!("跳过：没有 {}（不在完整 checkout 里）", path.display());
+            return;
+        };
+        let c: PluginConfig = serde_json::from_slice(&raw)
+            .unwrap_or_else(|e| panic!("{} 解析失败：{e}", path.display()));
+        c.validate()
+            .unwrap_or_else(|e| panic!("{} 校验失败：{e}", path.display()));
+        assert_eq!(c.id, "kvault");
+        // 该插件声明的能力组必须都是宿主认识的可执行组
+        for cap in &c.capabilities {
+            assert!(
+                CAP_GROUPS.contains(&cap.as_str()),
+                "宿主不认识的能力组：{cap}"
+            );
+        }
+        // 派生类型仍然在（kvault 走 webdav + kvault 参数）
+        assert_eq!(c.remote_types.len(), 1);
+        assert_eq!(c.remote_types[0].id, "kvault");
+        assert_eq!(c.remote_types[0].base_type, "webdav");
+        // 分页标签齐全，否则界面会显示空页签
+        assert!(!c.plugin_setting.pages.is_empty());
+    }
+
+    /// base_type 必须像后端名，且不能等于自己的 id。
+    #[test]
+    fn remote_types_reject_bad_base_type() {
+        let with_cap = |rt: serde_json::Value| -> PluginConfig {
+            serde_json::from_value(json!({
+                "id": "com.example.kvault", "name": "K-Vault", "version": "1.0.0",
+                "entry": "main.wasm",
+                "capabilities": ["kv"],
+                "remote_types": [rt]
+            }))
+            .unwrap()
+        };
+        let e = with_cap(json!({"id": "k-vault", "name": "KV", "base_type": "WebDAV"}))
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("不是合法的后端名"), "{e}");
+
+        let e = with_cap(json!({"id": "k-vault", "name": "KV", "base_type": "k-vault"}))
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("不能等于自己的 id"), "{e}");
+
+        // defaults 不允许改写 type
+        let e = with_cap(json!({
+            "id": "k-vault", "name": "KV", "base_type": "webdav",
+            "defaults": {"type": "s3"}
+        }))
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("不能设置 type"), "{e}");
+    }
+
+    /// 旧插件（没有 pages / remote_types 字段）必须继续能解析。
+    #[test]
+    fn legacy_config_without_new_fields_still_parses() {
+        let c: PluginConfig = serde_json::from_value(json!({
+            "id": "onerclone", "name": "一键 rclone", "version": "0.2.0",
+            "entry": "main.wasm",
+            "plugin_setting": {"controls": [{"kind": "status", "key": "conn", "label": "状态"}]}
+        }))
+        .unwrap();
+        c.validate().unwrap();
+        assert!(c.plugin_setting.pages.is_empty());
+        assert!(c.remote_types.is_empty());
+        assert!(c.plugin_setting.controls[0].page.is_empty());
     }
 }

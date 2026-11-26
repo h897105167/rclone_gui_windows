@@ -82,13 +82,20 @@ impl RcClient {
         if let Some((u, p)) = &self.auth {
             req = req.basic_auth(u, Some(p));
         }
-        let resp = req.send().await.map_err(|e| self.transport_error(method, e))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| self.transport_error(method, e))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
             let msg = serde_json::from_str::<Value>(&text)
                 .ok()
-                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                .and_then(|v| {
+                    v.get("error")
+                        .and_then(|e| e.as_str())
+                        .map(|s| s.to_string())
+                })
                 .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
             let kind = classify_response(status.as_u16(), &msg);
             return Err(RcError::new(kind, method, msg));
@@ -96,8 +103,13 @@ impl RcClient {
         if text.trim().is_empty() {
             return Ok(Value::Null);
         }
-        serde_json::from_str(&text)
-            .map_err(|e| RcError::new(RcErrorKind::Decode, method, rcgui_i18n::f("响应解析失败: {}", &[&(e)])))
+        serde_json::from_str(&text).map_err(|e| {
+            RcError::new(
+                RcErrorKind::Decode,
+                method,
+                rcgui_i18n::f("响应解析失败: {}", &[&(e)]),
+            )
+        })
     }
 
     /// 依次尝试多个方法名（新旧版本改名兼容），**仅**在「方法不存在」时回退。
@@ -116,7 +128,11 @@ impl RcClient {
             }
         }
         Err(last_err.unwrap_or_else(|| {
-            RcError::new(RcErrorKind::Unsupported, methods.join("|"), rcgui_i18n::t("无可用 RC 方法"))
+            RcError::new(
+                RcErrorKind::Unsupported,
+                methods.join("|"),
+                rcgui_i18n::t("无可用 RC 方法"),
+            )
         }))
     }
 
@@ -211,9 +227,12 @@ impl RcClient {
 
     /// 更新 remote 参数（仅覆盖给出的键）
     pub async fn config_update(&self, name: &str, parameters: Value) -> RcResult<()> {
-        self.call("config/update", &json!({ "name": name, "parameters": parameters }))
-            .await
-            .map(drop)
+        self.call(
+            "config/update",
+            &json!({ "name": name, "parameters": parameters }),
+        )
+        .await
+        .map(drop)
     }
 
     /// 读取单个 remote 的全部键值。
@@ -233,10 +252,7 @@ impl RcClient {
     /// - 因此调用方不能靠「有没有报错」判断「原来是否存在」，要看返回的 `removed`。
     pub async fn config_unset(&self, name: &str, keys: &[&str]) -> RcResult<Vec<String>> {
         let v = self
-            .call(
-                "config/unset",
-                &json!({ "name": name, "keys": keys }),
-            )
+            .call("config/unset", &json!({ "name": name, "keys": keys }))
             .await?;
         Ok(v.get("removed")
             .and_then(|r| r.as_array())
@@ -277,11 +293,16 @@ impl RcClient {
             params["pass"] = json!(pass);
         }
         let v = self.call("serve/start", &params).await?;
-        Ok(v.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string())
+        Ok(v.get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string())
     }
 
     pub async fn serve_stop(&self, id: &str) -> RcResult<()> {
-        self.call("serve/stop", &json!({ "id": id })).await.map(drop)
+        self.call("serve/stop", &json!({ "id": id }))
+            .await
+            .map(drop)
     }
 
     // ---------- job ----------
@@ -298,8 +319,16 @@ impl RcClient {
         self.call("job/status", &json!({ "jobid": jobid })).await
     }
 
+    /// 同 [`Self::job_status`]，但解析成结构体。
+    pub async fn job_status_parsed(&self, jobid: i64) -> RcResult<crate::types::JobStatus> {
+        let v = self.job_status(jobid).await?;
+        Ok(serde_json::from_value(v).unwrap_or_default())
+    }
+
     pub async fn job_stop(&self, jobid: i64) -> RcResult<()> {
-        self.call("job/stop", &json!({ "jobid": jobid })).await.map(drop)
+        self.call("job/stop", &json!({ "jobid": jobid }))
+            .await
+            .map(drop)
     }
 
     // ---------- options / bwlimit ----------
@@ -307,7 +336,10 @@ impl RcClient {
     /// 设置带宽限速，如 "1M"、"10M:100K"、"off"
     pub async fn bwlimit(&self, rate: &str) -> RcResult<String> {
         let v = self.call("core/bwlimit", &json!({ "rate": rate })).await?;
-        Ok(v.get("rate").and_then(|x| x.as_str()).unwrap_or(rate).to_string())
+        Ok(v.get("rate")
+            .and_then(|x| x.as_str())
+            .unwrap_or(rate)
+            .to_string())
     }
 
     pub async fn options_get(&self) -> RcResult<Value> {
@@ -321,13 +353,21 @@ impl RcClient {
 
     // ---------- operations ----------
 
-    pub async fn list(&self, fs: &str, remote: &str, options: Option<Value>) -> RcResult<Vec<ListEntry>> {
+    pub async fn list(
+        &self,
+        fs: &str,
+        remote: &str,
+        options: Option<Value>,
+    ) -> RcResult<Vec<ListEntry>> {
         let mut params = json!({ "fs": fs, "remote": remote });
         if let Some(opts) = options {
             params["options"] = opts;
         }
         let v = self.call("operations/list", &params).await?;
-        let list = v.get("list").cloned().unwrap_or_else(|| Value::Array(vec![]));
+        let list = v
+            .get("list")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(vec![]));
         Ok(serde_json::from_value(list).unwrap_or_default())
     }
 
@@ -350,9 +390,12 @@ impl RcClient {
     }
 
     pub async fn deletefile(&self, fs: &str, remote: &str) -> RcResult<()> {
-        self.call("operations/deletefile", &json!({ "fs": fs, "remote": remote }))
-            .await
-            .map(drop)
+        self.call(
+            "operations/deletefile",
+            &json!({ "fs": fs, "remote": remote }),
+        )
+        .await
+        .map(drop)
     }
 
     /// 复制文件（v1.75: copyfile；旧版: copy）
@@ -425,7 +468,10 @@ impl RcClient {
 
     pub async fn publiclink(&self, fs: &str, remote: &str) -> RcResult<String> {
         let v = self
-            .call("operations/publiclink", &json!({ "fs": fs, "remote": remote }))
+            .call(
+                "operations/publiclink",
+                &json!({ "fs": fs, "remote": remote }),
+            )
             .await?;
         Ok(v.get("url")
             .and_then(|u| u.as_str())
@@ -514,6 +560,73 @@ impl RcClient {
         )
         .await
         .map(drop)
+    }
+
+    // ---------- 异步 job ----------
+
+    /// 通用的异步调用：加 `_async:true` 让 rclone 立即返回 jobid。
+    ///
+    /// 同步版本会一直挂着直到整个目录传完 —— 界面显示进度、以及窗口退到托盘后
+    /// 仍然要继续跑，都要求调用方拿到 jobid 自己轮询，而不是阻塞住一个请求。
+    pub async fn call_async(&self, method: &str, params: &Value) -> RcResult<i64> {
+        let mut p = params.clone();
+        match &mut p {
+            Value::Object(m) => {
+                m.insert("_async".to_string(), Value::Bool(true));
+            }
+            Value::Null => p = json!({ "_async": true }),
+            _ => {
+                return Err(RcError::new(
+                    RcErrorKind::Decode,
+                    method,
+                    rcgui_i18n::t("异步调用的参数必须是对象"),
+                ))
+            }
+        }
+        let v = self.call(method, &p).await?;
+        v.get("jobid").and_then(Value::as_i64).ok_or_else(|| {
+            RcError::new(
+                RcErrorKind::Decode,
+                method,
+                rcgui_i18n::t("异步调用没有返回 jobid"),
+            )
+        })
+    }
+
+    /// 异步 `sync/copy`（不删除目标多余文件），返回 jobid。
+    pub async fn sync_copy_async(
+        &self,
+        src_fs: &str,
+        dst_fs: &str,
+        create_empty_src_dirs: bool,
+    ) -> RcResult<i64> {
+        self.call_async(
+            "sync/copy",
+            &json!({
+                "srcFs": src_fs,
+                "dstFs": dst_fs,
+                "createEmptySrcDirs": create_empty_src_dirs,
+            }),
+        )
+        .await
+    }
+
+    /// 异步 `sync/sync`（镜像，删除目标多余文件），返回 jobid。
+    pub async fn sync_sync_async(
+        &self,
+        src_fs: &str,
+        dst_fs: &str,
+        create_empty_src_dirs: bool,
+    ) -> RcResult<i64> {
+        self.call_async(
+            "sync/sync",
+            &json!({
+                "srcFs": src_fs,
+                "dstFs": dst_fs,
+                "createEmptySrcDirs": create_empty_src_dirs,
+            }),
+        )
+        .await
     }
 }
 

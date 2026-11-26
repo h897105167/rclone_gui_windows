@@ -17,7 +17,23 @@ rcgui-profile = { path = "../profile" }
 rcgui-rc = { path = "../rc" }
 rclone_client = { path = "../rclone" }
 plugin_host = { path = "../plugin" }
-slint = { version = "1", features = ["renderer-software", "unstable-winit-030"] }
+# 只留 Windows 上真正用到的那几样：
+# - backend-winit + renderer-software：窗口用 winit，绘制走 CPU 软渲染（远程桌面和
+#   没有显卡驱动的机器上 OpenGL 经常起不来，软渲染反而更稳）。
+# - accessibility：屏幕阅读器与键盘焦点。关掉默认特性后它不会自动带上，必须点名，
+#   否则无障碍就直接没了。
+# - unstable-winit-030：`slint::winit_030`，可见性采样要用 `with_winit_window`。
+# - compat-1-2：界面里还有 1.x 早期写法的 `for x[i] in ...`，去掉它编不过。
+# 默认特性里的 renderer-femtovg 与 system-tray 不要：托盘用的是 tray-icon 这个 crate，
+# 界面里没有任何 SystemTrayIcon，多带一个 OpenGL 渲染器只是白占体积和编译时间。
+slint = { version = "1", default-features = false, features = [
+    "std",
+    "backend-winit",
+    "renderer-software",
+    "accessibility",
+    "unstable-winit-030",
+    "compat-1-2",
+] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -35,6 +51,7 @@ winreg = "0.52"
 tray-icon = "0.14"
 arboard = "3"
 async-trait = { workspace = true }
+semver = { workspace = true }
 rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["png"] }
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_Globalization"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_Globalization", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_Console"] }

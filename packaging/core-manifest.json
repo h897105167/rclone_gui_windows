@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "core": {
+    "project": "rclone",
+    "version": "v1.76.0",
+    "published_at": "2026-11-06T16:29:59Z",
+    "platform": "windows",
+    "arch": "x64",
+    "release_url": "https://github.com/rclone/rclone/releases/tag/v1.76.0",
+    "asset_name": "rclone-v1.76.0-windows-amd64.zip",
+    "asset_url": "https://github.com/rclone/rclone/releases/download/v1.76.0/rclone-v1.76.0-windows-amd64.zip",
+    "asset_sha256": "8b4fd2737ade4e70c057ef4a49deb7cffe94b0fb9d7587c189d149823f21a1dc",
+    "asset_bytes": 32193987,
+    "checksums_url": "https://github.com/rclone/rclone/releases/download/v1.76.0/SHA256SUMS",
+    "checksums_mirror_url": "https://downloads.rclone.org/v1.76.0/SHA256SUMS",
+    "checksums_format": "pgp-clearsigned",
+    "license": "MIT",
+    "license_url": "https://raw.githubusercontent.com/rclone/rclone/v1.76.0/COPYING",
+    "license_sha256": "8cd2e9e750b90a04b7d82dbbca3930c696ae0309d7c10464f90a44f45754cd04",
+    "license_bytes": 1095,
+    "exe_name": "rclone.exe",
+    "exe_sha256": "acd80683e23151e93bbe0d6ffa74d26e542ec510332f630beecb9944f8d1a623",
+    "exe_bytes": 85647872
+  },
+  "notes": [
+    "asset_sha256 取自 GitHub Release 的 asset digest，并与官方 SHA256SUMS 中 <sha256>  rclone-v1.76.0-windows-amd64.zip 那一行交叉核对过。",
+    "SHA256SUMS 是 PGP 明文签名文件，脚本只解析形如 '<64 位十六进制>  <文件名>' 的行，忽略 -----BEGIN PGP SIGNED MESSAGE----- 包起来的那层。",
+    "官方 windows-amd64 zip 里没有 COPYING（v1.76.0 实测只有 README.txt、rclone.exe、git-log.txt、rclone.1、README.html），所以许可证全文按 license_url 单独取，并用 license_sha256 校验；取不到或不符就是失败，不降级成警告。",
+    "license_url 必须钉在 version 对应的 tag 上（当前 v1.76.0），不能指向 master 或 latest，否则拿到的许可证可能和这个内核不是同一个版本。",
+    "这个文件只固定一个版本；升级内核就是改这里的三行（version / asset_url / asset_sha256）并让 CI 重新校验，license_url 与 license_sha256 也要一起改并重新算过，不要就地手改 dist 里的 exe。"
+  ]
+}

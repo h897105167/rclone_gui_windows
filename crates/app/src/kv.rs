@@ -64,4 +64,17 @@ impl KvStore {
         ns.remove(key);
         self.save_ns(plugin_id, &ns)
     }
+
+    /// 丢掉某个插件的内存缓存，下次读会重新从磁盘取。
+    ///
+    /// 插件被替换/重装/导入后必须调用：磁盘上的 `kv.json` 已经变了，而这里的
+    /// 缓存还留着旧值，界面会显示插件升级前的内容。
+    pub fn invalidate(&self, plugin_id: &str) {
+        self.inner.lock().unwrap().remove(plugin_id);
+    }
+
+    /// 丢掉全部缓存（配置文件整体导入、插件目录被外部改动之后用）。
+    pub fn invalidate_all(&self) {
+        self.inner.lock().unwrap().clear();
+    }
 }

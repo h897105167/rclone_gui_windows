@@ -1,0 +1,238 @@
+# 发布流程：构建 setup 安装包与 portable 压缩包，附 licenses 与 SHA256SUMS。
+#
+# 触发方式两种：
+#   - 推 tag v*（例如 v0.3.0）：构建 + 创建 Release 并上传资产。
+#   - 人工 workflow_dispatch：只构建并把产物当 workflow artifact 留下，不创建 Release。
+#     想试打包流程又不想留下版本记录时用这个。
+#
+# 版本号只有一个来源：Cargo.toml 的 [workspace.package] version。
+# tag 与它不一致就直接失败——发布件名字里带的版本必须和二进制里的一致（见 docs/VERSIONING.md）。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# 创建 Release、上传资产需要写权限；这个 workflow 是唯一需要写的地方。
+permissions:
+  contents: write
+
+# 发布不允许并发：两个任务同时往同一个 tag 上传会互相覆盖资产。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: 构建发布件
+    runs-on: windows-latest
+    # 冷缓存下要编 workspace、下载内核、编译安装包，45 分钟不够，给 90。
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Release 说明要用历史提交，浅克隆拿不到。
+          fetch-depth: 0
+
+      - name: 读版本并核对 tag
+        id: ver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $toml = Get-Content -LiteralPath Cargo.toml -Raw
+          if ($toml -notmatch '(?ms)^\[workspace\.package\](.*?)(?=^\[|\z)') {
+            throw "Cargo.toml 里找不到 [workspace.package] 段。"
+          }
+          $block = $Matches[1]
+          if ($block -notmatch '(?m)^\s*version\s*=\s*"([^"]+)"') {
+            throw "[workspace.package] 里找不到 version。"
+          }
+          $version = $Matches[1]
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+            if ($tag -ne "v$version") {
+              throw "tag 是 $tag，Cargo.toml 里是 $version。改完版本号再打 tag，不要给旧代码贴新版本。"
+            }
+          }
+          Write-Host "版本：$version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - name: 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # 插件哈希对不上就让整个任务失败。发布件里的插件必须是 manifest 指定的那一份，
+      # 不能“校验不过但先发出去”。
+      - name: 取插件（哈希不符即失败）
+        run: ./scripts/fetch_plugins.ps1
+
+      - name: 核对插件清单与实际解出的包
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $manifest = Get-Content -LiteralPath plugins\manifest.json -Raw | ConvertFrom-Json
+          $assets = "crates\app\assets\plugins"
+          $problems = @()
+          foreach ($p in $manifest.plugins) {
+            $dir = if ($p.dir) { $p.dir } else { $p.id }
+            $marker = Join-Path $assets "$dir\.fetched.json"
+            if (-not (Test-Path -LiteralPath $marker)) {
+              $problems += "$($p.id)：$assets\$dir 下没有 .fetched.json，这个包不是按清单拉下来的。"
+              continue
+            }
+            $got = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
+            if ($got.sha256 -ne $p.sha256) {
+              $problems += "$($p.id)：清单写 $($p.sha256)，实际解出 $($got.sha256)。"
+            }
+            if ($got.tag -ne $p.tag) {
+              $problems += "$($p.id)：清单写 tag $($p.tag)，实际拉的是 $($got.tag)。"
+            }
+          }
+          if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host "错误：$_" }
+            throw "插件与清单不一致，不发布。"
+          }
+          Write-Host "插件与清单一致：$((($manifest.plugins | ForEach-Object { $_.id }) -join ', '))"
+
+      # tag 一推就直接打包发版，所以格式化与测试必须挡在打包之前：
+      # 这里挂了就不产出任何资产，不会出现“测挂了但包已经发出去了”。
+      # 插件先取，是因为 workspace 的测试会编到那些断言插件目录存在的用例。
+      - name: 格式化检查
+        timeout-minutes: 10
+        run: cargo fmt --all -- --check
+
+      - name: 测试
+        timeout-minutes: 45
+        run: cargo test --workspace --locked
+
+      # 内核版本固定在 packaging/core-manifest.json：按其中的 URL 下载、校验 sha256、
+      # 再和官方 SHA256SUMS（PGP 清签文件，只认哈希行）交叉核对。
+      - name: 打包（含内核与安装包）
+        run: ./scripts/build-release.ps1
+
+      - name: 检查产物内容与校验和
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ steps.ver.outputs.version }}"
+          $staging = "dist\RCGUI-$version-windows-x64-portable"
+          $portable = "dist\RCGUI-$version-windows-x64-portable.zip"
+          $setup = "dist\RCGUI-$version-windows-x64-setup.exe"
+
+          $problems = @()
+          foreach ($f in @($portable, $setup, "dist\SHA256SUMS")) {
+            if (-not (Test-Path -LiteralPath $f)) { $problems += "缺少产物：$f" }
+          }
+          foreach ($f in @("$staging\rclone-gui.exe", "$staging\core\rclone.exe", "$staging\core\rclone-COPYING.txt", "$staging\core\.fetched.json", "$staging\portable", "$staging\licenses\NOTICE.txt")) {
+            if (-not (Test-Path -LiteralPath $f)) { $problems += "portable 目录缺少：$f" }
+          }
+
+          # 插件目录必须和清单一一对应：多了说明夹带了清单外的东西，少了说明打包漏了。
+          # onerclone 是打包脚本无条件排掉的（它自己拉 rclone 进程，和受管内核抢端口），
+          # 所以这里也要排掉，两边名单才不会打架。见 scripts\build-release.ps1 的 $excludedPlugins。
+          $manifest = Get-Content -LiteralPath plugins\manifest.json -Raw | ConvertFrom-Json
+          $notPackaged = @("onerclone")
+          $wantDirs = @($manifest.plugins | Where-Object { $notPackaged -notcontains $_.id -and $notPackaged -notcontains $_.dir } | ForEach-Object { if ($_.dir) { $_.dir } else { $_.id } })
+          foreach ($d in $wantDirs) {
+            $dir = Join-Path $staging "assets\plugins\$d"
+            if (-not (Test-Path -LiteralPath (Join-Path $dir "main.wasm"))) { $problems += "portable 里缺少插件 $d（应为 assets\plugins\$d\main.wasm）。" }
+            $marker = Join-Path $dir ".fetched.json"
+            if (-not (Test-Path -LiteralPath $marker)) {
+              $problems += "$d 目录里没有 .fetched.json，无法证明这个包是按清单拉下来的。"
+            } else {
+              $got = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
+              $want = $manifest.plugins | Where-Object { $_.id -eq $d -or $_.dir -eq $d } | Select-Object -First 1
+              if ($got.sha256 -ne $want.sha256) { $problems += "$d 的包 sha256 与清单不一致。" }
+            }
+          }
+          $haveDirs = @()
+          if (Test-Path -LiteralPath "$staging\assets\plugins") {
+            $haveDirs = @(Get-ChildItem -LiteralPath "$staging\assets\plugins" -Directory | ForEach-Object { $_.Name })
+          }
+          foreach ($d in $haveDirs) {
+            if ($wantDirs -notcontains $d) { $problems += "portable 里出现了清单外的插件目录 $d。" }
+          }
+          if (Test-Path -LiteralPath "$staging\plugins") {
+            $problems += "portable 根下出现了 plugins 目录。程序只读 <exe>\assets\plugins，放到这里等于没装。"
+          }
+          if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host "错误：$_" }
+            throw "产物不完整，不发布。"
+          }
+
+          # 逐行重算 SHA256SUMS：写进文件的和实际文件必须一致。
+          $lines = Get-Content -LiteralPath dist\SHA256SUMS | Where-Object { $_.Trim() -ne "" }
+          if ($lines.Count -ne 2) { throw "SHA256SUMS 应该有 2 行（zip 与 setup），实际 $($lines.Count) 行。" }
+          foreach ($line in $lines) {
+            if ($line -notmatch '^([0-9a-fA-F]{64})\s+\*?(.+)$') { throw "看不懂这一行：$line" }
+            $want = $Matches[1].ToLower(); $name = $Matches[2].Trim()
+            $file = Join-Path dist $name
+            $got = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLower()
+            if ($got -ne $want) { throw "$name 的 sha256 与 SHA256SUMS 不一致。" }
+            Write-Host "$name  $got"
+          }
+
+          # 内核标记跟着产物走：fetch_core 现在把内核放进 target\release\core，
+          # 打包时随 core\ 一起进了 portable 目录。读这里才读得到本次实际用的内核。
+          $core = Get-Content -LiteralPath "$staging\core\.fetched.json" -Raw | ConvertFrom-Json
+          Write-Host "内核：rclone $($core.version)  exe sha256 $($core.exe_sha256)"
+
+      - name: 汇总
+        shell: pwsh
+        run: |
+          $version = "${{ steps.ver.outputs.version }}"
+          $core = Get-Content -LiteralPath "dist\RCGUI-$version-windows-x64-portable\core\.fetched.json" -Raw | ConvertFrom-Json
+          "## RCGUI $version" >> $env:GITHUB_STEP_SUMMARY
+          "" >> $env:GITHUB_STEP_SUMMARY
+          "- rclone 内核：$($core.version)（$($core.asset_name)，sha256 $($core.asset_sha256)）" >> $env:GITHUB_STEP_SUMMARY
+          "" >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+          Get-Content -LiteralPath dist\SHA256SUMS >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+          Get-ChildItem dist -File | Select-Object Name, Length | Format-Table | Out-String >> $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rcgui-${{ steps.ver.outputs.version }}-windows-x64
+          path: |
+            dist/RCGUI-*-windows-x64-setup.exe
+            dist/RCGUI-*-windows-x64-portable.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+      # 只有 tag 才创建 Release。人工触发只到上一步为止，产物留在 Actions 里，
+      # 便于在真正打 tag 之前检查一遍。
+      - name: 创建 Release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ steps.ver.outputs.version }}"
+          $tag = "${{ github.ref_name }}"
+          gh release create $tag `
+            "dist/RCGUI-$version-windows-x64-setup.exe" `
+            "dist/RCGUI-$version-windows-x64-portable.zip" `
+            "dist/SHA256SUMS" `
+            --title "RCGUI $version" `
+            --notes-file docs/CHANGELOG.md `
+            --verify-tag
+          if ($LASTEXITCODE -ne 0) { throw "创建 Release 失败（退出码 $LASTEXITCODE）。" }

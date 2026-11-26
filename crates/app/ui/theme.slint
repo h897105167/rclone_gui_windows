@@ -1,12 +1,16 @@
 // 主题全局：rcdeck（GitHub 风）
+//
 // 两个独立模块：
 //   1. 明暗模式（dark）：决定背景/面板/边框/文字等中性色
 //   2. 强调色（accent-idx）：决定主色/选中色，每种强调色在明/暗下各有一套取值
-// dark 由 Rust 侧根据系统/用户设置注入
+// dark 由 Rust 侧根据系统/用户设置注入。
+//
+// 尺寸 token 也放这里，理由只有一个：换皮时改一处，而不是在 5000 行里找 `12px`。
+// 值的取舍见各行注释。
 
 // 强调色定义：每种颜色给出 [暗色 accent, 亮色 accent, 暗色 primary, 亮色 primary, 暗色 primary-hover, 亮色 primary-hover]
 global AccentDef {
-    // 蓝（默认，GitHub 风）
+    // 蓝（默认）
     out property <color> blue-accent-d: #58a6ff;
     out property <color> blue-accent-l: #0969da;
     out property <color> blue-primary-d: #1f6feb;
@@ -46,12 +50,13 @@ export global ThemeG {
         accent-idx == 2 ? (dark ? AccentDef.purple-accent-d : AccentDef.purple-accent-l) :
         accent-idx == 3 ? (dark ? AccentDef.orange-accent-d : AccentDef.orange-accent-l) :
                           (dark ? AccentDef.blue-accent-d : AccentDef.blue-accent-l);
-    // 选中背景：强调色 + 低透明度
+    // 选中背景：强调色 + 低透明度。浅色下再压一档（1a → 14），
+    // 因为白底上同样的透明度看着比暗底更「脏」。
     in-out property <color> accent-soft:
-        accent-idx == 1 ? (dark ? #3fb95026 : #1a7f371a) :
-        accent-idx == 2 ? (dark ? #d2a8ff26 : #8250df1a) :
-        accent-idx == 3 ? (dark ? #ffa65726 : #bc4c001a) :
-                          (dark ? #58a6ff26 : #0969da1a);
+        accent-idx == 1 ? (dark ? #3fb95026 : #1a7f3714) :
+        accent-idx == 2 ? (dark ? #d2a8ff26 : #8250df14) :
+        accent-idx == 3 ? (dark ? #ffa65726 : #bc4c0014) :
+                          (dark ? #58a6ff26 : #0969da14);
     in-out property <color> primary:
         accent-idx == 1 ? (dark ? AccentDef.green-primary-d : AccentDef.green-primary-l) :
         accent-idx == 2 ? (dark ? AccentDef.purple-primary-d : AccentDef.purple-primary-l) :
@@ -64,22 +69,50 @@ export global ThemeG {
                           (dark ? AccentDef.blue-primary-hover-d : AccentDef.blue-primary-hover-l);
 
     // ---------- 明暗模块（中性色，不随强调色变化） ----------
+    // bg 是内容区底色，panel 是卡片/侧栏底色：两者只差一档明度，
+    // 这样卡片不需要阴影也能「浮」起来。
     in-out property <color> bg: dark ? #0d1117 : #f6f8fa;
     in-out property <color> panel: dark ? #161b22 : #ffffff;
-    in-out property <color> panel-2: dark ? #21262d : #eaeef2;
-    in-out property <color> border: dark ? #30363d : #e1e4e8;
-    in-out property <color> text: dark ? #c9d1d9 : #24292f;
-    in-out property <color> text-dim: dark ? #8b949e : #656d76;
+    in-out property <color> panel-2: dark ? #21262d : #eef1f4;
+    in-out property <color> border: dark ? #2b3138 : #e3e6ea;
+    in-out property <color> text: dark ? #c9d1d9 : #1f2328;
+    in-out property <color> text-dim: dark ? #8b949e : #636c76;
     in-out property <color> placeholder: dark ? #484f58 : #8c959f;
     in-out property <color> hover: dark ? #ffffff12 : #00000008;
     in-out property <color> pressed: dark ? #ffffff1c : #00000012;
+
+    // 侧栏：浅色下用纯白压在浅灰内容区上，暗色下用比内容区亮一档的面。
+    in-out property <color> nav-bg: dark ? #161b22 : #ffffff;
+    // 顶栏与侧栏同色，靠一条 1px 线跟内容区分开，不用阴影。
+    in-out property <color> chrome-bg: dark ? #161b22 : #ffffff;
 
     // ---------- 状态色（语义色，随明暗微调） ----------
     in-out property <color> ok: dark ? #3fb950 : #1a7f37;
     in-out property <color> warn: dark ? #d29922 : #bf8700;
     in-out property <color> err: dark ? #f85149 : #cf222e;
 
-    // 圆角：卡片 8px，按钮/输入框 6px
-    in-out property <length> radius: 8px;
-    in-out property <length> radius-s: 6px;
+    // ---------- 圆角 ----------
+    // radius 给卡片（12px），radius-s 给按钮/输入框（8px）。
+    // 这两个名字被几百处引用，直接改值就是全站生效，不必逐处替换。
+    in-out property <length> radius: 12px;
+    in-out property <length> radius-s: 8px;
+
+    // ---------- 字号 ----------
+    // 正文 13px 是 Windows 桌面在高 DPI 下的折中：12px 偏小、14px 会让
+    // 双栏文件列表提前截断文件名。页标题 20px，次级说明 12px。
+    in-out property <length> fs-body: 13px;
+    in-out property <length> fs-small: 12px;
+    in-out property <length> fs-title: 20px;
+    in-out property <length> fs-section: 14px;
+
+    // ---------- 间距 ----------
+    in-out property <length> pad-page: 24px;   // 内容区统一留白
+    in-out property <length> gap: 12px;        // 卡片之间
+    in-out property <length> gap-s: 8px;       // 卡片内控件之间
+    in-out property <length> gap-l: 16px;      // 分组之间
+
+    // ---------- 壳尺寸 ----------
+    in-out property <length> nav-width: 200px;     // 侧栏固定宽（196~208）
+    in-out property <length> topbar-h: 52px;
+    in-out property <length> statusbar-h: 26px;
 }
