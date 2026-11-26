@@ -13230,7 +13230,14 @@ mod tests {
             sites
         );
         assert!(sites[0].starts_with("async fn kv_cfg_for("));
-        assert!(sites[1].starts_with("let cfg = kv_cfg_for(ctx, remote).await?;"));
+        // 参数表可能被折成多行，比之前先压掉空白：这一条要守的是「第二处是桥的读
+        // 实现里那句赋值」，不是它排成几行。
+        let want = crate::source_scan::squash("let cfg = kv_cfg_for(ctx, remote).await?;");
+        assert!(
+            crate::source_scan::squash(sites[1]).starts_with(&want),
+            "桥的读实现里那句调用变了：{}",
+            sites[1]
+        );
     }
 
     /// 插件不在时，一条带标记的远程在**每个**入口都要被挡下来。
@@ -13253,6 +13260,14 @@ mod tests {
             "扫描基准不对（切分标记变了），先修这个用例"
         );
 
+        // 每个入口都得先问闸门、再碰远程。只查「有没有调」不够：顺序错了等于没闸
+        // ——先打了远程再问，插件不在时东西已经动过了。
+        //
+        // 比的是压掉空白之后的源码：`client.copyfile(` 这类带点的方法调用会被
+        // rustfmt 在点处折成 `client` + `.copyfile(` 两行，按字面量找就查不到——
+        // 这条用例当初就是在 CI 上这么红的（接线好着，只是排版变了）。要找的是
+        // 一件「事」，不是某一行字。
+        //
         // 命令分支：从 `Cmd::X => {` 起，到下一个同级 `        Cmd::` 止
         for marker in [
             "Cmd::FilesRefresh { seq } => {",
@@ -13273,15 +13288,38 @@ mod tests {
             };
             let rest = &prod[start..];
             let end = rest.find("\n        Cmd::").unwrap_or(rest.len());
-            assert!(
-                rest[..end].contains("kv_access_blocked("),
-                "{marker} 没有问 kv_access_blocked：插件不在时这个入口就是旁路"
-            );
+            let body = crate::source_scan::squash(&rest[..end]);
+            let gate_at = body.find("kv_access_blocked(").unwrap_or_else(|| {
+                panic!("{marker} 没有问 kv_access_blocked：插件不在时这个入口就是旁路")
+            });
+            // 凡是会对远程动手的调用，都必须排在闸门之后。清单里放的是「读/写远程」
+            // 而不是「读内存」的调用，所以多列几个不会误报；真漏一个，改的人会在
+            // 这里看到是哪一次调用先跑出去了。
+            for action in [
+                "client.copyfile(",
+                "client.sync_copy(",
+                "client.list(",
+                "client.mount(",
+                "client.serve_start(",
+                "client.config_dump(",
+                "client.config_create(",
+                "client.config_update(",
+                "kv_list_rows(",
+                "list_display_checked(",
+                "apply_bundle_to_rclone(",
+            ] {
+                if let Some(at) = body.find(action) {
+                    assert!(
+                        gate_at < at,
+                        "{marker} 先调 {action} 才问闸门：插件不在时这一下已经打到远程上了"
+                    );
+                }
+            }
         }
 
-        // 光有闸门不够，顺序也要对：闸门写在真正动手之后，用户看到的就是
-        // 「先报了错、可东西已经发出去了」。这里挑几处能一眼认出「动手」的位置
-        // 对一下先后，剩下的入口靠上面的存在性检查兜底。
+        // 上面那轮只检查「这次调用排在闸门后面」，如果某个分支哪天不再做那件事
+        // （比如下载改走了别的接口），它就悄悄变成空检查。这里逐个钉住每个入口
+        // 的特征动作：找不到就说明这一臂不再是我们以为的那件事，标记该跟着改。
         for (marker, op) in [
             ("Cmd::MountAdd => {", "client.mount("),
             ("Cmd::ServeStart => {", "client.serve_start("),
@@ -13292,17 +13330,19 @@ mod tests {
             ("Cmd::FilesMoveList { path, seq } => {", "client.list("),
             ("Cmd::RemoteEditLoad { name } => {", "client.config_dump("),
         ] {
-            let start = prod
-                .find(marker)
+            let body = crate::source_scan::region(prod, marker, "\n        Cmd::")
+                .or_else(|| {
+                    // 最后一条分支后面可能没有下一个 `Cmd::`：切到文件尾
+                    prod.find(marker).map(|i| &prod[i + marker.len()..])
+                })
                 .unwrap_or_else(|| panic!("找不到命令分支 {marker}，是不是改名了"));
-            let rest = &prod[start..];
-            let end = rest.find("\n        Cmd::").unwrap_or(rest.len());
-            let body = &rest[..end];
+            let body = crate::source_scan::squash(body);
+            let want = crate::source_scan::squash(op);
             let gate_at = body
                 .find("kv_access_blocked(")
                 .unwrap_or_else(|| panic!("{marker} 里没有 kv_access_blocked"));
             let op_at = body
-                .find(op)
+                .find(want.as_str())
                 .unwrap_or_else(|| panic!("{marker} 里找不到 {op}，标记该更新了"));
             assert!(
                 gate_at < op_at,
@@ -13310,7 +13350,8 @@ mod tests {
             );
         }
 
-        // 独立函数：签名起，到下一个顶层项止
+        // 独立函数：用 `source_scan::function_body` 切到函数收尾（顶格 `}`），
+        // 不依赖缩进和下一个函数怎么写。
         for sig in [
             "async fn files_navigate(",
             "async fn startup_flow(",
@@ -13320,24 +13361,17 @@ mod tests {
             // 档案导入：里面也会挂载和起服务
             "async fn apply_bundle_to_rclone(",
         ] {
-            let start = match prod.find(sig) {
-                Some(i) => i + sig.len(),
-                None => panic!("找不到函数 {sig}，是不是改名了"),
-            };
-            let rest = &prod[start..];
-            let end = ["\nfn ", "\nasync fn ", "\npub "]
-                .iter()
-                .filter_map(|p| rest.find(p))
-                .min()
-                .unwrap_or(rest.len());
+            let body = crate::source_scan::function_body(prod, sig)
+                .unwrap_or_else(|| panic!("找不到函数 {sig}，是不是改名了"));
             assert!(
-                rest[..end].contains("kv_access_blocked("),
+                crate::source_scan::squash(body).contains("kv_access_blocked("),
                 "{sig} 没有问 kv_access_blocked：插件不在时这个入口就是旁路"
             );
         }
 
-        // 自动恢复（挂载与服务）在另一个文件，那边同样是入口
-        let persist = include_str!("persist.rs").replace("\r\n", "\n");
+        // 自动恢复（挂载与服务）在另一个文件，那边同样是入口。
+        // 计数也压掉空白：折行不该让「少查一处」和「排版变了」混成一个红。
+        let persist = crate::source_scan::squash(&include_str!("persist.rs").replace("\r\n", "\n"));
         assert_eq!(
             persist.matches("crate::kv_access_blocked(").count(),
             2,
@@ -13345,7 +13379,7 @@ mod tests {
         );
 
         // 用量列也走 about：插件不在时问出来的是个数，看起来像「能用」
-        let refresh = include_str!("refresh.rs").replace("\r\n", "\n");
+        let refresh = crate::source_scan::squash(&include_str!("refresh.rs").replace("\r\n", "\n"));
         assert_eq!(
             refresh.matches("crate::kv_access_blocked(").count(),
             1,
@@ -13354,15 +13388,16 @@ mod tests {
 
         // 对账/自愈也是入口：它会把「档案里有、运行态没有」的挂载和服务重建，
         // 但它自己拿不到插件清单，只能靠调用方传进去的那张表。
-        let rec = include_str!("reconcile.rs").replace("\r\n", "\n");
+        let rec = crate::source_scan::squash(&include_str!("reconcile.rs").replace("\r\n", "\n"));
         assert_eq!(
             rec.matches("blocked.get(remote_of(fs))").count(),
             2,
             "对账的挂载与服务两臂都要查 blocked 表"
         );
         // 调用方必须把表真的递进去，否则上面那两处永远拿到空表
+        let prod_flat = crate::source_scan::squash(prod);
         assert_eq!(
-            prod.matches("kv_blocked_map(ctx, &draft)").count(),
+            prod_flat.matches("kv_blocked_map(ctx,&draft)").count(),
             2,
             "两处 reconcile 调用都要先算出 blocked 表"
         );
