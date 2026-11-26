@@ -81,7 +81,7 @@ async fn the_manifest_agrees_with_the_shipped_config() {
         eprintln!("{SKIP_NOTE}");
         return;
     };
-    let manifest = h.manifest().expect("读插件 manifest 失败");
+    let manifest = h.manifest().await.expect("读插件 manifest 失败");
     assert_eq!(manifest.get("id").and_then(Value::as_str), Some(PLUGIN_ID));
     let version = manifest
         .get("version")
@@ -108,6 +108,7 @@ async fn listing_walks_every_page_and_puts_folders_first() {
             "remote.list",
             json!({ "remote": "vault", "path": "", "sort": "name" }),
         )
+        .await
         .expect("remote.list 调用失败");
     let items = items_of(&got);
     let names: Vec<String> = items.iter().map(|(n, _)| n.clone()).collect();
@@ -147,6 +148,7 @@ async fn a_subfolder_listing_only_shows_files_under_that_folder() {
     };
     let got = h
         .call("remote.list", json!({ "remote": "vault", "path": "album" }))
+        .await
         .expect("remote.list 调用失败");
     let names: Vec<String> = items_of(&got).into_iter().map(|(n, _)| n).collect();
     assert!(
@@ -228,6 +230,7 @@ async fn upload_without_a_picked_file_is_refused_before_any_request() {
             "remote.upload",
             json!({ "remote": "vault", "path": "album" }),
         )
+        .await
         .expect("remote.upload 本身不该失败");
     let body = text_of(&got);
     assert!(
@@ -464,7 +467,7 @@ async fn the_manifest_declares_everything_the_host_router_reads() {
 
     // wasm 报回来的版本必须和这份 config.json 一致：拿错包时立刻暴露，
     // 而不是等到用户装上以后面板对不上。
-    let m = h.manifest().expect("wasm 没有返回 manifest");
+    let m = h.manifest().await.expect("wasm 没有返回 manifest");
     assert_eq!(m["version"].as_str(), Some(cfg.version.as_str()));
     assert_eq!(m["id"].as_str(), Some(cfg.id.as_str()));
 }

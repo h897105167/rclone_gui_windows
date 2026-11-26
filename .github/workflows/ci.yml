@@ -117,6 +117,11 @@ jobs:
       # 这个提交是 codex/kvault-separation 上「已通过插件自己 CI、可打包」的那一个。
       # 插件升级时同步改这三行：ref、以及下面「确认测试会真跑」里期望的 wasm 体积下限。
       # 合并进 main 之后改成 ref: main 的提交哈希（仍然钉提交，不要写分支名）。
+      #
+      # 落到 _kvault（工作区目录里）就必须让根 Cargo.toml 把它 exclude 掉，
+      # 否则插件的 Cargo.toml 会以为自己属于本工作区，报
+      # "current package believes it's in a workspace when it's not"。
+      # 下一步先验这件事，免得读者只看到一句 cargo 的报错。
       - name: 取插件源码
         uses: actions/checkout@v4
         with:
@@ -124,6 +129,20 @@ jobs:
           # Fix plugin release version validation
           ref: 4e7ed38723ef378b82fdaf0794c6cb08d1b2c7e2
           path: _kvault
+
+      - name: 确认插件不在主工作区里
+        run: |
+          set -eu
+          # 在插件目录里读它自己的清单：若它被主工作区收进去却不是成员，cargo 会在
+          # 这一步就报 "believes it's in a workspace when it's not"，先拦一道，
+          # 免得后面几十行编译日志里只剩一句 cargo 的报错。
+          # --no-deps 只读清单，不解析依赖、不碰网络，几秒钟。
+          if ! out=$(cargo metadata --no-deps --format-version 1 --manifest-path _kvault/Cargo.toml 2>&1); then
+            echo "插件清单读不出来（多半是根 Cargo.toml 少了 workspace.exclude = [\"_kvault\"]）："
+            printf '%s\n' "$out" | head -20
+            exit 1
+          fi
+          echo "插件是独立包，不受主工作区影响"
 
       - name: 编插件 wasm
         run: cargo build --locked --release --target wasm32-wasip1 --manifest-path _kvault/Cargo.toml

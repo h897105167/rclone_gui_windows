@@ -60,7 +60,10 @@ fn required() -> bool {
 }
 
 /// 拿不到输入时的统一出口：CI 里直接失败，本机只打印一句。
-fn absent(why: String) -> Option<Fixture> {
+///
+/// 返回类型是泛型的，因为调用方有两种：`Fixture::load()` 要 `Option<Fixture>`，
+/// `Harness::start()` 要 `Option<Harness>`。`panic!` 在这里返回 `!`，两种都对得上。
+fn absent<T>(why: String) -> Option<T> {
     if required() {
         panic!(
             "{why}\n当前工作目录是 {cwd}（cargo 跑测试时把工作目录设成包目录，\
