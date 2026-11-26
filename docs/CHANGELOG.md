@@ -6,18 +6,19 @@
 
 要点先说清楚：
 
-- 当前树里的版本是 **0.3.0，开发中**，不是已发布版本。
+- 当前树里的版本是 **0.3.1，开发中**，不是已发布版本。没有 `v0.3.0` 这个版本：
+  下文习惯写作 0.3.0 的那批内容，就是随 0.3.1 发布的这一批。
 - 唯一带 GitHub Release 产物的版本是 **v0.2.1**（资产名是旧的
   `rclone-gui-v0.2.1-windows-amd64.zip`）。新的
-  `RCGUI-<version>-windows-x64-*` 命名从 0.3.0 开始用，见 [RELEASE.md](RELEASE.md)。
+  `RCGUI-<version>-windows-x64-*` 命名从 0.3.1 开始用，见 [RELEASE.md](RELEASE.md)。
 - 本仓库早期按「会话」推进、没有版本号。为了让历史可查，那段按日期的记录**原样保留在文末**，
   不强行分摊到各个版本下——`v0.1.0` / `v0.2.0` / `v0.2.1` 三个 tag 打在 i18n 分支合并前后，
   版本号 bump 的提交出现在 `v0.2.1` 之后，硬套版本只会编出假的归属。
 
 ## [Unreleased]
 
-0.3.0 的功能与文档改动，状态 `developing`：已合进 `main` 的写在下面，
-只有设计、还没实现的写在 [ARCHITECTURE.md](ARCHITECTURE.md) 的 `规划` 行，不进这里。
+这一批的功能与文档改动（文档里习惯叫 0.3.0，实际随 0.3.1 发布），状态 `developing`：
+已合进 `main` 的写在下面，只有设计、还没实现的写在 [ARCHITECTURE.md](ARCHITECTURE.md) 的 `规划` 行，不进这里。
 
 ### Added
 
@@ -47,9 +48,19 @@
 - 插件商店投稿对任何 GitHub 账号开放：地址必须指向声明仓库自己的 Release 资产，
   人工审核看代码、许可证与申请的权限。字段与审核门槛见
   [store/README.md](store/README.md)，机器校验是 `scripts/validate-store-index.ps1`。
+- 插件可以自己声明远程类型：`remote_types[]` 增加 `marker`（识别这类远程的标记参数名）
+  与 `ops`（`remote.list` / `remote.upload` / `remote.delete` / `remote.rclone-write`），
+  再用 `adopt_legacy` 声明要接管的旧设置命名空间。主程序只按这些声明路由，不认插件专名；
+  某个远程属于哪个插件记在 `remote_owners.json`，停用或卸载插件后这个远程不会被当成普通
+  WebDAV 打开，普通 WebDAV 远程不受影响。
+- K-Vault 的站点接口、上传、删除与设置迁移搬进 K-Vault 插件，主程序不再含这份业务代码。
+  插件没装或停用时，相应远程在远程列表、文件页、挂载与启动恢复里都会说明原因，而不是静默失败。
 
 ### Changed
 
+- 版本号升到 **0.3.1**（补丁位）。`0.3.0` 从未打过 tag，这一批内容随 `0.3.1` 发布；
+  需要新插件协议的插件把 `min_gui_version` 写成 `0.3.1`，仍标 `0.3.0` 的构建在商店安装
+  与本地包加载两处都会明确拒绝，并提示先升级本程序。
 - `plugins/manifest.json` 锁定 teldrive `v0.3.0`。
 - `AGENTS.md` 重写：旧的「应用不得启动或停止 rclone」约束替换为受管内核约定
   （默认可管理自己的内核、外部端点只断开、不得接管他人进程）。

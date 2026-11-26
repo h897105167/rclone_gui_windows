@@ -127,7 +127,7 @@ jobs:
         with:
           repository: h897105167/rcgui-plugin-kvault
           # Fix plugin release version validation
-          ref: 737819ddfa4d49e23ecbeb522b63db7d1bc7c02d
+          ref: de537cc93a2ee5f0c6ac1c56c45e01e2c257bea0
           path: _kvault
 
       - name: 确认插件不在主工作区里
