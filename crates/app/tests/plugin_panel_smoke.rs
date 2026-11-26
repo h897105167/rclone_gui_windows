@@ -69,7 +69,14 @@ fn assets_dir() -> PathBuf {
 #[tokio::test]
 async fn shipped_plugins_answer_state_with_panel_body() {
     let root = assets_dir();
-    assert!(root.is_dir(), "{}", rcgui_i18n::f("随包插件目录不存在: {}（先跑 scripts/fetch_plugins.ps1）", &[&(root.display())]));
+    assert!(
+        root.is_dir(),
+        "{}",
+        rcgui_i18n::f(
+            "随包插件目录不存在: {}（先跑 scripts/fetch_plugins.ps1）",
+            &[&(root.display())]
+        )
+    );
 
     let mut checked = 0usize;
     let mut entries: Vec<_> = std::fs::read_dir(&root)
@@ -82,13 +89,33 @@ async fn shipped_plugins_answer_state_with_panel_body() {
 
     let host = PluginHost::new().unwrap();
     let caps: Arc<dyn CapProvider> = Arc::new(StubCaps);
+    // 用本程序自己的版本号，不是写死的旧版本：这里的版本号决定 minGui 校验的结果，
+    // 写死 0.1.0 会让所有要求更高版本的插件被静默判为"不兼容"而跳过，
+    // 测试就变成"一个都没测也算通过"。
+    let gui_version = env!("CARGO_PKG_VERSION");
+    let mut skipped: Vec<String> = Vec::new();
 
     for dir in entries {
-        let (cfg, _report) = match plugin_host::bundle::load_from_dir(&dir, "0.1.0") {
+        let (cfg, _report) = match plugin_host::bundle::load_from_dir(&dir, gui_version) {
             Ok(v) => v,
-            // 有些插件包可能只放 wasm（迁移期），跳过但要说清楚
+            // 目录里有 config.json 就说明它是个插件包，加载不了是问题而不是"迁移期"：
+            // 可能是 minGui 高于本程序，也可能是 config.json 本身坏了。报出来。
             Err(e) => {
-                eprintln!("跳过 {}: {e}", dir.display());
+                let has_cfg = dir.join("config.json").is_file();
+                assert!(
+                    !has_cfg,
+                    "{}",
+                    rcgui_i18n::f(
+                        "{}: 插件包加载失败（程序版本 {}）：{}",
+                        &[
+                            &(dir.display().to_string()),
+                            &(gui_version),
+                            &(e.to_string())
+                        ]
+                    )
+                );
+                eprintln!("跳过 {}（没有 config.json）: {e}", dir.display());
+                skipped.push(dir.display().to_string());
                 continue;
             }
         };
@@ -97,7 +124,12 @@ async fn shipped_plugins_answer_state_with_panel_body() {
 
         // 1) manifest 能取回来，且 id 与 config.json 一致
         let manifest = host.load_manifest(&wasm).await.unwrap();
-        assert_eq!(manifest.id, cfg.id, "{}", rcgui_i18n::f("{}: manifest.id 与 config.json 的 id 不一致", &[&(cfg.id)]));
+        assert_eq!(
+            manifest.id,
+            cfg.id,
+            "{}",
+            rcgui_i18n::f("{}: manifest.id 与 config.json 的 id 不一致", &[&(cfg.id)])
+        );
 
         // 2) 面板 `state` 动作回了一个可渲染的 body
         let out = host
@@ -110,16 +142,31 @@ async fn shipped_plugins_answer_state_with_panel_body() {
                 &allowed,
             )
             .await
-            .unwrap_or_else(|e| panic!("{}", rcgui_i18n::f("{}: state 调用失败: {}", &[&(cfg.id), &(e)])));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{}",
+                    rcgui_i18n::f("{}: state 调用失败: {}", &[&(cfg.id), &(e)])
+                )
+            });
 
-        let body = out
-            .get("body")
-            .unwrap_or_else(|| panic!("{}", rcgui_i18n::f("{}: state 没有 result.body，实际: {}", &[&(cfg.id), &(out)])));
+        let body = out.get("body").unwrap_or_else(|| {
+            panic!(
+                "{}",
+                rcgui_i18n::f("{}: state 没有 result.body，实际: {}", &[&(cfg.id), &(out)])
+            )
+        });
 
         // 面板渲染只认这几样；至少 status 或 checks 之一要出现，否则用户看到空面板
         let has_status = body.get("status").and_then(|v| v.as_str()).is_some();
         let has_checks = body.get("checks").and_then(|v| v.as_array()).is_some();
-        assert!(has_status || has_checks, "{}", rcgui_i18n::f("{}: 面板 body 既没有 status 也没有 checks: {}", &[&(cfg.id), &(body)]));
+        assert!(
+            has_status || has_checks,
+            "{}",
+            rcgui_i18n::f(
+                "{}: 面板 body 既没有 status 也没有 checks: {}",
+                &[&(cfg.id), &(body)]
+            )
+        );
 
         // 3) 未知动作不许 panic，要回错误（面板可能把 error 放在 body 里，也可能给 4xx 状态）
         let bad = host
@@ -135,13 +182,20 @@ async fn shipped_plugins_answer_state_with_panel_body() {
         match bad {
             Ok(v) => {
                 // 三种「拒绝」写法宿主都能显示：result.error、4xx 状态、或面板红灯 + 文案
-                let status_bad = v.get("status").and_then(|s| s.as_u64()).is_some_and(|s| s >= 400);
+                let status_bad = v
+                    .get("status")
+                    .and_then(|s| s.as_u64())
+                    .is_some_and(|s| s >= 400);
                 let bad_lamp = v
                     .pointer("/body/lamp")
                     .and_then(|l| l.as_str())
                     .is_some_and(|l| l == "err");
                 let text = v.to_string();
-                assert!(status_bad || bad_lamp || text.contains("\"error\""), "{}", rcgui_i18n::f("{}: 未知动作应当明确报错，实际: {}", &[&(cfg.id), &(v)]));
+                assert!(
+                    status_bad || bad_lamp || text.contains("\"error\""),
+                    "{}",
+                    rcgui_i18n::f("{}: 未知动作应当明确报错，实际: {}", &[&(cfg.id), &(v)])
+                );
             }
             Err(_) => { /* 宿主层报错也算拒绝，可接受 */ }
         }
@@ -149,5 +203,18 @@ async fn shipped_plugins_answer_state_with_panel_body() {
         checked += 1;
     }
 
-    assert!(checked > 0, "{}", rcgui_i18n::t("随包插件目录里一个可加载的插件都没有"));
+    // 两个一起断言：一个都不能跳过，也不能"目录里的包少于预期"还算通过。
+    assert!(
+        checked > 0,
+        "{}",
+        rcgui_i18n::t("随包插件目录里一个可加载的插件都没有")
+    );
+    assert!(
+        skipped.is_empty(),
+        "{}",
+        rcgui_i18n::f(
+            "有 {} 个目录被跳过（应当只有插件包）：{}",
+            &[&(skipped.len().to_string()), &(skipped.join(", "))]
+        )
+    );
 }

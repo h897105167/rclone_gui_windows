@@ -948,3 +948,288 @@ msgstr "＋ New proxy profile"
 
 msgid "＋ 新建远程"
 msgstr "＋ New remote"
+
+msgid "返回上一级"
+msgstr "Up one level"
+
+msgid "取消手动输入路径"
+msgstr "Cancel manual path entry"
+
+msgid "手动输入路径"
+msgstr "Enter path manually"
+
+msgid "类型（输入关键字筛选后点选）"
+msgstr "Type (filter by keyword, then pick)"
+
+msgid "搜索类型，中英文均可，如 s3、对象存储"
+msgstr "Search types in Chinese or English, e.g. s3, object storage"
+
+msgid "没有匹配的类型。请更换搜索词；若尚未连接内核，请先连接。"
+msgstr "No matching type. Try another keyword; if the core is not connected yet, connect first."
+
+msgid "{} 个可选"
+msgstr "{} available"
+
+msgid "浏览本地文件夹"
+msgstr "Browse for a local folder"
+
+msgid "传输任务"
+msgstr "Transfers"
+
+msgid "文件夹同步"
+msgstr "Folder sync"
+
+msgid "按周期在两个文件夹之间做增量复制：目标已有且不比源旧的同名文件会跳过；目标里多出来的文件不会被删除。"
+msgstr "Copies only what is new or changed between two folders, on a schedule. A file already at the destination is skipped unless the source is newer; extra files at the destination are never deleted."
+
+msgid "还没有同步任务。在下面填两个文件夹和周期，点「保存任务」。"
+msgstr "No sync jobs yet. Fill in two folders and a period below, then press Save job."
+
+msgid "云端 → 本地"
+msgstr "Cloud → local"
+
+msgid "本地 → 云端"
+msgstr "Local → cloud"
+
+msgid "已暂停"
+msgstr "Paused"
+
+msgid "尚未运行"
+msgstr "Not run yet"
+
+msgid "下次：{}"
+msgstr "Next: {}"
+
+msgid "运行"
+msgstr "Run"
+
+msgid "新建任务"
+msgstr "New job"
+
+msgid "给任务起个名字"
+msgstr "Name this job"
+
+msgid "方向"
+msgstr "Direction"
+
+msgid "周期"
+msgstr "Every"
+
+msgid "小时"
+msgstr "hours"
+
+msgid "本地文件夹"
+msgstr "Local folder"
+
+msgid "例如 D:\\照片"
+msgstr "e.g. D:\\Photos"
+
+msgid "云端目录"
+msgstr "Cloud folder"
+
+msgid "例如 remote:backup/photos（远端目录用冒号分隔）"
+msgstr "e.g. remote:backup/photos (a colon separates the remote name)"
+
+msgid "保存任务"
+msgstr "Save job"
+
+msgid "保存后按周期自动运行，也可以点「运行」马上跑一次。"
+msgstr "Runs on its schedule once saved. Press Run to copy once right now."
+
+msgid "商店"
+msgstr "Store"
+
+msgid "重新扫描插件目录"
+msgstr "Rescan the plugin folder"
+
+msgid "插件商店"
+msgstr "Plugin store"
+
+msgid "商店列表还没获取"
+msgstr "Store list not fetched yet"
+
+msgid "刷新列表"
+msgstr "Refresh list"
+
+msgid "商店里还没有可安装的插件。点「刷新列表」重新获取。"
+msgstr "No installable plugins in the store. Press Refresh list to fetch again."
+
+msgid "权限：{}"
+msgstr "Permissions: {}"
+
+msgid "更新"
+msgstr "Update"
+
+msgid "安装"
+msgstr "Install"
+
+msgid "常规"
+msgstr "General"
+
+msgid "内核与连接"
+msgstr "Core & connection"
+
+msgid "备份与同步"
+msgstr "Backup & sync"
+
+msgid "更新与诊断"
+msgstr "Updates & diagnostics"
+
+msgid "内核（rclone 本体）"
+msgstr "Core (rclone itself)"
+
+msgid "模式"
+msgstr "Mode"
+
+msgid "渠道"
+msgstr "Channel"
+
+msgid "托管内核"
+msgstr "Managed"
+
+msgid "外部 rclone"
+msgstr "External rclone"
+
+msgid "由 RCGUI 下载并启停，退出时一并关闭"
+msgstr "RCGUI downloads it, starts and stops it, and shuts it down on exit"
+
+msgid "只连已在运行的 RC，不启停任何进程"
+msgstr "Only connects to an RC endpoint that is already running; starts nothing"
+
+msgid "程序路径"
+msgstr "Executable path"
+
+msgid "留空则用随包位置"
+msgstr "Leave empty to use the bundled location"
+
+msgid "浏览…"
+msgstr "Browse…"
+
+msgid "可选择已安装的 rclone；使用 Teldrive 时请选择支持该类型的内核。填了路径就优先用它，想换成下载的版本点「改用托管内核」——原文件会保留。"
+msgstr "You can point at an installed rclone. For Teldrive, pick a core build that supports that remote type. A path filled in here always wins; to use a downloaded build instead, press Switch to managed core — the original file is kept."
+
+msgid "改用托管内核"
+msgstr "Switch to managed core"
+
+msgid "增强版"
+msgstr "Enhanced"
+
+msgid "原版"
+msgstr "Official"
+
+msgid "增强版来自 gulp79/rclone-extra，带 fork 专属后端；原版取 rclone 官方发布。"
+msgstr "Enhanced comes from gulp79/rclone-extra and carries fork-only backends; Official is the upstream rclone release."
+
+msgid "尚未检测"
+msgstr "Not checked yet"
+
+msgid "检测"
+msgstr "Check"
+
+msgid "安装 / 更新内核"
+msgstr "Install / update core"
+
+msgid "检查更新"
+msgstr "Check for updates"
+
+msgid "「停止」只会关闭 RCGUI 自己启动的进程；外部 rclone 一律不动。"
+msgstr "Stop only terminates a process RCGUI started itself; an external rclone is never touched."
+
+msgid "轻量模式"
+msgstr "Lightweight mode"
+
+msgid "启用轻量模式"
+msgstr "Enable lightweight mode"
+
+msgid "空闲降频"
+msgstr "Idle refreshing"
+
+msgid "分钟刷新一次；传输与连接不受影响"
+msgstr "minutes between refreshes; transfers and the connection are unaffected"
+
+msgid "备份到 WebDAV"
+msgstr "Back up to WebDAV"
+
+msgid "用户名"
+msgstr "Username"
+
+msgid "密码"
+msgstr "Password"
+
+msgid "备份中包含凭据（明文，谨慎）"
+msgstr "Include credentials in the backup (plain text — be careful)"
+
+msgid "备份会覆盖指定地址的配置文件；恢复时先预览，再确认应用。"
+msgstr "Backing up overwrites the config file at that address; restoring shows a preview before anything is applied."
+
+msgid "立即备份"
+msgstr "Back up now"
+
+msgid "从云端恢复"
+msgstr "Restore from cloud"
+
+msgid "尚未备份"
+msgstr "Not backed up yet"
+
+msgid "软件更新"
+msgstr "Software update"
+
+msgid "可用版本以发布页为准"
+msgstr "Available versions follow the release page"
+
+msgid "检查更新"
+msgstr "Check for updates"
+
+msgid "下载并更新"
+msgstr "Download and update"
+
+msgid "只替换 RCGUI 自身，不动 rclone，也不改已有配置。"
+msgstr "Replaces RCGUI only: rclone and the existing configuration stay untouched."
+
+msgid "尚未获取商店列表"
+msgstr "Store list not fetched yet"
+
+msgid "商店列表为空。点「刷新列表」从插件源获取。"
+msgstr "The store list is empty. Press Refresh list to fetch it from the plugin source."
+
+msgid "诊断"
+msgstr "Diagnostics"
+
+msgid "导出环境信息（版本、路径、连接状态、最近错误），不含 RC 密码与 token。"
+msgstr "Exports versions, paths, connection state and recent errors — never the RC password or tokens."
+
+msgid "生成诊断信息"
+msgstr "Generate diagnostics"
+
+msgid "最小化"
+msgstr "Minimize"
+
+msgid "还原窗口"
+msgstr "Restore window"
+
+msgid "最大化"
+msgstr "Maximize"
+
+msgid "工作区"
+msgstr "Workspace"
+
+msgid "运行时"
+msgstr "Runtime"
+
+msgid "系统"
+msgstr "System"
+
+msgid "未连接 rclone"
+msgstr "Not connected to rclone"
+
+msgid "已连接 {}"
+msgstr "Connected to {}"
+
+msgid "连接已失效，等待重连"
+msgstr "Connection lost, waiting to reconnect"
+
+msgid "上级目录"
+msgstr "Parent folder"
+
+msgid "进入文件夹 {}"
+msgstr "Open folder {}"

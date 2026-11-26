@@ -78,7 +78,16 @@ async fn plugin_dispatch(
     headers: HeaderMap,
     req: Request,
 ) -> impl IntoResponse {
-    dispatch(st, id, format!("/{}", rest.trim_start_matches('/')), method, q, headers, req).await
+    dispatch(
+        st,
+        id,
+        format!("/{}", rest.trim_start_matches('/')),
+        method,
+        q,
+        headers,
+        req,
+    )
+    .await
 }
 
 /// 统一入口：把 HTTP 请求打包成插件协议里的 `http` 对象，交给插件。
@@ -167,15 +176,24 @@ async fn dispatch(
                 }
             },
             Err(e) => {
-                return fail(StatusCode::BAD_REQUEST, rcgui_i18n::f("multipart 解析失败: {}", &[&(e)]));
+                return fail(
+                    StatusCode::BAD_REQUEST,
+                    rcgui_i18n::f("multipart 解析失败: {}", &[&(e)]),
+                );
             }
         }
-        (Some(json!({"fields": fields, "files": files})), String::new())
+        (
+            Some(json!({"fields": fields, "files": files})),
+            String::new(),
+        )
     } else {
         let bytes = match axum::body::to_bytes(req.into_body(), BODY_LIMIT).await {
             Ok(b) => b,
             Err(e) => {
-                return fail(StatusCode::BAD_REQUEST, rcgui_i18n::f("读取请求体失败: {}", &[&(e)]));
+                return fail(
+                    StatusCode::BAD_REQUEST,
+                    rcgui_i18n::f("读取请求体失败: {}", &[&(e)]),
+                );
             }
         };
         (
@@ -227,7 +245,11 @@ fn render(v: Value) -> axum::response::Response {
         }
     }
 
-    if let Some(b64) = v.get("body_b64").and_then(|b| b.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(b64) = v
+        .get("body_b64")
+        .and_then(|b| b.as_str())
+        .filter(|s| !s.is_empty())
+    {
         match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
             Ok(bytes) => {
                 let ctype = v

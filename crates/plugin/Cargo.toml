@@ -5,8 +5,17 @@ edition.workspace = true
 
 [dependencies]
 rcgui-i18n = { path = "../i18n" }
-wasmtime = "30"
-wasmtime-wasi = { version = "30", features = ["preview1"] }
+# 只开宿主真正用到的东西：JIT 编译（cranelift）+ 执行运行时（runtime）+ std 支持。
+# 关掉的默认特性里，wat 文本解析、磁盘编译缓存、GC、profiling、pooling allocator、
+# demangle、addr2line、coredump、debug-builtins、threads 都没用上，留着只是白带依赖和攻击面。
+# 注意：component-model 与 async 实际**去不掉**——wasmtime-wasi 依赖 wasmtime 时自己带上了
+# 这两个特性，cargo 的 feature union 会把它们合并回来。插件 ABI 是 core module + WASI
+# preview1，那部分能力只是没被我们用到，不代表从依赖里消失了。
+wasmtime = { version = "30", default-features = false, features = ["cranelift", "runtime", "std"] }
+# preview1：插件 ABI 就定在 WASI preview1 上，见 lib.rs 的 run_module。
+# default-features = false 在这里只是把"默认就是 preview1"写成显式依赖意图：preview1
+# 仍然开着（不写就编译不过 add_to_linker_sync），同时不会再被默认特性悄悄拉进别的东西。
+wasmtime-wasi = { version = "30", default-features = false, features = ["preview1"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

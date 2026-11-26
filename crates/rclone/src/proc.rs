@@ -20,7 +20,8 @@ pub fn extract_windows_path(line: &str) -> Option<String> {
         return None;
     }
     for i in 0..b.len() - 2 {
-        if b[i].is_ascii_alphabetic() && b[i + 1] == b':' && (b[i + 2] == b'\\' || b[i + 2] == b'/') {
+        if b[i].is_ascii_alphabetic() && b[i + 1] == b':' && (b[i + 2] == b'\\' || b[i + 2] == b'/')
+        {
             return Some(line[i..].trim().trim_matches(['"', '\'']).to_string());
         }
     }
@@ -71,7 +72,10 @@ pub fn discover_exe(custom: Option<&str>) -> anyhow::Result<PathBuf> {
             return Ok(p);
         }
     }
-    Err(anyhow!("{}", rcgui_i18n::t("未找到 rclone.exe，请确认已安装并加入 PATH")))
+    Err(anyhow!(
+        "{}",
+        rcgui_i18n::t("未找到 rclone.exe，请确认已安装并加入 PATH")
+    ))
 }
 
 /// 连接发布器：只负责「把可用的客户端放到共享连接状态里」。
@@ -105,7 +109,10 @@ impl RcloneManager {
             Ok(v) => v,
             Err(e) => {
                 self.rc.set_disconnected(Some(e.describe())).await;
-                return Err(anyhow!("{}", rcgui_i18n::f("连接已有 rclone 失败: {}", &[&(e)])));
+                return Err(anyhow!(
+                    "{}",
+                    rcgui_i18n::f("连接已有 rclone 失败: {}", &[&(e)])
+                ));
             }
         };
         self.rc.set_connected(client).await;
@@ -141,6 +148,124 @@ mod tests {
         assert!(a.chars().all(|c| c.is_ascii_alphanumeric()));
     }
 
+    /// 只答 `core/version` 的假 RC 服务器，够 `attach` 与握手验证可达。
+    ///
+    /// 端口交给系统分配：真机上每次启动内核的端口都是新的随机值，任何写死端口
+    /// 的断言都只是把「新内核上仍显示旧端口」这个 bug 固化下来。
+    /// `version` 由调用方给，这样测试能区分增强版（`v1.76.0-extra`）与原版。
+    fn spawn_fake_rc(version: &str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let version = version.to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let body = format!(r#"{{"version":"{version}","decomposed":[1,76,0]}}"#);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// 一个已经没人监听的地址：换内核之后旧端口就是这个样子。
+    fn dead_endpoint() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    /// 换内核之后必须落到新端口上，而不是继续指着旧端口。
+    ///
+    /// 走真实路径：`RcloneManager::attach` 真的发 HTTP 请求，`RcState` 真的改状态。
+    /// 旧内核死掉、新内核起来时依次是三步：
+    /// 1. 连一个死地址失败**不能**抹掉地址 —— 外部实例靠这条保留上次快照；
+    /// 2. 停掉自家内核时要 `forget`，否则界面永远显示那个已经消失的端口；
+    /// 3. 再 attach 必须用新端点和新的随机凭据。
+    #[tokio::test]
+    async fn reconnect_after_a_core_swap_targets_the_new_endpoint() {
+        let rc = Arc::new(RcState::new());
+        let mgr = RcloneManager::new(rc.clone());
+
+        let first = spawn_fake_rc("v1.76.0");
+        mgr.attach(&first, Some("old-user".into()), Some("old-pass".into()))
+            .await
+            .expect("第一个实例应该连得上");
+        assert_eq!(rc.endpoint().await.url, first);
+        assert!(rc.is_live());
+
+        let gone = dead_endpoint();
+        let err = mgr
+            .attach(&gone, Some("old-user".into()), Some("old-pass".into()))
+            .await
+            .expect_err("没人监听时必须报连接失败");
+        assert!(err.to_string().contains("连接已有 rclone 失败"), "{err}");
+        assert_eq!(
+            rc.endpoint().await.url,
+            first,
+            "连不上不该抹掉上一次的地址（外部实例要保留快照）"
+        );
+        assert!(!rc.is_live());
+
+        // 我们亲手停掉的自家内核：端口随进程没了，忘掉它。
+        rc.forget().await;
+        assert_eq!(rc.status().await, rcgui_rc::ConnStatus::Disconnected);
+        assert_ne!(rc.endpoint().await.url, first);
+
+        let second = spawn_fake_rc("v1.76.0");
+        mgr.attach(&second, Some("new-user".into()), Some("new-pass".into()))
+            .await
+            .expect("新实例应该连得上");
+        let ep = rc.endpoint().await;
+        assert_eq!(ep.url, second, "必须指向新端口");
+        assert_ne!(ep.url, first);
+        assert_eq!(ep.user.as_deref(), Some("new-user"));
+        assert!(ep.has_pass, "新凭据要跟着过来");
+        assert!(rc.is_live());
+    }
+
+    /// 握手报出的版本必须来自当前连着的那个进程。
+    ///
+    /// 换渠道时两个内核的版本号只差后缀（`v1.76.0-extra` / `v1.76.0`）：版本号若来自
+    /// 缓存、或来自上一次的端点，界面就会在换了内核之后继续显示旧渠道——「端口、进程、
+    /// 状态都换成新的，只有版本号还写 v1.76.0-extra」正是这种错位。
+    #[tokio::test]
+    async fn handshake_version_comes_from_the_endpoint_it_is_connected_to() {
+        let rc = Arc::new(RcState::new());
+        let mgr = RcloneManager::new(rc.clone());
+
+        let old = spawn_fake_rc("v1.76.0-extra");
+        mgr.attach(&old, Some("u1".into()), Some("p1".into()))
+            .await
+            .expect("旧内核应该连得上");
+        let before_client = rc.client().await;
+        let before = rcgui_rc::Handshake::perform(before_client.as_ref())
+            .await
+            .expect("握手");
+        assert_eq!(before.version.version, "v1.76.0-extra");
+
+        rc.forget().await;
+        let new = spawn_fake_rc("v1.76.0");
+        mgr.attach(&new, Some("u2".into()), Some("p2".into()))
+            .await
+            .expect("新内核应该连得上");
+        let after_client = rc.client().await;
+        let after = rcgui_rc::Handshake::perform(after_client.as_ref())
+            .await
+            .expect("握手");
+        assert_eq!(
+            after.version.version, "v1.76.0",
+            "换了内核之后握手必须报新端点上的版本，不能沿用上一个"
+        );
+    }
+
     #[test]
     fn crate_has_no_process_spawning() {
         // 防回归：本文件（以及整个 rclone_client）不应再出现进程派生/终止。
@@ -148,7 +273,12 @@ mod tests {
         let all = include_str!("proc.rs");
         // 只检查测试模块之前的实现代码，避免匹配到本测试自身的字符串字面量
         let src = &all[..all.find("#[cfg(test)]").unwrap_or(all.len())];
-        for banned in ["Command::new", "std::process::Command", "tokio::process", "child.kill"] {
+        for banned in [
+            "Command::new",
+            "std::process::Command",
+            "tokio::process",
+            "child.kill",
+        ] {
             assert!(
                 !src.contains(banned),
                 "rclone_client 不应包含进程管理代码：{banned}"

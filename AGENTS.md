@@ -1,101 +1,107 @@
-# RCGUI Refactoring Guide for Coding Agents
+# RCGUI Guide for Coding Agents
 
-This document guides coding agents working on the refactor. The goal is to gradually turn this project into **RCGUI: a Windows GUI for managing rclone remote, mount, and serve configurations**. Read this guide and the repository documentation before inspecting or changing code. Do not treat it as a request to rewrite every module at once.
+RCGUI is a Windows GUI for managing rclone remotes, mounts and serves, written in Rust with a Slint (native, no webview) interface. This document is the working agreement for coding agents: what must not break, which documents are authoritative, and how to build and verify. Read it, plus [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), before changing code.
 
-## 1. Product Goals and Boundaries
+Version in the tree is **0.3.0 in development**. The newest released version is **v0.2.1**. Do not describe in-development work as released, in code, docs or commit messages.
 
-- Use **RCGUI** as the product display name. Internal crate, directory, and executable names may be migrated in stages; avoid breaking builds or user data just to rename them.
-- The user installs and runs rclone. The application must not embed or extract rclone, or automatically start, stop, or restart an rclone process.
-- By default, read state from and call APIs on a local rclone RC endpoint explicitly selected by the user. Do not assume that finding an `rclone.exe` process means an RC service is available.
-- The application may perform user-requested mount/unmount, serve/start/stop, and remote configuration operations through the RC API. These operations are distinct from starting or terminating the rclone process.
-- WinFsp is a separate optional dependency for mounting. Keep its detection, installation guidance, and mount error messages separate from rclone installation and connection status.
-- RCGUI stores its own copies of remote configurations, desired mount/serve configurations, and profiles. Display runtime state returned by rclone separately. Do not treat current runtime state as a complete, reconstructable configuration.
-- The primary feature scope is remotes, mounts, serves, connection status, and profile import/export. First inventory and keep the legacy file management, transfers, plugins, embedded HTTP, and other unrelated features buildable. Do not remove or extensively modify them without an explicit user request.
+## 1. Product Boundaries
 
-## 2. Protect the Working Tree
+- **RCGUI** is the product name users see. Crate, directory and executable names may migrate in stages; never break a build or a user's data just to rename something.
+- **Two ways to reach rclone, one default.** `managed core` means RCGUI starts a child `rclone.exe` and owns its lifetime. `external endpoint` means the user (or a script) started rclone and RCGUI only connects. Managed core is the default; external stays fully supported because it is the only option for a shared or already-tuned setup.
+- **Never touch a process RCGUI did not start.** For an attached external endpoint, no code path may call `core/quit`, kill the process, or restart it. `mount/*` and `serve/*` calls are runtime operations and remain allowed; process lifetime is not the same thing as mount state, and code must keep them distinguishable.
+- Do not scan local ports or send control requests to unknown local services. Managed core binds loopback only. Do not assume that finding an `rclone.exe` process means an RC service is available.
+- After connecting, read the rclone version, the real configuration path and the supported feature set through RC before touching remotes, mounts or serves. Report missing APIs plainly instead of degrading silently.
+- If no endpoint is reachable, the GUI stays usable: local profiles can still be viewed, edited, imported and exported. Provide retry and reconnect.
+- WinFsp is a separate optional dependency for mounting. Its detection, installation guidance and error messages stay separate from rclone installation and connection status.
+- RCGUI keeps its own copy of desired state (remotes, mount/serve parameters, profiles) and shows rclone's runtime state separately. Runtime state is not a complete configuration and must never be used to reconstruct one.
+- Active feature scope: remotes, mounts, serves, connection status, profiles. Keep the legacy file management, transfers, plugins and embedded HTTP buildable; do not remove or rework them without an explicit request.
 
-This repository may contain uncommitted user changes and untracked files. At the start of each phase, run and inspect:
+## 2. Authoritative Documents
+
+| Topic | Document |
+|---|---|
+| Layers, dependency rules, concurrency/cache/credential/accessibility contracts | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| Plugin protocol, manifest schema, capability list | [docs/PLUGIN.md](docs/PLUGIN.md) |
+| Version numbering and changelog rules | [docs/VERSIONING.md](docs/VERSIONING.md) |
+| Release assets, naming, checksums, reproducibility | [docs/RELEASE.md](docs/RELEASE.md) |
+| Command-line contract (including what is not implemented yet) | [docs/CLI.md](docs/CLI.md) |
+| Performance budget and how to measure it | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) |
+| Contribution flow, review gates, how to add a plugin to the store | [CONTRIBUTING.md](CONTRIBUTING.md), [docs/store/README.md](docs/store/README.md) |
+
+If a document and the code disagree, the code is the current truth and the document is a bug — report it rather than quietly following either one.
+
+## 3. Protect the Working Tree
+
+Start each session with:
 
 ```powershell
 git status --short
 git diff --stat
 ```
 
-- Do not use `git reset`, `git checkout --`, `git clean`, or recursive deletion to clean the working tree.
-- Do not overwrite user changes unrelated to the current phase. Read the current file and its diff before editing an existing file.
-- Do not delete `vendor/`, LFS files, build scripts, or existing application data directories until all references have been checked and the impact has been explained.
-- If requirements conflict with code behavior, continue the inventory and work that do not depend on the decision. Raise only the smallest necessary question in the phase report; do not expand the product scope on your own.
+- Never use `git reset`, `git checkout --`, `git clean` or recursive deletion to tidy the tree.
+- Read a file and its diff before editing it. Do not overwrite changes that belong to someone else's task.
+- Do not delete `vendor/`, LFS assets, build scripts or existing application data directories until every reference has been checked and the impact explained.
+- If requirements collide with code behaviour, keep doing the work that does not depend on the decision, and raise the smallest necessary question in the report. Do not widen the scope on your own.
 
-## 3. Connection and Runtime State
+## 4. Connection, Core and Runtime State
 
-### Connection
+- Managed core: RCGUI allocates a free loopback port, generates the RC credentials, starts the child with the correct `--rc` flags, waits for a successful handshake, and records the real port in state. A port collision is its own error, never folded into "start failed".
+- The child is bound to a Job Object so it cannot outlive RCGUI. Do not leave orphan `rclone.exe` behind on crash or forced exit.
+- Automatic restart is off by default. A crashed core shows "stopped + reason + retry"; silent restarting hides configuration errors and loops.
+- External endpoint: the user supplies address, port and credentials. Default suggestions use loopback. Disconnecting stops polling and keeps the last snapshot marked stale; it never clears local data.
+- One active endpoint at a time in 0.3.0. Never merge data from two rclone instances into indistinguishable state.
+- Distinguish in the UI: "running now", "saved", "pending application", "disconnected/stale".
 
-- Rclone must be started with `--rc` to provide the RC API. The connection UI must let the user select or enter an endpoint. It may suggest `http://127.0.0.1:5572` as a default, but must allow a custom address, port, and authentication.
-- Do not scan arbitrary local ports or send control requests to unknown local services. RC access is powerful; default to loopback and never write authentication information to ordinary logs.
-- After connecting, query the rclone version, actual configuration path, and supported features through RC before reading remotes, mounts, and serves. Clearly report missing APIs or unsupported older versions.
-- If no rclone instance is reachable, keep the GUI open in offline mode. The user must still be able to view, edit, import, and export local profiles. Provide retry and reconnect actions.
-- Allow users to save multiple connections/profiles. The first release may support only one active endpoint, but must not merge data from multiple rclone instances into indistinguishable state.
+## 5. Configuration, Profiles, Import and Export
 
-### Keep Data Sources Separate
+- RCGUI data lives in its own user-data directory. When migrating from `%APPDATA%\rclone-gui`, copy first and keep a rollback path; never delete the old directory.
+- The import/export container is the versioned single file `rcgui.conf`: schema version, profile metadata, rclone configuration, desired mount/serve configurations, optional script manifest.
+- Validate before applying, then preview: profile name, remote names, mount/serve counts, target rclone configuration path, merge/overwrite differences. A failed import must leave the original configuration recoverable.
+- Exports can contain OAuth tokens, passwords and cloud credentials. Never log them. State clearly that an export is sensitive, handle encrypted configurations explicitly, and remember that rclone's `obscure` is obfuscation, not encryption.
+- Do not silently replace a configuration file that a running rclone is using. Prefer RC config APIs. For a full-file replacement, take a backup and mark that the user must reconnect — and in managed mode, that RCGUI will restart the core it owns.
+- Read the actual configuration path from the connected instance; never assume `%APPDATA%\rclone\rclone.conf`.
 
-- **Configured remotes:** obtained from the active rclone configuration/API.
-- **Live mounts and serves:** obtained from RC APIs such as `mount/listmounts` and `serve/list`.
-- **RCGUI profiles:** persisted locally by RCGUI and describe the configuration the user wants to save or restore.
-- In the UI, distinguish “running now,” “saved,” “pending application,” and “disconnected/stale.” When disconnected, preserve the last snapshot but mark it stale.
-- `mount/listmounts` is not guaranteed to return every option needed to recreate a mount. Do not generate a complete mount profile from the runtime list alone. Persist the user's original mount and serve parameters.
+## 6. Startup Scripts and Restore
 
-## 4. Configuration Files, Profiles, Import, and Export
+- rclone does not execute scripts registered in `rclone.conf`. Windows logon startup is the user's Startup folder, Task Scheduler, or an external launcher.
+- A generated PowerShell restore script connects to an **already running** RC endpoint, waits for a health check, then replays mounts/serves in saved order. It must not start or stop rclone: it cannot own a process. In managed mode the GUI can do the start itself; the generated script still may not.
+- Scripts inside an imported package are code. Preview contents and destinations; never execute, never register scheduled tasks or logon startup without an explicit user choice.
+- Never discover or delete scripts by filename prefix. Use an RCGUI-owned directory plus a manifest that records what was generated and at which version.
+- Build PowerShell from argument arrays or safe serialization, not string concatenation.
+- Keep "rclone process lifecycle" separate from "mount/serve runtime state" in code, tests and messages.
 
-- Store RCGUI data in its own user-data directory. When migrating data from the old `%APPDATA%\\rclone-gui` directory, copy/migrate it first and retain a rollback path; do not delete the old directory outright.
-- Define a versioned single-file import/export format using the user-requested filename `rcgui.conf`. Include at least a schema version, profile metadata, rclone configuration, desired mount/serve configurations, and an optional script manifest.
-- Specify the package format and import rules before implementation. If using an archive container, protect against path traversal, duplicate/overwriting paths, oversized files, and integrity-check failures. Write only to RCGUI-managed locations.
-- Parse and validate an import first. Then show the profile name, remote names, mount/serve counts, target rclone configuration path, and merge/overwrite differences before applying it. The original configuration must remain recoverable if import fails.
-- Exports may contain OAuth tokens, passwords, and cloud-service credentials. Never log credentials by default. Clearly disclose that an export contains sensitive data and explicitly handle encrypted configurations. Rclone's `obscure` format is not encryption.
-- Do not silently replace a configuration file while rclone is using it. Prefer supported RC config APIs for updating remotes. For a full-file replacement, make a backup and mark the change as requiring the user to restart/reconnect rclone manually. RCGUI does not restart the process.
-- Obtain the actual configuration path from the connected instance; do not assume `%APPDATA%\\rclone\\rclone.conf`.
-- Define “export current configuration” precisely. Remotes can be read from the active rclone configuration; mount/serve exports should prefer complete parameters saved by RCGUI. If runtime state is missing fields, disclose them in the export preview instead of silently creating an incomplete profile.
+## 7. Refresh and UI Behaviour
 
-## 5. Startup Scripts and Automatic Restore
-
-- Do not assume rclone automatically executes scripts registered in `rclone.conf`. Windows logon startup is handled through the user's Startup folder, Task Scheduler, or an external launcher.
-- Version 1 may generate an explicit PowerShell restore script. It must connect to an **already running rclone instance with RC enabled**, wait for a successful RC health check, and then restore mounts/serves in the saved order. If the endpoint is unavailable, it must exit with an error; it must not start or terminate rclone.
-- Scripts inside an imported package are executable code. Preview their contents and destination paths. Do not execute them, create scheduled tasks, or silently register logon startup unless the user explicitly chooses to do so.
-- Do not discover and delete scripts by filename prefix. Use an RCGUI-specific directory and a manifest that records generated files and versions. Only clean up files confirmed by the manifest as RCGUI-managed.
-- Generate PowerShell with argument arrays or safe serialization. Avoid constructing commands by string concatenation, which can misinterpret spaces, quotes, `&`, `%`, and similar characters.
-- Keep “rclone process lifecycle” separate from “mount/serve runtime state.” RCGUI does not start/exit rclone, but may create/stop mounts or serves through the RC API after an explicit user action.
-
-## 6. Refreshing and UI Behavior
-
-- Refresh immediately after connecting, when the window returns to the foreground, and when the user requests a refresh.
-- Run lightweight state polling only while the window is visible and in the foreground. Pause when minimized or hidden to the system tray. Refresh immediately on restore and update the “last refreshed” time.
-- Do not allow overlapping polls of the same kind. On timeout, cancel or ignore stale results and use backoff before retrying. An older response must never overwrite newer UI state.
-- Poll only lightweight remote/mount/serve/connection state. Do not periodically refresh remote file listings, probe remote backends, or repeat mount/serve operations.
-- Report connection errors, RC API errors, missing WinFsp, occupied drive letters, and slow remote backends separately. Avoid displaying a generic “mount failed” message for all cases.
-
-## 7. Recommended Implementation Phases
-
-1. **Inventory:** Inspect the workspace, `crates/app`, `crates/rclone`, `build.rs`, build scripts, LFS assets, configuration migration, and every process-management entry point. Produce a dependency map and split plan; do not delete files yet.
-2. **Decouple the RC client:** Separate connection/authentication/API calls to an external endpoint from launching/stopping rclone child processes. Migrate callers before removing process-management code.
-3. **Connection state and offline UI:** Implement connect/disconnect/retry, endpoint configuration, connection handshake, live-data refresh, and offline profile management.
-4. **Data model and persistence:** Establish versioned remote/mount/serve profile models, separate persistent configuration from runtime state, and account for legacy application configuration.
-5. **Import/export:** Implement the `rcgui.conf` format, preview, merge/replace, backups, sensitive-data handling, and failure recovery.
-6. **Restore script:** Generate and preview scripts from structured profiles. Scripts may connect only to an already running RC instance; they must not start or terminate rclone.
-7. **Cleanup and documentation:** Remove embedded rclone assets, extraction/download scripts, and old process management only after confirming no references remain. Update the README, build instructions, application name, and data-directory migration notes.
-
-At the end of each phase, report what changed, affected files, remaining assumptions, risks, and the next phase. Do not compress the entire refactor into one large unchecked rewrite.
+- Refresh on connect, on window restore, and on explicit user request.
+- Poll lightweight state only while the window is visible and focused. Pause when minimised or hidden to the tray; refresh immediately on restore and update "last refreshed".
+- Never overlap polls of the same kind. Cancel or discard stale results; an older response must not overwrite newer state.
+- Poll remote/mount/serve/connection state only. Do not periodically re-read remote listings or probe backends.
+- Report connection errors, RC API errors, missing WinFsp, occupied drive letters and slow backends separately. "Mount failed" is not an acceptable catch-all.
+- Accessibility is a requirement, not a nice-to-have: full keyboard reach, readable names on every control including icon buttons, visible focus, contrast ≥ 4.5:1, status never conveyed by colour alone, and respect for the OS "reduce motion" setting. Details and the honest limits of the static accessibility export are in [docs/ARCHITECTURE.md §4.5](docs/ARCHITECTURE.md).
 
 ## 8. Build and Command Constraints
 
-- Read the current `README.md`, relevant crate `Cargo.toml` files, `build.rs`, and PowerShell build scripts before choosing build commands. The README currently describes an embedded-rclone workflow that may remain necessary until migration is complete.
-- Plugins are **not** in this repository and are **not** compiled into the executable. Before building, `scripts/fetch_plugins.ps1` downloads each plugin's release zip listed in `plugins/manifest.json` and verifies its sha256; `crates/app/build.rs` only copies `crates/app/assets/plugins/` next to the binary. There is no `include_bytes!`/`IMAGEHOST_WASM` step any more, so the old "build the WASM plugins first" ordering rule is obsolete — but never drop the fetch step or ship without plugin assets. Plugin framework and integration rules: `docs/PLUGIN.md`.
-- Do not run the test suite unless the user explicitly asks for testing or verification. Explain the purpose before running other build/formatting commands. Do not install tools, modify system services, register startup tasks, or access the network unless necessary.
-- Never expose RC passwords, OAuth tokens, or full sensitive configuration in code, command output, screenshots, or documentation.
+- Read `README.md`, the relevant crate `Cargo.toml`, `crates/app/build.rs` and the scripts before choosing commands. The workspace version is the single source of truth for the product version; member crates inherit it via `version.workspace = true`.
+- Plugins are not in this repository and are not compiled into the executable. `scripts/fetch_plugins.ps1` downloads each release zip pinned in `plugins/manifest.json` and verifies its sha256 (twice: zip, then the package's own `check.sha256`); `crates/app/build.rs` only copies `crates/app/assets/plugins/` next to the binary. Never drop the fetch step, never ship without assets, and never weaken hash checking to "warn on mismatch".
+- Release packaging uses `scripts/build-release.ps1` (portable + checksums), `scripts/fetch_core.ps1` (rclone core pinned in `packaging/core-manifest.json`, sha256 verified), and `packaging/RCGUI.iss` (Inno Setup). The manifest holds two sources; `default_source` is `extra` (gulp79/rclone-extra, extra backends such as alist, alldebrid, teldrive, terabox) and `upstream` is plain rclone. `-CoreSource` selects one and never silently falls back; a non-default source suffixes the artifact names with `-<source>`. `-SkipPlugins` / `-SkipCore` skip downloads, never verification. A local unverified `rclone.exe` may be used for a private test build but never for a published artifact.
+- Do not run the test suite unless the user asks for testing or verification. Say what a command is for before running build or formatting commands. Do not install tools, change system services, register startup tasks or use the network unless it is necessary for the task.
+- Never expose RC passwords, OAuth tokens or full sensitive configuration in code, output, screenshots or documentation.
 
-## 9. Completion Criteria
+## 9. Honesty Rules for Docs, Store and Releases
 
-- With no rclone process running, RCGUI can start and edit/import/export local profiles without launching rclone.
-- RCGUI displays live state only after successfully handshaking with an explicitly selected RC endpoint.
-- Remote, mount/serve profiles, and live runtime state remain distinct; disconnecting does not clear local data.
-- Import does not silently overwrite a configuration in use; export and script execution provide clear previews and sensitive-data notices.
-- Mount/serve control calls the RC API only after an explicit user action. RCGUI does not call `core/quit`, kill rclone processes, or silently create logon startup tasks.
-- Build documentation matches actual dependencies. Before removing embedded rclone assets, verify that all compile-time and runtime references have been migrated.
+- Never claim a feature is shipped when it is only designed. `docs/ARCHITECTURE.md` marks every layer `已有` / `部分` / `规划`; keep that discipline in README, changelog and store listings.
+- The plugin store lists only plugins that exist as a real release, with the sha256 of that release asset. No placeholder URLs or invented hashes. The K-Vault plugin contributes a WebDAV preset and connection wizard; the app retains its file-upload bridge and legacy remote editing. Add K-Vault to the store only after its first verified release exists.
+- `oneclick` is deliberately absent from the store and from the portable package.
+- Badges, screenshots and numbers must be real. A hand-written SVG is fine if it is labelled as a diagram, not as a screenshot. Benchmarks come from `scripts/measure-perf.ps1` on named hardware; never invent or extrapolate a figure.
+- The static accessibility tree export describes what RCGUI intends to expose. It is not the live Windows UIA tree and must not be presented as accessibility verification.
+- No secrets, development data, absolute local paths or unverified binaries inside release artifacts. Verify before packaging; a checker script passing only proves the checker ran.
+
+## 10. Completion Criteria
+
+- With no rclone running, RCGUI starts, stays usable, and can view/edit/import/export local profiles; managed core can be started from the UI when the user asks for it.
+- Live state appears only after a successful handshake with the selected or self-started endpoint, and the UI shows which mode it is in.
+- Remotes, saved profiles and runtime state stay distinct; disconnecting never clears local data, and an attached external process is never killed or quit.
+- Import never silently overwrites a configuration in use; export and script execution always preview and warn.
+- Mount/serve control happens only after an explicit user action; no `core/quit`, no killing foreign processes, no silent logon startup.
+- Documentation matches the code, including everything still marked as planned. `docs/CHANGELOG.md` reflects what shipped, not what was attempted.

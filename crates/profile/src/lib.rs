@@ -15,8 +15,8 @@ pub mod proxy;
 pub mod restore;
 
 pub use bundle::{
-    diff as bundle_diff, BundleError, Diff, RcguiConf, RemoteConf, ScriptEntry, Summary,
-    BUNDLE_SCHEMA_VERSION, KIND as BUNDLE_KIND,
+    diff as bundle_diff, AppSettings, BundleError, Diff, PluginRef, RcguiConf, RemoteConf,
+    ScriptEntry, Summary, SyncTaskRef, BUNDLE_SCHEMA_VERSION, KIND as BUNDLE_KIND,
 };
 pub use proxy::{ProxyProfile, ProxyProtocol, ProxyRegistry, RemoteProxyBinding};
 
@@ -311,7 +311,10 @@ pub enum StoreError {
     Io(String),
     Parse(String),
     /// 文件版本比本程序新：拒绝降级写入，避免丢数据。
-    VersionTooNew { found: u32, supported: u32 },
+    VersionTooNew {
+        found: u32,
+        supported: u32,
+    },
 }
 
 impl std::fmt::Display for StoreError {
@@ -319,7 +322,14 @@ impl std::fmt::Display for StoreError {
         match self {
             Self::Io(e) => write!(f, "{}", rcgui_i18n::f("档案读写失败: {}", &[&(e)])),
             Self::Parse(e) => write!(f, "{}", rcgui_i18n::f("档案格式无效: {}", &[&(e)])),
-            Self::VersionTooNew { found, supported } => write!(f, "{}", rcgui_i18n::f("档案版本 {} 高于本程序支持的 {}，请升级 RCGUI（已拒绝写入以免损坏数据）", &[&(found), &(supported)])),
+            Self::VersionTooNew { found, supported } => write!(
+                f,
+                "{}",
+                rcgui_i18n::f(
+                    "档案版本 {} 高于本程序支持的 {}，请升级 RCGUI（已拒绝写入以免损坏数据）",
+                    &[&(found), &(supported)]
+                )
+            ),
         }
     }
 }
@@ -461,7 +471,6 @@ impl Store {
 static PERMISSION_HEALER: std::sync::Mutex<Option<fn() -> Result<(), StoreError>>> =
     std::sync::Mutex::new(None);
 
-
 #[cfg(test)]
 fn test_dir(tag: &str) -> std::path::PathBuf {
     // 本项目沙箱下 %TEMP% 不可写（os error 5），统一用测试可执行文件旁的目录
@@ -475,7 +484,9 @@ fn test_dir(tag: &str) -> std::path::PathBuf {
     d
 }
 pub fn now_iso() -> String {
-    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string()
+    chrono::Local::now()
+        .format("%Y-%m-%dT%H:%M:%S%:z")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -530,7 +541,10 @@ mod tests {
         assert_eq!(normalize_mount_point("T:"), "T:");
         assert_eq!(normalize_mount_point("T:\\"), "T:");
         assert_eq!(normalize_mount_point(" t "), "T:");
-        assert_eq!(normalize_mount_point("\\\\server\\share\\"), "\\\\server\\share");
+        assert_eq!(
+            normalize_mount_point("\\\\server\\share\\"),
+            "\\\\server\\share"
+        );
     }
 
     #[test]
@@ -545,10 +559,19 @@ mod tests {
 
     #[test]
     fn desired_state_matrix() {
-        assert_eq!(desired_state(true, true, false, true), DesiredState::Running);
-        assert_eq!(desired_state(true, false, true, true), DesiredState::Pending);
+        assert_eq!(
+            desired_state(true, true, false, true),
+            DesiredState::Running
+        );
+        assert_eq!(
+            desired_state(true, false, true, true),
+            DesiredState::Pending
+        );
         assert_eq!(desired_state(true, false, false, true), DesiredState::Saved);
-        assert_eq!(desired_state(false, false, false, true), DesiredState::Saved);
+        assert_eq!(
+            desired_state(false, false, false, true),
+            DesiredState::Saved
+        );
         assert_eq!(desired_state(true, false, true, false), DesiredState::Stale);
     }
 
@@ -637,11 +660,19 @@ mod tests {
         assert_eq!(d.proxies.len(), 1);
 
         d.bind_proxy("teldrive", "p1");
-        assert_eq!(d.proxy_registry().for_remote("teldrive").map(|x| x.id.as_str()), Some("p1"));
+        assert_eq!(
+            d.proxy_registry()
+                .for_remote("teldrive")
+                .map(|x| x.id.as_str()),
+            Some("p1")
+        );
 
         // 明确不代理：落一条空 id 记录，而不是删绑定
         d.bind_proxy("teldrive", "");
-        assert!(d.remote_proxies.iter().any(|b| b.remote == "teldrive" && b.is_direct()));
+        assert!(d
+            .remote_proxies
+            .iter()
+            .any(|b| b.remote == "teldrive" && b.is_direct()));
         assert!(d.proxy_registry().for_remote("teldrive").is_none());
 
         // 重复绑定同一 remote 不应产生第二条记录
@@ -741,7 +772,9 @@ mod tests {
         for i in 1..=5 {
             let mut doc = ProfileDoc::default();
             doc.meta.name = format!("第{i}次");
-            store.save(&doc).unwrap_or_else(|e| panic!("第 {i} 次保存失败: {e}"));
+            store
+                .save(&doc)
+                .unwrap_or_else(|e| panic!("第 {i} 次保存失败: {e}"));
             assert_eq!(store.load().unwrap().unwrap().meta.name, format!("第{i}次"));
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -784,6 +817,9 @@ mod badge_tests {
         // 档案里没有该远程（例如刚新建、尚未导出过）→ 不显示徽标
         let d = doc_with(true);
         assert!(!d.needs_auth_of("other"));
-        assert!(!d.needs_auth_of("TELDRIVE"), "按名称精确匹配，大小写不同即视为无记录");
+        assert!(
+            !d.needs_auth_of("TELDRIVE"),
+            "按名称精确匹配，大小写不同即视为无记录"
+        );
     }
 }

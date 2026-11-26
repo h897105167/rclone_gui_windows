@@ -1,0 +1,100 @@
+name: 商店索引审核
+
+# 每次 PR 改动商店索引时跑一遍机械检查。它代替不了人看代码，
+# 但它能把"格式对不上""哈希抄错""地址下不到"这类问题挡在合并之前。
+#
+# 人工审核门槛见 docs/store/README.md：代码、许可证、权限、行为，
+# 以及 min_gui_version 是否真的成立。那些都需要人读，不在这里。
+
+on:
+  pull_request:
+    paths:
+      - "docs/store/index.json"
+      - "plugins/manifest.json"
+      - ".github/workflows/store-review.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: store-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: 校验索引
+    runs-on: windows-latest
+    # 含 -VerifyRemote：要真的下载每个插件 zip 比对哈希。
+    # 两个插件的量级，正常一分钟内；给 20 分钟是为了容忍网络抖动。
+    timeout-minutes: 20
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+        with:
+          # 需要完整历史才能和 base 分支比较改动范围。
+          fetch-depth: 0
+
+      - name: 只许改索引
+        # 商店的提交方式就是"只改索引"：外部作者不能借插件 PR 夹带二进制、脚本或页面文件。
+        # 但仓库维护者自己做重构时，一个 PR 里改十几个文件是正常的，不该被这条挡住，
+        # 所以先看这是谁的分支：
+        #   - PR 作者就是仓库 owner            → 维护者本人，跳过范围检查
+        #   - PR 来自本仓库自己的分支          → 能推这种分支的本来就有写权限，跳过
+        #   - 带 store-maintainer 标签         → 受邀维护者，跳过
+        #   - 其它（fork 来的外部 PR）         → 只能改 docs/store/index.json
+        shell: pwsh
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          $owner = ($env:THIS_REPO -split '/')[0]
+          if ($env:PR_AUTHOR -eq $owner) {
+            Write-Host "PR 作者 $($env:PR_AUTHOR) 就是仓库 owner，跳过改动范围检查。"
+            exit 0
+          }
+          if ($env:PR_HEAD_REPO -eq $env:THIS_REPO) {
+            Write-Host "PR 来自本仓库自己的分支（$($env:PR_HEAD_REPO)），跳过改动范围检查。"
+            exit 0
+          }
+          if ($env:PR_LABELS -match 'store-maintainer') {
+            Write-Host "带 store-maintainer 标签，跳过改动范围检查（受邀维护者）。"
+            exit 0
+          }
+          git fetch --no-tags origin $env:BASE_REF
+          $changed = @(git diff --name-only "origin/$env:BASE_REF...HEAD")
+          Write-Host "本 PR 改动的文件："
+          $changed | ForEach-Object { Write-Host "  $_" }
+
+          $allowed = @("docs/store/index.json")
+          $offenders = @($changed | Where-Object { $allowed -notcontains $_ })
+          if ($offenders.Count -gt 0) {
+            Write-Host ""
+            Write-Host "以下文件不在允许范围内："
+            $offenders | ForEach-Object { Write-Host "  $_" }
+            Write-Host ""
+            Write-Host "提交插件只需要改 docs/store/index.json。"
+            Write-Host "不要把 zip、脚本或页面文件放进 PR；插件包发布在你自己的仓库 Release 上，"
+            Write-Host "这里只登记地址和校验值。"
+            exit 1
+          }
+
+      - name: 跑校验脚本
+        # -VerifyRemote：真的下载 url 并比对 sha256。
+        # 地址下不到、或下载到的文件和登记的哈希不一致，都在这里失败。
+        shell: pwsh
+        run: ./scripts/validate-store-index.ps1 -VerifyRemote
+
+      - name: 抽查索引可解析性
+        # 应用读的是同一份文件，用最小代码路径再确认一次它能被普通 JSON 解析器读出来，
+        # 且顶层结构是预期的那两个字段。
+        shell: pwsh
+        run: |
+          $raw = Get-Content -LiteralPath docs\store\index.json -Raw -Encoding UTF8
+          $data = $raw | ConvertFrom-Json
+          if ($data.schema_version -ne 1) { throw "schema_version 不是 1。" }
+          $top = @($data.PSObject.Properties.Name)
+          Write-Host ("顶层字段：" + ($top -join ", "))
+          Write-Host ("插件条数：" + @($data.plugins).Count)

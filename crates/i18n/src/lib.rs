@@ -159,7 +159,10 @@ mod tests {
     fn fill_basic() {
         assert_eq!(fill("a {} b {}", &[&1, &"x"]), "a 1 b x");
         assert_eq!(fill("{}", &[&"only"]), "only");
-        assert_eq!(fill("no placeholder", &[] as &[&dyn Display]), "no placeholder");
+        assert_eq!(
+            fill("no placeholder", &[] as &[&dyn Display]),
+            "no placeholder"
+        );
     }
 
     #[test]
@@ -201,7 +204,12 @@ mod tests {
     #[test]
     fn en_table_sorted() {
         for w in en::EN.windows(2) {
-            assert!(w[0].0 < w[1].0, "en.rs 未按 msgid 排序: {:?} >= {:?}", w[0].0, w[1].0);
+            assert!(
+                w[0].0 < w[1].0,
+                "en.rs 未按 msgid 排序: {:?} >= {:?}",
+                w[0].0,
+                w[1].0
+            );
         }
     }
 

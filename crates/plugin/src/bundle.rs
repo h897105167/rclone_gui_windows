@@ -53,7 +53,10 @@ pub fn check_text(dir: &Path) -> Result<String> {
         out.push('\n');
     }
     if out.is_empty() {
-        bail!("{}", rcgui_i18n::f("插件目录为空，无法生成 {}", &[&(config::CHECK_SHA256)]));
+        bail!(
+            "{}",
+            rcgui_i18n::f("插件目录为空，无法生成 {}", &[&(config::CHECK_SHA256)])
+        );
     }
     Ok(out)
 }
@@ -93,26 +96,46 @@ pub fn write_check(dir: &Path) -> Result<usize> {
 /// 但入口文件必须列入清单，否则无法证明被执行的字节没有被动过。
 pub fn verify_dir(dir: &Path, names: ConfigFileNames, cfg: &PluginConfig) -> Result<VerifyReport> {
     let check_path = dir.join(names.check);
-    let text = std::fs::read_to_string(&check_path)
-        .with_context(|| rcgui_i18n::f("读取 {} 失败: {}", &[&(names.check), &(check_path.display())]))?;
+    let text = std::fs::read_to_string(&check_path).with_context(|| {
+        rcgui_i18n::f(
+            "读取 {} 失败: {}",
+            &[&(names.check), &(check_path.display())],
+        )
+    })?;
     let entries = crate::package::parse_manifest(&text)
         .with_context(|| rcgui_i18n::f("解析 {} 失败", &[&(names.check)]))?;
 
     let entry_rel = cfg.entry.replace('\\', "/");
     if !entries.iter().any(|e| e.path == entry_rel) {
-        bail!("{}", rcgui_i18n::f("{} 未包含入口文件 {}，拒绝加载", &[&(names.check), &(entry_rel)]));
+        bail!(
+            "{}",
+            rcgui_i18n::f(
+                "{} 未包含入口文件 {}，拒绝加载",
+                &[&(names.check), &(entry_rel)]
+            )
+        );
     }
 
     let mut files = Vec::new();
     for e in &entries {
-        let p = zip::safe_join(dir, &e.path)
-            .with_context(|| rcgui_i18n::f("{} 中的路径不合法: {}", &[&(names.check), &(e.path)]))?;
+        let p = zip::safe_join(dir, &e.path).with_context(|| {
+            rcgui_i18n::f("{} 中的路径不合法: {}", &[&(names.check), &(e.path)])
+        })?;
         if !p.is_file() {
-            bail!("{}", rcgui_i18n::f("插件缺少清单中声明的文件: {}", &[&(e.path)]));
+            bail!(
+                "{}",
+                rcgui_i18n::f("插件缺少清单中声明的文件: {}", &[&(e.path)])
+            );
         }
         let got = zip::sha256_file(&p)?;
         if got != e.sha256 {
-            bail!("{}", rcgui_i18n::f("插件文件校验失败: {}\n  期望 {}\n  实际 {}", &[&(e.path), &(e.sha256), &(got)]));
+            bail!(
+                "{}",
+                rcgui_i18n::f(
+                    "插件文件校验失败: {}\n  期望 {}\n  实际 {}",
+                    &[&(e.path), &(e.sha256), &(got)]
+                )
+            );
         }
         files.push(e.path.clone());
     }
@@ -125,20 +148,35 @@ pub fn verify_dir(dir: &Path, names: ConfigFileNames, cfg: &PluginConfig) -> Res
 /// 读取并校验一个插件目录（新一代格式）。
 pub fn load_from_dir(dir: &Path, gui_version: &str) -> Result<(PluginConfig, VerifyReport)> {
     let names = ConfigFileNames::detect(dir).ok_or_else(|| {
-        anyhow!("{}", rcgui_i18n::f("目录里没有 {}（也不是旧格式 {}）: {}", &[&(config::CONFIG_JSON), &(config::LEGACY_PLUGIN_JSON), &(dir.display())]))
+        anyhow!(
+            "{}",
+            rcgui_i18n::f(
+                "目录里没有 {}（也不是旧格式 {}）: {}",
+                &[
+                    &(config::CONFIG_JSON),
+                    &(config::LEGACY_PLUGIN_JSON),
+                    &(dir.display())
+                ]
+            )
+        )
     })?;
     let path = dir.join(names.config);
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| rcgui_i18n::f("读取 {} 失败: {}", &[&(names.config), &(path.display())]))?;
-    let cfg: PluginConfig = serde_json::from_str(&text)
-        .with_context(|| rcgui_i18n::f("解析 {} 失败: {}", &[&(names.config), &(path.display())]))?;
+    let text = std::fs::read_to_string(&path).with_context(|| {
+        rcgui_i18n::f("读取 {} 失败: {}", &[&(names.config), &(path.display())])
+    })?;
+    let cfg: PluginConfig = serde_json::from_str(&text).with_context(|| {
+        rcgui_i18n::f("解析 {} 失败: {}", &[&(names.config), &(path.display())])
+    })?;
     cfg.validate()?;
     cfg.compatible_with(gui_version)?;
     let report = verify_dir(dir, names, &cfg)?;
     // 入口文件必须真实存在（清单里已保证，这里再确认可读）
     let entry = zip::safe_join(dir, &cfg.entry)?;
     if !entry.is_file() {
-        bail!("{}", rcgui_i18n::f("入口文件不存在: {}", &[&(entry.display())]));
+        bail!(
+            "{}",
+            rcgui_i18n::f("入口文件不存在: {}", &[&(entry.display())])
+        );
     }
     Ok((cfg, report))
 }
@@ -180,6 +218,42 @@ pub fn scan(root: &Path, gui_version: &str) -> (Vec<Installed>, Vec<(PathBuf, St
 
 /// 安装结果（与旧格式共用同一套语义，UI 不需要区分）。
 pub use crate::package::{InstallOutcome, MAX_EXTRACTED_BYTES};
+
+/// 插件目录里属于**用户数据**而不能随升级一起丢的文件。
+///
+/// `kv.json` 是插件自己攒下的状态（令牌、同步游标、界面偏好）。它和插件程序
+/// 放在同一个目录里（app 侧 `KvStore` 的路径就是 `<plugins>/<id>/kv.json`），
+/// 而升级是"整个目录换掉"，所以必须显式搬过去：用户点一次升级就丢密钥，
+/// 那种事没有第二次机会解释。
+pub const PRESERVED: &[&str] = &["kv.json"];
+
+/// 读出目标目录里需要保留的文件（读失败就当没有，不阻断升级）。
+pub fn read_preserved(dest: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    for name in PRESERVED {
+        if let Ok(bytes) = std::fs::read(dest.join(name)) {
+            out.push(((*name).to_string(), bytes));
+        }
+    }
+    out
+}
+
+/// 把保留的文件写回新目录。返回写回的数量。
+///
+/// 新包自带同名文件时不覆盖：包作者主动带上 `kv.json` 属于有意为之（迁移用它）。
+pub fn restore_preserved(dest: &std::path::Path, keep: &[(String, Vec<u8>)]) -> usize {
+    let mut n = 0;
+    for (name, bytes) in keep {
+        let target = dest.join(name);
+        if target.exists() {
+            continue;
+        }
+        if std::fs::write(&target, bytes).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
 
 /// 把已校验的插件目录安装到 `plugins_root/<id>`。
 ///
@@ -225,11 +299,13 @@ pub fn install_dir(
                 config::sanitize_dir_name(&cfg.id),
                 std::process::id()
             ));
+            let keep = read_preserved(&dest);
             let _ = std::fs::remove_dir_all(&backup);
             std::fs::rename(&dest, &backup)
                 .with_context(|| rcgui_i18n::f("备份旧版本失败: {}", &[&(dest.display())]))?;
             match copy_dir(src_dir, &dest) {
                 Ok(()) => {
+                    restore_preserved(&dest, &keep);
                     let _ = std::fs::remove_dir_all(&backup);
                     Ok(InstallOutcome::Upgraded {
                         id: cfg.id,
@@ -282,8 +358,12 @@ pub fn install_zip(
 
 /// 从 zip 里读出 `config.json`（不落盘）。
 pub fn peek_zip_config(data: &[u8]) -> Result<PluginConfig> {
-    let content = find_zip_config(data)?
-        .ok_or_else(|| anyhow!("{}", rcgui_i18n::f("压缩包里没有 {}，这不是插件包", &[&(config::CONFIG_JSON)])))?;
+    let content = find_zip_config(data)?.ok_or_else(|| {
+        anyhow!(
+            "{}",
+            rcgui_i18n::f("压缩包里没有 {}，这不是插件包", &[&(config::CONFIG_JSON)])
+        )
+    })?;
     let cfg: PluginConfig = serde_json::from_slice(&content)
         .with_context(|| rcgui_i18n::f("解析 {} 失败", &[&(config::CONFIG_JSON)]))?;
     cfg.validate()?;
@@ -301,7 +381,7 @@ fn find_zip_config(data: &[u8]) -> Result<Option<Vec<u8>>> {
     Ok(None)
 }
 
-fn unwrap_single_dir(dir: &Path) -> PathBuf {
+pub fn unwrap_single_dir(dir: &Path) -> PathBuf {
     let mut dirs = Vec::new();
     let mut files = 0usize;
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -345,9 +425,13 @@ pub fn uninstall(dir: &Path) -> Result<PathBuf> {
     }
     // 只允许删插件根目录下的一级子目录，杜绝误传路径造成的批量删除
     if dir.parent().is_none() {
-        bail!("{}", rcgui_i18n::f("拒绝删除根目录: {}", &[&(dir.display())]));
+        bail!(
+            "{}",
+            rcgui_i18n::f("拒绝删除根目录: {}", &[&(dir.display())])
+        );
     }
-    std::fs::remove_dir_all(dir).with_context(|| rcgui_i18n::f("删除插件目录失败: {}", &[&(dir.display())]))?;
+    std::fs::remove_dir_all(dir)
+        .with_context(|| rcgui_i18n::f("删除插件目录失败: {}", &[&(dir.display())]))?;
     Ok(dir.to_path_buf())
 }
 
@@ -376,8 +460,11 @@ mod tests {
                 "controls": [{"kind": "group", "key": "g", "label": "① 测试"}]
             }
         });
-        std::fs::write(dir.join(config::CONFIG_JSON), serde_json::to_vec_pretty(&cfg).unwrap())
-            .unwrap();
+        std::fs::write(
+            dir.join(config::CONFIG_JSON),
+            serde_json::to_vec_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
         std::fs::write(dir.join("main.wasm"), wasm).unwrap();
         write_check(dir).unwrap();
     }
@@ -455,7 +542,10 @@ mod tests {
         write_pkg(&v2, "demo.install", "1.1.0", b"two");
         let r = install_dir(&v2, &root, "1.0.0", false).unwrap();
         assert!(matches!(r, InstallOutcome::Upgraded { .. }), "实际: {r:?}");
-        assert_eq!(std::fs::read(root.join("demo.install/main.wasm")).unwrap(), b"two");
+        assert_eq!(
+            std::fs::read(root.join("demo.install/main.wasm")).unwrap(),
+            b"two"
+        );
 
         // 低版本 → 不替换
         let v0 = base.join("v0");
@@ -505,7 +595,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let filler = vec![b'A'; 300];
         let bytes = crate::zip::tests::build_store_zip(&[("readme.txt", filler.as_slice())]);
-        let err = install_zip(&bytes, &root, &tmp, "1.0.0").unwrap_err().to_string();
+        let err = install_zip(&bytes, &root, &tmp, "1.0.0")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("config.json"), "实际: {err}");
 
         let _ = std::fs::remove_dir_all(&base);

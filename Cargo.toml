@@ -12,7 +12,10 @@ members = [
 # 见 plugins/manifest.json 与 docs/PLUGIN.md。本工作区只编译本体。
 
 [workspace.package]
-version = "0.2.1"
+# 版本号的唯一来源：所有成员用 version.workspace = true 继承，二进制通过
+# env!("CARGO_PKG_VERSION") 读取，插件看到的 gui_version 和商店里的
+# min_gui_version 比较都用这个值。改这里等于发一个新版本，规则见 docs/VERSIONING.md。
+version = "0.3.0"
 edition = "2021"
 
 [workspace.dependencies]
@@ -33,6 +36,14 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 [profile.release]
+# 按体积权衡选的 opt-level = "s"：它介于默认 3 和 "z" 之间，代码不被压得那么狠，
+# 内联保留得多一些。选它是对"体积"和"Slint 这类吃内联的代码"的折中，不是测量结论——
+# 到底换来多少体积、启动变快还是变慢，这个仓库还没有发布版的实测数据。
+# 改动前后都用 scripts/measure-perf.ps1 量，方法见 docs/PERFORMANCE.md。
+opt-level = "s"
 strip = true
 lto = "thin"
 codegen-units = 1
+# panic 保持默认的 unwind。插件是 wasm，插件里的崩溃不会通过 catch_unwind 传到宿主——
+# 这是两件不同的事，别把 unwind 当成插件沙箱。保留它只是因为改成 abort 会让任何一处
+# panic 直接结束进程、日志来不及落盘，排查问题更难。

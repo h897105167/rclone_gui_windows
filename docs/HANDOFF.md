@@ -1,5 +1,13 @@
 # RCGUI 交接总结（供新对话使用）
 
+> **⚠️ 历史存档，不是当前状态。**
+> 这份文档写于 2026-10-17（0.2.x 时期），描述的是当时的仓库状态、当时的路径和当时的架构。
+> **它不描述 0.3.0**：受管内核、服务层、静态插件商店、CLI 这些都不在其中，文中出现的
+> 绝对路径、HEAD 号、测试数量也早已过期。
+> 想知道现在是什么样，看 [`ARCHITECTURE.md`](ARCHITECTURE.md)；想跑起来看
+> [`../README.md`](../README.md) 的「快速开始」，构建细节看 [`RELEASE.md`](RELEASE.md)。
+> 保留原文是为了留下决策过程，不要拿它当现状引用。
+
 > 生成时间：2026-10-17 · 仓库：`D:\work\Documents\projects\rclone_gui_windows`
 > 分支 `main` · HEAD `c6e328a` · 工作树**干净** · 与 `origin/main` 完全同步（0 ahead / 0 behind）
 

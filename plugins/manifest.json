@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "body_repo": "https://github.com/h897105167/rclone_gui_windows",
-  "note": "插件源码不在本仓库。每个插件是独立 GitHub 仓库，Release 里挂打包好的 zip；本文件只锁版本与哈希，脚本按它下载校验。改版本 = 改 tag + sha256。",
+  "note": "插件源码不在本仓库。每个插件是独立 GitHub 仓库，Release 里挂打包好的 zip；本文件只锁版本与哈希，脚本按它下载校验。改版本 = 改 tag + sha256。表里没有的插件不参与构建、不进 portable 包（例如 onerclone：它会自己拉起 rclone 进程，与受管内核抢同一个 6800 端口）。",
   "plugins": [
     {
       "id": "imagehost",
@@ -11,15 +11,6 @@
       "asset": "imagehost-0.6.1.zip",
       "sha256": "223248d77feb63f86182410eff8a42213e05f2c29f30175f64cc4497b59093c2",
       "dir": "imagehost"
-    },
-    {
-      "id": "onerclone",
-      "name": "一键 rclone",
-      "repo": "https://github.com/h897105167/rcgui-plugin-oneclick",
-      "tag": "v0.3.3",
-      "asset": "onerclone-0.3.3.zip",
-      "sha256": "33f2668d865fe3e6ac001c4f47c473b5cdf7d80671f8d4d33c83ddd3e0eed1b0",
-      "dir": "onerclone"
     },
     {
       "id": "teldrive",

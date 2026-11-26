@@ -75,7 +75,13 @@ impl PluginJson {
         }
         // id 必须像反向域名，避免与 WASM 插件或其它包混淆
         if !self.id.contains('.') || self.id.contains(char::is_whitespace) {
-            bail!("{}", rcgui_i18n::f("plugin.json 的 id 格式不合法（应类似 com.example.plugin）：{}", &[&(self.id)]));
+            bail!(
+                "{}",
+                rcgui_i18n::f(
+                    "plugin.json 的 id 格式不合法（应类似 com.example.plugin）：{}",
+                    &[&(self.id)]
+                )
+            );
         }
         if self.name.trim().is_empty() {
             bail!("{}", rcgui_i18n::t("plugin.json 缺少 name"));
@@ -83,11 +89,18 @@ impl PluginJson {
         if self.version.trim().is_empty() {
             bail!("{}", rcgui_i18n::t("plugin.json 缺少 version"));
         }
-        Version::parse(self.version.trim())
-            .with_context(|| rcgui_i18n::f("plugin.json 的 version 不是合法语义化版本：{}", &[&(self.version)]))?;
+        Version::parse(self.version.trim()).with_context(|| {
+            rcgui_i18n::f(
+                "plugin.json 的 version 不是合法语义化版本：{}",
+                &[&(self.version)],
+            )
+        })?;
         if !self.min_gui_version.trim().is_empty() {
             Version::parse(self.min_gui_version.trim()).with_context(|| {
-                rcgui_i18n::f("plugin.json 的 min_gui_version 不是合法语义化版本：{}", &[&(self.min_gui_version)])
+                rcgui_i18n::f(
+                    "plugin.json 的 min_gui_version 不是合法语义化版本：{}",
+                    &[&(self.min_gui_version)],
+                )
             })?;
         }
         if self.entry_file.trim().is_empty() {
@@ -97,7 +110,13 @@ impl PluginJson {
         // `any`（或不填）与 `windows` 都放行，其余拒绝。
         let platform = self.platform.trim();
         if !platform.is_empty() && platform != "windows" && platform != "any" {
-            bail!("{}", rcgui_i18n::f("插件声明的平台不受支持：{}（仅支持 windows / any）", &[&(platform)]));
+            bail!(
+                "{}",
+                rcgui_i18n::f(
+                    "插件声明的平台不受支持：{}（仅支持 windows / any）",
+                    &[&(platform)]
+                )
+            );
         }
         Ok(())
     }
@@ -111,7 +130,13 @@ impl PluginJson {
         let have = Version::parse(gui_version.trim())
             .with_context(|| rcgui_i18n::f("宿主版本号无法解析：{}", &[&(gui_version)]))?;
         if have < need {
-            bail!("{}", rcgui_i18n::f("插件需要宿主版本 >= {}，当前为 {}", &[&(self.min_gui_version), &(gui_version)]));
+            bail!(
+                "{}",
+                rcgui_i18n::f(
+                    "插件需要宿主版本 >= {}，当前为 {}",
+                    &[&(self.min_gui_version), &(gui_version)]
+                )
+            );
         }
         Ok(())
     }
@@ -142,10 +167,19 @@ pub fn parse_manifest(text: &str) -> Result<Vec<HashEntry>> {
         // 去掉 sha256sum 的二进制标记 "*"
         let path = rest.strip_prefix('*').unwrap_or(rest).trim();
         if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            bail!("{}", rcgui_i18n::f("manifest.sha256 第 {} 行的哈希不合法（应为 64 位十六进制）", &[&(lineno + 1)]));
+            bail!(
+                "{}",
+                rcgui_i18n::f(
+                    "manifest.sha256 第 {} 行的哈希不合法（应为 64 位十六进制）",
+                    &[&(lineno + 1)]
+                )
+            );
         }
         if path.is_empty() {
-            bail!("{}", rcgui_i18n::f("manifest.sha256 第 {} 行缺少文件路径", &[&(lineno + 1)]));
+            bail!(
+                "{}",
+                rcgui_i18n::f("manifest.sha256 第 {} 行缺少文件路径", &[&(lineno + 1)])
+            );
         }
         out.push(HashEntry {
             sha256: hash.to_ascii_lowercase(),
@@ -153,7 +187,10 @@ pub fn parse_manifest(text: &str) -> Result<Vec<HashEntry>> {
         });
     }
     if out.is_empty() {
-        bail!("{}", rcgui_i18n::t("manifest.sha256 为空，无法校验插件完整性"));
+        bail!(
+            "{}",
+            rcgui_i18n::t("manifest.sha256 为空，无法校验插件完整性")
+        );
     }
     Ok(out)
 }
@@ -179,7 +216,13 @@ pub fn verify_dir(dir: &Path, pj: &PluginJson) -> Result<VerifyReport> {
 
     let entry_rel = pj.entry_file.replace('\\', "/");
     if !entries.iter().any(|e| e.path == entry_rel) {
-        bail!("{}", rcgui_i18n::f("manifest.sha256 未包含入口文件 {}，拒绝加载", &[&(entry_rel)]));
+        bail!(
+            "{}",
+            rcgui_i18n::f(
+                "manifest.sha256 未包含入口文件 {}，拒绝加载",
+                &[&(entry_rel)]
+            )
+        );
     }
 
     let mut verified = Vec::new();
@@ -187,11 +230,20 @@ pub fn verify_dir(dir: &Path, pj: &PluginJson) -> Result<VerifyReport> {
         let p = zip::safe_join(dir, &e.path)
             .with_context(|| rcgui_i18n::f("manifest.sha256 中的路径不合法: {}", &[&(e.path)]))?;
         if !p.is_file() {
-            bail!("{}", rcgui_i18n::f("插件缺少清单中声明的文件: {}", &[&(e.path)]));
+            bail!(
+                "{}",
+                rcgui_i18n::f("插件缺少清单中声明的文件: {}", &[&(e.path)])
+            );
         }
         let got = zip::sha256_file(&p)?;
         if got != e.sha256 {
-            bail!("{}", rcgui_i18n::f("插件文件校验失败: {}\n  期望 {}\n  实际 {}", &[&(e.path), &(e.sha256), &(got)]));
+            bail!(
+                "{}",
+                rcgui_i18n::f(
+                    "插件文件校验失败: {}\n  期望 {}\n  实际 {}",
+                    &[&(e.path), &(e.sha256), &(got)]
+                )
+            );
         }
         verified.push(e.path.clone());
     }
@@ -265,9 +317,14 @@ pub fn scan_dir(root: &Path, gui_version: &str) -> (Vec<InstalledPlugin>, Vec<(P
 
 /// 从 zip 字节流读取插件元数据（不落盘）。
 pub fn peek_zip_meta(data: &[u8]) -> Result<PluginJson> {
-    let (_name, content) = zip::find_plugin_json(data)?
-        .ok_or_else(|| anyhow!("{}", rcgui_i18n::t("压缩包内未找到 plugin.json，这不是一个插件包")))?;
-    let pj: PluginJson = serde_json::from_slice(&content).context(rcgui_i18n::t("解析 plugin.json 失败"))?;
+    let (_name, content) = zip::find_plugin_json(data)?.ok_or_else(|| {
+        anyhow!(
+            "{}",
+            rcgui_i18n::t("压缩包内未找到 plugin.json，这不是一个插件包")
+        )
+    })?;
+    let pj: PluginJson =
+        serde_json::from_slice(&content).context(rcgui_i18n::t("解析 plugin.json 失败"))?;
     pj.validate()?;
     Ok(pj)
 }
@@ -305,7 +362,9 @@ pub enum InstallOutcome {
 impl InstallOutcome {
     pub fn message(&self) -> String {
         match self {
-            InstallOutcome::Added { id, version } => rcgui_i18n::f("已添加插件 {} v{}", &[&(id), &(version)]),
+            InstallOutcome::Added { id, version } => {
+                rcgui_i18n::f("已添加插件 {} v{}", &[&(id), &(version)])
+            }
             InstallOutcome::Upgraded { id, from, to } => {
                 rcgui_i18n::f("已更新插件 {}：v{} → v{}", &[&(id), &(from), &(to)])
             }
@@ -313,7 +372,10 @@ impl InstallOutcome {
                 id,
                 installed,
                 offered,
-            } => rcgui_i18n::f("插件 {} 已安装 v{}，来源版本 v{} 不更高，未替换", &[&(id), &(installed), &(offered)]),
+            } => rcgui_i18n::f(
+                "插件 {} 已安装 v{}，来源版本 v{} 不更高，未替换",
+                &[&(id), &(installed), &(offered)],
+            ),
         }
     }
 }
@@ -321,10 +383,22 @@ impl InstallOutcome {
 /// 检查来源文件大小是否合理。
 pub fn check_source_size(bytes: u64) -> Result<()> {
     if bytes < MIN_PACKAGE_BYTES {
-        bail!("{}", rcgui_i18n::f("文件太小（{} 字节），不像是一个插件包（至少 {} 字节）", &[&(bytes), &(MIN_PACKAGE_BYTES)]));
+        bail!(
+            "{}",
+            rcgui_i18n::f(
+                "文件太小（{} 字节），不像是一个插件包（至少 {} 字节）",
+                &[&(bytes), &(MIN_PACKAGE_BYTES)]
+            )
+        );
     }
     if bytes > MAX_PACKAGE_BYTES {
-        bail!("{}", rcgui_i18n::f("文件太大（{} MB），超过上限 {} MB，拒绝处理", &[&(bytes / 1024 / 1024), &(MAX_PACKAGE_BYTES / 1024 / 1024)]));
+        bail!(
+            "{}",
+            rcgui_i18n::f(
+                "文件太大（{} MB），超过上限 {} MB，拒绝处理",
+                &[&(bytes / 1024 / 1024), &(MAX_PACKAGE_BYTES / 1024 / 1024)]
+            )
+        );
     }
     Ok(())
 }
@@ -360,12 +434,19 @@ pub fn install_verified_dir(
         }),
         Some(old) => {
             // 替换：先把旧目录挪到旁边，避免复制中途失败导致新旧都不完整
-            let backup = plugins_root.join(format!("{}.old-{}", sanitize_dir_name(&meta.id), std::process::id()));
+            let backup = plugins_root.join(format!(
+                "{}.old-{}",
+                sanitize_dir_name(&meta.id),
+                std::process::id()
+            ));
+            // 插件的 KV 数据也在这个目录里，升级不能连用户状态一起删掉
+            let keep = crate::bundle::read_preserved(&dest);
             let _ = std::fs::remove_dir_all(&backup);
             std::fs::rename(&dest, &backup)
                 .with_context(|| rcgui_i18n::f("备份旧版本失败: {}", &[&(dest.display())]))?;
             match copy_dir(src_dir, &dest) {
                 Ok(()) => {
+                    crate::bundle::restore_preserved(&dest, &keep);
                     let _ = std::fs::remove_dir_all(&backup);
                     Ok(InstallOutcome::Upgraded {
                         id: meta.id,
@@ -402,7 +483,11 @@ pub fn install_from_zip(
     // 先看元数据（不解压全部），尽早拒绝非插件包
     let meta = peek_zip_meta(data)?;
 
-    let tmp = tmp_root.join(format!("unpack-{}-{}", std::process::id(), sanitize_dir_name(&meta.id)));
+    let tmp = tmp_root.join(format!(
+        "unpack-{}-{}",
+        std::process::id(),
+        sanitize_dir_name(&meta.id)
+    ));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
     let result = (|| -> Result<InstallOutcome> {
@@ -473,7 +558,10 @@ pub fn sanitize_dir_name(id: &str) -> String {
 pub fn run_entry_file(pkg_dir: &Path, meta: &PluginJson) -> Result<i32> {
     let entry = zip::safe_join(pkg_dir, &meta.entry_file)?;
     if !entry.is_file() {
-        bail!("{}", rcgui_i18n::f("入口文件不存在: {}", &[&(entry.display())]));
+        bail!(
+            "{}",
+            rcgui_i18n::f("入口文件不存在: {}", &[&(entry.display())])
+        );
     }
     let ext = entry
         .extension()
@@ -504,7 +592,13 @@ pub fn run_entry_file(pkg_dir: &Path, meta: &PluginJson) -> Result<i32> {
                 .arg(&entry);
             c
         }
-        other => bail!("{}", rcgui_i18n::f("不支持的入口文件类型: .{}（支持 msi / exe / bat / cmd / ps1）", &[&(other)])),
+        other => bail!(
+            "{}",
+            rcgui_i18n::f(
+                "不支持的入口文件类型: .{}（支持 msi / exe / bat / cmd / ps1）",
+                &[&(other)]
+            )
+        ),
     };
 
     cmd.args(&meta.entry_args);
@@ -587,7 +681,10 @@ a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2 *bin/helper.exe
         assert_eq!(es.len(), 3);
         assert_eq!(es[0].path, "config.json");
         // 哈希统一小写
-        assert_eq!(es[1].sha256, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(
+            es[1].sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
         // 二进制标记被去掉
         assert_eq!(es[2].path, "bin/helper.exe");
     }
@@ -596,9 +693,13 @@ a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2 *bin/helper.exe
     fn rejects_malformed_manifest() {
         assert!(parse_manifest("").is_err(), "空清单应报错");
         assert!(parse_manifest("# 只有注释\n").is_err());
-        assert!(parse_manifest("deadbeef config.json").is_err(), "哈希长度不足");
         assert!(
-            parse_manifest("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855").is_err(),
+            parse_manifest("deadbeef config.json").is_err(),
+            "哈希长度不足"
+        );
+        assert!(
+            parse_manifest("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+                .is_err(),
             "缺少路径"
         );
     }
@@ -662,9 +763,16 @@ a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2 *bin/helper.exe
 
         // 入口文件不在清单里 → 拒绝
         std::fs::write(dir.join("config.json"), cfg).unwrap();
-        std::fs::write(dir.join("manifest.sha256"), format!("{}  config.json\n", zip::sha256_hex(cfg))).unwrap();
+        std::fs::write(
+            dir.join("manifest.sha256"),
+            format!("{}  config.json\n", zip::sha256_hex(cfg)),
+        )
+        .unwrap();
         let err = load_from_dir(&dir, "2.0.0").unwrap_err().to_string();
-        assert!(err.contains("入口文件"), "应报入口文件未列入清单，实际: {err}");
+        assert!(
+            err.contains("入口文件"),
+            "应报入口文件未列入清单，实际: {err}"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -721,7 +829,10 @@ a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2 *bin/helper.exe
         let older = make_pkg(&base, "com.example.a", "0.9.0", b"v0");
         let r3 = install_verified_dir(&older, &root, "2.0.0").unwrap();
         assert!(matches!(r3, InstallOutcome::Kept { .. }), "实际: {r3:?}");
-        assert_eq!(std::fs::read(root.join("com.example.a/setup.msi")).unwrap(), b"v1");
+        assert_eq!(
+            std::fs::read(root.join("com.example.a/setup.msi")).unwrap(),
+            b"v1"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -744,7 +855,10 @@ a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2 *bin/helper.exe
             }
         );
         // 内容确实被替换
-        assert_eq!(std::fs::read(root.join("com.example.b/setup.msi")).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read(root.join("com.example.b/setup.msi")).unwrap(),
+            b"new"
+        );
         // 备份目录已清理
         let leftovers: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
@@ -759,7 +873,10 @@ a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2 *bin/helper.exe
     #[test]
     fn rejects_source_size_out_of_range() {
         assert!(check_source_size(10).is_err(), "过小应拒绝");
-        assert!(check_source_size(MAX_PACKAGE_BYTES + 1).is_err(), "过大应拒绝");
+        assert!(
+            check_source_size(MAX_PACKAGE_BYTES + 1).is_err(),
+            "过大应拒绝"
+        );
         assert!(check_source_size(4096).is_ok(), "正常大小应通过");
     }
 
@@ -781,7 +898,8 @@ a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2 *bin/helper.exe
         std::fs::create_dir_all(&tmp).unwrap();
 
         // 构造一个完整插件包（含 manifest.sha256）的 zip
-        let pj_json = br#"{"id":"com.example.z","name":"Z","version":"2.1.0","entry_file":"setup.msi"}"#;
+        let pj_json =
+            br#"{"id":"com.example.z","name":"Z","version":"2.1.0","entry_file":"setup.msi"}"#;
         let msi = b"msi-bytes-here";
         let manifest = format!("{}  setup.msi\n", zip::sha256_hex(msi));
         let zip_bytes = crate::zip::tests::build_store_zip(&[
@@ -798,7 +916,10 @@ a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2 *bin/helper.exe
                 version: "2.1.0".into()
             }
         );
-        assert_eq!(std::fs::read(root.join("com.example.z/setup.msi")).unwrap(), msi);
+        assert_eq!(
+            std::fs::read(root.join("com.example.z/setup.msi")).unwrap(),
+            msi
+        );
         // 安装后重新扫描必须能通过完整性校验
         let (ok, bad) = scan_dir(&root, "2.0.0");
         assert_eq!(ok.len(), 1);
@@ -818,12 +939,15 @@ a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2 *bin/helper.exe
         let tmp = base.join("tmp");
         std::fs::create_dir_all(&tmp).unwrap();
 
-        let pj_json = br#"{"id":"com.example.nomani","name":"N","version":"1.0.0","entry_file":"setup.msi"}"#;
+        let pj_json =
+            br#"{"id":"com.example.nomani","name":"N","version":"1.0.0","entry_file":"setup.msi"}"#;
         let zip_bytes = crate::zip::tests::build_store_zip(&[
             ("plugin.json", pj_json.as_slice()),
             ("setup.msi", b"x".as_slice()),
         ]);
-        let err = install_from_zip(&zip_bytes, &root, &tmp, "2.0.0").unwrap_err().to_string();
+        let err = install_from_zip(&zip_bytes, &root, &tmp, "2.0.0")
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("manifest.sha256"),
             "应提示缺少 manifest.sha256，实际: {err}"
@@ -842,17 +966,19 @@ a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2 *bin/helper.exe
 
         // 内容需大于最小体积阈值，确保测的是"缺少 plugin.json"而不是"文件太小"
         let filler = vec![b'A'; (MIN_PACKAGE_BYTES as usize) + 100];
-        let zip_bytes = crate::zip::tests::build_store_zip(&[(
-            "readme.txt",
-            filler.as_slice(),
-        )]);
+        let zip_bytes = crate::zip::tests::build_store_zip(&[("readme.txt", filler.as_slice())]);
         assert!(
             zip_bytes.len() as u64 >= MIN_PACKAGE_BYTES,
             "测试用 zip 必须超过最小体积阈值"
         );
 
-        let err = install_from_zip(&zip_bytes, &root, &tmp, "2.0.0").unwrap_err().to_string();
-        assert!(err.contains("plugin.json"), "应提示缺少 plugin.json，实际: {err}");
+        let err = install_from_zip(&zip_bytes, &root, &tmp, "2.0.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("plugin.json"),
+            "应提示缺少 plugin.json，实际: {err}"
+        );
         // 不应在插件目录留下任何东西
         assert!(!root.join("readme.txt").exists());
         assert!(!root.join("com.example").exists());
@@ -868,7 +994,8 @@ a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2 *bin/helper.exe
         let tmp = base.join("tmp");
         std::fs::create_dir_all(&tmp).unwrap();
 
-        let pj_json = br#"{"id":"com.example.nest","name":"N","version":"3.0.0","entry_file":"setup.msi"}"#;
+        let pj_json =
+            br#"{"id":"com.example.nest","name":"N","version":"3.0.0","entry_file":"setup.msi"}"#;
         let msi = b"nested-msi";
         let manifest = format!("{}  setup.msi\n", zip::sha256_hex(msi));
         let zip_bytes = crate::zip::tests::build_store_zip(&[
@@ -886,7 +1013,10 @@ a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2 *bin/helper.exe
             }
         );
         assert!(root.join("com.example.nest/plugin.json").is_file());
-        assert_eq!(std::fs::read(root.join("com.example.nest/setup.msi")).unwrap(), msi);
+        assert_eq!(
+            std::fs::read(root.join("com.example.nest/setup.msi")).unwrap(),
+            msi
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

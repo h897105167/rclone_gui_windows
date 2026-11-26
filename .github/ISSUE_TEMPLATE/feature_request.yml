@@ -1,0 +1,56 @@
+name: 功能建议
+description: 提出新功能或现有功能的改进
+title: "[feat] "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提之前请先看 [docs/ARCHITECTURE.md](https://github.com/h897105167/rclone_gui_windows/blob/main/docs/ARCHITECTURE.md) 的分层表和
+        「现在 vs 目标」——有些东西已经在开发排期里，有些则明确不属于 RCGUI 的范围
+        （例如：把界面换成 webview、在外部端点模式下接管进程、给官方 rclone 加原生后端）。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题
+      description: 描述场景和当前卡点，不要一上来就指定实现方式。
+      placeholder: 我经常在三个 remote 之间比对同一目录，现在要来回切…
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你设想的做法
+      description: 可以是界面草图、交互步骤、或者一句"照 xxx 那样"。
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: 涉及哪一块
+      options:
+        - 文件页
+        - 远程 / 挂载 / 服务
+        - 传输
+        - 插件
+        - 内核与连接
+        - 设置 / 配置 / 迁移
+        - 更新 / 商店
+        - 诊断 / 可访问性
+        - 其他 / 不确定
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你试过的替代方案
+      description: 例如用 rclone 命令行、别的 GUI、脚本绕过。这能说明痛点有多硬。
+    validations:
+      required: false
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 我搜索过已有 issue 和讨论
+          required: true

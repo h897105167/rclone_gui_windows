@@ -38,7 +38,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use plugin_host::config::{ControlKind, FieldKind, PluginConfig, PluginSetting, CONFIG_JSON};
 use plugin_host::{bundle, Allowed, CapProvider};
 use serde_json::{json, Map, Value};
-use slint::{ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle as _, ModelRc, SharedString, VecModel};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -82,7 +82,8 @@ pub fn builtin_ids() -> Vec<String> {
     out
 }
 
-fn copy_dir(src: &Path, dst: &Path) -> Result<()> {    std::fs::create_dir_all(dst)?;
+fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)?.flatten() {
         let from = entry.path();
         let to = dst.join(entry.file_name());
@@ -104,7 +105,11 @@ pub fn ensure_builtin(ctx: &Arc<Ctx>) -> Vec<String> {
     let Some(root) = builtin_root() else {
         return Vec::new();
     };
-    let removed = ctx.cfg.lock().map(|c| c.plugin_removed.clone()).unwrap_or_default();
+    let removed = ctx
+        .cfg
+        .lock()
+        .map(|c| c.plugin_removed.clone())
+        .unwrap_or_default();
     let dest_root = plugins_dir();
     let mut installed = Vec::new();
     let Ok(rd) = std::fs::read_dir(&root) else {
@@ -173,7 +178,8 @@ pub fn restore_builtin(ctx: &Arc<Ctx>, id: &str) -> Result<()> {
         cfg.plugin_enabled.insert(id.to_string(), true);
         let _ = config::save(&cfg);
     }
-    let root = builtin_root().ok_or_else(|| anyhow!("{}", rcgui_i18n::t("找不到内置插件目录（assets/plugins）")))?;
+    let root = builtin_root()
+        .ok_or_else(|| anyhow!("{}", rcgui_i18n::t("找不到内置插件目录（assets/plugins）")))?;
     let mut found = None;
     if let Ok(rd) = std::fs::read_dir(&root) {
         for entry in rd.flatten() {
@@ -186,7 +192,8 @@ pub fn restore_builtin(ctx: &Arc<Ctx>, id: &str) -> Result<()> {
             }
         }
     }
-    let src = found.ok_or_else(|| anyhow!("{}", rcgui_i18n::f("内置插件 {} 不在安装包里", &[&(id)])))?;
+    let src =
+        found.ok_or_else(|| anyhow!("{}", rcgui_i18n::f("内置插件 {} 不在安装包里", &[&(id)])))?;
     let dest = plugins_dir().join(plugin_host::config::sanitize_dir_name(id));
     if dest.exists() {
         std::fs::remove_dir_all(&dest).ok();
@@ -222,11 +229,18 @@ fn remove_plugin_files(path: &Path, plugins_root: &Path, id: &str) -> Result<Pat
     let removed = if path.is_dir() {
         plugin_host::bundle::uninstall(path)?
     } else if path.is_file() {
-        std::fs::remove_file(path).map_err(|e| anyhow!("{}", rcgui_i18n::f("删除 {} 失败: {}", &[&(path.display()), &(e)])))?;
+        std::fs::remove_file(path).map_err(|e| {
+            anyhow!(
+                "{}",
+                rcgui_i18n::f("删除 {} 失败: {}", &[&(path.display()), &(e)])
+            )
+        })?;
         path.to_path_buf()
     } else {
         // 路径已不存在：按目录再试一次，仍不行就报错（不要静默成功）
-        plugin_host::bundle::uninstall(&plugins_root.join(plugin_host::config::sanitize_dir_name(id)))?
+        plugin_host::bundle::uninstall(
+            &plugins_root.join(plugin_host::config::sanitize_dir_name(id)),
+        )?
     };
     // 单文件插件的 kv 目录与 wasm 同名，删完本体要顺手清掉
     let kv_dir = plugins_root.join(plugin_host::config::sanitize_dir_name(id));
@@ -276,6 +290,208 @@ pub fn removed_builtins(ctx: &Arc<Ctx>) -> Vec<(String, String, String)> {
     // 上面那次扫描就能列出它们的名字与版本。
     out.sort_by(|a, b| a.1.cmp(&b.1));
     out
+}
+
+// ---------------- 来源记录 ----------------
+
+/// 商店安装时写在插件目录里的来源文件。
+///
+/// 放在插件目录内（而不是应用配置里）是因为它描述的是"这个包装的是哪一份"，
+/// 随目录一起被删掉才不会留下指向已卸载插件的陈旧记录。校验清单
+/// `check.sha256` 只要求列出的文件存在且一致，不禁止多余文件，所以加这一个
+/// 文件不会让插件变成"校验失败"。
+pub const ORIGIN_FILE: &str = "origin.json";
+
+/// 记录插件来源。`source` 取 `"store"` / `"local"` / `"builtin"`。
+///
+/// 写失败只影响导出时的来源标注（那时会退化成按目录推断），不打断安装。
+pub fn write_origin(dir: &Path, source: &str, url: &str, sha256: &str) {
+    let body = json!({ "source": source, "url": url, "sha256": sha256 });
+    let _ = std::fs::write(
+        dir.join(ORIGIN_FILE),
+        serde_json::to_vec_pretty(&body).unwrap_or_default(),
+    );
+}
+
+/// 插件来源。读不到或读坏时三个字段都是空串，调用方据此回退到按目录推断。
+#[derive(Default)]
+struct Origin {
+    source: String,
+    url: String,
+    sha256: String,
+}
+
+fn read_origin(dir: &Path) -> Origin {
+    let Ok(raw) = std::fs::read(dir.join(ORIGIN_FILE)) else {
+        return Origin::default();
+    };
+    let Ok(v) = serde_json::from_slice::<Value>(&raw) else {
+        return Origin::default();
+    };
+    let get = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    Origin {
+        source: get("source"),
+        url: get("url"),
+        sha256: get("sha256"),
+    }
+}
+
+/// 导出 `rcgui.conf` 用的插件清单：装了什么、什么版本、从哪来、是否启用、它自己的设置。
+///
+/// 只写身份与设置，**不写二进制**：导入端按 `source` / `url` / `sha256` 重新安装，
+/// 装不上就跳过并告诉用户，而不是把一个看不见的旧 wasm 塞回磁盘。
+/// `settings` 里可能有凭据，是否真正写出由 `include_secrets` 决定，这里原样交出去。
+pub fn bundle_refs(ctx: &Arc<Ctx>) -> Vec<rcgui_profile::PluginRef> {
+    let enabled_map = ctx
+        .cfg
+        .lock()
+        .map(|c| c.plugin_enabled.clone())
+        .unwrap_or_default();
+    let builtin = builtin_ids();
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(plugins_dir()) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() || plugin_host::config::ConfigFileNames::detect(&dir).is_none() {
+            continue;
+        }
+        let Some(cfg) = bundle::read_config_lenient(&dir) else {
+            continue;
+        };
+        let id = cfg.id.clone();
+        let origin = read_origin(&dir);
+        // 没有来源记录的老插件只能按"是否随程序发布"推断，剩下的都算本地安装。
+        let source = if origin.source.is_empty() {
+            if builtin.iter().any(|b| *b == id) {
+                "builtin"
+            } else {
+                "local"
+            }
+        } else {
+            origin.source.as_str()
+        };
+        let mut settings = ctx.store.get_all(&id);
+        if let Some(o) = settings.as_object_mut() {
+            // `_state` 是插件自己写的过程状态（进度、上次校验结果），换台机器没意义。
+            o.remove("_state");
+        }
+        out.push(rcgui_profile::PluginRef {
+            id: id.clone(),
+            name: cfg.name.clone(),
+            version: cfg.version.clone(),
+            source: source.to_string(),
+            url: origin.url,
+            sha256: origin.sha256,
+            enabled: enabled_map.get(&id).copied().unwrap_or(false),
+            settings: settings.as_object().cloned().unwrap_or_default(),
+            secret_keys: declared_secret_keys(&cfg),
+        });
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// 插件 manifest 里声明为密码字段的键名（小写），交给导出侧做凭据剥离。
+///
+/// 键名本身不像凭据的字段（imagehost 的 `short_key` 就属于这种）只能靠这份声明认出来，
+/// 所以它必须以插件包为准，而不是靠 `is_secret_key` 猜。
+fn declared_secret_keys(cfg: &plugin_host::config::PluginConfig) -> Vec<String> {
+    let mut keys: Vec<String> = cfg
+        .plugin_setting
+        .controls
+        .iter()
+        .filter(|c| c.field.eq_ignore_ascii_case("password"))
+        .map(|c| c.key.to_ascii_lowercase())
+        .filter(|k| !k.is_empty())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// 把 `src` 合并进 `dst`：两边都是对象就逐键递归，其余情况用 `src` 覆盖。
+///
+/// null 与空字符串不覆盖，和 [`is_empty_value`] 保持同一套判断：导入端分不清
+/// 「文件里没这一项」和「这一项是空的」，而让用户的旧凭据活下来比让文件忠实更重要。
+fn merge_objects(dst: &mut Value, src: &Value) {
+    match (dst, src) {
+        (Value::Object(d), Value::Object(s)) => {
+            for (k, v) in s {
+                if k == "_state" || is_empty_value(v) {
+                    continue;
+                }
+                match (d.get_mut(k), v) {
+                    (Some(slot), v) if slot.is_object() && v.is_object() => merge_objects(slot, v),
+                    _ => {
+                        d.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        (d, s) => *d = s.clone(),
+    }
+}
+
+/// 把导入包里的插件设置写回各自的 `kv.json`，返回真正改过的插件 id。
+///
+/// 只写包里确实带了的键，绝不删除本机多出来的键：包可能是脱敏导出（凭据键已经
+/// 被剥掉），拿它整体覆盖会让用户本机还能用的 token 消失。空字符串和 null 也跳过，
+/// 因为"文件里没写"和"写了个空值"在导入端无法区分，而两者的代价不对称。
+/// 对象值（插件表单就是 `{"form":{…}}` 这种形状）逐键合并，缺的键保留本机值。
+pub fn apply_imported_settings(store: &KvStore, refs: &[rcgui_profile::PluginRef]) -> Vec<String> {
+    let mut touched = Vec::new();
+    for p in refs {
+        if p.settings.is_empty() {
+            continue;
+        }
+        let mut local = store.get_all(&p.id);
+        let mut changed = false;
+        for (k, v) in &p.settings {
+            // `_state` 是插件自己的过程状态（导出时已剔除）；旧包里若残留也不要恢复。
+            if k == "_state" || is_empty_value(v) {
+                continue;
+            }
+            let value = match local.get(k) {
+                Some(Value::Object(existing)) if v.is_object() => {
+                    let mut merged = Value::Object(existing.clone());
+                    merge_objects(&mut merged, v);
+                    merged
+                }
+                _ => v.clone(),
+            };
+            match store.set(&p.id, k, value.clone()) {
+                Ok(()) => {
+                    changed = true;
+                    if let Some(o) = local.as_object_mut() {
+                        o.insert(k.clone(), value);
+                    }
+                }
+                Err(e) => crate::logging::event(
+                    "error",
+                    "plugin",
+                    &format!("import settings {}/{} failed: {e:#}", p.id, k),
+                ),
+            }
+        }
+        if changed {
+            // 磁盘上的 kv.json 已经变了，内存里的旧值必须丢掉，
+            // 否则设置页和插件面板还显示导入前的内容。
+            store.invalidate(&p.id);
+            touched.push(p.id.clone());
+        }
+    }
+    touched.sort();
+    touched
+}
+
+fn is_empty_value(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::String(s) => s.trim().is_empty(),
+        _ => false,
+    }
 }
 
 // ---------------- 列表 ----------------
@@ -355,7 +571,11 @@ fn kv_str(store: &KvStore, id: &str, key: &str) -> String {
 /// 扫描全部插件（新格式 + 旧格式插件包 + 单文件 wasm）。
 pub async fn scan_rows(ctx: &Arc<Ctx>) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
-    let enabled_map = ctx.cfg.lock().map(|c| c.plugin_enabled.clone()).unwrap_or_default();
+    let enabled_map = ctx
+        .cfg
+        .lock()
+        .map(|c| c.plugin_enabled.clone())
+        .unwrap_or_default();
     let builtin = builtin_ids();
     let root = plugins_dir();
     let gv = gui_version();
@@ -448,7 +668,11 @@ pub async fn scan_rows(ctx: &Arc<Ctx>) -> Vec<Row> {
             seen.push(meta.id.clone());
             rows.push(Row {
                 enabled: enabled && verified,
-                lamp: if verified { String::new() } else { "err".into() },
+                lamp: if verified {
+                    String::new()
+                } else {
+                    "err".into()
+                },
                 loaded: verified,
                 verified,
                 has_panel: false,
@@ -532,7 +756,10 @@ pub fn filter_rows(rows: &[Row], needle: &str) -> Vec<Row> {
 
 /// 打开插件目录（explorer → cmd start 回退），是 `fs.open_dir` 与「打开目录」按钮的共用实现。
 pub fn open_path(p: &str) -> Result<()> {
-    let mut ok = std::process::Command::new("explorer.exe").arg(p).spawn().is_ok();
+    let mut ok = std::process::Command::new("explorer.exe")
+        .arg(p)
+        .spawn()
+        .is_ok();
     if !ok {
         ok = std::process::Command::new("cmd.exe")
             .args(["/c", "start", "", p])
@@ -669,7 +896,8 @@ pub fn now_json() -> Value {
 /// `body_b64` 用 base64 而不是字符串：上传的可能是任意二进制（图片），
 /// JSON 字符串装不下非 UTF-8 字节。
 pub async fn dispatch_http(ctx: &Arc<Ctx>, id: &str, req: Value) -> Result<Value> {
-    let (dir, cfg) = loaded_config(id).ok_or_else(|| anyhow!("{}", rcgui_i18n::f("找不到插件 {}", &[&(id)])))?;
+    let (dir, cfg) =
+        loaded_config(id).ok_or_else(|| anyhow!("{}", rcgui_i18n::f("找不到插件 {}", &[&(id)])))?;
     if !cfg.http_entry {
         bail!("{}", rcgui_i18n::f("插件 {} 没有声明 HTTP 入口", &[&(id)]));
     }
@@ -686,13 +914,9 @@ pub async fn dispatch_http(ctx: &Arc<Ctx>, id: &str, req: Value) -> Result<Value
 }
 
 /// 调一次插件：`action` 由 config.json 的 action 控件决定。
-async fn call_plugin(
-    ctx: &Arc<Ctx>,
-    id: &str,
-    action: &str,
-    extra: Value,
-) -> Result<Value> {
-    let (dir, cfg) = loaded_config(id).ok_or_else(|| anyhow!("{}", rcgui_i18n::f("找不到插件 {}", &[&(id)])))?;
+async fn call_plugin(ctx: &Arc<Ctx>, id: &str, action: &str, extra: Value) -> Result<Value> {
+    let (dir, cfg) =
+        loaded_config(id).ok_or_else(|| anyhow!("{}", rcgui_i18n::f("找不到插件 {}", &[&(id)])))?;
     let mut params = json!({
         "action": action,
         // 必须是合并过声明式默认值的有效表单：插件看到的要和界面显示的一致，
@@ -725,11 +949,17 @@ async fn call_entry(
     params: Value,
 ) -> Result<Value> {
     if !cfg.entry_is_wasm() {
-        bail!("{}", rcgui_i18n::f("插件 {} 的入口不是 WASM，无法执行", &[&(id)]));
+        bail!(
+            "{}",
+            rcgui_i18n::f("插件 {} 的入口不是 WASM，无法执行", &[&(id)])
+        );
     }
     let entry = dir.join(&cfg.entry);
     if !entry.is_file() {
-        bail!("{}", rcgui_i18n::f("入口文件不存在: {}", &[&(entry.display())]));
+        bail!(
+            "{}",
+            rcgui_i18n::f("入口文件不存在: {}", &[&(entry.display())])
+        );
     }
     let allowed = Allowed::from_groups(&cfg.capabilities);
     ctx.host
@@ -770,6 +1000,12 @@ pub struct PanelData {
     pub lamp: String,
     pub warning: bool,
     pub enabled: bool,
+    /// 这一行属于哪一页，存**本地化后的显示标签**（不是 `pages[].id`）。
+    ///
+    /// 界面拿它和 `panel-pages` 里的文字逐字比较来筛行，所以两边必须是同一份
+    /// 字符串；空串表示每页都显示。插件没声明 `pages` 时宿主按 group 自动分组，
+    /// 连 group 都没有就全是空串，界面退化成原来的单页。
+    pub page: String,
     /// `kind == "image"` 时这一行要显示的位图：RGBA 字节 + 宽 + 高。
     ///
     /// 解码放在合成线程（磁盘 IO 与解码都不该占 UI 线程），`slint::Image`
@@ -806,10 +1042,13 @@ impl PanelData {
             lamp: self.lamp.as_str().into(),
             warning: self.warning,
             enabled: self.enabled,
+            page: self.page.as_str().into(),
             img: match &self.image {
-                Some((bytes, w, h)) => slint::Image::from_rgba8(
-                    slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(bytes, *w, *h),
-                ),
+                Some((bytes, w, h)) => slint::Image::from_rgba8(slint::SharedPixelBuffer::<
+                    slint::Rgba8Pixel,
+                >::clone_from_slice(
+                    bytes, *w, *h
+                )),
                 None => slint::Image::default(),
             },
         }
@@ -821,9 +1060,211 @@ pub fn panel_to_slint(rows: &[PanelData]) -> Vec<PanelRow> {
     rows.iter().map(|r| r.to_slint()).collect()
 }
 
+/// 名字里带这些词的键，值一律不进调试输出。
+///
+/// 按 `.`/`-`/`_`/`:` 切成段逐段比较，所以 `site.token`、`api_key`、`rclone-password`
+/// 都能命中。`key` 也收进来了：多遮一个普通键只是少看点信息，漏一个凭据就收不回来。
+const SECRET_KEY_PARTS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "pass",
+    "secret",
+    "token",
+    "auth",
+    "authorization",
+    "bearer",
+    "credential",
+    "credentials",
+    "apikey",
+    "key",
+    "session",
+    "cookie",
+    "signature",
+];
+
+fn key_is_secret(key: &str) -> bool {
+    key.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .any(|part| SECRET_KEY_PARTS.contains(&part.to_ascii_lowercase().as_str()))
+}
+
+/// 遮掉一个值，但保留"空 / 非空、多长"这两条排查时要看的信息。
+fn mask_value(v: &str) -> String {
+    if v.is_empty() {
+        String::new()
+    } else {
+        format!("••••（{} 字符）", v.chars().count())
+    }
+}
+
+/// `RCGUI_PANEL_DUMP=<插件 id>` 的输出正文。
+///
+/// 密码框（`field_kind == "password"`）和名字像凭据的键，值只留圆点；其余值跑一遍
+/// [`crate::logging::redact`]，遮掉 URL 里的 userinfo/查询串和 `token=` 这类片段。
+/// 行数、键名、按钮、状态照常打印——调试面板外观不需要真实凭据，而这些输出经常被
+/// 整段贴进聊天窗口或 issue。
+pub fn dump_rows_text(rows: &[PanelData]) -> String {
+    let mut out = String::new();
+    for r in rows {
+        let secret = r.field_kind.eq_ignore_ascii_case("password") || key_is_secret(&r.key);
+        let buttons: Vec<String> = r
+            .buttons
+            .iter()
+            .map(|b| format!("{}/{}", b.label, b.action))
+            .collect();
+        let value = if secret {
+            mask_value(&r.value)
+        } else {
+            crate::logging::redact(&r.value)
+        };
+        out.push_str(&format!(
+            "[{}] key={} label={:?} value={:?}\n",
+            r.kind, r.key, r.label, value
+        ));
+        out.push_str(&format!("    text={:?}\n", crate::logging::redact(&r.text)));
+        out.push_str(&format!(
+            "    field={} options={:?} sel={}\n",
+            r.field_kind, r.options, r.selected_index
+        ));
+        out.push_str(&format!(
+            "    buttons={:?} enabled={} lamp={} ok={} warn={}\n",
+            buttons, r.enabled, r.lamp, r.ok, r.warning
+        ));
+        if let Some((_, w, h)) = &r.image {
+            out.push_str(&format!("    image={w}x{h}\n"));
+        }
+    }
+    out.push_str(&format!("-- total {} rows\n", rows.len()));
+    out
+}
+
 /// 把扫描结果转成 Slint 模型（**必须在 UI 线程调用**，`PluginRow` 含 `ModelRc`）。
 pub fn rows_to_slint(rows: &[Row]) -> Vec<PluginRow> {
     rows.iter().map(|r| r.to_slint()).collect()
+}
+
+/// 面板里出现过的页标签，按首次出现顺序去重。
+///
+/// 空串不算一页：它是「哪一页都显示」的行（插件没声明分页时的全部行、以及
+/// 分页声明里第一页之前的公共内容），把它当页名会多出一个空白的页签。
+pub fn pages_of(rows: &[PanelData]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for r in rows {
+        if r.page.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|p| p == &r.page) {
+            out.push(r.page.clone());
+        }
+    }
+    out
+}
+
+/// 重开面板之后该停在哪一页。
+///
+/// `old_plugin` / `old_page` 是**清空面板之前**读到的状态，`new_plugin` 是这次要
+/// 打开的那个，`pages` 是重建出来的页列表。
+///
+/// 只有同一个插件才回到原来那页：刷新面板、退出轻量模式都走这条路，用户没换插件，
+/// 就不该被弹回第一页。换成另一个插件时必须重置——两个插件可能有同名的页，
+/// 沿用旧页名会让人停在自己没点过的那一页上。旧页在新面板里已经不存在（插件改了
+/// `pages` 声明）也退回第一页，否则带页名的行全被筛掉，只剩一片空白。
+pub fn page_after_reopen(
+    old_plugin: &str,
+    old_page: &str,
+    new_plugin: &str,
+    pages: &[String],
+) -> String {
+    let same_plugin = !old_plugin.is_empty() && old_plugin == new_plugin;
+    if same_plugin && pages.iter().any(|p| p == old_page) {
+        return old_page.to_string();
+    }
+    pages.first().cloned().unwrap_or_default()
+}
+
+/// 重开面板之前先记下的状态：哪个插件、停在哪一页。
+///
+/// 存在的理由只有一个顺序问题：`Cmd::PluginPanelOpen` 会先清空面板，清空会把
+/// `panel-page` 抹成空串；等行建好再去读，读到的永远是空的。所以必须**先
+/// `capture`，再清空**，最后拿这份记录 `resolve` 出该停的页。
+/// `capture` 与 `resolve` 分处两个 UI 回调，中间隔着一次清空，所以要能复制出来带走。
+#[derive(Clone)]
+pub struct PanelReopen {
+    old_plugin: String,
+    old_page: String,
+}
+
+impl PanelReopen {
+    /// 记下"清空之前"的状态。传进清空之后的值没有意义，只会退回第一页。
+    pub fn capture(plugin: &str, page: &str) -> Self {
+        PanelReopen {
+            old_plugin: plugin.to_string(),
+            old_page: page.to_string(),
+        }
+    }
+
+    /// 重建行之后，算出该显示哪一页。
+    pub fn resolve(&self, new_plugin: &str, rows: &[PanelData]) -> String {
+        page_after_reopen(
+            &self.old_plugin,
+            &self.old_page,
+            new_plugin,
+            &pages_of(rows),
+        )
+    }
+}
+
+/// 把面板行、页签和指定的页推到界面（**必须在 UI 线程调用**）。
+///
+/// 页由调用方决定：`page_after_reopen` 算好再传进来，这里不再自己猜。
+pub fn apply_panel_with_page(ui: &crate::MainWindow, rows: &[PanelData], page: &str) {
+    let g = ui.global::<crate::PluginsG>();
+    let list = panel_to_slint(rows);
+    g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(list))));
+
+    let pages = pages_of(rows);
+    let model: Vec<SharedString> = pages.iter().map(|p| p.as_str().into()).collect();
+    g.set_panel_pages(ModelRc::from(Rc::new(VecModel::from(model))));
+    g.set_panel_page(page.into());
+}
+
+/// 重建当前插件的面板（**必须在 UI 线程调用**）。
+///
+/// 用于"还是这个插件、只是想重新取一遍行"的场合：插件 id 没变，所以当前页
+/// 能留就留，留不住才退回第一页。
+pub fn apply_panel(ui: &crate::MainWindow, rows: &[PanelData]) {
+    let g = ui.global::<crate::PluginsG>();
+    let id = g.get_panel_plugin().to_string();
+    let cur = g.get_panel_page().to_string();
+    let page = page_after_reopen(&id, &cur, &id, &pages_of(rows));
+    apply_panel_with_page(ui, rows, &page);
+}
+
+/// 按 `PanelReopen` 的记录重开面板（**必须在 UI 线程调用**）。
+///
+/// 与 `apply_panel` 的区别只在这份"清空之前"的状态：`PluginPanelOpen` 会先
+/// 清空面板，等行建好时已经无从知道用户原来停在哪一页了。
+pub fn apply_panel_reopened(
+    ui: &crate::MainWindow,
+    rows: &[PanelData],
+    new_plugin: &str,
+    before: &PanelReopen,
+) {
+    let page = before.resolve(new_plugin, rows);
+    apply_panel_with_page(ui, rows, &page);
+}
+
+/// 清空面板：行、页签、当前页一起清。
+///
+/// 只清行会留下上一个插件的页签，用户点进去什么也没有。
+pub fn clear_panel(ui: &crate::MainWindow) {
+    let g = ui.global::<crate::PluginsG>();
+    let none: Vec<PanelRow> = Vec::new();
+    g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(none))));
+    let none: Vec<SharedString> = Vec::new();
+    g.set_panel_pages(ModelRc::from(Rc::new(VecModel::from(none))));
+    g.set_panel_page("".into());
 }
 fn apply_body(ctx: &Arc<Ctx>, id: &str, body: &Value) -> Option<(i32, String)> {
     // 1) values → 表单
@@ -907,7 +1348,9 @@ async fn apply_rc(
     body: &Value,
     hold: bool,
 ) -> Result<()> {
-    let Some(rc) = body.get("rc") else { return Ok(()) };
+    let Some(rc) = body.get("rc") else {
+        return Ok(());
+    };
     let url = rc.get("url").and_then(|v| v.as_str()).unwrap_or("");
     if url.is_empty() {
         return Ok(());
@@ -1015,26 +1458,71 @@ fn choices_for(body: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-
 /// 合成面板行：声明式控件 + 插件运行时状态 → 一维列表。
-fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, _id: &str) -> Vec<PanelData> {
+fn compose(
+    setting: &PluginSetting,
+    body: &Value,
+    form: &Map<String, Value>,
+    _id: &str,
+) -> Vec<PanelData> {
     let mut out: Vec<PanelData> = Vec::new();
     let mut pending: Vec<BtnData> = Vec::new();
     let mut pending_line = String::new();
+    let mut pending_page = String::new();
 
-    fn flush(out: &mut Vec<PanelData>, pending: &mut Vec<BtnData>, line: &mut String) {
+    fn flush(out: &mut Vec<PanelData>, pending: &mut Vec<BtnData>, line: &mut String, page: &str) {
         if pending.is_empty() {
             return;
         }
         out.push(PanelData {
             kind: "actions".into(),
             key: line.clone(),
+            page: page.to_string(),
             buttons: std::mem::take(pending),
             enabled: true,
             ..Default::default()
         });
         line.clear();
     }
+
+    // 每个控件归哪一页。标签直接用插件给的本地化文案（`pages[].label` 已在解析
+    // config 时按当前语言挑好），界面拿它跟 `PanelRow.page` 逐字比较来筛行，
+    // 所以两边必须是同一份字符串。
+    //
+    // 旧插件没有 `pages` 声明：把 group 的标题当页名 —— 它们本来就用 group 把面板
+    // 分成几段，这样不用改插件也能得到页签。第一个 group 之前的内容没有归属，
+    // 留空串（空串的意图是「哪一页都显示」）。group 行本身也留在它自己那一页里，
+    // 看起来和页签名重复，但它的正文可能带着插件的动态提示，删掉就丢了信息。
+    let pages_of_control: Vec<String> = if setting.pages.is_empty() {
+        let mut cur = String::new();
+        setting
+            .controls
+            .iter()
+            .map(|c| {
+                if c.kind_enum().ok() == Some(ControlKind::Group) && !c.label.trim().is_empty() {
+                    cur = c.label.trim().to_string();
+                }
+                cur.clone()
+            })
+            .collect()
+    } else {
+        let by_id: std::collections::HashMap<&str, &str> = setting
+            .pages
+            .iter()
+            .map(|p| (p.id.as_str(), p.label.as_str()))
+            .collect();
+        setting
+            .controls
+            .iter()
+            .map(|c| {
+                by_id
+                    .get(c.page.as_str())
+                    .copied()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect()
+    };
 
     // 插件可以让整段控件消失（`body.hide: ["key", …]`）：光靠 `enabled:false`
     // 只能置灰，登录之后还挂着一整套登录框，看着像没用完的表单。
@@ -1044,14 +1532,22 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, _id
         .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
         .unwrap_or_default();
 
-    for c in &setting.controls {
+    for (ci, c) in setting.controls.iter().enumerate() {
+        let page = pages_of_control.get(ci).cloned().unwrap_or_default();
         if !c.key.trim().is_empty() && hidden.contains(c.key.trim()) {
             continue;
         }
+        // 换页时先把上一页攒着的按钮在原页里落一行。跨页合并会让用户在
+        // 「基础」页看到一个本来属于「高级」页的按钮，点下去自己也说不清做了什么。
+        if !pending.is_empty() && pending_page != page {
+            flush(&mut out, &mut pending, &mut pending_line, &pending_page);
+        }
+        pending_page = page.clone();
+        let row_start = out.len();
         let kind = c.kind_enum().unwrap_or(ControlKind::Group);
         match kind {
             ControlKind::Group => {
-                flush(&mut out, &mut pending, &mut pending_line);
+                flush(&mut out, &mut pending, &mut pending_line, &page);
                 let text = hint_text(body, &c.key, &c.label);
                 let mut row = simple_row("group", &c.key, "");
                 row.label = c.label.clone();
@@ -1059,11 +1555,11 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, _id
                 out.push(row);
             }
             ControlKind::Divider => {
-                flush(&mut out, &mut pending, &mut pending_line);
+                flush(&mut out, &mut pending, &mut pending_line, &page);
                 out.push(simple_row("divider", &c.key, ""));
             }
             ControlKind::Status => {
-                flush(&mut out, &mut pending, &mut pending_line);
+                flush(&mut out, &mut pending, &mut pending_line, &page);
                 let lamp = body
                     .get("lamp")
                     .and_then(|v| v.as_str())
@@ -1082,7 +1578,7 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, _id
                 });
             }
             ControlKind::Hint => {
-                flush(&mut out, &mut pending, &mut pending_line);
+                flush(&mut out, &mut pending, &mut pending_line, &page);
                 let text = hint_text(body, &c.key, &c.text);
                 out.push(PanelData {
                     warning: text.starts_with('⚠'),
@@ -1091,7 +1587,7 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, _id
                 });
             }
             ControlKind::Progress => {
-                flush(&mut out, &mut pending, &mut pending_line);
+                flush(&mut out, &mut pending, &mut pending_line, &page);
                 // 只有插件真的在报进度时才显示这一行。
                 // 长任务（下载 / 解压 / 安装）的进度由宿主 caps::ProgressHub 广播到页面
                 // 顶部，插件一次调用只跑一轮、拿不到自己内部的中间态，所以这里不做兜底 ——
@@ -1106,7 +1602,7 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, _id
             }
             // 图片行：插件只给绝对路径（`body.images.<key>`），读盘与解码在这里做。
             ControlKind::Image => {
-                flush(&mut out, &mut pending, &mut pending_line);
+                flush(&mut out, &mut pending, &mut pending_line, &page);
                 let path = body
                     .get("images")
                     .and_then(|v| v.get(c.key.as_str()))
@@ -1138,7 +1634,7 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, _id
                 }
             }
             ControlKind::Checks => {
-                flush(&mut out, &mut pending, &mut pending_line);
+                flush(&mut out, &mut pending, &mut pending_line, &page);
                 let checks = body
                     .get("checks")
                     .and_then(|v| v.as_array())
@@ -1175,7 +1671,7 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, _id
                 }
             }
             ControlKind::Field => {
-                flush(&mut out, &mut pending, &mut pending_line);
+                flush(&mut out, &mut pending, &mut pending_line, &page);
                 let value = form
                     .get(&c.key)
                     .map(value_as_str)
@@ -1200,7 +1696,10 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, _id
                         .map(|o| (o.value().to_string(), o.label()))
                         .collect()
                 } else {
-                    runtime_choices.iter().map(|o| (o.clone(), o.clone())).collect()
+                    runtime_choices
+                        .iter()
+                        .map(|o| (o.clone(), o.clone()))
+                        .collect()
                 };
                 // 当前值不在候选里就补到第一位：插件还没给候选时（如远程列表要
                 // 点「刷新远程」才来），下拉框也必须显示真实值而不是空着。
@@ -1230,11 +1729,11 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, _id
                 let line = c.line.clone();
                 if !line.is_empty() {
                     if !pending_line.is_empty() && line != pending_line {
-                        flush(&mut out, &mut pending, &mut pending_line);
+                        flush(&mut out, &mut pending, &mut pending_line, &page);
                     }
                     pending_line = line;
                 } else {
-                    flush(&mut out, &mut pending, &mut pending_line);
+                    flush(&mut out, &mut pending, &mut pending_line, &page);
                 }
                 pending.push(BtnData {
                     label: c.label.clone(),
@@ -1244,8 +1743,14 @@ fn compose(setting: &PluginSetting, body: &Value, form: &Map<String, Value>, _id
                 });
             }
         }
+        // 这一轮里新加的行都归当前页。放在这里统一盖，而不是每个 push 逐处写：
+        // 分支多、每支还会 push 好几行，逐处写必漏。换页时的 flush 发生在
+        // row_start 之前，所以不会被误盖成新页。
+        for row in out[row_start..].iter_mut() {
+            row.page = page.clone();
+        }
     }
-    flush(&mut out, &mut pending, &mut pending_line);
+    flush(&mut out, &mut pending, &mut pending_line, &pending_page);
 
     // 藏掉一整段之后，它两侧的分隔线会连成两条空线（分隔线不参与 key 校验，
     // 所以没法按 key 隐藏）。这里把连续的分隔线和首尾的分隔线去掉。
@@ -1292,7 +1797,6 @@ fn load_panel_image(path: &str) -> Option<(Vec<u8>, u32, u32)> {
     }
     Some((rgba.into_raw(), w, h))
 }
-
 
 /// 面板定时重跑：插件用 `body.repeat {action, interval_ms}` 要求宿主隔一会儿
 /// 自己再点一次某个按钮。
@@ -1370,7 +1874,10 @@ pub fn panel_repeat_clear() {
 /// 拉取并合成某个插件的面板（`action` 默认 "state"）。
 pub async fn build_panel(ctx: &Arc<Ctx>, id: &str) -> Result<Vec<PanelData>> {
     let Some((_dir, cfg)) = loaded_config(id) else {
-        bail!("{}", rcgui_i18n::f("找不到插件 {} 的 config.json", &[&(id)]));
+        bail!(
+            "{}",
+            rcgui_i18n::f("找不到插件 {} 的 config.json", &[&(id)])
+        );
     };
     if cfg.plugin_setting.controls.is_empty() {
         return Ok(Vec::new());
@@ -1404,7 +1911,10 @@ pub async fn run_action(
         .map(|c| c.plugin_enabled.get(id).copied().unwrap_or(false))
         .unwrap_or(false);
     if !enabled {
-        bail!("{}", rcgui_i18n::f("插件 {} 已停用，请先启用再操作", &[&(id)]));
+        bail!(
+            "{}",
+            rcgui_i18n::f("插件 {} 已停用，请先启用再操作", &[&(id)])
+        );
     }
     let body = call_plugin(ctx, id, action, Value::Null).await?;
     if let Some((kind, msg)) = apply_body(ctx, id, &body) {
@@ -1416,7 +1926,11 @@ pub async fn run_action(
 
 /// 触发插件自启动（宿主只负责按插件的回复去连接 rclone）。
 pub async fn autostart(ctx: &Arc<Ctx>, ui: &slint::Weak<crate::MainWindow>) {
-    let enabled = ctx.cfg.lock().map(|c| c.plugin_enabled.clone()).unwrap_or_default();
+    let enabled = ctx
+        .cfg
+        .lock()
+        .map(|c| c.plugin_enabled.clone())
+        .unwrap_or_default();
     let rows = scan_rows(ctx).await;
     for r in rows {
         if !r.has_panel || !r.verified {
@@ -1468,6 +1982,100 @@ pub async fn shutdown_plugin(ctx: &Arc<Ctx>, id: &str) {
 mod tests {
     use super::*;
 
+    /// 导入的插件设置不能把本机凭据清掉：默认导出会把 token 这类键剥掉，
+    /// 若按"包里有什么就覆盖什么"去写，用户导入一次就会掉登录。
+    #[test]
+    fn imported_settings_keep_local_secrets_and_form() {
+        let dir = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("rcgui-kvimport-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = KvStore::new(dir.clone());
+
+        store
+            .set("kvault", "site.token", json!("local-secret"))
+            .unwrap();
+        store.set("kvault", "site.host", json!("old")).unwrap();
+        // 本机表单里有凭据，脱敏导出里这一项会被剥掉。
+        store
+            .set(
+                "kvault",
+                "form",
+                json!({ "user": "old-user", "short_key": "local-key", "note": "keep" }),
+            )
+            .unwrap();
+
+        let mut settings = Map::new();
+        settings.insert("site.host".into(), json!("new"));
+        settings.insert("site.token".into(), json!(""));
+        settings.insert("form".into(), json!({ "user": "alice" }));
+        let refs = vec![rcgui_profile::PluginRef {
+            id: "kvault".into(),
+            name: "K-Vault".into(),
+            version: "0.1.0".into(),
+            source: "builtin".into(),
+            url: String::new(),
+            sha256: String::new(),
+            enabled: true,
+            settings,
+            secret_keys: vec!["short_key".to_string()],
+        }];
+
+        let touched = apply_imported_settings(&store, &refs);
+        assert_eq!(touched, vec!["kvault".to_string()]);
+
+        let all = store.get_all("kvault");
+        assert_eq!(all["site.host"], json!("new"), "包里带的值要写进去");
+        assert_eq!(
+            all["site.token"],
+            json!("local-secret"),
+            "空值不能覆盖本机凭据"
+        );
+        assert_eq!(all["form"]["user"], json!("alice"), "表单值要跟着恢复");
+        assert_eq!(
+            all["form"]["short_key"],
+            json!("local-key"),
+            "包里没带的表单键（脱敏剥掉的凭据）必须留在本机"
+        );
+        assert_eq!(
+            all["form"]["note"],
+            json!("keep"),
+            "合并而不是整体替换：包里没提到的键不能丢"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 剥离凭据时要认的键名必须来自插件自己的声明：`short_key` 这种名字
+    /// 按关键词猜不出来，只有 manifest 里 `field: "password"` 认得出来。
+    /// 这里直接解析随包的两个真 manifest——若测试自己编一份结构，写错了也照样过。
+    #[test]
+    fn declared_secret_keys_come_from_the_real_manifests() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/plugins");
+
+        let imagehost = plugin_host::bundle::read_config_lenient(&root.join("imagehost"))
+            .expect("随包的 imagehost 必须能被解析");
+        assert_eq!(
+            declared_secret_keys(&imagehost),
+            vec!["short_key".to_string()],
+            "imagehost 的 api_key 字段在 manifest 里声明成 password"
+        );
+
+        let teldrive = plugin_host::bundle::read_config_lenient(&root.join("teldrive"))
+            .expect("随包的 teldrive 必须能被解析");
+        assert_eq!(
+            declared_secret_keys(&teldrive),
+            vec!["password".to_string()],
+            "teldrive 只有 Telegram 两步验证密码声明成 password"
+        );
+        // 机器人 token 声明的是 multiline，不在这份清单里，靠关键词剥。
+        // 两条路径都得管用，否则 teldrive 的 token 会随导出走。
+        assert!(!declared_secret_keys(&teldrive).contains(&"tokens".to_string()));
+        assert!(rcgui_profile::bundle::is_secret_key("tokens"));
+    }
+
     fn row(id: &str, name: &str, tags: &[&str], desc: &str) -> Row {
         Row {
             id: id.into(),
@@ -1494,7 +2102,12 @@ mod tests {
     #[test]
     fn search_matches_tags() {
         let rows = vec![
-            row("onerclone", "一键 rclone", &["下载", "进程"], "启动本机 rclone"),
+            row(
+                "onerclone",
+                "一键 rclone",
+                &["下载", "进程"],
+                "启动本机 rclone",
+            ),
             row("imagehost", "图床", &["图床", "上传"], "基于 rclone 的图床"),
         ];
         // 只出现在 tags 里、不在这两个插件的名称/id/描述里的词
@@ -1604,7 +2217,10 @@ mod tests {
         assert_eq!(f.get("port").unwrap(), "5572");
         assert_eq!(f.get("no_auth").unwrap(), "false");
         assert!(!f.contains_key("exe"), "没有默认值的字段不该凭空造键");
-        assert!(form_of(&store, "onerclone").is_empty(), "默认值不能写回磁盘");
+        assert!(
+            form_of(&store, "onerclone").is_empty(),
+            "默认值不能写回磁盘"
+        );
 
         // ② 用户填过：用户值优先，其余字段仍走默认值
         store
@@ -1650,14 +2266,44 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/plugins");
         let mut checked = 0usize;
         let mut bad: Vec<String> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
 
-        for id in ["imagehost", "onerclone"] {
-            rcgui_i18n::set_lang(rcgui_i18n::Lang::En);
+        // 随包插件由 scripts/fetch_plugins.ps1 抓取，抓过的目录才是可查的；
+        // 写死插件名单会让"没抓到的插件"看起来像"英文没问题"。
+        let mut ids: Vec<String> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&root) {
+            for e in rd.flatten() {
+                let dir = e.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                let name = e.file_name().to_string_lossy().to_string();
+                if dir.join("config.json").is_file() {
+                    ids.push(name);
+                } else {
+                    missing.push(name);
+                }
+            }
+        }
+        ids.sort();
+        missing.sort();
+        if !missing.is_empty() {
+            eprintln!(
+                "跳过没有 config.json 的随包插件目录：{}",
+                missing.join(", ")
+            );
+        }
+
+        for id in &ids {
             let dir = root.join(id);
-            let cfg = bundle::read_config_lenient(&dir)
-                .unwrap_or_else(|| panic!("读不到随包插件 {id} 的 config.json"));
-            let panels = compose(&cfg.plugin_setting, &json!({}), &Map::new(), id);
-            rcgui_i18n::set_lang(rcgui_i18n::Lang::Zh);
+            // 语言是进程级全局量：读 config.json 和合面板时都要在英文下，
+            // 一次持锁做完，别让并行用例把语言切回中文。
+            let panels = {
+                let _lang = crate::test_lang::use_lang(rcgui_i18n::Lang::En);
+                let cfg = bundle::read_config_lenient(&dir)
+                    .unwrap_or_else(|| panic!("读不到随包插件 {id} 的 config.json"));
+                compose(&cfg.plugin_setting, &json!({}), &Map::new(), id)
+            };
 
             assert!(!panels.is_empty(), "{id}: 面板一行都没合成出来");
             for p in &panels {
@@ -1687,6 +2333,127 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "英文模式下仍有中文：\n{}", bad.join("\n"));
-        assert!(checked > 0);
+        assert!(
+            checked > 0,
+            "一个随包插件的面板都没检查到，这条测试等于没跑（assets/plugins 里没有 config.json）"
+        );
+    }
+
+    #[test]
+    fn panel_dump_hides_credentials_but_keeps_shape() {
+        // 这条输出会被整段贴进聊天窗口：值里的凭据必须看不到，但"填了没填、
+        // 有几个字、有哪些按钮"这些排查信息要留着。
+        let rows = vec![
+            PanelData {
+                kind: "input".into(),
+                key: "site.token".into(),
+                label: "Token".into(),
+                value: "tk_live_9f8e7d6c5b4a".into(),
+                field_kind: "password".into(),
+                ..Default::default()
+            },
+            PanelData {
+                kind: "input".into(),
+                key: "site.pass".into(),
+                label: "密码".into(),
+                // 键名本身就够敏感，即使 field_kind 没标 password 也要遮
+                value: "hunter2".into(),
+                field_kind: "text".into(),
+                ..Default::default()
+            },
+            PanelData {
+                kind: "text".into(),
+                key: "status".into(),
+                text: "已保存 https://alice:pw@example.com/x?token=abc123".into(),
+                value: "https://bob:pw2@example.com/y".into(),
+                ..Default::default()
+            },
+            PanelData {
+                kind: "input".into(),
+                key: "site.user".into(),
+                label: "用户".into(),
+                value: "alice".into(),
+                field_kind: "text".into(),
+                ..Default::default()
+            },
+        ];
+        let out = dump_rows_text(&rows);
+        for leaked in [
+            "tk_live_9f8e7d6c5b4a",
+            "hunter2",
+            "alice:pw",
+            "bob:pw2",
+            "abc123",
+        ] {
+            assert!(!out.contains(leaked), "调试输出里漏了 {leaked}：\n{out}");
+        }
+        // 形状信息还在
+        assert!(out.contains("site.token"), "{out}");
+        assert!(out.contains("••••（20 字符）"), "{out}");
+        assert!(out.contains("••••（7 字符）"), "{out}");
+        assert!(out.contains("site.user"), "{out}");
+        assert!(out.contains("\"alice\""), "用户名不是秘密，要留着：\n{out}");
+        assert!(out.contains("-- total 4 rows"), "{out}");
+    }
+
+    /// 造几行带页名的面板行：`pages` 里每个名字一行，顺序即页签顺序。
+    fn paged(pages: &[&str]) -> Vec<PanelData> {
+        pages
+            .iter()
+            .map(|p| PanelData {
+                kind: "text".into(),
+                key: format!("k.{p}"),
+                page: (*p).into(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reopen_capture_must_happen_before_the_panel_is_cleared() {
+        // 这就是 `Cmd::PluginPanelOpen` 的真实顺序：读状态 → 清空 → 建行 → 还原。
+        // 清空之后 `panel-page` 是空串，此时再 capture 就什么都没记住，只能回第一页；
+        // 所以这条测试同时钉住"先记后清"的必要性和还原结果。
+        let rows = paged(&["基础", "高级"]);
+        let before = PanelReopen::capture("com.example.kvault", "高级");
+        assert_eq!(before.resolve("com.example.kvault", &rows), "高级");
+
+        // 反例：清空之后才记（等于没记），结果退回第一页。
+        let after_clear = PanelReopen::capture("com.example.kvault", "");
+        assert_eq!(after_clear.resolve("com.example.kvault", &rows), "基础");
+    }
+
+    #[test]
+    fn reopen_keeps_page_for_the_same_plugin() {
+        let rows = paged(&["基础", "高级", "关于"]);
+        let before = PanelReopen::capture("com.example.kvault", "关于");
+        assert_eq!(before.resolve("com.example.kvault", &rows), "关于");
+    }
+
+    #[test]
+    fn reopen_resets_for_a_different_plugin_even_with_the_same_page_name() {
+        // 两个插件都声明了"高级"：换插件必须回第一页，不能停在用户没点过的页上。
+        let rows = paged(&["基础", "高级"]);
+        let before = PanelReopen::capture("com.example.imagehost", "高级");
+        assert_eq!(before.resolve("com.example.teldrive", &rows), "基础");
+    }
+
+    #[test]
+    fn reopen_resets_when_the_page_no_longer_exists() {
+        // 插件改了 pages 声明：旧页没了，退回第一页，而不是留一个筛不出任何行的页名。
+        let rows = paged(&["连接", "上传"]);
+        let before = PanelReopen::capture("com.example.kvault", "高级");
+        assert_eq!(before.resolve("com.example.kvault", &rows), "连接");
+    }
+
+    #[test]
+    fn reopen_without_any_page_clears_the_page() {
+        let rows = vec![PanelData {
+            kind: "text".into(),
+            key: "status".into(),
+            ..Default::default()
+        }];
+        let before = PanelReopen::capture("com.example.kvault", "高级");
+        assert_eq!(before.resolve("com.example.kvault", &rows), "");
     }
 }

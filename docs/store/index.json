@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "imagehost",
+      "name": "图床 (Image host)",
+      "version": "0.6.1",
+      "description": "把图片传到你自己的 rclone 远程，上传后拿到直链，可顺便生成短链。需要先有一个能写的 remote。",
+      "repository": "https://github.com/h897105167/rcgui-plugin-imagehost",
+      "url": "https://github.com/h897105167/rcgui-plugin-imagehost/releases/download/v0.6.1/imagehost-0.6.1.zip",
+      "sha256": "223248d77feb63f86182410eff8a42213e05f2c29f30175f64cc4497b59093c2",
+      "min_gui_version": "0.2.1",
+      "capabilities": ["kv", "ui", "fs", "http", "rclone", "env"]
+    },
+    {
+      "id": "teldrive",
+      "name": "Teldrive",
+      "version": "0.3.0",
+      "description": "部署 teldrive、登录 Telegram、建频道与机器人，再把远程加进 rclone 并挂载。依赖 teldrive 版 rclone 内核，官方内核没有这个后端。",
+      "repository": "https://github.com/h897105167/rcgui-plugin-teldrive",
+      "url": "https://github.com/h897105167/rcgui-plugin-teldrive/releases/download/v0.3.0/teldrive-0.3.0.zip",
+      "sha256": "f14d231150b1e5a9f96fc573961b34eeec51b0a14b8114b1075415e8cba8ef1d",
+      "min_gui_version": "0.3.0",
+      "capabilities": ["kv", "fs", "http", "proc", "net", "rclone", "env"]
+    }
+  ]
+}

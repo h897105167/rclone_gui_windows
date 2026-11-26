@@ -183,7 +183,11 @@ pub enum Action {
     /// 卸载（挂载点已不存在于期望状态，但仍在运行）
     Unmount { point: String },
     /// 启动服务
-    StartServe { stype: String, fs: String, addr: String },
+    StartServe {
+        stype: String,
+        fs: String,
+        addr: String,
+    },
     /// 停止服务（id）
     StopServe { addr: String, id: String },
 }
@@ -195,7 +199,9 @@ impl Action {
             Self::UnsetProxy { remote } => rcgui_i18n::f("移除 {} 的代理", &[&(remote)]),
             Self::Mount { fs, point } => rcgui_i18n::f("挂载 {} → {}", &[&(fs), &(point)]),
             Self::Unmount { point } => rcgui_i18n::f("卸载 {}", &[&(point)]),
-            Self::StartServe { stype, addr, .. } => rcgui_i18n::f("启动 {} 服务 {}", &[&(stype), &(addr)]),
+            Self::StartServe { stype, addr, .. } => {
+                rcgui_i18n::f("启动 {} 服务 {}", &[&(stype), &(addr)])
+            }
             Self::StopServe { addr, .. } => rcgui_i18n::f("停止服务 {}", &[&(addr)]),
         }
     }
@@ -278,9 +284,7 @@ pub fn plan(
     let want_set: HashSet<String> = want_points.iter().map(|p| crate::mount_key(p)).collect();
     for p in &actual.mount_points {
         if !want_set.contains(&crate::mount_key(p)) {
-            out.push(Action::Unmount {
-                point: p.clone(),
-            });
+            out.push(Action::Unmount { point: p.clone() });
         }
     }
 
@@ -387,7 +391,10 @@ pub async fn collect_proxy_actual(
                 backend_type: ProxyConfigValues::backend_type(&map),
                 values: ProxyConfigValues::from_config_map(&map),
             }),
-            Err(e) => errors.push(rcgui_i18n::f("读取 {} 的代理状态失败：{}（本次跳过该远程）", &[&(r), &(e)])),
+            Err(e) => errors.push(rcgui_i18n::f(
+                "读取 {} 的代理状态失败：{}（本次跳过该远程）",
+                &[&(r), &(e)],
+            )),
         }
     }
     (out, errors)
@@ -457,7 +464,9 @@ pub async fn execute(
                         rep.changed += 1;
                     }
                     Ok(Err(e)) => rep.failed.push(format!("{}：{e}", a.describe())),
-                    Err(_) => rep.failed.push(rcgui_i18n::f("{}：超时", &[&(a.describe())])),
+                    Err(_) => rep
+                        .failed
+                        .push(rcgui_i18n::f("{}：超时", &[&(a.describe())])),
                 }
             }
             Action::Unmount { point } => match client.unmount(point).await {
@@ -541,7 +550,12 @@ mod tests {
         c
     }
 
-    fn proxy_profile(id: &str, protocol: rcgui_profile::ProxyProtocol, host: &str, port: u16) -> ProxyProfile {
+    fn proxy_profile(
+        id: &str,
+        protocol: rcgui_profile::ProxyProtocol,
+        host: &str,
+        port: u16,
+    ) -> ProxyProfile {
         ProxyProfile {
             id: id.into(),
             name: "n".into(),
@@ -561,7 +575,12 @@ mod tests {
         }
     }
 
-    fn binding_with_footprint(remote: &str, key: &str, value: &str, original: Option<&str>) -> RemoteProxyBinding {
+    fn binding_with_footprint(
+        remote: &str,
+        key: &str,
+        value: &str,
+        original: Option<&str>,
+    ) -> RemoteProxyBinding {
         RemoteProxyBinding {
             remote: remote.into(),
             proxy_id: String::new(),
@@ -584,10 +603,7 @@ mod tests {
         };
         let (acts, errs) = plan(&desired, &actual, &[]);
         assert!(errs.is_empty());
-        assert!(
-            acts.is_empty(),
-            "已经在跑且一致时不应产生任何动作"
-        );
+        assert!(acts.is_empty(), "已经在跑且一致时不应产生任何动作");
     }
 
     #[test]
@@ -600,7 +616,10 @@ mod tests {
         // （与 profile crate 的 "T:" 形式不同；挂载这一步用的是 app 侧实现）
         assert_eq!(
             acts,
-            vec![Action::Mount { fs: "r:".into(), point: "T:\\".into() }]
+            vec![Action::Mount {
+                fs: "r:".into(),
+                point: "T:\\".into()
+            }]
         );
     }
 
@@ -681,15 +700,22 @@ mod tests {
         let (acts, _) = plan(&desired, &actual, &[]);
         assert_eq!(
             acts,
-            vec![Action::StopServe { addr: "127.0.0.1:9".into(), id: "id9".into() }]
+            vec![Action::StopServe {
+                addr: "127.0.0.1:9".into(),
+                id: "id9".into()
+            }]
         );
     }
 
     #[test]
     fn proxy_change_produces_set() {
         let mut cfg = AppConfig::default();
-        cfg.proxies
-            .push(proxy_profile("p1", rcgui_profile::ProxyProtocol::Http, "127.0.0.1", 8899));
+        cfg.proxies.push(proxy_profile(
+            "p1",
+            rcgui_profile::ProxyProtocol::Http,
+            "127.0.0.1",
+            8899,
+        ));
         cfg.bind_proxy_slot("teldrive", "p1");
         let (desired, errs) = desired_from(&cfg);
         assert!(errs.is_empty());
@@ -709,8 +735,12 @@ mod tests {
     #[test]
     fn unchanged_proxy_is_noop() {
         let mut cfg = AppConfig::default();
-        cfg.proxies
-            .push(proxy_profile("p1", rcgui_profile::ProxyProtocol::Http, "h", 1));
+        cfg.proxies.push(proxy_profile(
+            "p1",
+            rcgui_profile::ProxyProtocol::Http,
+            "h",
+            1,
+        ));
         cfg.bind_proxy_slot("r", "p1");
         let (desired, _) = desired_from(&cfg);
         let proxy_actual = vec![state(
@@ -721,15 +751,21 @@ mod tests {
                 ..Default::default()
             },
         )];
-        assert!(plan(&desired, &Actual::default(), &proxy_actual).0.is_empty());
+        assert!(plan(&desired, &Actual::default(), &proxy_actual)
+            .0
+            .is_empty());
     }
 
     /// ftp 的目标键是原生 http_proxy：override 上有没有值都不该影响判断。
     #[test]
     fn ftp_proxy_compares_native_http_key() {
         let mut cfg = AppConfig::default();
-        cfg.proxies
-            .push(proxy_profile("p1", rcgui_profile::ProxyProtocol::Http, "rcgui", 1));
+        cfg.proxies.push(proxy_profile(
+            "p1",
+            rcgui_profile::ProxyProtocol::Http,
+            "rcgui",
+            1,
+        ));
         cfg.bind_proxy_slot("r", "p1");
         let (desired, _) = desired_from(&cfg);
 
@@ -763,8 +799,12 @@ mod tests {
     #[test]
     fn ftp_existing_user_proxy_is_reported_by_apply() {
         let mut cfg = AppConfig::default();
-        cfg.proxies
-            .push(proxy_profile("p1", rcgui_profile::ProxyProtocol::Http, "rcgui", 1));
+        cfg.proxies.push(proxy_profile(
+            "p1",
+            rcgui_profile::ProxyProtocol::Http,
+            "rcgui",
+            1,
+        ));
         cfg.bind_proxy_slot("r", "p1");
         let (desired, _) = desired_from(&cfg);
         let proxy_actual = vec![state(
@@ -786,8 +826,12 @@ mod tests {
     #[test]
     fn direct_binding_with_footprint_rolls_back() {
         let mut cfg = AppConfig::default();
-        cfg.proxy_bindings
-            .push(binding_with_footprint("r", "override.http_proxy", "http://old:1", None));
+        cfg.proxy_bindings.push(binding_with_footprint(
+            "r",
+            "override.http_proxy",
+            "http://old:1",
+            None,
+        ));
         let (desired, _) = desired_from(&cfg);
         let proxy_actual = vec![state(
             "r",
@@ -819,15 +863,21 @@ mod tests {
                 ..Default::default()
             },
         )];
-        assert!(plan(&desired, &Actual::default(), &proxy_actual).0.is_empty());
+        assert!(plan(&desired, &Actual::default(), &proxy_actual)
+            .0
+            .is_empty());
     }
 
     /// 采集失败（没有现状）时不能猜，也不能产生动作。
     #[test]
     fn missing_proxy_state_is_skipped() {
         let mut cfg = AppConfig::default();
-        cfg.proxies
-            .push(proxy_profile("p1", rcgui_profile::ProxyProtocol::Http, "h", 1));
+        cfg.proxies.push(proxy_profile(
+            "p1",
+            rcgui_profile::ProxyProtocol::Http,
+            "h",
+            1,
+        ));
         cfg.bind_proxy_slot("r", "p1");
         let (desired, _) = desired_from(&cfg);
         assert!(plan(&desired, &Actual::default(), &[]).0.is_empty());
@@ -836,6 +886,8 @@ mod tests {
     /// 原生 socks 凭据无法表达时，plan 要把原因当成错误报出来，而不是静默。
     #[test]
     fn unrepresentable_native_socks_is_reported() {
+        // 断言里有中文文案，先独占语言，别被并行的英文用例带跑
+        let _lang = crate::test_lang::use_lang(rcgui_i18n::Lang::Zh);
         let mut cfg = AppConfig::default();
         let mut p = proxy_profile("p1", rcgui_profile::ProxyProtocol::Socks5, "h", 1080);
         p.user = "a@b".into();
@@ -850,6 +902,8 @@ mod tests {
 
     #[test]
     fn dangling_binding_reports_error_and_clears() {
+        // 断言里有中文文案，先独占语言，别被并行的英文用例带跑
+        let _lang = crate::test_lang::use_lang(rcgui_i18n::Lang::Zh);
         let mut cfg = AppConfig::default();
         cfg.bind_proxy_slot("r", "gone-id");
         let (desired, errs) = desired_from(&cfg);
@@ -862,8 +916,12 @@ mod tests {
     #[test]
     fn dangling_binding_with_footprint_still_rolls_back() {
         let mut cfg = AppConfig::default();
-        cfg.proxy_bindings
-            .push(binding_with_footprint("r", "override.http_proxy", "http://old:1", None));
+        cfg.proxy_bindings.push(binding_with_footprint(
+            "r",
+            "override.http_proxy",
+            "http://old:1",
+            None,
+        ));
         cfg.proxy_bindings[0].proxy_id = "gone".into();
         let (desired, _) = desired_from(&cfg);
         let proxy_actual = vec![state(
@@ -880,6 +938,8 @@ mod tests {
 
     #[test]
     fn report_summary_messages() {
+        // 断言里有中文文案，先独占语言，别被并行的英文用例带跑
+        let _lang = crate::test_lang::use_lang(rcgui_i18n::Lang::Zh);
         let mut r = ReconcileReport::default();
         assert!(r.is_empty());
         assert!(r.summary().contains("无需重载"));

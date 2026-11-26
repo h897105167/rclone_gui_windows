@@ -1,4 +1,4 @@
-﻿# 按 plugins/manifest.json 下载并校验插件包，解到 crates/app/assets/plugins/<dir>/
+# 按 plugins/manifest.json 下载并校验插件包，解到 crates/app/assets/plugins/<dir>/
 #
 # 本仓库**不存**插件源码：每个插件是独立仓库，Release 里挂打包好的 zip。
 # 这个脚本负责「锁文件 → 本地资产」这一步，构建前跑一次即可。
@@ -7,6 +7,8 @@
 #   1. zip 的 sha256 与 manifest 里写的一致（防传输损坏 / 换包）
 #   2. 解开后再按包内 check.sha256 逐文件核对（防解开时丢文件）
 # 通过后写 <dir>/.fetched.json 记下 tag + sha256，下次同版本直接跳过。
+# 清单里删掉的插件（例如 onerclone），本地残留目录会被一起清掉——这只发生在
+# crates/app/assets/plugins 这层构建资产里，不碰用户自己的插件目录。
 #
 # 用法：
 #   .\scripts\fetch_plugins.ps1            # 缺什么下什么
@@ -60,6 +62,29 @@ $list = @($manifest.plugins)
 if ($Id) {
     $list = @($list | Where-Object { $_.id -eq $Id })
     if ($list.Count -eq 0) { Fail "manifest 里没有 id=$Id" }
+}
+
+# 清单里已经删掉的插件，目录也要清掉：crates/app/assets/plugins 只放构建资产。
+# 留着的话，打包脚本按清单取件不会带上它，但"目录还在"这件事本身会误导人
+# （onerclone 之前就是这样留在 assets 里的）。只清这一层、只清清单外的目录。
+# -Id 取单个插件时不动其它目录——那时候用户没打算全量同步。
+# 这里绝不动 %APPDATA% 下的用户插件目录：那是别人装的，删了就是丢数据。
+if (-not $Id -and $list.Count -gt 0) {
+    $destRootFull = [System.IO.Path]::GetFullPath($destRoot)
+    $keepDirs = @{}
+    foreach ($p in $list) {
+        $dirName = if ($p.dir) { $p.dir } else { $p.id }
+        $keepDirs[$dirName] = $true
+    }
+    foreach ($dirInfo in @(Get-ChildItem -LiteralPath $destRoot -Directory -Force -ErrorAction SilentlyContinue)) {
+        if ($keepDirs.ContainsKey($dirInfo.Name)) { continue }
+        $full = [System.IO.Path]::GetFullPath($dirInfo.FullName)
+        # 只删 $destRoot 的直接子目录；链接指向哪儿不由这个脚本保证，直接跳过。
+        if ((Split-Path -Parent $full) -ne $destRootFull) { continue }
+        if ($dirInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+        Write-Host "− $($dirInfo.Name) 不在清单里，清掉构建资产" -ForegroundColor Yellow
+        Remove-Item -LiteralPath $full -Recurse -Force
+    }
 }
 
 $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("rcgui-plugins-" + [guid]::NewGuid().ToString("n"))
@@ -159,3 +184,8 @@ if ($failed.Count -gt 0) {
 
 Write-Host ""
 Write-Host "插件资产已就绪：$destRoot" -ForegroundColor Green
+
+# 成功也必须显式 exit 0。调用方（build-release.ps1 的 Invoke-Native、GitHub 的 pwsh 壳）
+# 只看退出码；脚本自然结束时 PowerShell 不会设置它，读到的要么是上一条原生命令留下的
+# 旧值，要么干脆不存在——两种情况都会把这次成功报成失败。
+exit 0

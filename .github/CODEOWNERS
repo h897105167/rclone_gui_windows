@@ -1,0 +1,21 @@
+# 默认所有路径由维护者 h897105167 审核。
+# 商店索引、发布脚本、工作流这类会影响别人装到什么东西的路径单列，
+# 避免"顺手合一个 PR"就把未审核的下载地址推进去。
+*                                   @h897105167
+
+# 插件商店：索引决定用户能一键装到什么，必须人工过审核
+/docs/store/                        @h897105167
+/plugins/manifest.json              @h897105167
+
+# 发布与打包：产物命名、校验和、内核版本固定都在这里
+/packaging/                         @h897105167
+/scripts/                           @h897105167
+/.github/workflows/                 @h897105167
+
+# 契约类文档：改它们等于改约定，需要维护者确认
+/AGENTS.md                          @h897105167
+/CONTRIBUTING.md                    @h897105167
+/docs/ARCHITECTURE.md               @h897105167
+/docs/RELEASE.md                    @h897105167
+/docs/VERSIONING.md                 @h897105167
+/docs/CLI.md                        @h897105167

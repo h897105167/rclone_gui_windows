@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 插件上架流程
+    url: https://github.com/h897105167/rclone_gui_windows/blob/main/docs/store/README.md
+    about: 收录规则、sha256 怎么取、审核看什么。读这个比直接开 issue 快。
+  - name: 版本与发布约定
+    url: https://github.com/h897105167/rclone_gui_windows/blob/main/docs/VERSIONING.md
+    about: 当前哪个版本是已发布、哪些还是开发中，以及变更记录怎么写。
+  - name: 架构与分层
+    url: https://github.com/h897105167/rclone_gui_windows/blob/main/docs/ARCHITECTURE.md
+    about: 内核模式、插件沙箱、服务边界的现行设计，先看这里再提架构类建议。

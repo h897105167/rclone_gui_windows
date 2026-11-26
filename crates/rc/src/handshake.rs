@@ -28,10 +28,30 @@ pub struct MethodReq {
 
 /// 主功能所需的方法表。
 pub const METHOD_REQS: &[MethodReq] = &[
-    MethodReq { name: "config/listremotes", alternatives: &[], required: true, capability: "列出远程" },
-    MethodReq { name: "config/create", alternatives: &[], required: true, capability: "新建远程" },
-    MethodReq { name: "config/update", alternatives: &[], required: true, capability: "修改远程" },
-    MethodReq { name: "config/delete", alternatives: &[], required: true, capability: "删除远程" },
+    MethodReq {
+        name: "config/listremotes",
+        alternatives: &[],
+        required: true,
+        capability: "列出远程",
+    },
+    MethodReq {
+        name: "config/create",
+        alternatives: &[],
+        required: true,
+        capability: "新建远程",
+    },
+    MethodReq {
+        name: "config/update",
+        alternatives: &[],
+        required: true,
+        capability: "修改远程",
+    },
+    MethodReq {
+        name: "config/delete",
+        alternatives: &[],
+        required: true,
+        capability: "删除远程",
+    },
     // rclone 1.75 起为 mount/listmounts，更早版本是 mount/list
     MethodReq {
         name: "mount/listmounts",
@@ -39,25 +59,100 @@ pub const METHOD_REQS: &[MethodReq] = &[
         required: true,
         capability: "读取挂载列表",
     },
-    MethodReq { name: "mount/mount", alternatives: &[], required: true, capability: "挂载" },
-    MethodReq { name: "mount/unmount", alternatives: &[], required: true, capability: "卸载" },
-    MethodReq { name: "serve/list", alternatives: &[], required: true, capability: "读取服务列表" },
-    MethodReq { name: "serve/start", alternatives: &[], required: true, capability: "启动服务" },
-    MethodReq { name: "serve/stop", alternatives: &[], required: true, capability: "停止服务" },
+    MethodReq {
+        name: "mount/mount",
+        alternatives: &[],
+        required: true,
+        capability: "挂载",
+    },
+    MethodReq {
+        name: "mount/unmount",
+        alternatives: &[],
+        required: true,
+        capability: "卸载",
+    },
+    MethodReq {
+        name: "serve/list",
+        alternatives: &[],
+        required: true,
+        capability: "读取服务列表",
+    },
+    MethodReq {
+        name: "serve/start",
+        alternatives: &[],
+        required: true,
+        capability: "启动服务",
+    },
+    MethodReq {
+        name: "serve/stop",
+        alternatives: &[],
+        required: true,
+        capability: "停止服务",
+    },
     // 以下缺失只影响体验，不阻断
-    MethodReq { name: "config/paths", alternatives: &[], required: false, capability: "读取配置文件路径" },
-    MethodReq { name: "config/providers", alternatives: &[], required: false, capability: "动态参数表单" },
+    MethodReq {
+        name: "config/paths",
+        alternatives: &[],
+        required: false,
+        capability: "读取配置文件路径",
+    },
+    MethodReq {
+        name: "config/providers",
+        alternatives: &[],
+        required: false,
+        capability: "动态参数表单",
+    },
     // 代理功能需要：config/get 读现有值、config/unset 移除代理。
     // 做成非阻断：老版本缺这两个方法时，远程/挂载/服务仍可用，
     // 只是「按 remote 分配代理」这项能力要明确报「不支持」而不是通用失败。
-    MethodReq { name: "config/get", alternatives: &[], required: false, capability: "读取单条远程配置（代理功能依赖）" },
-    MethodReq { name: "config/unset", alternatives: &[], required: false, capability: "移除远程代理（代理功能依赖）" },
-    MethodReq { name: "options/get", alternatives: &[], required: false, capability: "读取运行参数" },
-    MethodReq { name: "options/set", alternatives: &[], required: false, capability: "修改运行参数" },
-    MethodReq { name: "core/bwlimit", alternatives: &[], required: false, capability: "全局限速" },
-    MethodReq { name: "core/transferred", alternatives: &[], required: false, capability: "后台任务列表" },
-    MethodReq { name: "job/stop", alternatives: &[], required: false, capability: "停止任务" },
-    MethodReq { name: "operations/about", alternatives: &[], required: false, capability: "远程容量/连通性" },
+    MethodReq {
+        name: "config/get",
+        alternatives: &[],
+        required: false,
+        capability: "读取单条远程配置（代理功能依赖）",
+    },
+    MethodReq {
+        name: "config/unset",
+        alternatives: &[],
+        required: false,
+        capability: "移除远程代理（代理功能依赖）",
+    },
+    MethodReq {
+        name: "options/get",
+        alternatives: &[],
+        required: false,
+        capability: "读取运行参数",
+    },
+    MethodReq {
+        name: "options/set",
+        alternatives: &[],
+        required: false,
+        capability: "修改运行参数",
+    },
+    MethodReq {
+        name: "core/bwlimit",
+        alternatives: &[],
+        required: false,
+        capability: "全局限速",
+    },
+    MethodReq {
+        name: "core/transferred",
+        alternatives: &[],
+        required: false,
+        capability: "后台任务列表",
+    },
+    MethodReq {
+        name: "job/stop",
+        alternatives: &[],
+        required: false,
+        capability: "停止任务",
+    },
+    MethodReq {
+        name: "operations/about",
+        alternatives: &[],
+        required: false,
+        capability: "远程容量/连通性",
+    },
 ];
 
 /// 握手结果。`Err` 只用于「连不上 / 鉴权失败」等无法继续的情况。
@@ -90,7 +185,18 @@ impl Handshake {
 
         if !hs.version.at_least(MIN_MAJOR, MIN_MINOR) {
             hs.too_old = true;
-            hs.warnings.push(rcgui_i18n::f("rclone {} 低于建议版本 {}.{}，部分接口可能缺失", &[&(if hs.version.version.is_empty() { rcgui_i18n::t("（未知版本）") } else { &hs.version.version }), &(MIN_MAJOR), &(MIN_MINOR)]));
+            hs.warnings.push(rcgui_i18n::f(
+                "rclone {} 低于建议版本 {}.{}，部分接口可能缺失",
+                &[
+                    &(if hs.version.version.is_empty() {
+                        rcgui_i18n::t("（未知版本）")
+                    } else {
+                        &hs.version.version
+                    }),
+                    &(MIN_MAJOR),
+                    &(MIN_MINOR),
+                ],
+            ));
         }
 
         // 鉴权探测：`core/version` 是 NoAuth 接口，它答得上来**不代表能干活**。
@@ -105,17 +211,21 @@ impl Handshake {
             Err(e) if e.is_auth_not_configured() => auth_unset = true,
             // 老版本没有 rc/noopauth：探测不了，不能当成「没配鉴权」（否则会把好实例判死）
             Err(e) if e.is_unsupported() => {}
-            Err(e) => hs.warnings.push(rcgui_i18n::f("鉴权探测失败：{}", &[&(e.describe())])),
+            Err(e) => hs
+                .warnings
+                .push(rcgui_i18n::f("鉴权探测失败：{}", &[&(e.describe())])),
         }
         if auth_unset {
             // 后面每个调用都会 403，索性只报这一个原因，不再堆一串误导性的
             // 「读取配置文件路径：鉴权失败」「该实例不支持特性探测」。
             hs.auth_unset = true;
             hs.warnings.push(
-                rcgui_i18n::t("对端 rclone 没有配置 RC 鉴权：除 core/version 外的接口都会返回 403，\
+                rcgui_i18n::t(
+                    "对端 rclone 没有配置 RC 鉴权：除 core/version 外的接口都会返回 403，\
                  挂载、服务、运行参数全部不可用。请用 --rc-user/--rc-pass 或 --rc-no-auth \
-                 重启 rclone 后重新握手（内置插件「一键 rclone」默认会带上用户名）")
-                    .to_string(),
+                 重启 rclone 后重新握手（内置插件「一键 rclone」默认会带上用户名）",
+                )
+                .to_string(),
             );
             return Ok(hs);
         }
@@ -123,7 +233,10 @@ impl Handshake {
         // 配置路径：可选能力，失败不阻断
         match client.config_paths().await {
             Ok(p) => hs.config = Some(p),
-            Err(e) => hs.warnings.push(rcgui_i18n::f("无法读取配置文件路径：{}", &[&(e.kind.label())])),
+            Err(e) => hs.warnings.push(rcgui_i18n::f(
+                "无法读取配置文件路径：{}",
+                &[&(e.kind.label())],
+            )),
         }
 
         // 方法表：老版本可能没有 rc/list
@@ -153,15 +266,18 @@ impl Handshake {
                     if *required {
                         hs.missing_required.push((cap.clone(), method.clone()));
                     } else {
-                        hs.warnings
-                            .push(rcgui_i18n::f("缺少「{}」能力（需要 {}）", &[&(cap), &(method)]));
+                        hs.warnings.push(rcgui_i18n::f(
+                            "缺少「{}」能力（需要 {}）",
+                            &[&(cap), &(method)],
+                        ));
                     }
                 }
                 hs.methods = Some(list);
             }
-            Err(e) => hs
-                .warnings
-                .push(rcgui_i18n::f("该实例不支持特性探测（rc/list：{}）", &[&(e.kind.label())])),
+            Err(e) => hs.warnings.push(rcgui_i18n::f(
+                "该实例不支持特性探测（rc/list：{}）",
+                &[&(e.kind.label())],
+            )),
         }
 
         Ok(hs)
@@ -204,7 +320,10 @@ impl Handshake {
         if missing.is_empty() {
             Ok(())
         } else {
-            Err(rcgui_i18n::f("该 rclone 实例缺少 {}，无法按远程分配代理（升级 rclone 后重试）", &[&(missing.join(" / "))]))
+            Err(rcgui_i18n::f(
+                "该 rclone 实例缺少 {}，无法按远程分配代理（升级 rclone 后重试）",
+                &[&(missing.join(" / "))],
+            ))
         }
     }
 
@@ -231,7 +350,10 @@ impl Handshake {
             s.push_str(rcgui_i18n::t(" · 对端未配置 RC 鉴权"));
         }
         if !self.missing_required.is_empty() {
-            s.push_str(&rcgui_i18n::f(" · 缺 {} 项必需能力", &[&(self.missing_required.len())]));
+            s.push_str(&rcgui_i18n::f(
+                " · 缺 {} 项必需能力",
+                &[&(self.missing_required.len())],
+            ));
         }
         s
     }
@@ -281,11 +403,18 @@ mod tests {
     /// （NoAuth 接口），但 5 项自动恢复全部 403。旧代码在这里判成「已连接」。
     #[test]
     fn auth_unset_blocks_compatibility() {
-        let mut hs = hs_with(Some(&["mount/mount", "serve/start", "config/listremotes"]), (1, 75));
+        let mut hs = hs_with(
+            Some(&["mount/mount", "serve/start", "config/listremotes"]),
+            (1, 75),
+        );
         assert!(hs.is_compatible());
         hs.auth_unset = true;
         assert!(!hs.is_compatible(), "对端未配置 RC 鉴权时必须判为不可用");
-        assert!(hs.summary().contains("未配置 RC 鉴权"), "摘要要点明原因：{}", hs.summary());
+        assert!(
+            hs.summary().contains("未配置 RC 鉴权"),
+            "摘要要点明原因：{}",
+            hs.summary()
+        );
     }
 
     /// 起一个假的 RC 服务器，`core/version` 永远答 200，其余接口按 `mode` 回答：
@@ -349,7 +478,10 @@ mod tests {
             .await
             .expect("core/version 能答上来，就不该报成连接失败");
         assert!(hs.auth_unset, "必须判定为「对端未配置鉴权」");
-        assert!(!hs.is_compatible(), "这种实例挂载/服务/参数全做不了，不能算可用");
+        assert!(
+            !hs.is_compatible(),
+            "这种实例挂载/服务/参数全做不了，不能算可用"
+        );
         assert!(
             hs.warnings.iter().any(|w| w.contains("没有配置 RC 鉴权")),
             "必须给出可操作提示，实际: {:?}",
@@ -387,8 +519,13 @@ mod tests {
     }
 
     #[test]
-    fn version_threshold() {        assert!(hs_with(None, (1, 75)).version.at_least(MIN_MAJOR, MIN_MINOR));
-        assert!(!hs_with(None, (1, 40)).version.at_least(MIN_MAJOR, MIN_MINOR));
+    fn version_threshold() {
+        assert!(hs_with(None, (1, 75))
+            .version
+            .at_least(MIN_MAJOR, MIN_MINOR));
+        assert!(!hs_with(None, (1, 40))
+            .version
+            .at_least(MIN_MAJOR, MIN_MINOR));
     }
 
     #[test]

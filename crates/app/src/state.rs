@@ -147,6 +147,9 @@ pub struct FetchToken {
     pub seq: u64,
     /// 取数开始时的操作序号。取数期间用户开始了操作 → 这份数据不可信
     pub op_seq: u64,
+    /// 取数开始时的端点世代（见 `rcgui_rc::RcState::epoch`）。
+    /// 取数期间内核被换掉 → 这份数据来自旧实例，不能画到新连接上
+    pub conn_epoch: u64,
 }
 
 impl FetchToken {
@@ -193,13 +196,17 @@ impl Hub {
     }
 
     /// 开始一次取数。占用期间 `fetches_in_flight` > 0。
-    pub fn begin_fetch(self: &std::sync::Arc<Self>) -> FetchGuard {
+    ///
+    /// `conn_epoch` 是发起时的端点世代，提交时要拿它与当时的值比较：
+    /// 期间内核换代（换进程、换端口、换口令），这份数据就不再属于当前连接。
+    pub fn begin_fetch(self: &std::sync::Arc<Self>, conn_epoch: u64) -> FetchGuard {
         self.fetches_in_flight.fetch_add(1, Ordering::SeqCst);
         FetchGuard {
             hub: self.clone(),
             token: FetchToken {
                 seq: self.fetch_seq.fetch_add(1, Ordering::SeqCst) + 1,
                 op_seq: self.op_seq.load(Ordering::SeqCst),
+                conn_epoch,
             },
         }
     }
@@ -211,11 +218,16 @@ impl Hub {
 
     /// 提交结果：返回 true 表示可以写 UI。
     ///
-    /// 丢弃的两种情形：
+    /// 丢弃的三种情形：
     /// - 取数期间用户开始了操作（数据可能早于操作）；
-    /// - 已经有更新的结果提交过（乱序回来）。
-    pub fn try_commit(&self, token: FetchToken) -> bool {
+    /// - 已经有更新的结果提交过（乱序回来）；
+    /// - 取数期间换了端点（`conn_epoch_now` 与发起时不同）——这是旧内核的数据，
+    ///   写上去会让界面一直显示上一个端口，而真正的新连接反而看不到。
+    pub fn try_commit(&self, token: FetchToken, conn_epoch_now: u64) -> bool {
         if token.op_seq != self.op_seq.load(Ordering::SeqCst) {
+            return false;
+        }
+        if token.conn_epoch != conn_epoch_now {
             return false;
         }
         if token.seq <= self.commit_seq.load(Ordering::SeqCst) {
@@ -292,9 +304,9 @@ impl FetchGuard {
         self.token
     }
 
-    /// 消费守卫并提交（失败时也释放计数）。
-    pub fn commit(self) -> bool {
-        let ok = self.hub.try_commit(self.token);
+    /// 消费守卫并提交（失败时也释放计数）。`conn_epoch_now` 是提交时刻的端点世代。
+    pub fn commit(self, conn_epoch_now: u64) -> bool {
+        let ok = self.hub.try_commit(self.token, conn_epoch_now);
         ok
     }
 }
@@ -480,12 +492,18 @@ pub fn hint_text(endpoint_url: &str, listed: &[MountState], drives: &[String]) -
     if !listed.is_empty() || drives.is_empty() {
         return String::new();
     }
-    rcgui_i18n::f("本机存在 rclone 挂载盘 {}，但当前连接的 {} 报告没有挂载。该盘属于另一个 rclone 实例；\
-         界面只反映当前端点的状态。", &[&(drives.join("、")), &(if endpoint_url.is_empty() {
-            rcgui_i18n::t("端点")
-        } else {
-            endpoint_url
-        })])
+    rcgui_i18n::f(
+        "本机存在 rclone 挂载盘 {}，但当前连接的 {} 报告没有挂载。该盘属于另一个 rclone 实例；\
+         界面只反映当前端点的状态。",
+        &[
+            &(drives.join("、")),
+            &(if endpoint_url.is_empty() {
+                rcgui_i18n::t("端点")
+            } else {
+                endpoint_url
+            }),
+        ],
+    )
 }
 
 #[cfg(test)]
@@ -522,36 +540,52 @@ mod tests {
     #[test]
     fn fetch_seq_increases_monotonically() {
         let hub = std::sync::Arc::new(Hub::new());
-        let a = hub.begin_fetch();
-        let b = hub.begin_fetch();
+        let a = hub.begin_fetch(1);
+        let b = hub.begin_fetch(1);
         assert!(b.token().seq() > a.token().seq(), "取数序号必须单调递增");
     }
 
     #[test]
     fn older_fetch_is_discarded_after_newer_commit() {
         let hub = std::sync::Arc::new(Hub::new());
-        let a = hub.begin_fetch();
-        let b = hub.begin_fetch();
-        assert!(b.commit(), "较新的结果先到：可以提交");
-        assert!(!a.commit(), "较旧的结果后到：必须丢弃");
+        let a = hub.begin_fetch(1);
+        let b = hub.begin_fetch(1);
+        assert!(b.commit(1), "较新的结果先到：可以提交");
+        assert!(!a.commit(1), "较旧的结果后到：必须丢弃");
     }
 
     #[test]
     fn fetch_started_before_user_op_is_discarded() {
         let hub = std::sync::Arc::new(Hub::new());
-        let a = hub.begin_fetch();
+        let a = hub.begin_fetch(1);
         hub.begin_user_op();
-        assert!(!a.commit(), "取数期间用户开始操作 → 数据可能早于操作，不可用");
+        assert!(
+            !a.commit(1),
+            "取数期间用户开始操作 → 数据可能早于操作，不可用"
+        );
         hub.end_user_op();
-        let b = hub.begin_fetch();
-        assert!(b.commit(), "操作结束后重新取的数据可以提交");
+        let b = hub.begin_fetch(1);
+        assert!(b.commit(1), "操作结束后重新取的数据可以提交");
+    }
+
+    /// 换内核时正在飞的取数：它问的是旧端口，答案属于旧实例。
+    #[test]
+    fn late_result_from_the_old_endpoint_is_dropped() {
+        let hub = std::sync::Arc::new(Hub::new());
+        let old = hub.begin_fetch(1);
+        // 期间内核换代：世代 1 → 2
+        assert!(!old.commit(2), "旧端点的迟到结果不能写进新连接的界面");
+
+        // 被丢弃的那次不能污染提交序号：新世代的取数仍要能提交
+        let new = hub.begin_fetch(2);
+        assert!(new.commit(2), "新端点的取数必须能提交");
     }
 
     #[test]
     fn fetch_guard_releases_in_flight_even_on_drop() {
         let hub = std::sync::Arc::new(Hub::new());
         {
-            let g = hub.begin_fetch();
+            let g = hub.begin_fetch(1);
             assert!(hub.fetch_in_flight(), "取数期间必须标为在跑（轮询不叠加）");
             let _ = g.token();
         }
@@ -566,7 +600,11 @@ mod tests {
             let _op = UserOpGuard::begin(&hub);
             assert_eq!(hub.status(true, true), PollStatus::UserBusy);
         }
-        assert_eq!(hub.status(true, true), PollStatus::Running, "守卫 Drop 后必须恢复");
+        assert_eq!(
+            hub.status(true, true),
+            PollStatus::Running,
+            "守卫 Drop 后必须恢复"
+        );
     }
 
     #[test]
@@ -634,16 +672,24 @@ mod tests {
 
     #[test]
     fn hint_text_names_endpoint_and_drive() {
+        // 断言里有中文文案，先独占语言，别被并行的英文用例带跑
+        let _lang = crate::test_lang::use_lang(rcgui_i18n::Lang::Zh);
         let drives = vec!["T:".to_string()];
         let hint = hint_text("http://127.0.0.1:5572", &[], &drives);
         assert!(hint.contains("T:"), "必须说出是哪个盘：{hint}");
         assert!(hint.contains("127.0.0.1:5572"), "必须说出当前端点：{hint}");
-        assert!(hint.contains("另一个 rclone 实例"), "要解释清楚归属：{hint}");
+        assert!(
+            hint.contains("另一个 rclone 实例"),
+            "要解释清楚归属：{hint}"
+        );
     }
 
     #[test]
     fn hint_text_empty_without_evidence() {
-        assert!(hint_text("http://x", &[], &[]).is_empty(), "没有盘符就不提示");
+        assert!(
+            hint_text("http://x", &[], &[]).is_empty(),
+            "没有盘符就不提示"
+        );
         assert!(
             hint_text("http://x", &snap_with(1).mounts, &["T:".into()]).is_empty(),
             "当前端点明明有挂载时不该提示"

@@ -35,6 +35,43 @@ impl VersionInfo {
     }
 }
 
+/// `job/status` 的返回。
+///
+/// `finished=false` 表示还在跑；跑完再看 `success` 与 `error`。
+/// 注意 rclone 对「已完成但失败」的 job 也返回 `finished=true`，所以判断失败
+/// 必须看 `success`，不能只看 `finished`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JobStatus {
+    #[serde(default)]
+    pub jobid: i64,
+    #[serde(default)]
+    pub finished: bool,
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default)]
+    pub error: String,
+    #[serde(default)]
+    pub duration: f64,
+    #[serde(default)]
+    pub group: String,
+}
+
+impl JobStatus {
+    /// 一句话结果，供界面直接显示；运行中返回空串。
+    pub fn outcome(&self) -> String {
+        if !self.finished {
+            return String::new();
+        }
+        if self.success && self.error.is_empty() {
+            "ok".to_string()
+        } else if self.error.is_empty() {
+            "failed".to_string()
+        } else {
+            format!("failed: {}", self.error)
+        }
+    }
+}
+
 /// `config/paths` 的返回：rclone 实际使用的目录。
 ///
 /// 用途：握手时向**运行的实例**询问真实配置路径，而不是假设
@@ -141,7 +178,10 @@ pub fn parse_mounts(v: serde_json::Value) -> Vec<MountInfo> {
             let mp = get_str(&o, &["MountPoint", "mountPoint", "mount_point"]);
             let fs = get_str(&o, &["Fs", "fs"]);
             if !mp.is_empty() {
-                out.push(MountInfo { mount_point: mp, fs });
+                out.push(MountInfo {
+                    mount_point: mp,
+                    fs,
+                });
             }
         }
     }

@@ -93,7 +93,11 @@ async fn fetch(ctx: &Arc<Ctx>) -> Fetched {
                         .to_string();
                     // K-Vault 远程在 rclone 里就是 webdav：界面上要显示成 k-vault，
                     // 否则用户看到「类型 webdav」会以为自己的专用远程没保存对。
-                    if rtype == crate::kvault::BACKEND && entry.map(crate::kvault::KvCfg::is_marked_entry).unwrap_or(false) {
+                    if rtype == crate::kvault::BACKEND
+                        && entry
+                            .map(crate::kvault::KvCfg::is_marked_entry)
+                            .unwrap_or(false)
+                    {
                         rtype = crate::kvault::TYPE.to_string();
                     }
                     RemoteState {
@@ -223,7 +227,11 @@ fn merge_pending(ctx: &Arc<Ctx>, mounts: &[MountState]) -> Vec<MountRow> {
         })
         .collect();
     let mut pending = ctx.pending_mounts.lock().unwrap();
-    pending.retain(|(_, pt)| !rows.iter().any(|r| mount_key(&r.mount_point) == mount_key(pt)));
+    pending.retain(|(_, pt)| {
+        !rows
+            .iter()
+            .any(|r| mount_key(&r.mount_point) == mount_key(pt))
+    });
     for (fs, pt) in pending.iter() {
         rows.push(MountRow {
             fs: fs.clone().into(),
@@ -232,6 +240,41 @@ fn merge_pending(ctx: &Arc<Ctx>, mounts: &[MountState]) -> Vec<MountRow> {
         });
     }
     rows
+}
+
+/// 界面要显示的「当前连接」。
+///
+/// 地址取自**实际握手的端点**（`RcState::endpoint()`），不是设置里存的那条字符串：
+/// 受管内核每次启动都用随机端口和临时口令，保存的地址在托管模式下从来不是正在用的
+/// 那个。`managed` 同理取自「内核是不是本进程拉起来的」，不是常量。
+///
+/// 之所以单独成一个值：这两项以前各自就近取，一处读了保存的配置、一处写死
+/// `false`，于是仪表盘长期显示「外部 · http://127.0.0.1:5572」——哪怕真实连接是
+/// 本机受管内核的 54283，并且页面上还显示着刚跑成功的同步。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionView {
+    /// 实际使用的 RC 地址，形如 `http://127.0.0.1:54283`
+    pub url: String,
+    /// 这个地址对应的 rclone 是否由本进程启动并持有
+    pub managed: bool,
+}
+
+impl ConnectionView {
+    /// `core_running` 来自 `Maintenance::core.is_running()`，即「我在管着它」，
+    /// 而不是「我连上了它」——外部模式下这句永远是 `false`。
+    pub fn from_live(endpoint: &rcgui_rc::Endpoint, core_running: bool) -> Self {
+        Self {
+            url: endpoint.url.clone(),
+            managed: core_running,
+        }
+    }
+}
+
+/// 读一次实际连接状态。`RcState::endpoint()` 记录的是上次握手成功的地址，
+/// 与设置里保存的「外部地址」是两回事，后者只在外部模式下才等于实际值。
+async fn live_connection(ctx: &Arc<Ctx>) -> ConnectionView {
+    let endpoint = ctx.rc.endpoint().await;
+    ConnectionView::from_live(&endpoint, ctx.maint.core.is_running())
 }
 
 /// 取一次并更新界面。
@@ -245,7 +288,7 @@ pub async fn refresh_state(ctx: &Arc<Ctx>, ui: &slint::Weak<MainWindow>, force: 
         // 离线：保留上次快照（指南 §3），不发请求、不清空列表
         return false;
     }
-    let guard = ctx.hub.begin_fetch();
+    let guard = ctx.hub.begin_fetch(ctx.rc.epoch());
     // 只看当前快照里是否已有数据，用于给用量字段做「沿用上次」的默认值
     let prev = ctx.hub.applied();
 
@@ -268,8 +311,9 @@ pub async fn refresh_state(ctx: &Arc<Ctx>, ui: &slint::Weak<MainWindow>, force: 
 
     let snapshot: Snapshot = fetched.merge_into(prev.as_ref());
 
-    // 世代号：取数期间用户动了手，或已有更新的结果提交过 → 这份数据不能用来画界面
-    if !guard.commit() {
+    // 世代号：取数期间用户动了手、已有更新的结果提交过，或内核被换掉（端点世代变了）
+    // → 这份数据不能用来画界面
+    if !guard.commit(ctx.rc.epoch()) {
         return false;
     }
     let changed = ctx.hub.note_applied(&snapshot, force);
@@ -279,7 +323,11 @@ pub async fn refresh_state(ctx: &Arc<Ctx>, ui: &slint::Weak<MainWindow>, force: 
 
     // ---- 计数与列表同源：全部从这一份 snapshot 投影 ----
     let mount_rows = merge_pending(ctx, &snapshot.mounts);
-    let url = ctx.cfg.lock().unwrap().rclone.url.clone();
+    // 地址与「谁持有这个 rclone」都取自实际状态，不读设置里保存的那条：
+    // 托管内核每次启动都换随机端口与临时口令，保存值在托管模式下永远不是正在用的那个。
+    let conn = live_connection(ctx).await;
+    let url = conn.url.clone();
+    let managed = conn.managed;
     let running = snapshot.version.starts_with('v');
 
     // 远程行：沿用既有的筛选函数（它会读搜索框），因此先给缓存赋值再调用
@@ -306,9 +354,7 @@ pub async fn refresh_state(ctx: &Arc<Ctx>, ui: &slint::Weak<MainWindow>, force: 
     *ctx.serves_cache.lock().unwrap() = serve_rows.clone();
 
     // 挂载页的「实例不匹配」提示：列表为空但本机确有 rclone 盘符时才有内容
-    let hint = ctx
-        .drives
-        .mismatch_hint(&url, &snapshot.mounts);
+    let hint = ctx.drives.mismatch_hint(&url, &snapshot.mounts);
 
     let stats = snapshot.stats.clone();
     let version = snapshot.version.clone();
@@ -336,7 +382,7 @@ pub async fn refresh_state(ctx: &Arc<Ctx>, ui: &slint::Weak<MainWindow>, force: 
         d.set_speed(format!("{}/s", fmt_bytes(stats.speed)).into());
         d.set_total_bytes(fmt_bytes(stats.bytes).into());
         d.set_running(running);
-        d.set_managed(false);
+        d.set_managed(managed);
         d.set_url(url_ui.clone().into());
         let rows: Vec<crate::XferRow> = stats
             .xfers
@@ -353,7 +399,8 @@ pub async fn refresh_state(ctx: &Arc<Ctx>, ui: &slint::Weak<MainWindow>, force: 
         )));
 
         // 「实例不匹配」提示：与列表同一份快照算出来
-        ui.global::<MountsG>().set_instance_hint(hint_ui.clone().into());
+        ui.global::<MountsG>()
+            .set_instance_hint(hint_ui.clone().into());
     });
 
     // 三个列表都走既有的「筛选」实现：搜索框里的词必须继续生效，
@@ -417,24 +464,22 @@ async fn spawn_usage(
         let ui2 = ui.clone();
         let n = name.clone();
         tokio::spawn(async move {
-            let usage = match tokio::time::timeout(
-                Duration::from_secs(15),
-                client.about(&format!("{n}:")),
-            )
-            .await
-            {
-                Ok(Ok(v)) => {
-                    let total = v.get("total").and_then(|x| x.as_f64());
-                    let used = v.get("used").and_then(|x| x.as_f64());
-                    match (total, used) {
-                        (Some(t), Some(u)) => format!("{} / {}", fmt_bytes(u), fmt_bytes(t)),
-                        (None, Some(u)) => rcgui_i18n::f("已用 {}", &[&(fmt_bytes(u))]),
-                        _ => "—".into(),
+            let usage =
+                match tokio::time::timeout(Duration::from_secs(15), client.about(&format!("{n}:")))
+                    .await
+                {
+                    Ok(Ok(v)) => {
+                        let total = v.get("total").and_then(|x| x.as_f64());
+                        let used = v.get("used").and_then(|x| x.as_f64());
+                        match (total, used) {
+                            (Some(t), Some(u)) => format!("{} / {}", fmt_bytes(u), fmt_bytes(t)),
+                            (None, Some(u)) => rcgui_i18n::f("已用 {}", &[&(fmt_bytes(u))]),
+                            _ => "—".into(),
+                        }
                     }
-                }
-                // 后端不支持 about（部分网盘）或慢：保持「—」，不要报错打扰用户
-                _ => return,
-            };
+                    // 后端不支持 about（部分网盘）或慢：保持「—」，不要报错打扰用户
+                    _ => return,
+                };
             {
                 let mut cache = ctx2.remotes_cache.lock().unwrap();
                 if let Some(e) = cache.iter_mut().find(|(cn, _, _)| cn == &n) {
@@ -455,5 +500,46 @@ async fn spawn_usage(
                 }
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn endpoint(url: &str) -> rcgui_rc::Endpoint {
+        rcgui_rc::Endpoint {
+            url: url.to_string(),
+            user: Some("gui".to_string()),
+            has_pass: true,
+        }
+    }
+
+    /// 受管内核：显示的必须是它自己的端口，而不是设置里保存的那条。
+    ///
+    /// 这条守的是实测到的缺陷——受管内核在 54283，仪表盘却一直写
+    /// 「外部 · http://127.0.0.1:5572」，因为地址读了保存的配置、`managed` 写死 false。
+    #[test]
+    fn managed_core_shows_its_own_endpoint() {
+        let v = ConnectionView::from_live(&endpoint("http://127.0.0.1:54283"), true);
+        assert_eq!(v.url, "http://127.0.0.1:54283");
+        assert!(v.managed, "本进程拉起来的内核必须显示成托管");
+    }
+
+    /// 外部模式：地址不归我们管，`managed` 必须是 false。
+    #[test]
+    fn external_endpoint_is_not_managed() {
+        let v = ConnectionView::from_live(&endpoint("http://127.0.0.1:5572"), false);
+        assert_eq!(v.url, "http://127.0.0.1:5572");
+        assert!(!v.managed);
+    }
+
+    /// 保存的地址不能参与显示：设置里留着的 5572 不能顶替真实端点。
+    #[test]
+    fn saved_url_never_replaces_the_live_endpoint() {
+        let saved = "http://127.0.0.1:5572";
+        let v = ConnectionView::from_live(&endpoint("http://127.0.0.1:54283"), true);
+        assert_ne!(v.url, saved);
+        assert_eq!(v.url, "http://127.0.0.1:54283");
     }
 }

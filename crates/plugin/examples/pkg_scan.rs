@@ -19,7 +19,10 @@ fn main() {
     let (ok, bad) = package::scan_dir(std::path::Path::new(&dir), &gui_version);
     println!("可用: {}", ok.len());
     for p in &ok {
-        println!("  OK  {} v{}  entry={}", p.meta.id, p.meta.version, p.meta.entry_file);
+        println!(
+            "  OK  {} v{}  entry={}",
+            p.meta.id, p.meta.version, p.meta.entry_file
+        );
     }
     println!("损坏: {}", bad.len());
     for (d, e) in &bad {

@@ -23,6 +23,6 @@ pub use error::{RcError, RcErrorKind, RcResult};
 pub use fetch::{fetch_to_temp, unique_tmp_name, TempFile};
 pub use handshake::{Handshake, MethodReq, METHOD_REQS, MIN_MAJOR, MIN_MINOR};
 pub use types::{
-    fmt_bytes, fmt_eta, parse_mounts, ConfigPaths, CoreStats, ListEntry, MountInfo, Transferring,
-    VersionInfo,
+    fmt_bytes, fmt_eta, parse_mounts, ConfigPaths, CoreStats, JobStatus, ListEntry, MountInfo,
+    Transferring, VersionInfo,
 };

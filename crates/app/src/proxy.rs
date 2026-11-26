@@ -19,8 +19,8 @@
 
 use crate::config::AppConfig;
 use rcgui_profile::proxy::{
-    plan_apply, uses_native_keys, ApplyPlan, PlanOutcome, ProxyConfigValues, ProxyKey, ProxyProfile,
-    ProxyStep,
+    plan_apply, uses_native_keys, ApplyPlan, PlanOutcome, ProxyConfigValues, ProxyKey,
+    ProxyProfile, ProxyStep,
 };
 use rcgui_profile::{ProxyRegistry, RemoteProxyBinding};
 use rcgui_rc::RcClient;
@@ -172,17 +172,9 @@ pub async fn apply_to_remote(
         }
         ApplyPlan::Unmanaged => Ok(ApplyOutcome::LeftAlone),
         ApplyPlan::RespectExisting { key } => Ok(ApplyOutcome::RespectExisting { key }),
-        ApplyPlan::Conflict {
-            key,
-            ours,
-            current,
-        } => {
+        ApplyPlan::Conflict { key, ours, current } => {
             // 什么都不改：用户的改动优先，让他在界面上确认后再操作
-            Ok(ApplyOutcome::Conflict {
-                key,
-                ours,
-                current,
-            })
+            Ok(ApplyOutcome::Conflict { key, ours, current })
         }
         ApplyPlan::Steps {
             steps,
@@ -256,7 +248,6 @@ pub fn native_key_hint() -> &'static str {
 pub fn native_note(rtype: &str) -> Option<&'static str> {
     uses_native_keys(rtype).then_some(native_key_hint())
 }
-
 
 /// 新建代理配置时的 ID 生成。
 pub fn new_proxy_id() -> String {
@@ -377,7 +368,10 @@ pub fn annotate_error(raw: &str, proxy_endpoint: Option<&str>) -> String {
         return raw.to_string();
     }
     if let Some(f) = classify_proxy_failure(raw) {
-        return rcgui_i18n::f("【代理】{}：{}{}{}）", &[&(f.label()), &(f.hint()), &(annotated_mark()), &(raw)]);
+        return rcgui_i18n::f(
+            "【代理】{}：{}{}{}）",
+            &[&(f.label()), &(f.hint()), &(annotated_mark()), &(raw)],
+        );
     }
     if let Some(ep) = proxy_endpoint {
         if looks_like_network_failure(raw) {
@@ -460,7 +454,10 @@ mod tests {
                 ..Default::default()
             }],
         );
-        assert_eq!(bound_profile(&cfg, "teldrive").map(|p| p.id), Some("p1".into()));
+        assert_eq!(
+            bound_profile(&cfg, "teldrive").map(|p| p.id),
+            Some("p1".into())
+        );
         assert!(bound_profile(&cfg, "other").is_none());
     }
 
@@ -469,8 +466,16 @@ mod tests {
         let cfg = cfg_with(
             vec![prof("p1")],
             vec![
-                RemoteProxyBinding { remote: "a".into(), proxy_id: "p1".into(), ..Default::default() },
-                RemoteProxyBinding { remote: "b".into(), proxy_id: "gone".into(), ..Default::default() },
+                RemoteProxyBinding {
+                    remote: "a".into(),
+                    proxy_id: "p1".into(),
+                    ..Default::default()
+                },
+                RemoteProxyBinding {
+                    remote: "b".into(),
+                    proxy_id: "gone".into(),
+                    ..Default::default()
+                },
             ],
         );
         assert_eq!(dangling_remotes(&cfg), vec!["b".to_string()]);
@@ -480,6 +485,8 @@ mod tests {
 
     #[test]
     fn hints_do_not_overpromise() {
+        // 断言里有中文文案，先独占语言，别被并行的英文用例带跑
+        let _lang = crate::test_lang::use_lang(rcgui_i18n::Lang::Zh);
         // 「不代理」的文案不得出现「强制直连」这类误导说法
         assert!(direct_hint().contains("不等于强制直连"));
         assert!(direct_hint().contains("HTTP_PROXY"));
@@ -588,19 +595,27 @@ mod tests {
         assert!(!ApplyOutcome::Applied.is_failure());
         assert!(!ApplyOutcome::Unchanged.is_failure());
         assert!(!ApplyOutcome::LeftAlone.is_failure());
-        assert!(!ApplyOutcome::RespectExisting { key: ProxyKey::NativeSocks }.is_failure());
+        assert!(!ApplyOutcome::RespectExisting {
+            key: ProxyKey::NativeSocks
+        }
+        .is_failure());
         // 只有真正写过的才算「已重载」
         assert!(ApplyOutcome::Applied.is_changed());
         assert!(ApplyOutcome::Removed.is_changed());
         assert!(ApplyOutcome::Restored("x".into()).is_changed());
         assert!(!ApplyOutcome::Unchanged.is_changed());
         assert!(!ApplyOutcome::LeftAlone.is_changed());
-        assert!(ApplyOutcome::RespectExisting { key: ProxyKey::NativeHttp }.is_skipped());
+        assert!(ApplyOutcome::RespectExisting {
+            key: ProxyKey::NativeHttp
+        }
+        .is_skipped());
     }
 
     /// 冲突提示必须把凭据打码：它会进 toast、历史记录，也可能被截图。
     #[test]
     fn conflict_description_redacts_credentials() {
+        // 断言里有中文文案，先独占语言，别被并行的英文用例带跑
+        let _lang = crate::test_lang::use_lang(rcgui_i18n::Lang::Zh);
         let d = ApplyOutcome::Conflict {
             key: ProxyKey::Override,
             ours: "http://u:secret@h:1".into(),
@@ -621,6 +636,8 @@ mod tests {
 
     #[test]
     fn respect_message_does_not_leak_values() {
+        // 断言里有中文文案，先独占语言，别被并行的英文用例带跑
+        let _lang = crate::test_lang::use_lang(rcgui_i18n::Lang::Zh);
         let d = ApplyOutcome::RespectExisting {
             key: ProxyKey::NativeSocks,
         }
@@ -652,14 +669,26 @@ mod tests {
 
     #[test]
     fn refused_proxy_is_recognized_for_http_and_socks5() {
-        assert_eq!(classify_proxy_failure(SAMPLE_HTTP_REFUSED), Some(ProxyFailure::Refused));
-        assert_eq!(classify_proxy_failure(SAMPLE_SOCKS_REFUSED), Some(ProxyFailure::Refused));
+        assert_eq!(
+            classify_proxy_failure(SAMPLE_HTTP_REFUSED),
+            Some(ProxyFailure::Refused)
+        );
+        assert_eq!(
+            classify_proxy_failure(SAMPLE_SOCKS_REFUSED),
+            Some(ProxyFailure::Refused)
+        );
     }
 
     #[test]
     fn auth_and_gateway_failures_are_recognized() {
-        assert_eq!(classify_proxy_failure(SAMPLE_407), Some(ProxyFailure::AuthRequired));
-        assert_eq!(classify_proxy_failure(SAMPLE_502), Some(ProxyFailure::BadGateway));
+        assert_eq!(
+            classify_proxy_failure(SAMPLE_407),
+            Some(ProxyFailure::AuthRequired)
+        );
+        assert_eq!(
+            classify_proxy_failure(SAMPLE_502),
+            Some(ProxyFailure::BadGateway)
+        );
     }
 
     #[test]
@@ -684,6 +713,8 @@ mod tests {
     /// 已知的判定边界：超时/EOF 这类文本里没有代理证据，不做强归因。
     #[test]
     fn timeout_without_proxy_evidence_stays_raw() {
+        // 断言里有中文文案，先独占语言，别被并行的英文用例带跑
+        let _lang = crate::test_lang::use_lang(rcgui_i18n::Lang::Zh);
         let raw = r#"operation error S3: ListBuckets, request send failed, Get "http://127.0.0.1:9/": net/http: timeout awaiting response headers"#;
         assert_eq!(classify_proxy_failure(raw), None);
         assert_eq!(annotate_error(raw, None), raw);
@@ -697,6 +728,8 @@ mod tests {
 
     #[test]
     fn annotate_keeps_raw_text_and_is_idempotent() {
+        // 断言里有中文文案，先独占语言，别被并行的英文用例带跑
+        let _lang = crate::test_lang::use_lang(rcgui_i18n::Lang::Zh);
         let once = annotate_error(SAMPLE_407, None);
         assert!(once.starts_with("【代理】代理要求认证："));
         assert!(once.contains("ProxyAuthenticationRequired"), "原文必须保留");

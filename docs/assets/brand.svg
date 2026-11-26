@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="bt bd">
+  <title id="bt">RCGUI 标志</title>
+  <desc id="bd">深色圆角方块内有一个开口圆环与一扇原生窗口，表示用原生界面管理 rclone 的连接循环。</desc>
+  <rect width="512" height="512" rx="104" fill="#0f172a"/>
+  <g transform="translate(256 244)">
+    <circle r="150" fill="none" stroke="#38bdf8" stroke-width="34" stroke-linecap="round"
+            stroke-dasharray="826 116" transform="rotate(-96)"/>
+    <rect x="-86" y="-62" width="172" height="124" rx="18" fill="#f8fafc"/>
+    <rect x="-86" y="-62" width="172" height="34" rx="18" fill="#cbd5e1"/>
+    <rect x="-86" y="-46" width="172" height="18" fill="#cbd5e1"/>
+    <circle cx="-64" cy="-45" r="6" fill="#0f172a"/>
+    <rect x="-62" y="-16" width="124" height="14" rx="7" fill="#334155"/>
+    <rect x="-62" y="12" width="86" height="14" rx="7" fill="#94a3b8"/>
+  </g>
+  <text x="256" y="452" text-anchor="middle"
+        font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="46" font-weight="600"
+        fill="#e2e8f0" letter-spacing="6">RCGUI</text>
+</svg>

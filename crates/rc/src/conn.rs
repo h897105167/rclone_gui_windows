@@ -46,7 +46,18 @@ impl Endpoint {
     /// 面向 UI 的安全展示串：只显示地址与用户名，绝不含密码。
     pub fn display(&self) -> String {
         match &self.user {
-            Some(u) if !u.is_empty() => rcgui_i18n::f("{}（用户 {}{}）", &[&(self.url), &(u), &(if self.has_pass { rcgui_i18n::t("，含密码") } else { "" })]),
+            Some(u) if !u.is_empty() => rcgui_i18n::f(
+                "{}（用户 {}{}）",
+                &[
+                    &(self.url),
+                    &(u),
+                    &(if self.has_pass {
+                        rcgui_i18n::t("，含密码")
+                    } else {
+                        ""
+                    }),
+                ],
+            ),
             _ => self.url.clone(),
         }
     }
@@ -93,6 +104,12 @@ pub struct RcState {
     inner: RwLock<Inner>,
     /// `Connected` 的同步镜像：让轮询热路径不做 `await` 也能判断「该不该发请求」。
     live: std::sync::atomic::AtomicBool,
+    /// 端点世代：换过一次客户端就 +1。
+    ///
+    /// 取数要花几十毫秒到十几秒。这个时间里内核可能被换掉（换了进程、新端口、
+    /// 新口令），那份还在飞的响应属于旧实例，画上去就是「界面显示旧端口」。
+    /// 取数开始时记下世代，提交前再读一次，不相等就丢弃。
+    epoch: std::sync::atomic::AtomicU64,
 }
 
 impl Default for RcState {
@@ -116,7 +133,17 @@ impl RcState {
                 connected_at: None,
             }),
             live: std::sync::atomic::AtomicBool::new(false),
+            epoch: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// 端点世代。同一世代内的数据可以互相覆盖；跨世代的数据不能。
+    ///
+    /// 每次 `set_connected` 与 `forget` 都会推进它（客户端被换了）；只改连接
+    /// 状态（`set_disconnected`）不动它 —— 那时客户端还是同一个，旧的快照仍然
+    /// 属于同一个内核，标成「上次快照」给人看是对的。
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 同步判断是否处于已连接状态（供轮询门控使用，不发请求、不 await）。
@@ -150,6 +177,8 @@ impl RcState {
         g.status = ConnStatus::Connected;
         g.last_error = None;
         g.connected_at = Some(Instant::now());
+        self.epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.live.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -163,6 +192,25 @@ impl RcState {
         };
         g.last_error = err;
         g.connected_at = None;
+        self.live.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 忘掉当前端点，回到「从没连过」的初始状态。
+    ///
+    /// 只在我们亲手停掉自己拉起的内核之后调用：那个端口随进程一起消失，把它留着
+    /// 并标成 `Stale`，等于告诉用户「还连着上一次的实例，只是断了」。外部实例
+    /// 一律不走这里 —— 那是别人的进程，它的地址不该被我们抹掉。
+    pub async fn forget(&self) {
+        let endpoint = Endpoint::loopback_default();
+        let client = Arc::new(RcClient::new(endpoint.url.clone(), None, None));
+        let mut g = self.inner.write().await;
+        g.client = client;
+        g.endpoint = endpoint;
+        g.status = ConnStatus::Disconnected;
+        g.last_error = None;
+        g.connected_at = None;
+        self.epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.live.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -187,7 +235,11 @@ mod tests {
     #[tokio::test]
     async fn connect_then_disconnect_keeps_client_as_stale() {
         let st = RcState::new();
-        let c = Arc::new(RcClient::new("http://127.0.0.1:6000", Some("u".into()), Some("p".into())));
+        let c = Arc::new(RcClient::new(
+            "http://127.0.0.1:6000",
+            Some("u".into()),
+            Some("p".into()),
+        ));
         st.set_connected(c.clone()).await;
         assert_eq!(st.status().await, ConnStatus::Connected);
         assert!(st.status().await.is_live());
@@ -206,6 +258,109 @@ mod tests {
         let st = RcState::new();
         st.set_disconnected(Some("refused".into())).await;
         assert_eq!(st.status().await, ConnStatus::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn forget_drops_the_endpoint_of_a_core_we_stopped() {
+        let st = RcState::new();
+        let old = Arc::new(RcClient::new(
+            "http://127.0.0.1:62147",
+            Some("olduser".into()),
+            Some("oldpass".into()),
+        ));
+        st.set_connected(old).await;
+
+        st.forget().await;
+
+        // 回到「从没连过」：旧端口一个字都不能留在状态里
+        assert_eq!(st.status().await, ConnStatus::Disconnected);
+        assert!(!st.is_live());
+        assert_ne!(st.endpoint().await.url, "http://127.0.0.1:62147");
+        assert_ne!(st.client().await.endpoint(), "http://127.0.0.1:62147");
+        assert!(st.endpoint().await.user.is_none());
+        assert!(!st.endpoint().await.has_pass);
+        assert!(st.last_error().await.is_none());
+        assert!(st.connected_for().await.is_none());
+    }
+
+    /// 换代后的真实顺序：连旧的 → 我们自己把旧内核停掉（forget）→ 连新的。
+    /// 断言最后用的是新地址，旧地址不会被「上次快照」带回来。
+    #[tokio::test]
+    async fn reconnecting_after_forget_uses_the_new_core() {
+        let st = RcState::new();
+        st.set_connected(Arc::new(RcClient::new(
+            "http://127.0.0.1:62147",
+            Some("olduser".into()),
+            Some("oldpass".into()),
+        )))
+        .await;
+        st.forget().await;
+
+        st.set_connected(Arc::new(RcClient::new(
+            "http://127.0.0.1:55981",
+            Some("newuser".into()),
+            Some("newpass".into()),
+        )))
+        .await;
+
+        assert_eq!(st.status().await, ConnStatus::Connected);
+        assert!(st.is_live());
+        assert_eq!(st.endpoint().await.url, "http://127.0.0.1:55981");
+        assert_eq!(st.endpoint().await.user.as_deref(), Some("newuser"));
+        assert_eq!(st.client().await.endpoint(), "http://127.0.0.1:55981");
+    }
+
+    /// 换内核 = 换客户端：世代必须前进，否则换装前发出的取数会被当成有效结果。
+    #[tokio::test]
+    async fn epoch_changes_when_the_client_is_replaced() {
+        let st = RcState::new();
+        let before = st.epoch();
+        st.set_connected(Arc::new(RcClient::new(
+            "http://127.0.0.1:55097",
+            Some("a".into()),
+            Some("b".into()),
+        )))
+        .await;
+        let first = st.epoch();
+        assert!(first > before, "连上之后世代要前进");
+        st.set_connected(Arc::new(RcClient::new(
+            "http://127.0.0.1:64673",
+            Some("c".into()),
+            Some("d".into()),
+        )))
+        .await;
+        assert!(st.epoch() > first, "换到新端点后世代要再前进");
+    }
+
+    /// 只是掉线（客户端还是同一个）不推进世代：那份快照仍属于这个内核，
+    /// 每次网络抖动都换代的话，正常轮询结果会被自己当成过期数据全丢掉。
+    #[tokio::test]
+    async fn epoch_holds_when_only_the_status_changes() {
+        let st = RcState::new();
+        st.set_connected(Arc::new(RcClient::new(
+            "http://127.0.0.1:64673",
+            Some("c".into()),
+            Some("d".into()),
+        )))
+        .await;
+        let e = st.epoch();
+        st.set_disconnected(Some("connection refused".into())).await;
+        assert_eq!(st.epoch(), e);
+    }
+
+    /// 停掉自己拉起的内核（forget）同样算换代：那个端口的响应一条都不能再上台面。
+    #[tokio::test]
+    async fn forget_advances_the_epoch() {
+        let st = RcState::new();
+        st.set_connected(Arc::new(RcClient::new(
+            "http://127.0.0.1:55097",
+            Some("a".into()),
+            Some("b".into()),
+        )))
+        .await;
+        let e = st.epoch();
+        st.forget().await;
+        assert!(st.epoch() > e);
     }
 
     #[test]

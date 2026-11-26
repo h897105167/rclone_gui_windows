@@ -36,12 +36,173 @@ const LOCAL_SIG: u32 = 0x0403_4b50;
 const METHOD_STORE: u16 = 0;
 const METHOD_DEFLATE: u16 = 8;
 
-/// 读取 zip 的中央目录。
+/// 解压预算：条目数、解压后总体积、单个文件体积。
+///
+/// 三个上限都要有，缺一个就留下一种攻击面：只限总体积挡不住"四万个空文件"
+/// 把解压后的目录树撑爆（每个文件仍占磁盘块），只限单文件挡不住"很多个刚好
+/// 小于上限的文件"。默认值与插件包上限一致，见 `crate::package`。
+#[derive(Debug, Clone, Copy)]
+pub struct ZipBudget {
+    pub max_entries: usize,
+    pub max_total: u64,
+    pub max_file: u64,
+}
+
+impl Default for ZipBudget {
+    fn default() -> Self {
+        Self {
+            max_entries: 4096,
+            max_total: crate::package::MAX_EXTRACTED_BYTES,
+            max_file: crate::package::MAX_PACKAGE_BYTES,
+        }
+    }
+}
+
+/// 读取中央目录并做安全校验（条目数/体积/文件名）。
+///
+/// 所有"要落盘"或"要信任"的路径都应该走这个函数，而不是裸 `read_entries`：
+/// 裸版本只解析结构，恶意归档仍然能通过。
+pub fn read_entries_checked(data: &[u8], budget: &ZipBudget) -> Result<Vec<ZipEntry>> {
+    let entries = read_entries(data)?;
+    validate_entries(&entries, budget)?;
+    Ok(entries)
+}
+
+/// 校验已解析的条目表。拆成独立函数，便于对同一张表重复用不同预算检查。
+pub fn validate_entries(entries: &[ZipEntry], budget: &ZipBudget) -> Result<()> {
+    if entries.len() > budget.max_entries {
+        bail!(
+            "{}",
+            rcgui_i18n::f(
+                "插件包条目过多（{} 个，上限 {}）",
+                &[&(entries.len()), &(budget.max_entries)]
+            )
+        );
+    }
+    let mut total: u64 = 0;
+    // 用全小写名字查重：Windows 文件系统不区分大小写，"A.dll" 与 "a.dll"
+    // 会互相覆盖，攻击者可以借此让校验过的文件被后一个条目替换掉。
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(entries.len());
+    for e in entries {
+        validate_entry_name(&e.name)?;
+        if !seen.insert(e.name.to_lowercase()) {
+            bail!(
+                "{}",
+                rcgui_i18n::f("插件包内存在重复文件名（忽略大小写）: {}", &[&(e.name)])
+            );
+        }
+        if e.uncompressed_size > budget.max_file {
+            bail!(
+                "{}",
+                rcgui_i18n::f(
+                    "插件包内单文件过大（{}，上限 {} MB）",
+                    &[&(e.name), &(budget.max_file / 1024 / 1024)]
+                )
+            );
+        }
+        total = total.saturating_add(e.uncompressed_size);
+        if total > budget.max_total {
+            bail!(
+                "{}",
+                rcgui_i18n::f(
+                    "解压后体积超过上限（{} MB），已中止",
+                    &[&(budget.max_total / 1024 / 1024)]
+                )
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Windows 上不允许作为普通文件名使用的名字。带扩展名时（CON.txt）同样被系统
+/// 当成设备，所以按第一个 '.' 之前的部分判断。
+const RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+fn validate_entry_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("{}", rcgui_i18n::t("插件包内含空文件名"));
+    }
+    if name.contains('\\') {
+        // read_entries 已把 '\\' 统一成 '/'，走到这里说明名字被拼回去过
+        bail!(
+            "{}",
+            rcgui_i18n::f("插件包内文件名含非法分隔符: {}", &[&(name)])
+        );
+    }
+    if name.chars().any(|c| (c as u32) < 0x20 || c as u32 == 0x7f) {
+        bail!(
+            "{}",
+            rcgui_i18n::f("插件包内文件名含控制字符: {}", &[&(name.escape_debug())])
+        );
+    }
+    // ':' 是 NTFS 的备用数据流（file.txt:evil.exe），解压到磁盘会写出校验清单
+    // 之外的内容；归一化的 '/' 之外不该出现冒号。
+    if name.contains(':') {
+        bail!(
+            "{}",
+            rcgui_i18n::f("插件包内文件名含备用数据流（:）: {}", &[&(name)])
+        );
+    }
+    if name.starts_with('/') {
+        bail!("{}", rcgui_i18n::f("插件包内含绝对路径: {}", &[&(name)]));
+    }
+    let trimmed = name.trim_end_matches('/');
+    if trimmed.is_empty() {
+        bail!("{}", rcgui_i18n::f("插件包内含空目录名: {}", &[&(name)]));
+    }
+    for seg in trimmed.split('/') {
+        if seg.is_empty() {
+            bail!("{}", rcgui_i18n::f("插件包内含空路径段: {}", &[&(name)]));
+        }
+        if seg == "." || seg == ".." {
+            bail!(
+                "{}",
+                rcgui_i18n::f("插件包内含非法路径（..）: {}", &[&(name)])
+            );
+        }
+        // Windows 会静默去掉结尾的点和空格，导致 "a." 与 "a" 落到同一个文件，
+        // 从而绕过重名检查。
+        if seg.ends_with('.') || seg.ends_with(' ') {
+            bail!(
+                "{}",
+                rcgui_i18n::f("插件包内文件名以点或空格结尾: {}", &[&(name)])
+            );
+        }
+        if seg
+            .chars()
+            .any(|c| matches!(c, '*' | '?' | '"' | '<' | '>' | '|'))
+        {
+            bail!(
+                "{}",
+                rcgui_i18n::f("插件包内文件名含 Windows 保留字符: {}", &[&(name)])
+            );
+        }
+        let stem = seg.split('.').next().unwrap_or(seg);
+        if RESERVED_NAMES.iter().any(|r| r.eq_ignore_ascii_case(stem)) {
+            bail!(
+                "{}",
+                rcgui_i18n::f("插件包内文件名是 Windows 设备名: {}", &[&(name)])
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 读取 zip 的中央目录（只解析结构，不做安全校验）。
 pub fn read_entries(data: &[u8]) -> Result<Vec<ZipEntry>> {
     if data.len() < 22 {
         bail!("{}", rcgui_i18n::t("文件太小，不是有效的 zip"));
     }
-    let eocd_off = find_eocd(data).ok_or_else(|| anyhow!("{}", rcgui_i18n::t("未找到 zip 结尾标记（EOCD），文件可能已损坏")))?;
+    let eocd_off = find_eocd(data).ok_or_else(|| {
+        anyhow!(
+            "{}",
+            rcgui_i18n::t("未找到 zip 结尾标记（EOCD），文件可能已损坏")
+        )
+    })?;
     let mut cen_count = u16::from_le_bytes([data[eocd_off + 10], data[eocd_off + 11]]) as u64;
     let mut cen_off = u32::from_le_bytes([
         data[eocd_off + 16],
@@ -53,7 +214,13 @@ pub fn read_entries(data: &[u8]) -> Result<Vec<ZipEntry>> {
     // ZIP64：EOCD 中对应字段为 0xFFFF/0xFFFFFFFF 时，去 ZIP64 EOCD 取真实值
     if cen_count == 0xFFFF
         || cen_off == 0xFFFF_FFFF
-        || eocd_off >= 20 && u32::from_le_bytes([data[eocd_off - 20], data[eocd_off - 19], data[eocd_off - 18], data[eocd_off - 17]]) == EOCD64_LOCATOR_SIG
+        || eocd_off >= 20
+            && u32::from_le_bytes([
+                data[eocd_off - 20],
+                data[eocd_off - 19],
+                data[eocd_off - 18],
+                data[eocd_off - 17],
+            ]) == EOCD64_LOCATOR_SIG
     {
         if let Some(z64) = find_zip64_eocd(data, eocd_off) {
             cen_count = u64::from_le_bytes(data[z64 + 32..z64 + 40].try_into().unwrap());
@@ -69,7 +236,10 @@ pub fn read_entries(data: &[u8]) -> Result<Vec<ZipEntry>> {
         }
         let sig = u32::from_le_bytes(data[p..p + 4].try_into().unwrap());
         if sig != CEN_SIG {
-            bail!("{}", rcgui_i18n::f("zip 中央目录签名错误（偏移 {}）", &[&(p)]));
+            bail!(
+                "{}",
+                rcgui_i18n::f("zip 中央目录签名错误（偏移 {}）", &[&(p)])
+            );
         }
         let method = u16::from_le_bytes([data[p + 10], data[p + 11]]);
         let crc32 = u32::from_le_bytes(data[p + 16..p + 20].try_into().unwrap());
@@ -104,7 +274,10 @@ pub fn read_entries(data: &[u8]) -> Result<Vec<ZipEntry>> {
             bail!("{}", rcgui_i18n::f("zip 本地头越界（条目 {}）", &[&(name)]));
         }
         if u32::from_le_bytes(data[lo..lo + 4].try_into().unwrap()) != LOCAL_SIG {
-            bail!("{}", rcgui_i18n::f("zip 本地头签名错误（条目 {}）", &[&(name)]));
+            bail!(
+                "{}",
+                rcgui_i18n::f("zip 本地头签名错误（条目 {}）", &[&(name)])
+            );
         }
         let l_name_len = u16::from_le_bytes([data[lo + 26], data[lo + 27]]) as usize;
         let l_extra_len = u16::from_le_bytes([data[lo + 28], data[lo + 29]]) as usize;
@@ -129,7 +302,8 @@ fn find_eocd(data: &[u8]) -> Option<usize> {
     let start = data.len().saturating_sub(22 + 65535);
     let mut i = data.len().checked_sub(22)?;
     loop {
-        if i + 4 <= data.len() && u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) == EOCD_SIG {
+        if i + 4 <= data.len() && u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) == EOCD_SIG
+        {
             return Some(i);
         }
         if i == start {
@@ -222,16 +396,43 @@ pub fn read_entry(data: &[u8], e: &ZipEntry) -> Result<Vec<u8>> {
         bail!("{}", rcgui_i18n::f("zip 数据越界（条目 {}）", &[&(e.name)]));
     }
     let raw = &data[start..end];
+    // 解压时按中央目录记录的大小限流：deflate 流本身可以声明很小的
+    // uncompressed_size 却解出几个 GB，只靠事后检查总大小会在中途就 OOM。
+    let cap = e.uncompressed_size;
     let out = match e.method {
-        METHOD_STORE => raw.to_vec(),
+        METHOD_STORE => {
+            if raw.len() as u64 != cap {
+                bail!(
+                    "{}",
+                    rcgui_i18n::f(
+                        "zip 条目大小不符（{}）：目录记录 {} 字节，实际 {} 字节",
+                        &[&(e.name), &(cap), &(raw.len())]
+                    )
+                );
+            }
+            raw.to_vec()
+        }
         METHOD_DEFLATE => {
-            let mut out = Vec::with_capacity(e.uncompressed_size as usize);
+            let mut out = Vec::with_capacity(cap.min(8 * 1024 * 1024) as usize);
             flate2::read::DeflateDecoder::new(Cursor::new(raw))
+                .take(cap.saturating_add(1))
                 .read_to_end(&mut out)
                 .with_context(|| rcgui_i18n::f("解压失败（条目 {}）", &[&(e.name)]))?;
+            if out.len() as u64 != cap {
+                bail!(
+                    "{}",
+                    rcgui_i18n::f(
+                        "zip 条目大小不符（{}）：目录记录 {} 字节，解出 {} 字节",
+                        &[&(e.name), &(cap), &(out.len())]
+                    )
+                );
+            }
             out
         }
-        m => bail!("{}", rcgui_i18n::f("不支持的 zip 压缩方法 {}（条目 {}）", &[&(m), &(e.name)])),
+        m => bail!(
+            "{}",
+            rcgui_i18n::f("不支持的 zip 压缩方法 {}（条目 {}）", &[&(m), &(e.name)])
+        ),
     };
     // 校验 CRC-32：能发现 zip 在传输/下载中损坏，避免把坏文件当插件装上
     if e.crc32 != 0 || !out.is_empty() {
@@ -239,7 +440,13 @@ pub fn read_entry(data: &[u8], e: &ZipEntry) -> Result<Vec<u8>> {
         h.update(&out);
         let got = h.finalize();
         if got != e.crc32 {
-            bail!("{}", rcgui_i18n::f("zip 条目校验失败（{}）：CRC-32 不匹配，文件可能已损坏", &[&(e.name)]));
+            bail!(
+                "{}",
+                rcgui_i18n::f(
+                    "zip 条目校验失败（{}）：CRC-32 不匹配，文件可能已损坏",
+                    &[&(e.name)]
+                )
+            );
         }
     }
     Ok(out)
@@ -254,8 +461,13 @@ pub fn safe_join(root: &Path, name: &str) -> Result<PathBuf> {
         match comp {
             Component::Normal(c) => out.push(c),
             Component::CurDir => {}
-            Component::ParentDir => bail!("{}", rcgui_i18n::f("插件包内含非法路径（..）: {}", &[&(name)])),
-            Component::RootDir | Component::Prefix(_) => bail!("{}", rcgui_i18n::f("插件包内含绝对路径: {}", &[&(name)])),
+            Component::ParentDir => bail!(
+                "{}",
+                rcgui_i18n::f("插件包内含非法路径（..）: {}", &[&(name)])
+            ),
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("{}", rcgui_i18n::f("插件包内含绝对路径: {}", &[&(name)]))
+            }
         }
     }
     Ok(out)
@@ -265,14 +477,13 @@ pub fn safe_join(root: &Path, name: &str) -> Result<PathBuf> {
 ///
 /// 限制总解压体积，避免"zip 炸弹"耗尽磁盘（插件包本身不该这么大）。
 pub fn extract_all(data: &[u8], dest: &Path, max_total: u64) -> Result<usize> {
-    let entries = read_entries(data)?;
-    let mut total: u64 = 0;
+    let budget = ZipBudget {
+        max_total,
+        ..ZipBudget::default()
+    };
+    let entries = read_entries_checked(data, &budget)?;
     let mut files = 0usize;
     for e in &entries {
-        total = total.saturating_add(e.uncompressed_size);
-        if total > max_total {
-            bail!("{}", rcgui_i18n::f("解压后体积超过上限（{} MB），已中止", &[&(max_total / 1024 / 1024)]));
-        }
         let path = safe_join(dest, &e.name)?;
         if e.is_dir {
             std::fs::create_dir_all(&path)?;
@@ -506,7 +717,10 @@ pub mod tests {
         let es = read_entries(&zip).unwrap();
         assert_eq!(es.len(), 1);
         assert_eq!(es[0].method, METHOD_DEFLATE);
-        assert!(es[0].compressed_size < es[0].uncompressed_size, "应确实被压缩");
+        assert!(
+            es[0].compressed_size < es[0].uncompressed_size,
+            "应确实被压缩"
+        );
         assert_eq!(read_entry(&zip, &es[0]).unwrap(), payload);
     }
 
@@ -572,5 +786,147 @@ pub mod tests {
         let es = read_entries(&zip).unwrap();
         assert_eq!(es[0].uncompressed_size, 1000);
         assert_eq!(read_entry(&zip, &es[0]).unwrap().len(), 1000);
+    }
+
+    /// 正常包必须继续可用：加严校验后不能把合法插件包挡在门外。
+    #[test]
+    fn accepts_normal_package() {
+        let zip = build_store_zip(&[
+            ("plugin.json", b"{\"id\":\"demo\"}" as &[u8]),
+            ("README.md", b"# demo"),
+            ("bin/helper.dll", b"\x4d\x5a"),
+            ("bin/", b""),
+        ]);
+        let es = read_entries_checked(&zip, &ZipBudget::default()).unwrap();
+        assert_eq!(es.len(), 4);
+    }
+
+    /// 条目数上限：大量空文件能把解压后的目录树撑爆，体积上限挡不住。
+    #[test]
+    fn rejects_too_many_entries() {
+        let zip = build_store_zip(&[
+            ("a", b"" as &[u8]),
+            ("b", b"" as &[u8]),
+            ("c", b"" as &[u8]),
+        ]);
+        let budget = ZipBudget {
+            max_entries: 2,
+            ..ZipBudget::default()
+        };
+        let err = read_entries_checked(&zip, &budget).unwrap_err().to_string();
+        assert!(err.contains("条目过多"), "应报条目数超限，实际: {err}");
+    }
+
+    #[test]
+    fn rejects_oversized_single_file() {
+        let big = vec![0u8; 100];
+        let zip = build_store_zip(&[("big.bin", &big[..])]);
+        let budget = ZipBudget {
+            max_file: 10,
+            ..ZipBudget::default()
+        };
+        let err = read_entries_checked(&zip, &budget).unwrap_err().to_string();
+        assert!(err.contains("单文件过大"), "应报单文件超限，实际: {err}");
+    }
+
+    #[test]
+    fn rejects_oversized_total() {
+        let big = vec![0u8; 80];
+        let zip = build_store_zip(&[("a.bin", &big[..]), ("b.bin", &big[..])]);
+        let budget = ZipBudget {
+            max_total: 100,
+            ..ZipBudget::default()
+        };
+        let err = read_entries_checked(&zip, &budget).unwrap_err().to_string();
+        assert!(err.contains("体积超过上限"), "应报总体积超限，实际: {err}");
+    }
+
+    /// 大小写重名：Windows 上 "A.dll" 与 "a.dll" 是同一个文件，后解压的会覆盖
+    /// 先写好的，等于绕过对已校验文件的信任。
+    #[test]
+    fn rejects_case_insensitive_duplicates() {
+        let zip = build_store_zip(&[("A.dll", b"1" as &[u8]), ("a.dll", b"2")]);
+        let err = read_entries_checked(&zip, &ZipBudget::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("重复文件名"), "应报重名，实际: {err}");
+    }
+
+    /// NTFS 备用数据流：`kv.json:evil` 会把内容写到另一个流里，落地后统计不到。
+    #[test]
+    fn rejects_alternate_data_stream() {
+        let zip = build_store_zip(&[("kv.json:evil", b"x" as &[u8])]);
+        let err = read_entries_checked(&zip, &ZipBudget::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("备用数据流"), "应报 ADS，实际: {err}");
+    }
+
+    #[test]
+    fn rejects_windows_device_names() {
+        for name in ["CON", "con.txt", "AUX", "LPT1.dll", "com9"] {
+            let zip = build_store_zip(&[(name, b"x" as &[u8])]);
+            let err = read_entries_checked(&zip, &ZipBudget::default())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("设备名"), "{name} 应被拒绝，实际: {err}");
+        }
+        // 名字里含设备名但不是设备本身，不能误杀
+        let ok = build_store_zip(&[("console.txt", b"x" as &[u8])]);
+        assert!(read_entries_checked(&ok, &ZipBudget::default()).is_ok());
+    }
+
+    /// 结尾的点和空格会被 Windows 静默去掉，"a." 与 "a" 落到同一文件。
+    #[test]
+    fn rejects_trailing_dot_or_space() {
+        for name in ["a.", "dir/b ", "x.txt."] {
+            let zip = build_store_zip(&[(name, b"x" as &[u8])]);
+            let err = read_entries_checked(&zip, &ZipBudget::default())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("结尾"), "{name} 应被拒绝，实际: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_control_characters_and_reserved_chars() {
+        let zip = build_store_zip(&[("a\u{1}b", b"x" as &[u8])]);
+        let err = read_entries_checked(&zip, &ZipBudget::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("控制字符"), "应报控制字符，实际: {err}");
+
+        let zip2 = build_store_zip(&[("a|b.txt", b"x" as &[u8])]);
+        let err2 = read_entries_checked(&zip2, &ZipBudget::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err2.contains("保留字符"), "应报保留字符，实际: {err2}");
+    }
+
+    #[test]
+    fn rejects_path_traversal_in_entries() {
+        let zip = build_store_zip(&[("../evil.txt", b"x" as &[u8])]);
+        let err = read_entries_checked(&zip, &ZipBudget::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(".."), "应报非法路径，实际: {err}");
+    }
+
+    /// deflate 炸弹的核心防线：解压量按中央目录声明的大小限流，声明与实物不符
+    /// 就立刻中止，而不是先解出几个 GB 再说。
+    #[test]
+    fn rejects_declared_size_mismatch() {
+        let data = vec![9u8; 32];
+        let entry = ZipEntry {
+            name: "a.bin".to_string(),
+            compressed_size: 32,
+            uncompressed_size: 8,
+            method: METHOD_STORE,
+            data_offset: 0,
+            is_dir: false,
+            crc32: 0,
+        };
+        let err = read_entry(&data, &entry).unwrap_err().to_string();
+        assert!(err.contains("大小不符"), "应报大小不符，实际: {err}");
     }
 }

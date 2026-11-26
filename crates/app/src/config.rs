@@ -5,11 +5,12 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// rclone 连接配置。
+/// 连接用的 RC 配置：连到哪个地址、用什么账号口令、启动时要不要自动连。
 ///
-/// **语义（重构指南 §1/§3）**：RCGUI 只连接用户指定的 RC endpoint，
-/// 不启动、不终止、不重启 rclone 进程。因此这里没有 exe / 托管模式的概念，
-/// 只有「连哪里、用什么凭据、启动时要不要自动连」。
+/// 这里只描述「连接」这一件事，进程由谁管是 [`CoreCfg`] 的 `mode`：managed 时
+/// 程序自己挑空闲端口、生成一次性口令、起子进程并握手；external 时程序只连，
+/// 不启动、不停止、不重启对方。所以 managed 那次握手的临时凭据属于运行时状态，
+/// 不写回这里——写回来就等于把一次性口令变成用户下次启动时的连接凭据。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RcloneCfg {
     /// 完整 RC endpoint，如 `http://127.0.0.1:5572`
@@ -108,6 +109,226 @@ fn d_unit() -> i32 {
     1
 }
 
+/// 由本程序管理的 rclone 内核。
+///
+/// `mode` 只有两个合法值：
+/// - `"managed"`（默认）：程序自己挑空闲端口、自己生成 RC 账号口令、自己启动子进程并握手。
+///   退出时只关自己启动的那个进程。
+/// - `"external"`：用户已经有一个 rclone 在跑，程序只连接、不启动、不停止、不重启它。
+///
+/// `path` 是用户指定的内核可执行文件。查找顺序是 **`path` → 数据目录 `core/` 里
+/// 用户明确装过的那份 → 程序同级 `core/` 与数据目录 `core/` 中版本较新的那个 →
+/// `PATH`**：显式填的路径排在最前，因为官方 rclone 缺少某些 fork 才有的后端
+/// （例如 `teldrive`），插件随包部署的 fork 一旦被同级目录里的官方 exe 盖住，
+/// 用户设的路径就永远不生效——「设置存在但不生效」比没有设置更糟。
+///
+/// 第二档看 [`CoreCfg::has_managed_install`]：装过就稳定用装的那份，不再比版本。
+/// 版本号比不出渠道（`v1.77.0-extra` 的数字比 `v1.76.0` 大，但用户要的是原版），
+/// 而每次换便携包都重新比版本，等于让随包那份在用户不知情时把渠道改回去。
+/// 一份都没装过（老配置、第一次运行）时才退回按版本比较，新者胜；两边都探测不出
+/// （例如跑不起来）时选数据目录那份，好让下一次内核更新能覆盖它。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreCfg {
+    #[serde(default = "d_managed")]
+    pub mode: String,
+    #[serde(default)]
+    pub path: String,
+    /// 启动时检查新版本。默认开，但检查在后台进行，不阻塞窗口显示。
+    #[serde(default = "d_true")]
+    pub update_check: bool,
+    /// 上次成功握手过的内核版本，仅用于界面显示与「内核被换掉了」的提示。
+    #[serde(default)]
+    pub last_version: String,
+    /// 下载/更新走哪个渠道：`"extra"`（增强版，默认）或 `"official"`（原版）。
+    ///
+    /// 存空串表示「这份配置还没选过」——此时按 [`CoreCfg::normalized_flavor`]
+    /// 从 `last_version` 推断，这样老配置里已经装着官方版的用户不会被下一次更新
+    /// 悄悄换成增强版；全新配置（`last_version` 也空）则落到默认的增强版。
+    #[serde(default)]
+    pub flavor: String,
+    /// 以前手填过的内核路径，按先后顺序留着。
+    ///
+    /// 「改用托管内核」只把它记到这里、把 `path` 清空，**文件本身不动**：用户填路径
+    /// 往往是为了某个后端特地挑的 fork，删掉或覆盖等于把他的选择扔掉。想换回去时
+    /// 照着这里的路径重新填进「程序路径」即可。
+    #[serde(default)]
+    pub kept_paths: Vec<String>,
+}
+
+fn d_managed() -> String {
+    "managed".to_string()
+}
+
+impl Default for CoreCfg {
+    fn default() -> Self {
+        Self {
+            mode: d_managed(),
+            path: String::new(),
+            update_check: true,
+            last_version: String::new(),
+            flavor: String::new(),
+            kept_paths: Vec::new(),
+        }
+    }
+}
+
+impl CoreCfg {
+    /// 规范化 `mode`：只有 `"external"` 是另一个合法值，其余（含空串/旧配置）
+    /// 一律回到 `"managed"`。
+    pub fn normalized_mode(&self) -> &'static str {
+        if self.mode.eq_ignore_ascii_case("external") {
+            "external"
+        } else {
+            "managed"
+        }
+    }
+
+    /// 实际生效的下载渠道，兼作旧配置迁移。
+    ///
+    /// 显式存了值就照它；没存过就从 `last_version` 反推（`-extra` 后缀是增强版，
+    /// 只有数字是官方版），两者都没有才用默认的增强版。只看已握手过的版本而不看
+    /// 目录里的 exe，是因为版本串是唯一稳定的信号，而 exe 可能被人换过。
+    pub fn normalized_flavor(&self) -> crate::core::Flavor {
+        if !self.flavor.trim().is_empty() {
+            crate::core::Flavor::parse(&self.flavor)
+        } else if !self.last_version.trim().is_empty() {
+            crate::core::Flavor::of_version(&self.last_version)
+        } else {
+            crate::core::Flavor::Extra
+        }
+    }
+
+    /// 上次装好后写下的渠道。没写过（老配置）返回 `None`，让调用方决定是去推还是重装。
+    pub fn recorded_flavor(&self) -> Option<crate::core::Flavor> {
+        if self.flavor.trim().is_empty() {
+            None
+        } else {
+            Some(crate::core::Flavor::parse(&self.flavor))
+        }
+    }
+
+    /// 数据目录 `core/` 里那份是不是用户明确装过/选过的托管内核。
+    ///
+    /// 判断依据只有 `flavor`（渠道）这一个字段，因为它的写入点只有三处：`--core-install`
+    /// 装成功、维护页点渠道（`core-flavor`）、界面点「安装内核」装成功（`core_install`）。
+    /// 三处都是"用户明确要这个渠道"，所以它非空就说明数据目录那份的来历清楚。
+    ///
+    /// 不拿 `last_version` 判断：那是握手回来的实际版本，可能来自随包的内核或别人的
+    /// 实例，跟"我们装过没有"没关系；用它当凭据会让没装过的人也走托管首选。
+    pub fn has_managed_install(&self) -> bool {
+        self.recorded_flavor().is_some()
+    }
+
+    /// 把手填的内核路径收进备选、改回托管模式，返回被收起来的那个路径。
+    ///
+    /// 只改配置，不碰文件：这是「改用托管内核」按钮的全部动作，下载与替换留给
+    /// `core-install`，于是用户能在同一个界面里分两步看清后果。
+    pub fn adopt_managed(&mut self) -> Option<String> {
+        let custom = self.path.trim().to_string();
+        self.path.clear();
+        self.mode = d_managed();
+        if custom.is_empty() {
+            return None;
+        }
+        if !self
+            .kept_paths
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(&custom))
+        {
+            self.kept_paths.push(custom.clone());
+        }
+        Some(custom)
+    }
+}
+
+/// 一个同步文件夹任务。
+///
+/// 默认 `direction = "up"`（本地 → 远程）、`mirror = false`（只 copy，不删除目标多余文件）。
+/// 镜像删除（`sync` 语义）必须由用户在本界面显式勾选，因为它的后果是"目标端多出来的文件被删掉"，
+/// 一旦方向或路径选错就是数据丢失。双向同步不提供：rclone 的 bisync 需要额外的状态目录与
+/// 冲突策略，默认打开它等于把"哪边更新"这种判断交给一个没看过配置的人。
+///
+/// `direction` / `mode` 的解释只有一处：`crate::sync_tasks`（`is_up` / `is_mirror` /
+/// `pair` / `ui_direction`）。这里只存字符串，不要再加第二套语义。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncTask {
+    /// 稳定 id（创建时生成），改名不影响调度
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    /// 本地目录绝对路径
+    pub local: String,
+    /// 远程路径，形如 `remote:sub/dir`
+    pub remote: String,
+    /// `"up"` | `"down"`
+    #[serde(default = "d_up")]
+    pub direction: String,
+    /// `"copy"`（默认，不删目标）| `"sync"`（镜像，删除目标多余文件）
+    #[serde(default = "d_copy")]
+    pub mode: String,
+    #[serde(default = "d_true")]
+    pub enabled: bool,
+    /// 间隔小时，0 表示只在启动时跑一次
+    #[serde(default = "d_six")]
+    pub interval_hours: u32,
+    /// 上次运行开始时刻（RFC3339，空 = 从未运行）
+    #[serde(default)]
+    pub last_run: String,
+    /// 上次运行结果：`""` | `"ok"` | `"failed: 原因"`
+    #[serde(default)]
+    pub last_status: String,
+}
+
+fn d_up() -> String {
+    "up".to_string()
+}
+
+fn d_copy() -> String {
+    "copy".to_string()
+}
+
+fn d_six() -> u32 {
+    6
+}
+
+/// 轻量模式：窗口隐藏到托盘一段时间后释放界面占用的内存。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LightCfg {
+    #[serde(default = "d_true")]
+    pub enabled: bool,
+    /// 隐藏多少分钟后进入轻量模式
+    #[serde(default = "d_ten")]
+    pub minutes: u32,
+}
+
+fn d_ten() -> u32 {
+    // 和轻量模式自己用的默认值保持同一个来源，免得两处慢慢走散
+    crate::lightweight::DEFAULT_MINUTES
+}
+
+impl Default for LightCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            minutes: crate::lightweight::DEFAULT_MINUTES,
+        }
+    }
+}
+
+/// WebDAV 备份目标（导出/导入 rcgui.conf 用）。
+///
+/// `pass` 与 URL 里的 userinfo 都算凭据：导出到文件时默认剔除，
+/// 只有用户显式勾选"包含凭据"才写进去。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BackupCfg {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub pass: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -189,6 +410,23 @@ pub struct AppConfig {
     /// 也不该在代码里固化第三方源。
     #[serde(default)]
     pub winget_mirror_source: String,
+    /// 由本程序管理的 rclone 内核（见 [`CoreCfg`]）
+    #[serde(default)]
+    pub core: CoreCfg,
+    /// 同步文件夹任务
+    #[serde(default)]
+    pub sync_tasks: Vec<SyncTask>,
+    /// 轻量模式
+    #[serde(default)]
+    pub light: LightCfg,
+    /// WebDAV 备份目标
+    #[serde(default)]
+    pub backup: BackupCfg,
+    /// 是否已把旧 oneclick 插件的设置迁移到 [`CoreCfg`]。
+    ///
+    /// 迁移只做一次：之后用户再改 `core.path` 不该被旧设置覆盖回去。
+    #[serde(default)]
+    pub oneclick_migrated: bool,
 }
 
 impl Default for AppConfig {
@@ -226,14 +464,55 @@ impl AppConfig {
     }
 }
 
+/// 显式指定的数据目录（`RCGUI_DATA_DIR`），没有设置时返回 `None`。
+///
+/// 设了它就意味着「这次运行用的是别人的配置」：便携目录、`%APPDATA%\RCGUI` 都不再参与，
+/// **也不做任何旧配置迁移**。复制一份真实用户数据进验收目录会同时污染两边——
+/// 验收脚本会以为改的是自己的配置，用户那边则多出一份来历不明的记录。
+///
+/// 空白值按未设置处理（`RCGUI_DATA_DIR=` 这种写法在 PowerShell 里很常见）。
+/// 相对路径按当前工作目录解析成绝对路径：相对目录会让「单实例隔离」「日志目录」
+/// 跟着 cwd 漂移，是验收最难查的一类问题。
+pub fn data_dir_override() -> Option<PathBuf> {
+    override_dir(std::env::var("RCGUI_DATA_DIR").ok().as_deref())
+}
+
+/// [`data_dir_override`] 的纯函数版本。
+///
+/// 拆出来是为了能测：环境变量是进程级的，并行跑的测试改它会影响别的用例
+/// （比如诊断测试会跟着写进别人的目录）。
+fn override_dir(raw: Option<&str>) -> Option<PathBuf> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(raw);
+    Some(if p.is_absolute() {
+        p
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(p),
+            Err(_) => p,
+        }
+    })
+}
+
 /// 应用数据根目录。
 ///
+/// - `RCGUI_DATA_DIR` 有值：就是它（见 [`data_dir_override`]），不迁移、不猜。
 /// - 便携模式（exe 旁边有 `portable` 文件）：`exe目录\data`
 /// - 否则：`%APPDATA%\RCGUI`，并在首次启动时从旧目录 `%APPDATA%\rclone-gui` **复制**迁移。
 ///
 /// 迁移原则（指南 §4）：复制而不是移动，旧目录**不删除、不修改**，随时可回滚；
 /// 迁移失败则继续使用旧目录，绝不因为换目录导致用户数据「消失」。
 pub fn data_dir() -> PathBuf {
+    if let Some(dir) = data_dir_override() {
+        // 验收目录通常事先不存在，这里建出来；权限自愈沿用同一套逻辑，
+        // 但只对这一个目录生效，不碰 %APPDATA%。
+        let _ = std::fs::create_dir_all(&dir);
+        ensure_user_can_write_once(&dir);
+        return dir;
+    }
     if let Some(dir) = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -257,6 +536,38 @@ pub fn data_dir() -> PathBuf {
     // 只在「确实缺 Users 权限」时执行，避免每次取数据目录都去 spawn icacls。
     ensure_user_can_write_once(&dir);
     dir
+}
+
+/// 数据目录的隔离键：同一个目录的两个进程算出同一个值，不同目录算出不同的值。
+///
+/// 用途是单实例互斥量和唤醒通道的命名。它们必须跟着数据目录走：便携版、以及
+/// 用 `RCGUI_DATA_DIR` 指到别处的验收实例，如果和用户正在运行的那个实例共用名字，
+/// 第二个实例会直接退出并把窗口请求发给另一个配置的进程——表现为「点了没反应」，
+/// 或者更糟：验收脚本操作的是用户真实数据的那份界面。
+///
+/// 先尝试规范化（消除 8.3 短名、`..`、符号链接），Windows 上再折叠大小写；
+/// 规范化失败（目录还不存在）就用调用方给的路径，同一进程内仍然自洽。
+pub fn data_dir_scope() -> String {
+    scope_hash(&data_dir())
+}
+
+/// [`data_dir_scope`] 的前 16 个十六进制字符，够避免同机碰撞，也够短到能进名字。
+fn scope_hash(dir: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut key = canon.display().to_string();
+    while key.ends_with('\\') || key.ends_with('/') {
+        key.pop();
+    }
+    if cfg!(windows) {
+        key = key.to_lowercase();
+    }
+    let digest = Sha256::digest(key.as_bytes());
+    let mut out = String::with_capacity(16);
+    for b in &digest[..8] {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 /// 每个进程只尝试修复一次，且只在**确实缺少 Users 权限**时才真正执行。
@@ -283,7 +594,9 @@ fn ensure_user_can_write_once(dir: &std::path::Path) {
         }
         let ok = ensure_user_can_write(dir, true);
         let after = probe_writable(dir);
-        debug_log(&format!("[perm] repair attempted -> {ok}, writable_after={after}"));
+        debug_log(&format!(
+            "[perm] repair attempted -> {ok}, writable_after={after}"
+        ));
         ok && after
     });
 }
@@ -316,7 +629,9 @@ fn debug_log(msg: &str) {
         return;
     }
     let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-    let path = std::path::PathBuf::from(base).join("RCGUI").join("perm-debug.log");
+    let path = std::path::PathBuf::from(base)
+        .join("RCGUI")
+        .join("perm-debug.log");
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -326,7 +641,6 @@ fn debug_log(msg: &str) {
         let _ = writeln!(f, "{} {msg}", rcgui_profile::now_iso());
     }
 }
-
 
 /// 确保本目录对**普通用户**可写（补一条 `BUILTIN\Users` 的显式 ACE 并递归）。
 ///
@@ -386,7 +700,8 @@ fn long_path(p: &std::path::Path) -> PathBuf {
         }
         Err(_) => p.to_path_buf(),
     }
-}/// 选择数据目录，必要时执行一次性迁移。
+}
+/// 选择数据目录，必要时执行一次性迁移。
 fn resolve_data_dir(new_dir: PathBuf, legacy_dir: PathBuf) -> PathBuf {
     // 新目录已存在（已迁移过/全新安装）→ 直接用
     if new_dir.exists() || !legacy_dir.exists() {
@@ -405,10 +720,23 @@ fn resolve_data_dir(new_dir: PathBuf, legacy_dir: PathBuf) -> PathBuf {
                 // 回滚 = 删除新目录即可，旧目录从未被修改
                 "rollback": rcgui_i18n::t("删除该 RCGUI 目录后重启，程序会回到旧目录 %APPDATA%\\rclone-gui")
             });
-            let _ = write_atomic(&new_dir.join("migration.json"), marker.to_string().as_bytes());
-            let mut msg = rcgui_i18n::f("数据已从旧目录迁移到 {}（{} 个文件 / {} MB；旧目录保留，可回滚）", &[&(new_dir.display()), &(files), &(format!("{:.1}", bytes as f64 / 1024.0 / 1024.0))]);
+            let _ = write_atomic(
+                &new_dir.join("migration.json"),
+                marker.to_string().as_bytes(),
+            );
+            let mut msg = rcgui_i18n::f(
+                "数据已从旧目录迁移到 {}（{} 个文件 / {} MB；旧目录保留，可回滚）",
+                &[
+                    &(new_dir.display()),
+                    &(files),
+                    &(format!("{:.1}", bytes as f64 / 1024.0 / 1024.0)),
+                ],
+            );
             if !skipped.is_empty() {
-                msg.push_str(&rcgui_i18n::f("；{} 个条目被跳过（详见 migration.json）", &[&(skipped.len())]));
+                msg.push_str(&rcgui_i18n::f(
+                    "；{} 个条目被跳过（详见 migration.json）",
+                    &[&(skipped.len())],
+                ));
             }
             crate::profiles::push_notice(msg);
             new_dir
@@ -416,7 +744,10 @@ fn resolve_data_dir(new_dir: PathBuf, legacy_dir: PathBuf) -> PathBuf {
         Err(e) => {
             // 只清理本次自己创建的不完整副本（进入本函数时 new_dir 尚不存在）
             let _ = std::fs::remove_dir_all(&new_dir);
-            crate::profiles::push_notice(rcgui_i18n::f("数据目录迁移失败（{}），本次继续使用旧目录 {}", &[&(e), &(legacy_dir.display())]));
+            crate::profiles::push_notice(rcgui_i18n::f(
+                "数据目录迁移失败（{}），本次继续使用旧目录 {}",
+                &[&(e), &(legacy_dir.display())],
+            ));
             legacy_dir
         }
     }
@@ -428,13 +759,7 @@ fn resolve_data_dir(new_dir: PathBuf, legacy_dir: PathBuf) -> PathBuf {
 /// 只记为 skipped，不中断整个迁移——否则用户只要开着旧版 rclone，数据目录就永远迁不过去。
 /// 返回 (文件数, 字节数, 跳过的条目)。
 fn copy_tree(src: &Path, dst: &Path) -> Result<(u64, u64, Vec<String>)> {
-    fn walk(
-        src: &Path,
-        dst: &Path,
-        files: &mut u64,
-        bytes: &mut u64,
-        skipped: &mut Vec<String>,
-    ) {
+    fn walk(src: &Path, dst: &Path, files: &mut u64, bytes: &mut u64, skipped: &mut Vec<String>) {
         if let Err(e) = std::fs::create_dir_all(dst) {
             skipped.push(format!("{}（{e}）", dst.display()));
             return;
@@ -450,7 +775,10 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(u64, u64, Vec<String>)> {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    skipped.push(rcgui_i18n::f("{} 内部条目（{}）", &[&(src.display()), &(e)]));
+                    skipped.push(rcgui_i18n::f(
+                        "{} 内部条目（{}）",
+                        &[&(src.display()), &(e)],
+                    ));
                     continue;
                 }
             };
@@ -485,8 +813,12 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(u64, u64, Vec<String>)> {
     let mut bytes = 0u64;
     let mut skipped: Vec<String> = Vec::new();
     // 只有「连根目录都建不出来」才算致命错误
-    std::fs::create_dir_all(dst)
-        .map_err(|e| anyhow::anyhow!("{}", rcgui_i18n::f("创建 {} 失败: {}", &[&(dst.display()), &(e)])))?;
+    std::fs::create_dir_all(dst).map_err(|e| {
+        anyhow::anyhow!(
+            "{}",
+            rcgui_i18n::f("创建 {} 失败: {}", &[&(dst.display()), &(e)])
+        )
+    })?;
     walk(src, dst, &mut files, &mut bytes, &mut skipped);
     Ok((files, bytes, skipped))
 }
@@ -529,7 +861,10 @@ pub fn repair_data_dir_permissions() -> Result<(), String> {
             (_, Ok(u)) => u,
             _ => rcgui_i18n::t("<你的用户名>").to_string(),
         };
-        Err(rcgui_i18n::f("自动修复数据目录权限失败。可手动执行：icacls \"{}\" /grant \"{}:(OI)(CI)F\" /T", &[&(dir.display()), &(account)]))
+        Err(rcgui_i18n::f(
+            "自动修复数据目录权限失败。可手动执行：icacls \"{}\" /grant \"{}:(OI)(CI)F\" /T",
+            &[&(dir.display()), &(account)],
+        ))
     }
 }
 
@@ -559,7 +894,10 @@ pub fn write_atomic(file: &PathBuf, data: &[u8]) -> Result<()> {
         Ok(()) => Ok(()),
         Err(e) if is_permission_error(&e) => {
             repair_data_dir_permissions().map_err(|re| {
-                anyhow::anyhow!("{}", rcgui_i18n::f("{}；自动修复权限也失败了：{}", &[&(e), &(re)]))
+                anyhow::anyhow!(
+                    "{}",
+                    rcgui_i18n::f("{}；自动修复权限也失败了：{}", &[&(e), &(re)])
+                )
             })?;
             // 修完重试一次；这次仍失败就把原始错误抛出去
             write_atomic_once(file, data)
@@ -609,7 +947,11 @@ fn load_raw() -> AppConfig {
     let p = config_path();
     if let Ok(raw) = std::fs::read(&p) {
         // 容忍 UTF-8 BOM（外部工具编辑配置文件时可能引入）
-        let raw: &[u8] = if raw.starts_with(&[0xEF, 0xBB, 0xBF]) { &raw[3..] } else { &raw };
+        let raw: &[u8] = if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            &raw[3..]
+        } else {
+            &raw
+        };
         if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(raw) {
             migrate(&mut v);
             if let Ok(cfg) = serde_json::from_value::<AppConfig>(v) {
@@ -698,7 +1040,8 @@ fn migrate_rclone(v: &mut serde_json::Value) {
     }
     if let Some(obj) = v.get_mut("rclone").and_then(|x| x.as_object_mut()) {
         obj.insert("url".into(), serde_json::json!(new_url));
-        obj.entry("connect_on_start").or_insert(serde_json::json!(true));
+        obj.entry("connect_on_start")
+            .or_insert(serde_json::json!(true));
         // 旧字段清除：不再有「托管模式」和「自带 rclone.exe」这两个概念
         obj.remove("mode");
         obj.remove("port");
@@ -721,6 +1064,114 @@ pub fn save(cfg: &AppConfig) -> Result<()> {
 mod tests {
     use super::*;
     use rcgui_profile::ProxyProfile;
+
+    /// 没存过渠道的旧配置要按已装版本反推，别把官方版用户悄悄换成增强版。
+    #[test]
+    fn kernel_flavor_migrates_from_last_version() {
+        use crate::core::Flavor;
+
+        let mut c = CoreCfg::default();
+        assert_eq!(c.flavor, "");
+        // 全新配置：默认增强版。
+        assert_eq!(c.normalized_flavor(), Flavor::Extra);
+
+        // 装过官方版：反推成 official，切渠道之前不该改这个人的内核来源。
+        c.last_version = "1.70.1".into();
+        assert_eq!(c.normalized_flavor(), Flavor::Official);
+
+        c.last_version = "1.76.0-extra".into();
+        assert_eq!(c.normalized_flavor(), Flavor::Extra);
+
+        // 显式选过就以它为准，哪怕和已装版本对不上（用户可能刚换完渠道还没下载）。
+        c.flavor = "official".into();
+        assert_eq!(c.normalized_flavor(), Flavor::Official);
+        c.flavor = "extra".into();
+        assert_eq!(c.normalized_flavor(), Flavor::Extra);
+
+        // 存了空白等于没存：仍然回落到推断。
+        c.flavor = "  ".into();
+        assert_eq!(c.normalized_flavor(), Flavor::Extra);
+    }
+
+    /// 老配置文件里没有 `flavor` 这一项，读进来必须是"没选过"而不是被默认值写死。
+    #[test]
+    fn old_config_without_flavor_stays_unset() {
+        let c: CoreCfg =
+            serde_json::from_str(r#"{"mode":"managed","last_version":"1.70.1"}"#).unwrap();
+        assert_eq!(c.flavor, "");
+        assert_eq!(c.normalized_flavor(), crate::core::Flavor::Official);
+    }
+
+    /// 「改用托管内核」只搬配置：清掉 `path`、记进备选、回到托管模式，文件不动。
+    #[test]
+    fn adopt_managed_keeps_the_old_path_but_stops_using_it() {
+        let mut c = CoreCfg::default();
+        c.mode = "external".into();
+        c.path = r"C:\Users\someone\AppData\Local\Rclone\rclone.exe".into();
+
+        let kept = c.adopt_managed();
+        assert_eq!(
+            kept.as_deref(),
+            Some(r"C:\Users\someone\AppData\Local\Rclone\rclone.exe")
+        );
+        // 路径已经不再生效，但原样留了一份，想填回去随时能填。
+        assert_eq!(c.path, "");
+        assert_eq!(
+            c.kept_paths,
+            vec![r"C:\Users\someone\AppData\Local\Rclone\rclone.exe".to_string()]
+        );
+        assert_eq!(c.normalized_mode(), "managed");
+    }
+
+    /// 同一个路径反复点不该堆出一串重复项（Windows 路径大小写不敏感）。
+    #[test]
+    fn adopt_managed_dedupes_paths_ignoring_case() {
+        let mut c = CoreCfg::default();
+        for p in [
+            r"C:\Tools\rclone.exe",
+            r"c:\tools\RCLONE.exe",
+            r"C:\Tools\rclone.exe",
+        ] {
+            c.path = p.into();
+            assert_eq!(c.adopt_managed().as_deref(), Some(p));
+        }
+        assert_eq!(c.kept_paths.len(), 1, "大小写不同的同一个路径只留一份");
+        assert_eq!(c.kept_paths[0], r"C:\Tools\rclone.exe");
+    }
+
+    /// 没填路径就没有可搬的东西：返回 `None`，顺带把模式改回托管。
+    #[test]
+    fn adopt_managed_reports_nothing_to_keep_without_a_path() {
+        let mut c = CoreCfg::default();
+        c.mode = "external".into();
+        c.path = "   ".into();
+        assert_eq!(c.adopt_managed(), None);
+        assert_eq!(c.normalized_mode(), "managed");
+        assert!(c.kept_paths.is_empty(), "空白路径不该进备选");
+    }
+
+    /// 备选路径要能存进配置文件并读回来，否则重启后就丢了。
+    #[test]
+    fn kept_paths_survive_a_config_round_trip() {
+        let mut c = CoreCfg::default();
+        c.path = r"D:\fork\rclone.exe".into();
+        c.adopt_managed();
+        let json = serde_json::to_string(&c).unwrap();
+        let back: CoreCfg = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kept_paths, vec![r"D:\fork\rclone.exe".to_string()]);
+        assert_eq!(back.path, "");
+    }
+
+    /// `recorded_flavor` 只在真的存过时给值，空白（老配置）要让调用方去推。
+    #[test]
+    fn recorded_flavor_is_none_until_explicitly_stored() {
+        let mut c = CoreCfg::default();
+        assert_eq!(c.recorded_flavor(), None);
+        c.flavor = "official".into();
+        assert_eq!(c.recorded_flavor(), Some(crate::core::Flavor::Official));
+        c.flavor = "  ".into();
+        assert_eq!(c.recorded_flavor(), None, "空白等于没存过");
+    }
 
     /// `bind_proxy_slot` 换目标时只清 `applied`，保留脚印（回滚依据）。
     ///
@@ -749,5 +1200,35 @@ mod tests {
         assert_eq!(b.applied_value, "http://ours:1", "回滚依据不能被清掉");
         assert_eq!(b.applied_key, "http_proxy");
         assert!(b.has_footprint());
+    }
+
+    #[test]
+    fn data_dir_override_needs_a_real_path() {
+        // 未设置 / 空白：都不算覆盖，老路径（便携或 %APPDATA%）照旧。
+        assert!(override_dir(None).is_none());
+        assert!(override_dir(Some("")).is_none());
+        assert!(override_dir(Some("   ")).is_none());
+        // 绝对路径原样使用。
+        let abs = if cfg!(windows) {
+            r"D:\qa\rcgui-data"
+        } else {
+            "/tmp/rcgui-data"
+        };
+        assert_eq!(override_dir(Some(abs)), Some(PathBuf::from(abs)));
+        // 相对路径解析成绝对路径：相对目录会让互斥量、日志目录跟着 cwd 漂。
+        let rel = override_dir(Some("qa-data")).expect("相对路径也要认");
+        assert!(rel.is_absolute(), "相对覆盖路径应被解析成绝对路径：{rel:?}");
+        assert!(rel.ends_with("qa-data"));
+    }
+
+    #[test]
+    fn scope_separates_different_data_dirs() {
+        let a = scope_hash(std::path::Path::new(r"D:\qa\a"));
+        let b = scope_hash(std::path::Path::new(r"D:\qa\b"));
+        assert_eq!(a.len(), 16);
+        assert_ne!(a, b, "不同数据目录必须算出不同的隔离键");
+        // 大小写与结尾分隔符不该改变归属（同一个目录必须同键，否则单实例失效）。
+        let a2 = scope_hash(std::path::Path::new(r"d:\QA\a\"));
+        assert_eq!(a, a2, "同一目录的不同写法要聚成同一个键");
     }
 }

@@ -1,160 +1,188 @@
 # RCGUI
 
-English | [简体中文](README.zh-CN.md)
+<img src="docs/assets/brand.svg" alt="RCGUI" width="96" height="96" align="right">
 
-RCGUI is a Windows desktop front end for [rclone](https://rclone.org/), written in Rust with a [Slint](https://slint.dev) UI.
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-It is a front end and nothing more: RCGUI never embeds rclone, never starts it, and never stops it. You run `rclone rcd` yourself — or let the bundled *one-click rclone* plugin start it for you — and RCGUI connects to that RC endpoint over HTTP. Everything the window shows is a projection of rclone's own state, so a change made from the command line appears here too. Mounts additionally need [WinFsp](https://winfsp.dev), which RCGUI can install for you with one click.
+A Windows desktop front end for [rclone](https://rclone.org/), written in Rust with a [Slint](https://slint.dev) interface. There is no webview: the window is native, drawn by Slint, and talks to rclone over rclone's own RC API.
 
-The interface ships in Chinese and English and switches at runtime.
+**Status: version 0.3.0 is in development.** The newest released build is **v0.2.1**. Everything this page marks *developing* is in the tree at HEAD and has not shipped; nothing here is called released until a tag, a GitHub Release and the assets listed below actually exist together. The version history and the exact wording rules are in [`docs/VERSIONING.md`](docs/VERSIONING.md) and [`docs/CHANGELOG.md`](docs/CHANGELOG.md).
 
-> RCGUI is not the old *rcdeck* (the Node + Vue rewrite of the rclone web UI). It is a ground-up Rust/Slint application, and it does not ship a web front end at all — it only serves the plugin HTTP endpoints described below.
+## What changed in 0.3.0
+
+Until 0.2.1 RCGUI was strictly a client: you started `rclone rcd` yourself (or let the *one-click rclone* plugin do it) and pointed the app at that endpoint.
+
+0.3.0 (developing) makes RCGUI own a local rclone process by default, while keeping the old way as a first-class option:
+
+<img src="docs/assets/core-modes.svg" alt="Two core modes: managed core (default) and external endpoint" width="720">
+
+| Mode | Who starts rclone | Who may stop it | When to use it |
+| --- | --- | --- | --- |
+| **Managed core** (default in 0.3.0) | RCGUI starts a bundled `rclone.exe` on a loopback port with a generated password | RCGUI, and only the process it started itself | You want to click the icon and use the app |
+| **External endpoint** | You, by hand or by a service manager | You. RCGUI only disconnects | You already run `rclone rcd` for other tools and want one source of truth |
+
+The rules that make this safe are written down in [`AGENTS.md`](AGENTS.md) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); the short version:
+
+- RCGUI stops **only** the process it started, identified by PID plus a job object. It never calls `core/quit`, never kills a process it did not start, and never scans for stray `rclone.exe` on the machine.
+- If startup fails, it says why and stays stopped. It does not retry in the background forever, and it does not silently fall back to a different port.
+- Credentials for a managed core are generated per launch, kept in memory, and never written to logs.
+
+## Architecture
+
+<img src="docs/assets/architecture.svg" alt="RCGUI layers: UI shell, core manager, RC transport, plugin sandbox, services" width="760">
+
+Five layers, and only the first one touches the screen:
+
+| Layer | Responsibility |
+| --- | --- |
+| **Shell / UI** | Slint views, keyboard navigation, the declarative settings panels plugins describe. Runs everything user-facing on the UI thread; long work hands off to async tasks. |
+| **Core manager** (developing) | Chooses managed core or external endpoint, starts and supervises the child process, reports health, performs the one orderly shutdown. |
+| **RC transport** | Typed client for rclone's RC API: handshake, timeouts, error mapping, the projection of remote state the UI renders. |
+| **Plugin sandbox** | WASI host for `wasm32-wasip1` modules, capability broker, per-plugin storage, HTTP entry dispatch. |
+| **Services** (partly developing) | Update check, plugin store, backup, sync and diagnostics live here as separate concerns, so none of them can block the UI. |
+
+The layers are not one crate each. The core manager is `crates/app/src/core.rs` — executable discovery, start, health, one orderly shutdown — and it exists at HEAD but has not shipped. `crates/rclone` is still an attach-only helper, and its test `crate_has_no_process_spawning` keeps asserting that it starts nothing; that test is not going away. The services layer is a set of modules in `crates/app/src/` (`maintenance.rs`, `store.rs`, `update.rs`, `backup.rs`, `sync_tasks.rs`, `cli.rs`), not a crate of its own. `docs/ARCHITECTURE.md` labels every piece as existing, partial or planned.
 
 ## Features
 
-| Page | What you can do |
-| --- | --- |
-| **Dashboard** | Connection state and the RC endpoint actually in use, live counters for remotes / mounts / services / transfers, and a history of what the app just did |
-| **Files** | Two-pane browser — local disk on the left, remote on the right — with a sort menu (name / size / modified), multi-select, upload to or download into a chosen folder, and drag-and-drop between the two panes |
-| **Remotes** | Create, edit and delete remotes (name, backend type, `key=value` parameters), fill in a dedicated **K-Vault** form, keep a list of proxies and bind one per remote — re-applied on every start |
-| **Mounts** | Mount any remote to a drive letter with cache mode and read-only flags, see whether the drive letter actually appeared, install WinFsp from the official or a mirror source — and have a mount you created re-created after the next successful connect |
-| **Services** | Serve a remote over HTTP, WebDAV, FTP, SFTP or DLNA with per-service credentials, start and stop them, see what is running right now, and get remembered services re-created on reconnect |
-| **Transfers** | Live and finished transfers with progress, speed and totals, and every background job labelled by kind (copy, move, rename, delete) |
-| **Plugins** | Install, enable, disable and uninstall plugins, drive their declarative settings panel, restore a built-in plugin you removed, and open the plugin directory |
-| **Settings** | RC endpoint and credentials, theme, accent colour, UI language, the embedded HTTP server port, the winget mirror source, the config file path, and `rcgui.conf` import/export |
+Status legend: **released** = present in v0.2.1; **developing** = in the tree at HEAD, unreleased.
 
-## Bundled plugins
-
-Plugins live in their own repositories; this repository only keeps the lock file `plugins/manifest.json` that pins a version, an asset name and a SHA-256 for each of them.
-
-| Plugin | Version | What it does |
+| Page | What you can do | Status |
 | --- | --- | --- |
-| [imagehost](https://github.com/h897105167/rcgui-plugin-imagehost) | 0.6.1 | Uploads local images to an rclone remote, hands back a direct link (and an optional short link), and exposes an HTTP upload service that other apps can post to |
-| [oneclick](https://github.com/h897105167/rcgui-plugin-oneclick) | 0.3.3 | Finds, verifies, downloads and starts a local rclone, then keeps it running for as long as RCGUI is open (Windows only) |
+| **Dashboard** | Connection state and the endpoint actually in use, live counters for remotes / mounts / services / transfers, and a history of what the app just did | released |
+| **Files** | Two-pane browser — local disk left, remote right — sort menu, multi-select, upload and download into a chosen folder, drag and drop between panes | released |
+| **Remotes** | Create, edit, delete remotes; a dedicated **K-Vault** form (a WebDAV-derived rclone backend plus the site's own upload API, so links and de-duplication come from the site, not from DAV); a list of proxies bound per remote and re-applied on start | released |
+| **Mounts** | Mount to a drive letter with cache mode and read-only flags, see whether the letter appeared, install WinFsp from the official or a mirror source, re-create remembered mounts after the next connect | released |
+| **Services** | Serve a remote over HTTP, WebDAV, FTP, SFTP or DLNA with per-service credentials; start, stop, inspect, and re-create remembered services on reconnect | released |
+| **Transfers** | Live and finished transfers with progress, speed and totals, background jobs labelled by kind | released |
+| **Plugins** | Install, enable, disable, uninstall; declarative settings panel; restore a built-in plugin you removed; open the plugin directory | released |
+| **Settings** | RC endpoint and credentials, theme, accent colour, language, winget mirror, config path, `rcgui.conf` import/export, core selection | endpoint and appearance released; **core selection developing** |
+| **Plugin store** | Browse the static index, look up permissions and source, install a verified release archive | developing (index, page and the in-app client are all in the tree; unpublished) |
+| **Diagnostics** | `--diagnostics --json`, a support bundle, an accessibility tree dump for scripting and review | developing (the CLI is in the tree at HEAD; the contract is [`docs/CLI.md`](docs/CLI.md)) |
 
-![The one-click rclone plugin panel](docs/oneclick-plugin-panel.png)
+Not planned, so it does not surprise anyone later: a webview UI, taking over a process RCGUI did not start, and adding native backends to an official rclone build by editing metadata.
 
-## Requirements
+## Install
 
-| Item | Notes |
-| --- | --- |
-| Windows 10 / 11 (x64) | The only supported target today |
-| [Rust](https://rustup.rs/) with the MSVC toolchain | Needed to build from source |
-| `wasm32-wasip1` target | `rustup target add wasm32-wasip1` — plugins are WASI modules |
-| [WinFsp](https://winfsp.dev) | Optional; only needed for the **Mounts** page, and installable from inside the app |
-| A running `rclone rcd` | Optional at build time; required at runtime unless a plugin starts one for you |
+Two artifacts per release, one naming scheme:
 
-## Quick start
+```
+RCGUI-<version>-windows-x64-setup.exe      # installer
+RCGUI-<version>-windows-x64-portable.zip   # portable
+```
+
+- **Setup** installs per user by default — under `%LOCALAPPDATA%\Programs\RCGUI` — and asks for elevation only if you choose a location that needs it. Your data lives in `%APPDATA%\RCGUI` and is never overwritten by an upgrade: an uninstall leaves it in place.
+- **Portable**: unzip anywhere and run the exe next to an empty file named `portable`. The archive contains `rclone-gui.exe`, the pinned `core\rclone.exe`, the plugins that ship with the app, and a `licenses\` folder. Data then goes to `data\` beside the exe.
+- Both ship the **enhanced** rclone core by default: [gulp79/rclone-extra](https://github.com/gulp79/rclone-extra) at `v1.76.0-extra`, a fork of rclone v1.76.0 that adds backends upstream does not have (alist, alldebrid, teldrive, terabox). `core\.fetched.json` inside the package records which source was used and its SHA-256. Builds from plain upstream rclone are still possible and are named with an `-upstream` suffix, so the two can never be confused.
+- Both carry `SHA256SUMS` and the third-party license files (`licenses\`), including rclone's MIT `COPYING`. Download the checksums from the same Release page and compare before running.
+
+**The 0.3.0 assets do not exist yet** — these filenames are the contract the release workflow implements, not links. The only published release is [v0.2.1](https://github.com/h897105167/rclone_gui_windows/releases/tag/v0.2.1), whose asset predates the scheme and is named `rclone-gui-v0.2.1-windows-amd64.zip`.
+
+### Build from source
 
 ```powershell
 git clone https://github.com/h897105167/rclone_gui_windows.git
 cd rclone_gui_windows
-.\scripts\build.ps1
+.\scripts\build.ps1 -Release
 ```
 
-`build.ps1` fetches the pinned plugin archives, verifies their SHA-256, builds the workspace and leaves the executable in `target\release\rclone-gui.exe`.
+`build.ps1` does three things in order: fetches the pinned plugin archives into `crates\app\assets\plugins\`, verifies each SHA-256 against `plugins/manifest.json`, then fetches the pinned rclone release into `target\release\core\` (that is the "core" — the `rclone.exe` the app manages itself), and finally builds the workspace. It prints the path of `target\release\rclone-gui.exe`. `-SkipPlugins` builds without touching the plugin cache, `-SkipCore` leaves `core\rclone.exe` out (the app then only has external endpoints to talk to), `-CoreZip <path>` uses a local rclone archive instead of downloading, `-CoreSource upstream` fetches plain upstream rclone instead of the default enhanced fork, and `-Run` launches the result.
 
-| Parameter | Effect |
-| --- | --- |
-| `-Release` | Build the release profile (the default is debug) |
-| `-Run` | Launch the app as soon as the build succeeds |
-| `-SkipPlugins` | Do not fetch or refresh plugin archives |
-| `-ForcePlugins` | Re-download the plugin archives even when the cached copies match the lock file |
+Packaging (`.\scripts\build-release.ps1`) refuses to run if the core or its `COPYING` is missing, so a release can never ship rclone without its license.
 
-## Building by hand
+Requirements: Windows 10/11 x64, Rust with the MSVC toolchain, and `rustup target add wasm32-wasip1` for the plugins. WinFsp is optional and only needed for the Mounts page.
 
-The plugin archives have to be in place before `cargo build`, because they are embedded into the binary:
+## Performance
+
+No performance numbers are published for 0.3.0, because no 0.3.0 build has been measured. The measurement tool is in the repository and anyone can run it:
 
 ```powershell
-.\scripts\fetch_plugins.ps1
-cargo build -p rclone-gui
+.\scripts\measure-perf.ps1 -Exe .\target\release\rclone-gui.exe -Samples 5 -Json
 ```
 
-`fetch_plugins.ps1` reads `plugins/manifest.json`, downloads each release archive from the plugin repository, verifies its SHA-256 against the lock file and unpacks it into `crates/app/assets/plugins/`.
+It launches one process per sample with its own data directory, waits for the real readiness signal, reads working set, private bytes and peak, then ends only the process tree it started. A sample whose own data directory never appeared is dropped instead of being recorded, so an instance already running on your desktop cannot quietly flatter the result. It reports `null` when it cannot read a value and exits `2` rather than printing a zero. What each column means, the median convention, the known blind spots (Win32 alias executables cannot be measured; tray-only builds need `-HealthUrl`) and the rules for quoting a number are in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
-## Connecting to rclone
+## Privacy and plugin permissions
 
-RCGUI talks to rclone's RC API, so `rclone` has to be listening somewhere. A typical session:
+- No telemetry, no analytics, no network calls you did not configure. The update check and the plugin store are the only outbound requests the app makes on your behalf, and both are documented in [`docs/RELEASE.md`](docs/RELEASE.md).
+- External-endpoint RC passwords are stored in cleartext in `config.json`. Managed-core RC credentials are generated per launch and excluded from saved configuration and exports. Keep RC on loopback. `rclone obscure` is obfuscation, not encryption.
+- Plugins are `wasm32-wasip1` modules inside a WASI sandbox. They reach the system only through capabilities they declare in `config.json`: `kv`, `ui`, `fs`, `http`, `proc`, `net`, `rclone`, `env`. `fs.`, `proc.` and `http.` are the ones worth reading before you trust a plugin; the store page shows them next to every entry.
+- The embedded HTTP server (default port 5273) binds to loopback and has no authentication of its own. The port is no longer editable in Settings — the app still writes it to `config.json`, so change it there if you need to. Treat anything a plugin exposes through `http_entry` as reachable by any local process.
 
-```powershell
-rclone rcd --rc-addr 127.0.0.1:5574 --rc-user gui --rc-pass <your-password>
-```
+## Plugins and the store
 
-Then put the same address and credentials into **Settings** and press **Connect / handshake**. If rclone was started with `--rc-no-auth`, tick *no authentication* instead — otherwise every endpoint except `core/version` answers 403.
+Plugins live in their own repositories; this repository keeps only the lock file `plugins/manifest.json`, which pins a tag, an asset name and a SHA-256 per plugin, and it builds the ones that ship with the app.
 
-Mounts and services have no persistence of their own in rclone: `rclone mount` and `rclone serve` live only as long as the process that started them. RCGUI therefore remembers the ones you created and re-applies them through the RC API after every successful connect, skipping whatever is already mounted or already listening, and reporting per-item failures without blocking the rest. Unmounting or stopping an item forgets it. If the RC endpoint has no authentication configured at all, the replay is skipped — the connection status already says so.
+| Plugin | Version | What it does |
+| --- | --- | --- |
+| [imagehost](https://github.com/h897105167/rcgui-plugin-imagehost) | 0.6.1 | Uploads local images to an rclone remote, hands back a direct link (optionally shortened), and serves an HTTP upload endpoint |
+| [teldrive](https://github.com/h897105167/rcgui-plugin-teldrive) | 0.3.0 | Deploys teldrive, signs in to Telegram, creates channels and a bot, then adds the remote to rclone and mounts it. Needs the teldrive build of rclone — official rclone has no teldrive backend |
 
-## Embedded HTTP server
+Those two are what the portable archive carries. The [oneclick](https://github.com/h897105167/rcgui-plugin-oneclick) plugin is not among them, and not in the store either: it starts and supervises its own rclone, which is now the managed core's job, and its newer builds no longer start rclone themselves. Installing it by hand therefore does not restore the old behaviour — use the managed core, or keep your own `rclone rcd` and connect in external-endpoint mode.
 
-RCGUI can expose a small HTTP server (default port **5273**, configurable in Settings) so external tools and plugins can reach it:
+The intended deployment addresses are below. The new store goes live after this change is merged and its Pages workflow is enabled:
 
-| Route | Purpose |
-| --- | --- |
-| `GET /api/health` | Liveness probe for the app itself |
-| `ANY /plugin/{id}` | Dispatch to the plugin whose id is `{id}` |
-| `ANY /plugin/{id}/{*rest}` | Same, with an arbitrary sub-path |
-| `ANY /api/plugin/{id}/{*rest}` | Legacy alias of the route above, kept for older clients |
+- Web page: <https://h897105167.github.io/rclone_gui_windows/store/>
+- Index the app reads: <https://h897105167.github.io/rclone_gui_windows/store/index.json>
 
-A plugin opts into HTTP handling with `"http_entry": true` in its `config.json`; requests are then negotiated through the plugin's `http` capability, one JSON round per invocation.
+Every entry is a URL plus a SHA-256 that the app verifies before unpacking, so the index can list a plugin whose code lives in someone else's repository — including yours.
 
-## How plugins work
+Authors submit a manifest through a pull request to [`docs/store/index.json`](docs/store/index.json); the submission rules, the review gate and the checks the CI runs are in [`docs/store/README.md`](docs/store/README.md). Nothing in the store is executable code hosted by the repository — entries are URLs plus a SHA-256, and the app verifies the hash before unpacking.
 
-A plugin is a directory with a `config.json` (identity, version, capabilities, entry point) and a `main.wasm` compiled for `wasm32-wasip1`. There is no plugin API in the host UI: the panel is described **declaratively** by `plugin_setting.controls` in `config.json`, and the host renders whatever the plugin declares without knowing any specific plugin.
+In 0.3.0, the new-remote list comes from the connected rclone core and presets declared by enabled plugins. The [kvault plugin](https://github.com/h897105167/rcgui-plugin-kvault) supplies the K-Vault connection wizard and WebDAV preset; the app no longer inserts that type unconditionally. The app retains the site's file-upload adapter and compatibility with existing remotes. The plugin source and test archive are under review, **unreleased and absent from the store**. Store entries require a real Release asset and verified checksum.
 
-- **Capabilities.** A plugin must declare and then request each capability it uses: `kv`, `ui`, `fs`, `http`, `proc`, `net`, `rclone`, `env`. Dependencies are checked by the host, and every call is a JSON request/response round over stdin/stdout.
-- **Localisation.** Display strings — labels, hints, option labels, `tags` — may be written as `{"zh": "…", "en": "…"}`. The host passes the active language to the plugin on every call (`params.lang`), and stores the value the user picked rather than the display string.
-- **Lifecycle.** A plugin may declare `on_start` / `on_exit` hooks, may be disabled, and may be uninstalled — a built-in plugin leaves a tombstone behind so it can be restored from the Plugins page instead of disappearing for good.
-- **Integrity.** The build-time archives are verified once when fetching and again when the app unpacks them into `%APPDATA%\RCGUI\plugins\<id>\`.
+<img src="docs/plugins-store-preview.png" alt="RCGUI 0.3.0 development build: the Plugins window with the Store tab open" width="720">
 
-The full contract — manifest schema, capability signatures, action protocol — is in [`docs/PLUGIN.md`](docs/PLUGIN.md).
+*A preview of the 0.3.0 development build: the Plugins window, Store tab. The rows are QA fixture data — one entry is deliberately fictional — so the picture shows the layout, not the published store contents.*
 
-## Data directory
+## Upgrading from 0.2.x
 
-Configuration and runtime state are separated:
-
-- `%APPDATA%\RCGUI\` — `config.json` (RC endpoint, server port, UI language, per-remote proxy bindings, the mounts and services you asked for), profiles, plugin copies and kv stores.
-- On first start RCGUI copies an existing `%APPDATA%\rclone-gui\` directory over, so upgrading from the old name keeps your settings.
-- **Portable mode:** drop an empty file named `portable` next to `rclone-gui.exe` and everything moves to `data\` beside the executable.
-
-`rcgui.conf` is the versioned import/export format for a profile (remotes, mounts, services). Credentials are stripped by default, so an exported file is safe to carry around.
-
-## Development
-
-```powershell
-cargo build --workspace
-cargo test --workspace
-cargo run -p plugin_host --example protocol_test
-```
-
-## Project layout
-
-```
-crates/
-  app/       the Slint UI, the RC client wiring and the HTTP server
-  i18n/      Chinese/English dictionaries and the `t` / `f` helpers
-  profile/   the versioned `rcgui.conf` import/export format
-  rc/        a typed client for rclone's RC API
-  rclone/    legacy process helpers (exe discovery, a managed `rcd` child, `cat`
-             streaming); the RC client has moved to rc/ and this crate is slated
-             for removal
-  plugin/    the WASI plugin host, capability broker and manifest handling
-plugins/
-  manifest.json   pinned plugin versions plus their SHA-256
-scripts/     build.ps1, fetch_plugins.ps1, packaging helpers
-docs/        PLUGIN.md, CHANGELOG.md, verification notes
-```
+- Your data directory stays `%APPDATA%\RCGUI`; a first run also copies an existing `%APPDATA%\rclone-gui\` over, so older installs keep their settings.
+- If you used the one-click plugin, its `bin\rclone.exe` is still on disk and still usable. 0.3.0 starts a managed core by default; point the app at that binary as a custom core if you would rather keep using it, or keep running your own `rclone rcd` and connect in **external endpoint** mode. What no longer works is letting the plugin start rclone for you: the newer plugin builds do not.
+- **teldrive** remotes need care: the plugin deploys a `bin\rclone.exe` built from the tgdrive/rclone fork, because official rclone has no teldrive provider. If the core currently selected in Settings has no `teldrive` backend, choose that deployed `bin\rclone.exe` as the core. Editing a remote's metadata cannot add a native backend to an official rclone build.
 
 ## Documentation
 
 | File | Contents |
 | --- | --- |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Layers, core modes, concurrency, caching, credentials, accessibility, and what is planned rather than built |
+| [`docs/PLUGIN.md`](docs/PLUGIN.md) | Plugin manifest, capabilities, action protocol, HTTP entry points |
+| [`docs/store/README.md`](docs/store/README.md) | Store index schema, submission and review process |
+| [`docs/CLI.md`](docs/CLI.md) | Command-line contract for 0.3.0 — in the tree, not yet released: `--version`, `--diagnostics --json`, `--validate-config <path>`, `--list-plugins`, `--export-accessibility-tree <path>` |
+| [`docs/RELEASE.md`](docs/RELEASE.md) | Artifact names, checksums, the pinned core manifest, and what a release must contain |
+| [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | What is measured, how, and how to quote a number honestly |
+| [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) | 0.3.0 requirement mapping, acceptance evidence and remaining release checks |
+| [`docs/VERSIONING.md`](docs/VERSIONING.md) | Version rules, tag policy, changelog rules |
 | [`docs/CHANGELOG.md`](docs/CHANGELOG.md) | Everything that changed, newest first |
-| [`docs/PLUGIN.md`](docs/PLUGIN.md) | Plugin manifest, capability groups, action protocol, HTTP entry points |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Build, review gates, what gets rejected |
 | [`docs/proxy-verification.md`](docs/proxy-verification.md) | What each rclone backend actually accepts for a proxy, measured |
 
-## Security notes
+## Project layout
 
-- The RC password is stored in cleartext in `config.json`. Use a dedicated `--rc-user/--rc-pass` pair, and keep the RC port on loopback.
-- Plugins run inside a WASI sandbox and reach the system only through declared capabilities. `fs.`, `proc.` and `http.` are the dangerous ones — read a plugin's `config.json` before you trust it.
-- The embedded HTTP server binds to loopback and has no authentication of its own; treat anything you expose through a plugin's `http_entry` as reachable by any local process.
-- `rclone obscure` obfuscates configuration values, it does not encrypt them: an obscured password in `rclone.conf` is recoverable.
+```
+crates/
+  app/       Slint views, RC wiring, embedded HTTP server, managed core
+             (core.rs), services (maintenance, store, update, backup,
+             sync, cli), K-Vault file adapter and legacy compatibility
+  i18n/      Chinese/English dictionaries and the t / f helpers
+  profile/   the versioned rcgui.conf import/export format
+  rc/        typed client for rclone's RC API
+  rclone/    process helpers: attach and exe discovery only; its guard
+             test asserts that it starts nothing
+  plugin/    WASI plugin host, capability broker, manifest handling
+plugins/
+  manifest.json   pinned plugin tags, asset names and SHA-256
+packaging/        core manifest and the Inno Setup script
+scripts/          build, plugin fetch, core fetch, packaging, performance
+docs/             architecture, plugin, store, release, versioning, assets
+```
+
+## Security
+
+- Only RCGUI's own child process is ever stopped; in external-endpoint mode the app can do nothing but disconnect.
+- Plugin archives are verified twice: at fetch time against the lock file and the store index, and again when unpacked into `%APPDATA%\RCGUI\plugins\<id>\`. A hash mismatch is a hard failure, never a warning.
+- Builds and release assets contain no credentials, no tokens and no absolute developer paths; `.gitignore` and the packaging script both refuse to include local data.
+
+## License
+
+This repository does not declare a project license yet, so there is no legal grant to reuse it beyond what GitHub's terms and applicable law allow. Third-party components keep their own licenses, collected under `licenses/` in release artifacts — rclone, for instance, is MIT.

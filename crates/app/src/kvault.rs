@@ -126,10 +126,7 @@ pub struct RemoteFile {
 impl KvCfg {
     /// 远程参数里是否带 `kvault=1` 标记。
     pub fn is_marked(params: &Map<String, Value>) -> bool {
-        params
-            .get(MARKER)
-            .map(|v| truthy(v))
-            .unwrap_or(false)
+        params.get(MARKER).map(|v| truthy(v)).unwrap_or(false)
     }
 
     /// 从 `rclone config dump` 的**条目**（`Value::Object`）判定标记。
@@ -206,7 +203,10 @@ impl KvCfg {
             }
         }
         m.insert(MARKER.into(), json!("1"));
-        m.insert("kvault_folder".into(), json!(self.folder.trim().trim_matches('/')));
+        m.insert(
+            "kvault_folder".into(),
+            json!(self.folder.trim().trim_matches('/')),
+        );
         m.insert("kvault_storage".into(), json!(self.storage));
         m.insert(
             "kvault_dedup".into(),
@@ -226,9 +226,10 @@ impl KvCfg {
             return Err(rcgui_i18n::t("K-Vault 远程没有站点地址").into());
         }
         if self.token.trim().is_empty() {
-            return Err(
-                rcgui_i18n::t("K-Vault 上传需要 API 访问令牌（WebDAV 通道只读）。请编辑该远程填入令牌。").into(),
-            );
+            return Err(rcgui_i18n::t(
+                "K-Vault 上传需要 API 访问令牌（WebDAV 通道只读）。请编辑该远程填入令牌。",
+            )
+            .into());
         }
         Ok(())
     }
@@ -265,7 +266,10 @@ pub async fn probe(base: &str, token: &str) -> Result<Probe, String> {
     let status = health.status().as_u16();
     let body = health.text().await.unwrap_or_default();
     if status >= 400 {
-        return Err(rcgui_i18n::f("健康检查失败 · {}", &[&(api_error(status, &body))]));
+        return Err(rcgui_i18n::f(
+            "健康检查失败 · {}",
+            &[&(api_error(status, &body))],
+        ));
     }
 
     if token.trim().is_empty() {
@@ -281,7 +285,10 @@ pub async fn probe(base: &str, token: &str) -> Result<Probe, String> {
     let status = me.status().as_u16();
     let body = me.text().await.unwrap_or_default();
     if status >= 400 {
-        return Err(rcgui_i18n::f("令牌不可用 · {}", &[&(api_error(status, &body))]));
+        return Err(rcgui_i18n::f(
+            "令牌不可用 · {}",
+            &[&(api_error(status, &body))],
+        ));
     }
     let v: Value = serde_json::from_str(&body)
         .map_err(|e| rcgui_i18n::f("令牌信息不是 JSON（HTTP {}）: {}", &[&(status), &(e)]))?;
@@ -316,7 +323,11 @@ fn parse_me(v: &Value) -> Probe {
             .unwrap_or_default()
     };
     Probe {
-        id: node.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        id: node
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         name: node
             .get("name")
             .and_then(|x| x.as_str())
@@ -346,11 +357,22 @@ fn parse_me(v: &Value) -> Probe {
 /// 不会变成两个文件（站点实现见 `functions/api/v1/upload.js`）。钥匙把「目标
 /// 目录 + 后端 + 文件名 + 大小 + 秒级 mtime」都算进去，所以「同一份文件传到
 /// 另一个目录」不会误命中上一次的响应。
-pub async fn upload(cfg: &KvCfg, path: &Path, name: &str, folder: &str) -> Result<Uploaded, String> {
+pub async fn upload(
+    cfg: &KvCfg,
+    path: &Path,
+    name: &str,
+    folder: &str,
+) -> Result<Uploaded, String> {
     cfg.upload_ready()?;
     let meta = std::fs::metadata(path).map_err(|e| rcgui_i18n::f("读取文件失败: {}", &[&(e)]))?;
     if meta.len() > MAX_UPLOAD {
-        return Err(rcgui_i18n::f("文件 {} MB 超过站点单文件上限 {} MB", &[&(format!("{:.1}", meta.len() as f64 / 1048576.0)), &(format!("{:.0}", MAX_UPLOAD as f64 / 1048576.0))]));
+        return Err(rcgui_i18n::f(
+            "文件 {} MB 超过站点单文件上限 {} MB",
+            &[
+                &(format!("{:.1}", meta.len() as f64 / 1048576.0)),
+                &(format!("{:.0}", MAX_UPLOAD as f64 / 1048576.0)),
+            ],
+        ));
     }
     let folder = folder.trim().trim_matches('/').to_string();
     let mtime = meta
@@ -508,7 +530,10 @@ pub async fn list_files(base: &str, token: &str) -> Result<Vec<RemoteFile>, Stri
         let status = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();
         if status >= 400 {
-            return Err(rcgui_i18n::f("读取站点文件列表失败 · {}", &[&(api_error(status, &body))]));
+            return Err(rcgui_i18n::f(
+                "读取站点文件列表失败 · {}",
+                &[&(api_error(status, &body))],
+            ));
         }
         let v: Value = serde_json::from_str(&body)
             .map_err(|e| rcgui_i18n::f("文件列表不是 JSON（HTTP {}）: {}", &[&(status), &(e)]))?;
@@ -534,7 +559,11 @@ fn parse_files(v: &Value) -> (Vec<RemoteFile>, Option<String>) {
     let list = files
         .iter()
         .map(|f| RemoteFile {
-            id: f.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            id: f
+                .get("id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
             name: f
                 .get("name")
                 .and_then(|x| x.as_str())
@@ -604,8 +633,7 @@ fn encode_id(id: &str) -> String {
     let mut out = String::with_capacity(id.len());
     for b in id.as_bytes() {
         let ch = *b as char;
-        let keep = ch.is_ascii_alphanumeric()
-            || matches!(ch, '-' | '_' | '.' | '~' | ':' | '/');
+        let keep = ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~' | ':' | '/');
         if keep {
             out.push(ch);
         } else {
@@ -898,9 +926,15 @@ mod tests {
             dedup: true,
         };
         let p = cfg.params(true);
-        assert_eq!(p.get("url").unwrap().as_str().unwrap(), "https://kvault.example.com/dav");
+        assert_eq!(
+            p.get("url").unwrap().as_str().unwrap(),
+            "https://kvault.example.com/dav"
+        );
         assert_eq!(p.get("vendor").unwrap().as_str().unwrap(), "other");
-        assert_eq!(p.get("kvault_folder").unwrap().as_str().unwrap(), "image_bed");
+        assert_eq!(
+            p.get("kvault_folder").unwrap().as_str().unwrap(),
+            "image_bed"
+        );
         assert_eq!(p.get("kvault_dedup").unwrap().as_str().unwrap(), "1");
 
         let back = KvCfg::from_params(&p);
@@ -960,11 +994,14 @@ mod tests {
         assert_eq!(base_from_url("https://h/dav/"), "https://h");
         assert_eq!(base_from_url("https://h/"), "https://h");
         assert_eq!(base_from_url("https://h/dav/dav"), "https://h/dav");
-        assert_eq!(KvCfg {
-            base: "https://h".into(),
-            ..Default::default()
-        }
-        .dav_url(), "https://h/dav");
+        assert_eq!(
+            KvCfg {
+                base: "https://h".into(),
+                ..Default::default()
+            }
+            .dav_url(),
+            "https://h/dav"
+        );
     }
 
     #[test]
@@ -1066,7 +1103,13 @@ mod tests {
     fn targets_match_folder_and_name() {
         let files = vec![
             rf("tg:AAAAAA", "a.png", "image_bed", 1, "2026-10-23T10:00:00Z"),
-            rf("tg:00ff0011", "a.png", "image_bed", 1, "2026-10-23T10:00:00Z"),
+            rf(
+                "tg:00ff0011",
+                "a.png",
+                "image_bed",
+                1,
+                "2026-10-23T10:00:00Z",
+            ),
             rf("tg:3", "b.png", "image_bed/sub", 1, "2026-10-23T10:00:00Z"),
             rf("tg:4", "a.png", "other", 1, "2026-10-23T10:00:00Z"),
         ];
@@ -1146,5 +1189,4 @@ mod tests {
         assert_eq!(encode_id("r2:dir/a b.png"), "r2:dir/a%20b.png");
         assert_eq!(encode_id("tg:a#b"), "tg:a%23b");
     }
-
 }

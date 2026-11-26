@@ -1,0 +1,124 @@
+name: 插件提交（商店收录）
+description: 申请把一个已发布的插件收录进 RCGUI 插件商店
+title: "[plugin] "
+labels: ["plugin-store", "needs-review"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        这个 issue 只是**审核的起点，不是收录本身**。收录要改
+        [`docs/store/index.json`](https://github.com/h897105167/rclone_gui_windows/blob/main/docs/store/index.json)，流程见
+        [docs/store/README.md](https://github.com/h897105167/rclone_gui_windows/blob/main/docs/store/README.md)：
+        先开这个 issue 拿到初审结论，再提 PR 改索引。**不要上传 zip 或任何可执行文件**，
+        下载地址必须是插件仓库自己的 GitHub Release。
+
+        会被拒的情形：占位条目、猜出来的 sha256、下载地址指向自己的服务器或国内网盘、
+        `oneclick`（与主程序耦合，刻意不上架）、zip 内容与源码不符。
+  - type: input
+    id: plugin-id
+    attributes:
+      label: 插件 id
+      description: 与 `config.json` 里的 `id` 完全一致，小写字母、数字、连字符。
+      placeholder: imagehost
+    validations:
+      required: true
+  - type: input
+    id: display-name
+    attributes:
+      label: 显示名称
+      description: 商店卡片上显示的名字，英文或中文均可，字符串。
+      placeholder: Image host / 图床
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: semver，与 `config.json` 的 `version`、Release 的 tag 三者一致。
+      placeholder: 0.6.1
+    validations:
+      required: true
+  - type: input
+    id: min-gui
+    attributes:
+      label: min_gui_version
+      description: 这个插件要求的最低 RCGUI 版本。必须是确实包含该插件的版本，不能填未来版本。
+      placeholder: 0.2.1
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: 一句话说明
+      description: 用户能看懂它做什么、需要什么前提。别写"强大""优雅"。
+      placeholder: 上传图片，拿到直链，可选按模板换短链。
+    validations:
+      required: true
+  - type: input
+    id: repository
+    attributes:
+      label: 源码仓库
+      description: 公开可访问的 https 地址；闭源插件请说明原因。
+      placeholder: https://github.com/owner/repo
+    validations:
+      required: true
+  - type: input
+    id: url
+    attributes:
+      label: Release 下载地址
+      description: 直接指向 zip 资产，形如 https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>.zip
+      placeholder: https://github.com/owner/repo/releases/download/v0.6.1/plugin-0.6.1.zip
+    validations:
+      required: true
+  - type: input
+    id: sha256
+    attributes:
+      label: zip 的 SHA-256
+      description: 对**已发布的 Release 资产**做 `Get-FileHash -Algorithm SHA256` 得到的值。自己本地重新打包的 zip 哈希不同，不能用。
+      placeholder: 64 位小写十六进制
+    validations:
+      required: true
+  - type: dropdown
+    id: capabilities
+    attributes:
+      label: 声明的能力
+      description: 与 `config.json` 的 `capabilities` 一致，只声明实际用到的。
+      multiple: true
+      options:
+        - kv（插件私有键值存储）
+        - ui（面板控件）
+        - fs（读写本机文件）
+        - http（对外 HTTP 入口 / 发起请求）
+        - proc（启动子进程）
+        - net（网络访问）
+        - rclone（调用 RC 接口）
+        - env（读取环境变量 / 运行目录）
+    validations:
+      required: true
+  - type: input
+    id: license
+    attributes:
+      label: 插件许可证
+      placeholder: MIT / Apache-2.0 / 其他（写明）
+    validations:
+      required: true
+  - type: textarea
+    id: behaviour
+    attributes:
+      label: 它会做什么、不会做什么
+      description: 重点写：读写哪些目录、连哪些域名、是否启动子进程、是否上传用户数据。审核会按这段核对代码。
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 提交者确认
+      options:
+        - label: zip 与我公开的源码一致，且 sha256 取自实际 Release 资产
+          required: true
+        - label: 不含遥测、不收集凭据、不向未声明的域名发请求
+          required: true
+        - label: 能力声明是最小集合，没有多要权限
+          required: true
+        - label: 我理解收录需要提 PR 改索引，并接受代码、许可证、权限、恶意行为四方面审核
+          required: true

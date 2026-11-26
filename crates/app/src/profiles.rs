@@ -20,7 +20,9 @@ use std::sync::Mutex;
 
 /// 档案文件路径：`<数据目录>/profiles/default.json`
 pub fn profile_path() -> PathBuf {
-    crate::config::data_dir().join("profiles").join("default.json")
+    crate::config::data_dir()
+        .join("profiles")
+        .join("default.json")
 }
 
 /// 当前档案里「凭据未随包导出」的远程名索引（UI 徽标用）。
@@ -46,8 +48,7 @@ pub fn store() -> Store {
 /// 让它发现权限错误时能请求修复并自动重试。
 pub fn install_permission_healer() {
     rcgui_profile::Store::set_permission_healer(|| {
-        crate::config::repair_data_dir_permissions()
-            .map_err(rcgui_profile::StoreError::Io)
+        crate::config::repair_data_dir_permissions().map_err(rcgui_profile::StoreError::Io)
     });
 }
 
@@ -85,8 +86,14 @@ pub fn load_doc(legacy: &AppConfig) -> Option<ProfileDoc> {
                 && doc.proxies.is_empty();
             if !empty {
                 match s.save(&doc) {
-                    Ok(()) => notice(rcgui_i18n::f("已把挂载/服务预设迁移到档案：{}", &[&(s.path().display())])),
-                    Err(e) => notice(rcgui_i18n::f("档案初始化失败（{}），本次改动仅保存在内存", &[&(e)])),
+                    Ok(()) => notice(rcgui_i18n::f(
+                        "已把挂载/服务预设迁移到档案：{}",
+                        &[&(s.path().display())],
+                    )),
+                    Err(e) => notice(rcgui_i18n::f(
+                        "档案初始化失败（{}），本次改动仅保存在内存",
+                        &[&(e)],
+                    )),
                 }
             }
             Some(doc)
@@ -116,11 +123,16 @@ pub fn current_doc(cfg: &AppConfig) -> ProfileDoc {
 /// 用导入文件替换本地档案（挂载 / 服务 / 预设名 / 远程元信息），并把结果同步回内存 cfg。
 ///
 /// 只调用 `Store::save`，即仍然是「单一写入口」；调用方负责先备份。
-pub fn replace_from_bundle(
+///
+/// 档案路径由调用方给出，只为一件事：失败时「原档案一个字节都没动」这条保证要能在临时目录里
+/// 测出来，而不是靠读代码相信。读失败（更高版本的档案、文件损坏）必须先于任何写入返回，
+/// 否则用户导入一次就把自己回不去的档案覆盖了。
+pub fn replace_from_bundle_at(
+    store_path: &std::path::Path,
     conf: &rcgui_profile::bundle::RcguiConf,
     cfg: &mut AppConfig,
 ) -> Result<()> {
-    let s = store();
+    let s = Store::new(store_path.to_path_buf());
     let mut doc = match s.load() {
         Ok(Some(d)) => d,
         Ok(None) => ProfileDoc::default(),

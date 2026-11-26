@@ -45,7 +45,9 @@ impl Drop for TempFile {
 
 /// 本地路径 → rclone local backend 的 fs 字符串。
 fn local_fs(p: &Path) -> String {
-    p.to_string_lossy().trim_end_matches(['\\', '/']).to_string()
+    p.to_string_lossy()
+        .trim_end_matches(['\\', '/'])
+        .to_string()
 }
 
 /// 取远端文件字节。失败时不会留下临时文件。

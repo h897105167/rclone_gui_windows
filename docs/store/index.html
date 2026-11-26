@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RCGUI 插件商店</title>
+<meta name="description" content="RCGUI 的插件清单：每个插件的版本、来源、权限与 sha256 校验值。">
+<meta name="color-scheme" content="light dark">
+<link rel="stylesheet" href="style.css">
+<!-- 页面不加载任何第三方脚本、字体或统计；所有内容来自同目录的 index.json。 -->
+</head>
+<body>
+
+<header>
+  <p class="eyebrow">RCGUI 插件商店</p>
+  <h1>为你的文件工作台添加能力</h1>
+  <p class="lede">浏览经过审核的插件，在 RCGUI 中安装和更新。</p>
+  <p class="fineprint">
+    这里只列<strong>已经发布过、校验值核对过</strong>的包。想自己再核一遍，每张卡片展开就是 sha256 与来源。
+  </p>
+  <nav class="nav-links" aria-label="相关链接">
+    <a href="https://github.com/h897105167/rclone_gui_windows/blob/main/docs/store/README.md">作者指南</a>
+    <a href="https://github.com/h897105167/rclone_gui_windows">主程序</a>
+    <a href="index.json">index.json</a>
+  </nav>
+  <p id="notice" class="notice" hidden></p>
+</header>
+
+<main>
+  <div class="search">
+    <label for="search">搜索插件</label>
+    <input id="search" type="search" autocomplete="off" spellcheck="false"
+           placeholder="插件名、id、说明或权限，例如 teldrive / http">
+  </div>
+
+  <p id="count" class="count" role="status" aria-live="polite">正在读取索引…</p>
+
+  <ul id="cards" class="cards" aria-label="插件列表"></ul>
+
+  <noscript>
+    <p class="notice">
+      这个页面用脚本读取同目录下的 <code>index.json</code> 来渲染插件列表。
+      关掉脚本后页面不会显示内容；索引文件本身可以直接打开看，格式见
+      <a href="https://github.com/h897105167/rclone_gui_windows/blob/main/docs/store/README.md">商店说明</a>。
+    </p>
+  </noscript>
+</main>
+
+<footer>
+  <p>
+    索引文件：<a href="index.json">index.json</a>（schema_version 1，公开格式，机器可读）。
+    提交插件请按
+    <a href="https://github.com/h897105167/rclone_gui_windows/blob/main/docs/store/README.md">作者指南</a>
+    提 PR，审核通过并合并后才会出现在这里。
+  </p>
+  <p>
+    RCGUI 本体仍在开发中，当前开发版本 0.3.0；对外发布过的最新版本是 v0.2.1。
+    插件包由各自的作者维护，本仓库只记录来源与校验值。
+  </p>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

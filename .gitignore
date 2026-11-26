@@ -8,3 +8,13 @@ crates/app/data
 # 的 Release 下载生成（crates/app/assets/plugins/<id>/）。不进本仓库 ——
 # 插件源码与打包产物都在各自的独立仓库里。
 /crates/app/assets/plugins/
+
+# 受管内核：80 MB 级的 rclone.exe + COPYING，由 scripts/fetch_core.ps1 按
+# packaging/core-manifest.json 下载校验。现在默认写 target\<profile>\core
+# （已被上面的 /target 覆盖），这条留着是因为早先默认值就是仓库根的 core/，
+# 手跑一次旧脚本或粘贴旧命令就会再冒出来 —— 那是下载物，不该进 Git。
+/core
+
+# 打包输出：scripts/build-release.ps1 的 -OutDir 默认 dist，里面是几 GB 的
+# 安装包、portable 目录和校验和。要发布就上传 Release 资产，不进仓库。
+/dist
