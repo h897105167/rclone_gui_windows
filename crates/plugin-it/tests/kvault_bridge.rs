@@ -114,15 +114,17 @@ async fn listing_walks_every_page_and_puts_folders_first() {
     let names: Vec<String> = items.iter().map(|(n, _)| n.clone()).collect();
 
     // 站点第一页只给两条并说还有下一页（photo.png、big.bin），第二页才给
-    // notes.txt：根目录能同时看见 photo.png 和 notes.txt，就说明翻页真的走了。
+    // notes.txt。`path` 传空串时插件列的是这条远程自己的上传目录（假宿主配的
+    // 是 `album`），所以这一层里能看见 photo.png（第一页）、notes.txt（第二页）
+    // 和由 album/2026 折出来的子目录 2026：两页都读到，说明翻页真的走了。
     assert_eq!(
         names,
         vec![
-            "album".to_string(),
+            "2026".to_string(),
             "notes.txt".to_string(),
             "photo.png".to_string()
         ],
-        "根目录应该是先目录后文件、且覆盖两页：{}",
+        "上传目录这一层应该先目录后文件、且覆盖两页：{}",
         text_of(&got)
     );
     assert!(items[0].1, "目录没有排在文件前面：{}", text_of(&got));
@@ -279,12 +281,20 @@ async fn adopt_legacy_fills_only_the_slots_that_are_still_empty() {
         return;
     };
     // 插件里已经有一份设置（用户在插件面板里填过的），旧数据只能补空缺。
+    //
+    // 形状要和插件真实存的一致：整站设置放在 `site` 这一格里（插件读的是
+    // `kv["site"]`），不是摊在命名空间顶层。摊平了写进来，插件会以为「一格都没填」，
+    // 于是把旧地址、旧令牌全部盖上去——测出来的红是夹具的错，不是迁移的错。
     h.host.put_kv(
         PLUGIN_ID,
-        json!({ "base": "https://new.example.com", "token": "fresh-token" }),
+        json!({ "site": { "base": "https://new.example.com", "token": "fresh-token" } }),
     );
+    // 旧库的形状（`crates/app/src/kvault.rs` 被删之前的样子）：`kvault` 命名空间里
+    // 一个 `site` 键放开店设置，其余键是「远程名 → {token}」；`kvault_tokens` 里
+    // 全是后者。插件认的正是这个形状——键名 `site` 就是整站设置，别把它改叫
+    // 命名空间名，那样插件会当成一条叫 kvault 的远程，站点设置原样丢掉。
     let legacy = json!({
-        "kvault": {
+        "site": {
             "base": "https://old.example.com",
             "token": "old-token",
             "folder": "album",
@@ -307,7 +317,11 @@ async fn adopt_legacy_fills_only_the_slots_that_are_still_empty() {
     );
 
     let kept = h.host.kv_snapshot();
-    let site = kept.get(PLUGIN_ID).cloned().unwrap_or(Value::Null);
+    let site = kept
+        .get(PLUGIN_ID)
+        .and_then(|ns| ns.get("site"))
+        .cloned()
+        .unwrap_or(Value::Null);
     // 已有的两项必须原样留着：覆盖是最坏的失败方式，用户的令牌会悄悄失效。
     assert_eq!(
         site.get("token").and_then(Value::as_str),
@@ -329,7 +343,13 @@ async fn adopt_legacy_fills_only_the_slots_that_are_still_empty() {
         text_of(&site)
     );
     // 另一条远程的令牌也搬了过来，而且只搬 token 这一项。
-    let remote = kept.get("vault").cloned().unwrap_or(Value::Null);
+    // 快照是按插件 id 分层的（`kv_get_all` 只给插件看它自己那一格），所以先取
+    // `kvault` 这一层，再取里面的远程名。
+    let remote = kept
+        .get(PLUGIN_ID)
+        .and_then(|ns| ns.get("vault"))
+        .cloned()
+        .unwrap_or(Value::Null);
     assert_eq!(
         remote.get("token").and_then(Value::as_str),
         Some("remote-token"),
@@ -344,8 +364,10 @@ async fn adopt_legacy_refuses_garbage_instead_of_wiping_settings() {
         eprintln!("{SKIP_NOTE}");
         return;
     };
-    h.host
-        .put_kv(PLUGIN_ID, json!({ "base": "https://keep.example.com" }));
+    h.host.put_kv(
+        PLUGIN_ID,
+        json!({ "site": { "base": "https://keep.example.com" } }),
+    );
     let got = h
         .call(
             "adopt_legacy",
@@ -361,7 +383,8 @@ async fn adopt_legacy_refuses_garbage_instead_of_wiping_settings() {
     let kept = h.host.kv_snapshot();
     assert_eq!(
         kept.get(PLUGIN_ID)
-            .and_then(|v| v.get("base"))
+            .and_then(|ns| ns.get("site"))
+            .and_then(|site| site.get("base"))
             .and_then(Value::as_str),
         Some("https://keep.example.com"),
         "拒绝时手里的设置被动了"
@@ -398,6 +421,9 @@ async fn a_plugin_without_the_capability_group_is_refused() {
         return;
     };
     let none = Allowed::from_groups(&[]);
+    // 拒绝发生在第二个 need 上：第一个 `kv.get_all` 走的是宿主的旧通道，不查能力组；
+    // 第二个 `rclone.call` 才被 `Allowed::check` 挡住。所以文案里点名的是 rclone 组，
+    // 这里就按真实文案断言——传空片段等于断言「随便什么错误都行」，那才是掩盖问题。
     let err = expect_error(
         h.call_allowed(
             &none,
@@ -405,7 +431,7 @@ async fn a_plugin_without_the_capability_group_is_refused() {
             json!({ "remote": "vault", "path": "" }),
         )
         .await,
-        &[],
+        &["rclone"],
     );
     assert!(!err.is_empty(), "空能力组应该让调用失败");
     assert!(h.site.hits().is_empty(), "没有能力却发出了 HTTP 请求");
