@@ -1726,17 +1726,24 @@ fn pe_info(p: &Path) -> Result<(String, String, String, String)> {
     ))
 }
 
+/// 数字签名的 PowerShell 命令。路径只经由环境变量传入，不进脚本源码。
+///
+/// 路径来自用户选择的文件，里面可以有单引号、分号、换行；这些字符只要出现在脚本文本里
+/// 就得靠转义保证不被当代码。环境变量的值 PowerShell 只当数据读，路径怎么长都无所谓。
+fn signature_command(path: &str) -> std::process::Command {
+    // 固定字符串：脚本内容与路径完全无关，路径再看也不会改变要执行的语句。
+    const SCRIPT: &str = "$s=Get-AuthenticodeSignature -LiteralPath $env:RCGUI_SIG_PATH; \
+         if($s.Status -eq 'Valid'){'VALID'}else{$s.Status.ToString()}; \
+         if($s.SignerCertificate){$s.SignerCertificate.Subject}";
+    let mut cmd = std::process::Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .env("RCGUI_SIG_PATH", path);
+    cmd
+}
+
 /// 数字签名（PowerShell `Get-AuthenticodeSignature`，拿不到就返回 unknown）。
 fn signature_json(path: &str) -> Value {
-    let quoted = path.replace('\'', "''");
-    let script = format!(
-        "$s=Get-AuthenticodeSignature -LiteralPath '{quoted}'; \
-         if($s.Status -eq 'Valid'){{'VALID'}}else{{$s.Status.ToString()}}; \
-         if($s.SignerCertificate){{$s.SignerCertificate.Subject}}"
-    );
-    let mut cmd = std::process::Command::new("powershell.exe");
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()]);
-    let Ok(v) = run_capture(cmd, Duration::from_secs(20)) else {
+    let Ok(v) = run_capture(signature_command(path), Duration::from_secs(20)) else {
         return json!({ "status": "unknown", "signer": "" });
     };
     let text = v.get("stdout").and_then(|x| x.as_str()).unwrap_or("");
@@ -1838,5 +1845,35 @@ mod search_tests {
             "image_bed/2026/10"
         );
         assert_eq!(super::kv_join(&["", ""]), "");
+    }
+
+    /// 路径只许出现在环境变量里，不许进 PowerShell 的脚本文本。
+    ///
+    /// 以前路径是拼进脚本字符串的，靠把单引号翻倍兜底；这条守的是更简单的事实：
+    /// 脚本内容与路径无关，所以引号、分号、换行、`$()` 都不可能是代码。
+    #[test]
+    fn signature_command_never_inlines_the_path() {
+        let hostile = "C:\\tmp\\a'; Remove-Item C:\\ -Recurse; '\n$(calc.exe)\"& whoami";
+        let cmd = signature_command(hostile);
+
+        let env = cmd
+            .get_envs()
+            .find(|(k, _)| k.to_string_lossy() == "RCGUI_SIG_PATH")
+            .expect("必须通过 RCGUI_SIG_PATH 传路径");
+        assert_eq!(env.1.unwrap().to_string_lossy().as_ref(), hostile);
+
+        for a in cmd.get_args() {
+            let s = a.to_string_lossy();
+            assert!(!s.contains(hostile), "参数里不该有路径: {s}");
+            assert!(!s.contains("Remove-Item"), "参数里不该有路径片段: {s}");
+            assert!(!s.contains("calc.exe"), "参数里不该有路径片段: {s}");
+        }
+
+        // 换成另一个路径，命令行完全不变——说明路径没参与拼接
+        let other = signature_command("D:\\x\\b.exe");
+        assert_eq!(
+            cmd.get_args().map(|a| a.to_owned()).collect::<Vec<_>>(),
+            other.get_args().map(|a| a.to_owned()).collect::<Vec<_>>()
+        );
     }
 }
