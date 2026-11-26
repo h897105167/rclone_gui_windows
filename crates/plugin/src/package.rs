@@ -546,15 +546,54 @@ pub fn sanitize_dir_name(id: &str) -> String {
         .collect()
 }
 
+/// 按扩展名组出启动命令。
+///
+/// 单独成函数是为了能在测试里检查参数向量：验"参数里没有去执行策略的开关"
+/// 只需要看命令行，不需要系统里真的有个可运行的 `.ps1`。
+fn command_for(entry: &Path, ext: &str) -> Result<std::process::Command> {
+    let cmd = match ext {
+        "msi" => {
+            let mut c = std::process::Command::new("msiexec");
+            c.arg("/i").arg(entry);
+            // 静默安装：不弹 UI，失败不重启
+            c.arg("/qn").arg("/norestart");
+            c
+        }
+        "exe" => std::process::Command::new(entry),
+        "bat" | "cmd" => {
+            let mut c = std::process::Command::new("cmd");
+            c.arg("/c").arg(entry);
+            c
+        }
+        // 不传执行策略开关：脚本能不能跑由本机设置和组策略决定。
+        // 旧版本这里写死过强制放行的开关，等于替用户绕过管理员设的限制。
+        "ps1" => {
+            let mut c = std::process::Command::new("powershell");
+            c.arg("-NoProfile").arg("-File").arg(entry);
+            c
+        }
+        other => bail!(
+            "{}",
+            rcgui_i18n::f(
+                "不支持的入口文件类型: .{}（支持 msi / exe / bat / cmd / ps1）",
+                &[&(other)]
+            )
+        ),
+    };
+    Ok(cmd)
+}
+
 /// 执行插件的 entry_file（启用插件 = 运行入口文件）。
 ///
 /// 支持的入口类型：
 /// - `.msi`  → `msiexec /i "<file>" /qn`（静默安装）
 /// - `.exe`  → 直接运行，附加 `entry_args`
 /// - `.bat` / `.cmd` → `cmd /c`
-/// - `.ps1`  → `powershell -ExecutionPolicy Bypass -File`
+/// - `.ps1`  → `powershell -NoProfile -File`，执行策略按系统设置
 ///
-/// 返回子进程退出码（0 表示成功）。
+/// 返回子进程退出码（0 表示成功）。`.ps1` 退化为非 0 时返回 `Err`，因为脚本插件
+/// 失败的原因（执行策略拒绝、语法错、权限不足）只在 PowerShell 的 stderr 里，
+/// 只给退出码的话用户不知道要不要去找管理员。
 pub fn run_entry_file(pkg_dir: &Path, meta: &PluginJson) -> Result<i32> {
     let entry = zip::safe_join(pkg_dir, &meta.entry_file)?;
     if !entry.is_file() {
@@ -569,38 +608,7 @@ pub fn run_entry_file(pkg_dir: &Path, meta: &PluginJson) -> Result<i32> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let mut cmd = match ext.as_str() {
-        "msi" => {
-            let mut c = std::process::Command::new("msiexec");
-            c.arg("/i").arg(&entry);
-            // 静默安装：不弹 UI，失败不重启
-            c.arg("/qn").arg("/norestart");
-            c
-        }
-        "exe" => std::process::Command::new(&entry),
-        "bat" | "cmd" => {
-            let mut c = std::process::Command::new("cmd");
-            c.arg("/c").arg(&entry);
-            c
-        }
-        "ps1" => {
-            let mut c = std::process::Command::new("powershell");
-            c.arg("-NoProfile")
-                .arg("-ExecutionPolicy")
-                .arg("Bypass")
-                .arg("-File")
-                .arg(&entry);
-            c
-        }
-        other => bail!(
-            "{}",
-            rcgui_i18n::f(
-                "不支持的入口文件类型: .{}（支持 msi / exe / bat / cmd / ps1）",
-                &[&(other)]
-            )
-        ),
-    };
-
+    let mut cmd = command_for(&entry, &ext)?;
     cmd.args(&meta.entry_args);
     cmd.current_dir(pkg_dir);
     // 不弹控制台窗口（与 rclone 子进程一致的处理）
@@ -610,10 +618,65 @@ pub fn run_entry_file(pkg_dir: &Path, meta: &PluginJson) -> Result<i32> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    if ext == "ps1" {
+        return run_ps1(cmd, &entry);
+    }
     let status = cmd
         .status()
         .with_context(|| rcgui_i18n::f("启动入口文件失败: {}", &[&(entry.display())]))?;
     Ok(status.code().unwrap_or(-1))
+}
+
+/// 跑 `.ps1` 入口：收下 PowerShell 的错误输出，非 0 退出码时原样带进错误消息。
+///
+/// stdin 置空是必须的：脚本要交互输入时，继承来的 stdin 会让它无声地卡住，
+/// 而启用插件的地方没有取消按钮。
+fn run_ps1(mut cmd: std::process::Command, entry: &Path) -> Result<i32> {
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped());
+    let child = cmd
+        .spawn()
+        .with_context(|| rcgui_i18n::f("启动入口文件失败: {}", &[&(entry.display())]))?;
+    let out = child
+        .wait_with_output()
+        .with_context(|| rcgui_i18n::f("启动入口文件失败: {}", &[&(entry.display())]))?;
+    let code = out.status.code().unwrap_or(-1);
+    if code == 0 {
+        return Ok(0);
+    }
+    let detail = stderr_excerpt(&out.stderr);
+    bail!(
+        "{}",
+        rcgui_i18n::f(
+            "入口文件执行失败（退出码 {}）：{}",
+            &[&(code.to_string()), &detail]
+        )
+    );
+}
+
+/// 把 PowerShell 的 stderr 压成一行放进提示框：空白合并、最多 400 字符。
+///
+/// 不做任何解析或翻译——这段话是给用户看线索的，判断"是不是执行策略拒绝"要由用户
+/// 看着原文做，代码只负责别弄丢它。
+fn stderr_excerpt(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    let mut one_line = String::new();
+    for word in text.split_whitespace() {
+        if !one_line.is_empty() {
+            one_line.push(' ');
+        }
+        one_line.push_str(word);
+    }
+    if one_line.is_empty() {
+        return rcgui_i18n::t("（无输出）").to_string();
+    }
+    if one_line.chars().count() > 400 {
+        let cut: String = one_line.chars().take(400).collect();
+        return format!("{cut}…");
+    }
+    one_line
 }
 
 #[cfg(test)]
@@ -1062,5 +1125,99 @@ a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2 *bin/helper.exe
         assert_eq!(errs.len(), 1, "应报告 1 个损坏插件");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 要禁的两个开关名。用 `concat!` 拆开写：这两个字符串会出现在守卫自己的
+    /// 源码里，写成一整段的话"扫源码找它"那条测试就会命中自己。
+    fn forbidden_switches() -> [String; 2] {
+        [
+            concat!("-exec", "utionpolicy").to_string(),
+            concat!("Byp", "ass").to_string(),
+        ]
+    }
+
+    fn args_of(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect()
+    }
+
+    /// ps1 的启动参数里不许有指定执行策略的开关。
+    ///
+    /// 脚本插件按本机设置和组策略跑；替它强制放行等于绕过管理员定的限制。
+    /// 用户不同意时 PowerShell 会自己拒绝并说明原因，我们只把 reject 如实报出来。
+    #[test]
+    fn ps1_command_leaves_policy_to_the_system() {
+        let cmd = command_for(std::path::Path::new("C:\\plugins\\p\\main.ps1"), "ps1").unwrap();
+        assert_eq!(
+            args_of(&cmd),
+            vec!["-NoProfile", "-File", "C:\\plugins\\p\\main.ps1"]
+        );
+        let joined = args_of(&cmd).join(" ").to_ascii_lowercase();
+        for needle in forbidden_switches() {
+            assert!(
+                !joined.contains(&needle.to_ascii_lowercase()),
+                "ps1 参数不应出现 {needle}: {joined}"
+            );
+        }
+    }
+
+    /// 老入口类型的行为保持不变：只换了 ps1 那一支。
+    #[test]
+    fn legacy_entry_types_keep_their_arguments() {
+        let msi = command_for(std::path::Path::new("C:\\p\\setup.msi"), "msi").unwrap();
+        assert!(msi.get_program().to_string_lossy().contains("msiexec"));
+        assert_eq!(
+            args_of(&msi),
+            vec!["/i", "C:\\p\\setup.msi", "/qn", "/norestart"]
+        );
+
+        for ext in ["bat", "cmd"] {
+            let bat = command_for(std::path::Path::new("C:\\p\\run.bat"), ext).unwrap();
+            assert_eq!(bat.get_program().to_string_lossy(), "cmd");
+            assert_eq!(args_of(&bat), vec!["/c", "C:\\p\\run.bat"]);
+        }
+
+        // exe 直接运行入口文件本身，不带额外参数
+        let exe = command_for(std::path::Path::new("C:\\p\\setup.exe"), "exe").unwrap();
+        assert!(exe.get_program().to_string_lossy().contains("setup.exe"));
+        assert!(args_of(&exe).is_empty());
+
+        let err = command_for(std::path::Path::new("C:\\p\\x.sh"), "sh").unwrap_err();
+        assert!(format!("{err}").contains("不支持的入口文件类型"));
+    }
+
+    /// 源码级守卫：这个文件里不该再出现那两个开关。
+    ///
+    /// 扫整份文件（含本测试模块），所以测试里的开关名都用 `concat!` 拆开写；
+    /// 有人把强制放行写回 `command_for`，这条会红。
+    #[test]
+    fn package_source_never_sets_execution_policy() {
+        let src = include_str!("package.rs").to_ascii_lowercase();
+        for needle in forbidden_switches() {
+            let hit = src.find(&needle.to_ascii_lowercase());
+            assert!(
+                hit.is_none(),
+                "package.rs 出现 {needle}（字节 {}）：插件入口按系统执行策略运行",
+                hit.unwrap_or(0)
+            );
+        }
+    }
+
+    /// 失败原因要能进一行提示框，且不能把 PowerShell 的原话弄丢。
+    #[test]
+    fn stderr_excerpt_keeps_the_reason_on_one_line() {
+        let raw = "C:\\p\\main.ps1 : 无法加载文件 C:\\p\\main.ps1，因为在此系统上禁止运行脚本。\r\n    + CategoryInfo : SecurityError\r\n";
+        let got = stderr_excerpt(raw.as_bytes());
+        assert!(!got.contains('\n') && !got.contains('\r'), "应压成一行: {got}");
+        assert!(got.contains("禁止运行脚本"), "应保留原话: {got}");
+
+        // 没有输出时也不能给出空提示
+        assert_eq!(stderr_excerpt(b""), rcgui_i18n::t("（无输出）"));
+
+        // 超长截断，加省略号，且按字符数算而不是字节数
+        let long = stderr_excerpt("错".repeat(1000).as_bytes());
+        assert_eq!(long.chars().count(), 401, "400 字符 + 省略号");
+        assert!(long.ends_with('…'));
     }
 }

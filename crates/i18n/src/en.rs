@@ -221,6 +221,7 @@ pub static EN: &[(&str, &str)] = &[
     ("先在命令行注册镜像源：winget source add -n <源名> -a <源地址>；此处填的源名要和 -n 一致。留空则在挂载页只能用官方源。", "Register the mirror source from a command line first: winget source add -n <name> -a <url>. The name entered here must match the one given to -n; leave it empty to use only the official source on the Mounts page."),
     ("先选一个远程类型再保存（当前搜索词下没有选中项）", "Pick a remote type before saving; nothing is selected under the current keyword"),
     ("入口文件不存在: {}", "The entry file does not exist: {}"),
+    ("入口文件执行失败（退出码 {}）：{}", "The entry file failed (exit code {}): {}"),
     ("全局限速", "Global rate limit"),
     ("内核已安装（{}）并在 {} 上重新启动，但没能连上，请看下面的状态", "Kernel installed ({}) and restarted on {} — the connection did not come up, see the status below"),
     ("内核已安装（{}）并在 {} 上重新启动，已重新连接", "Kernel installed ({}) and restarted on {} — reconnected"),
