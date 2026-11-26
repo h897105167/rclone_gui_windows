@@ -7,6 +7,9 @@ members = [
     "crates/rc",
     "crates/rclone",
     "crates/plugin",
+    # 跨仓库集成测试：拿插件仓库产出的 wasm 跑真的宿主桥。
+    # 没有 wasm 时全部跳过，所以平时 `cargo test --workspace` 不受影响。
+    "crates/plugin-it",
 ]
 # 插件不在这里：每个插件是独立仓库，以 WASM 包的形式从 Release 拉取，
 # 见 plugins/manifest.json 与 docs/PLUGIN.md。本工作区只编译本体。
