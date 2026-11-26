@@ -127,27 +127,6 @@ impl Fixture {
     pub fn config_json(&self) -> Result<PluginConfig> {
         Ok(serde_json::from_slice(&std::fs::read(&self.config)?)?)
     }
-
-    /// 上一版安装留下的那份 `config.json`：版本号改成 `version`，其余字节照旧。
-    ///
-    /// 真实升级里这一幕很常见：wasm 换了，插件目录里的 config 还是旧版本号（手动换文件、
-    /// 或者只更新了半个包）。宿主只按 `capabilities` 决定放不放行，从不比对版本号，
-    /// 所以「config 说旧、wasm 是新」必须能正常用。造在临时目录里，不动被测包里的原件。
-    ///
-    /// 读不出来或写不进去时返回 `None`——由调用方按「跳过还是失败」处理。
-    pub fn with_version(&self, version: &str) -> Option<Fixture> {
-        let raw = std::fs::read(&self.config).ok()?;
-        let mut cfg: Value = serde_json::from_slice(&raw).ok()?;
-        cfg["version"] = json!(version);
-        let dir = std::env::temp_dir().join(format!("plugin-it-cfg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok()?;
-        let path = dir.join(format!("config-{version}.json"));
-        std::fs::write(&path, serde_json::to_vec_pretty(&cfg).ok()?).ok()?;
-        Some(Fixture {
-            wasm: self.wasm.clone(),
-            config: path,
-        })
-    }
 }
 
 /// 一个假站点 + 宿主桥，随时可以回答插件。
@@ -166,16 +145,6 @@ impl Harness {
     /// 站点由调用方先起好再传进来，因为宿主的 `config/get` 回答里要写站点地址。
     pub async fn start(site: MockSite, host: Arc<MockHost>) -> Option<Harness> {
         let fixture = Fixture::load()?;
-        Harness::with_fixture(fixture, site, host).await
-    }
-
-    /// 同 [`Harness::start`]，但夹具由调用方给：升级用例要拿一份「上一版的 config.json」，
-    /// 那份文件不在环境变量指的目录里。
-    pub async fn with_fixture(
-        fixture: Fixture,
-        site: MockSite,
-        host: Arc<MockHost>,
-    ) -> Option<Harness> {
         let allowed = match fixture.allowed() {
             Ok(a) => a,
             Err(e) => return absent(format!("插件 config.json 读不出来: {e:#}")),

@@ -8,14 +8,11 @@
 //! `cargo test --workspace` 仍然是绿的。CI 里设 `RCGUI_IT_REQUIRED=1`，那时缺输入
 //! 就是失败——不能靠「全是跳过」假装通过。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use plugin_host::config::REMOTE_OPS;
 use plugin_host::Allowed;
-use plugin_it::{
-    expect_error, kvault_harness, plain_webdav_harness, Fixture, Harness, MockHost, MockSite,
-    PLUGIN_ID, SKIP_NOTE,
-};
+use plugin_it::{expect_error, kvault_harness, plain_webdav_harness, PLUGIN_ID, SKIP_NOTE};
 use serde_json::{json, Value};
 
 /// 插件把业务失败写成 `Ok` 里的 `status`/`toast`，不是 `Err`。
@@ -379,64 +376,38 @@ async fn adopt_legacy_refuses_garbage_instead_of_wiping_settings() {
     );
 }
 
-/// 上一版写下的设置，换上新二进制之后要照旧读得懂，而且一个键都不许动。
+/// 早期版本写下的设置形状（只有站点地址、令牌、目录三样）现在照样读得懂，读完一个键都不许动。
 ///
-/// 插件不记「设置版本号」——它按形状读 `kv["site"]`，缺的字段取默认值。所以升级路径
-/// 真正的风险不是「迁移没跑」，而是「新版本把老形状读成空，再把一坨半成品写回去」。
-/// 这条用例把「config.json 还是旧版本号」这个状态真造出来，再验旧设置能不能用、
-/// 用完有没有被动过。
+/// **这条验的是设置文件形状的兼容，不是二进制跨版本升级。**插件不记「设置版本号」，
+/// 它按形状读 `kv["site"]`、缺的字段取默认值，所以升级真正的风险不是「迁移没跑」，
+/// 而是「新版本把老形状读成空，再把一坨半成品写回去」。
+///
+/// 真跨版本（旧 wasm 写数据、新 wasm 读）需要两个版本的二进制同时在场，这里只有当前
+/// 那一个；拿改 config 版本号来假装旧版是伪造，不做。见 `docs/REPORT-ui-core-fixes.md`
+/// 局限一节。
 #[tokio::test]
-async fn settings_written_by_the_previous_version_still_work() {
-    let Some(pkg) = Fixture::load() else {
+async fn settings_without_the_newer_fields_are_read_as_written() {
+    let Some(h) = kvault_harness().await else {
         eprintln!("{SKIP_NOTE}");
         return;
     };
-    let Some(stale) = pkg.with_version("0.3.0") else {
-        panic!("造不出上一版的 config.json：{}", pkg.config.display());
-    };
-    let site = MockSite::start();
-    // 设置页里存的是站点根（不带 `/dav`），0.3 存的也是这一串。
-    let base = site.base();
-    let host = MockHost::kvault(&site.dav_url(), "test-token");
-    let Some(h) = Harness::with_fixture(stale, site, host).await else {
-        eprintln!("{SKIP_NOTE}");
-        return;
-    };
-
-    // 先确认「确实处在升级状态」：config 说 0.3.0，wasm 自己不是。两边一样的话，
-    // 这条用例什么都没验到，却会一直是绿的。
-    assert_eq!(
-        h.fixture
-            .config_json()
-            .expect("config.json 读不出来")
-            .version,
-        "0.3.0",
-        "夹具的版本号没改成上一版"
-    );
-    let born = h.manifest().await.expect("wasm 清单读不出来");
-    assert_ne!(
-        born.get("version").and_then(Value::as_str),
-        Some("0.3.0"),
-        "wasm 与 config 版本一致，验不到升级路径：{}",
-        text_of(&born)
-    );
-
-    // 0.3 只写站点地址、令牌、目录三样；`storage`/`dedup` 是后来才有的字段。
-    // 老形状读得懂读不懂，正是升级最该验的那一条。
+    // 早期只写站点根（不带 `/dav`）、令牌、目录；`storage`/`dedup` 是后来才加的字段，
+    // 缺了它们必须走默认值，而不是读成空设置。
+    let base = h.site.base();
     h.host.put_kv(
         "site",
-        json!({ "base": base.clone(), "token": "test-token", "folder": "album" }),
+        json!({ "base": base, "token": "test-token", "folder": "album" }),
     );
     let before = h.host.kv_snapshot();
     let got = h
         .call("remote.list", json!({ "remote": "", "path": "" }))
         .await
-        .expect("换了二进制之后，上一版的设置应当照旧能用");
+        .expect("只有早期字段的设置，应当照旧能用");
     let rows = items_of(&got);
     assert!(
         rows.iter()
             .any(|(name, is_dir)| name == "photo.png" && !*is_dir),
-        "上一版设置的目录没被用上：{rows:?}"
+        "设置里的目录没被用上：{rows:?}"
     );
     assert_eq!(
         h.host.kv_snapshot(),
@@ -551,7 +522,3 @@ async fn the_manifest_declares_everything_the_host_router_reads() {
     assert_eq!(m["version"].as_str(), Some(cfg.version.as_str()));
     assert_eq!(m["id"].as_str(), Some(cfg.id.as_str()));
 }
-
-/// 让三个类型在只用到其中一部分时也不产生「未使用」告警。
-#[allow(dead_code)]
-fn _exports(_: &Harness, _: &MockHost, _: &MockSite, _: &Path) {}
