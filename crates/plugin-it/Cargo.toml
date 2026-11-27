@@ -1,0 +1,18 @@
+[package]
+name = "plugin_it"
+version.workspace = true
+edition.workspace = true
+# 只是测试脚手架：不进发布包、不上商店目录。
+publish = false
+
+[dependencies]
+# 被测的宿主桥就是它。插件 wasm 不在这个仓库里，测试时由环境变量指过来。
+plugin_host = { path = "../plugin" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+# 插件按 `now.date` 造默认目录，这里必须给和主程序一样的六个键，所以要真的时区。
+chrono = { workspace = true }
+# 假宿主要真发 HTTP（插件的 http.request 得有人接），所以这里保留真的 reqwest。
+reqwest = { workspace = true }

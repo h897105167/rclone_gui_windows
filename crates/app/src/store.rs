@@ -126,18 +126,23 @@ impl StoreEntry {
         Ok(())
     }
 
-    /// `StoreRow.permissions` 用的文本，一行一条。空串表示没有声明权限。
-    pub fn permissions_text(&self) -> String {
+    /// 安装前给用户看的权限清单，一条一项，已排序去重。空表表示没有声明权限。
+    ///
+    /// 之所以给列表而不是拼好的字符串：界面要一项一行地排版换行，读屏也要
+    /// 逐项念，把换行藏在字符串里两件事都做不到。
+    pub fn permissions_list(&self) -> Vec<String> {
         if self.capabilities.is_empty() {
-            return String::new();
+            return Vec::new();
         }
         let mut caps = self.capabilities.clone();
         caps.sort();
         caps.dedup();
-        caps.iter()
-            .map(|c| capability_line(c))
-            .collect::<Vec<_>>()
-            .join("\n")
+        caps.iter().map(|c| capability_line(c)).collect()
+    }
+
+    /// 同上，拼成一行一条的纯文本。给只能放一段文字的确认框用。
+    pub fn permissions_text(&self) -> String {
+        self.permissions_list().join("\n")
     }
 }
 
@@ -249,16 +254,19 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// 能力组 → 一句人话。未知能力原样展示（并标出来），不假装它无害。
+///
+/// 这八个组以 `plugin_host::config::CAP_GROUPS` 为准：清单里写了别的字符串
+/// 就是清单错了，照实说"未识别的权限"，别给它编一句好听的话盖过去。
 fn capability_line(cap: &str) -> String {
     match cap {
-        "http" => rcgui_i18n::t("访问网络（按你填写的地址收发请求）").to_string(),
-        "fs" => rcgui_i18n::t("读写插件自己的数据目录").to_string(),
         "kv" => rcgui_i18n::t("读写本应用内的键值存储").to_string(),
-        "systray" => rcgui_i18n::t("在托盘区放图标和菜单").to_string(),
-        "clipboard" => rcgui_i18n::t("读剪贴板").to_string(),
-        "notify" => rcgui_i18n::t("发系统通知").to_string(),
-        "remote_types" => rcgui_i18n::t("在“新建远程”里新增类型").to_string(),
-        "ui" => rcgui_i18n::t("往界面里加自己的控件").to_string(),
+        "ui" => rcgui_i18n::t("往界面里弹提示、加自己的控件").to_string(),
+        "fs" => rcgui_i18n::t("读写本机文件（选文件、解压、算哈希）").to_string(),
+        "http" => rcgui_i18n::t("访问网络（按你填写的地址收发请求）").to_string(),
+        "proc" => rcgui_i18n::t("启动、停止、查询其他程序").to_string(),
+        "net" => rcgui_i18n::t("探测端口是否开放").to_string(),
+        "rclone" => rcgui_i18n::t("通过已连接的 rclone 读写远程").to_string(),
+        "env" => rcgui_i18n::t("读取本应用的版本、架构、是否提权").to_string(),
         other => rcgui_i18n::f("未识别的权限：{}", &[&(other)]),
     }
 }
@@ -369,6 +377,10 @@ pub async fn install(
     .await
     .context(rcgui_i18n::t("安装线程异常"))??;
 
+    // 用户卸载过这个插件、现在又从商店装了回来：把卸载时备份的设置放回原位。
+    // 只补空位，自己带了 kv.json 或已经重新填过的新值都不动。
+    crate::plugins::restore_backup_after_install(&outcome);
+
     // 记下"这个插件是从商店装的"。导出配置时靠它区分来源（内置 / 商店 / 用户自己放的），
     // 导入端才能知道该不该去商店重装。
     //
@@ -447,7 +459,7 @@ pub struct Row {
     pub description: String,
     pub installed: bool,
     pub update: bool,
-    pub permissions: String,
+    pub permissions: Vec<String>,
 }
 
 /// 把清单与已安装列表合成界面行。
@@ -470,7 +482,7 @@ pub fn rows(entries: &[StoreEntry], installed: &[Installed]) -> Vec<Row> {
                 description: e.description.clone(),
                 installed: cur.is_some(),
                 update: is_update(e, cur),
-                permissions: e.permissions_text(),
+                permissions: e.permissions_list(),
             }
         })
         .collect()
@@ -591,7 +603,7 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert!(r[0].installed);
         assert!(r[0].update, "1.2.0 应比 1.1.0 新");
-        assert!(r[0].permissions.contains('\n'), "权限应一行一条");
+        assert_eq!(r[0].permissions.len(), 2, "两条权限应各自成项");
 
         let same = vec![Installed {
             id: "kvault".into(),
@@ -610,6 +622,93 @@ mod tests {
         let mut e = entry();
         e.capabilities.clear();
         assert_eq!(e.permissions_text(), "");
+        assert!(e.permissions_list().is_empty());
+    }
+
+    #[test]
+    fn every_capability_group_has_a_label() {
+        // 回归：`proc`/`net`/`rclone`/`env` 曾经落到"未识别的权限"分支，
+        // 用户看到的是一堆看不懂的英文标识，等于没告诉他要授权什么。
+        for g in plugin_host::config::CAP_GROUPS {
+            let line = capability_line(g);
+            assert!(
+                !line.contains("未识别"),
+                "能力组 {g} 应有自己的说明，实际是：{line}"
+            );
+            assert!(line.len() > 2, "能力组 {g} 的说明太短：{line}");
+        }
+        // 清单里写了不存在的组，必须照实标出来，不能编一句好听的盖过去。
+        assert!(capability_line("systray").contains("未识别"));
+    }
+
+    /// 仓库里那份 `docs/store/index.json` 就是发给用户的清单：写错一个字符，
+    /// 用户点安装会在最后一步被拒。这里直接读那份文件（编译期嵌进来，不联网、
+    /// 不碰凭据），把「能不能装上」在测试里复现一遍。
+    #[test]
+    fn the_shipped_store_index_lets_kvault_in_only_from_0_3_1() {
+        let parsed = parse_index(include_str!("../../../docs/store/index.json"))
+            .expect("仓库里的商店索引读不出来");
+        assert!(
+            parsed.warnings.is_empty(),
+            "索引里有条目过不了自身校验：{:?}",
+            parsed.warnings
+        );
+        let kv = parsed
+            .entries
+            .iter()
+            .find(|e| e.id == "kvault")
+            .expect("商店索引里少了 kvault");
+        assert_eq!(kv.version, "0.3.0", "版本要和发布出来的 zip 同名");
+        assert_eq!(
+            kv.url,
+            "https://github.com/h897105167/rcgui-plugin-kvault/releases/download/v0.3.0/kvault-0.3.0.zip"
+        );
+        // 这条门槛是收录它的全部意义：0.3.1 之前的宿主没有插件远程协议，
+        // 装进去只会在远程列表里显示成没人认领的类型。旧构建必须在安装前被拒。
+        assert_eq!(kv.min_gui_version, "0.3.1");
+        assert!(
+            kv.allows_gui("0.3.0").is_err(),
+            "0.3.0 的宿主不该装得上需要新协议的 K-Vault"
+        );
+        assert!(kv.allows_gui("0.3.1").is_ok());
+        let mut caps = kv.capabilities.clone();
+        caps.sort();
+        assert_eq!(
+            caps,
+            ["http", "kv", "rclone", "ui"],
+            "能力组要和包内 config.json 一致：多写一个就是多要一项授权"
+        );
+    }
+
+    /// 随包发布的插件（`plugins/manifest.json`）如果也在商店里，两处必须指同一个
+    /// 包。PowerShell 校验脚本只在 PR 流程里跑；这条让 `cargo test` 也能拦住
+    /// 「改了一处忘了另一处」——那会让应用按清单拉的包和商店页面展示的不是一个东西。
+    #[test]
+    fn a_bundled_plugin_points_at_the_same_package_in_the_store() {
+        let parsed = parse_index(include_str!("../../../docs/store/index.json"))
+            .expect("仓库里的商店索引读不出来");
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../../plugins/manifest.json"))
+                .expect("plugins/manifest.json 不是合法 JSON");
+        let list = manifest["plugins"]
+            .as_array()
+            .expect("manifest 缺少 plugins");
+        for p in list {
+            let id = p["id"].as_str().unwrap_or_default();
+            let Some(store) = parsed.entries.iter().find(|e| e.id == id) else {
+                continue; // 随包发布但没上架是允许的：商店只服务愿意自己装的用户
+            };
+            assert_eq!(
+                p["sha256"].as_str().unwrap_or_default(),
+                store.sha256,
+                "{id} 在清单与商店里的 sha256 不一致：两个包不是同一个东西"
+            );
+            assert_eq!(
+                p["tag"].as_str().unwrap_or_default(),
+                format!("v{}", store.version),
+                "{id} 的清单 tag 与商店 version 对不上"
+            );
+        }
     }
 
     #[test]

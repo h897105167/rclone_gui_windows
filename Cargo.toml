@@ -7,15 +7,25 @@ members = [
     "crates/rc",
     "crates/rclone",
     "crates/plugin",
+    # 跨仓库集成测试：拿插件仓库产出的 wasm 跑真的宿主桥。
+    # 没有 wasm 时全部跳过，所以平时 `cargo test --workspace` 不受影响。
+    "crates/plugin-it",
 ]
 # 插件不在这里：每个插件是独立仓库，以 WASM 包的形式从 Release 拉取，
 # 见 plugins/manifest.json 与 docs/PLUGIN.md。本工作区只编译本体。
+#
+# `_kvault` 是 CI 把插件仓库 checkout 进来的临时目录（.github/workflows/ci.yml
+# 的 cross-repo job），平时不存在。必须排除：插件的 Cargo.toml 自己没有
+# [workspace] 段，落在本工作区目录里就会被当成「以为自己属于这个工作区」，
+# cargo 直接报 current package believes it's in a workspace when it's not。
+# 排除之后它是独立包，用自己的 Cargo.lock 单独 build。
+exclude = ["_kvault"]
 
 [workspace.package]
 # 版本号的唯一来源：所有成员用 version.workspace = true 继承，二进制通过
 # env!("CARGO_PKG_VERSION") 读取，插件看到的 gui_version 和商店里的
 # min_gui_version 比较都用这个值。改这里等于发一个新版本，规则见 docs/VERSIONING.md。
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 
 [workspace.dependencies]
@@ -23,8 +33,11 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-# multipart: K-Vault 上传走 multipart/form-data（POST /api/v1/upload）
-reqwest = { version = "0.12", features = ["json", "multipart"] }
+# multipart: 插件上传走 multipart/form-data
+# stream: `http.upload` 边读文件边发（`reqwest::Body::wrap_stream`），大文件不整块进内存
+reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+# 上面那条流的胶水：pre 段 + 文件流 + 尾段靠 `StreamExt::chain` 拼起来
+futures-util = "0.3"
 base64 = "0.22"
 sha1 = "0.10"
 sha2 = "0.10"

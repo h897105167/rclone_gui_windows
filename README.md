@@ -6,7 +6,7 @@
 
 A Windows desktop front end for [rclone](https://rclone.org/), written in Rust with a [Slint](https://slint.dev) interface. There is no webview: the window is native, drawn by Slint, and talks to rclone over rclone's own RC API.
 
-**Status: version 0.3.0 is in development.** The newest released build is **v0.2.1**. Everything this page marks *developing* is in the tree at HEAD and has not shipped; nothing here is called released until a tag, a GitHub Release and the assets listed below actually exist together. The version history and the exact wording rules are in [`docs/VERSIONING.md`](docs/VERSIONING.md) and [`docs/CHANGELOG.md`](docs/CHANGELOG.md).
+**Status: version 0.3.1 is in development.** The newest released build is **v0.2.1**. Everything this page marks *developing* is in the tree at HEAD and has not shipped; nothing here is called released until a tag, a GitHub Release and the assets listed below actually exist together. The version history and the exact wording rules are in [`docs/VERSIONING.md`](docs/VERSIONING.md) and [`docs/CHANGELOG.md`](docs/CHANGELOG.md). There is no `v0.3.0`: what the sections below call "0.3.0" is this same body of work, which ships as 0.3.1.
 
 ## What changed in 0.3.0
 

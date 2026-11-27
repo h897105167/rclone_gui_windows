@@ -271,94 +271,6 @@ impl HostCaps {
     }
 }
 
-/// 把「源/目标是 K-Vault 远程」的写操作接到站点 API 上；`None` = 与 k-vault 无关。
-///
-/// 站点只开放「上传 / 列表 / 删除」：删除映射到 `DELETE /api/v1/file/<id>`，
-/// 而改名、移动、建目录没有对应接口——那边给一句明确的原因，比把 rclone 的
-/// 403 原样抛给用户更有用。读方法（list/stat/cat…）不动，DAV 读是允许的。
-async fn kv_write_op(
-    client: &rclone_client::RcClient,
-    store: &KvStore,
-    method: &str,
-    params: &Value,
-) -> Result<Option<Value>> {
-    let deletes = matches!(method, "operations/deletefile" | "operations/purge");
-    let refuses = matches!(
-        method,
-        "operations/movefile"
-            | "operations/move"
-            | "operations/copyfile"
-            | "operations/copy"
-            | "operations/mkdir"
-            | "operations/rmdir"
-    );
-    if !deletes && !refuses {
-        return Ok(None);
-    }
-    let fs = params.get("fs").and_then(|v| v.as_str()).unwrap_or("");
-    let Some((remote, sub)) = fs.split_once(':') else {
-        return Ok(None);
-    };
-    let Some(cfg) = crate::kv_cfg_lookup(client, store, remote).await else {
-        return Ok(None);
-    };
-    if refuses {
-        let what = match method {
-            "operations/mkdir" => rcgui_i18n::t("新建目录"),
-            "operations/rmdir" => rcgui_i18n::t("删除目录"),
-            _ => rcgui_i18n::t("改名/移动/复制"),
-        };
-        return Err(anyhow!(
-            "{}",
-            rcgui_i18n::f(
-                "K-Vault 远程不支持{}：站点的 DAV 只读，API 也只开放上传、列表、删除。\
-             要在站点上调整目录，请到站点网页端操作。",
-                &[&(what)]
-            )
-        ));
-    }
-    let path = params
-        .get("remote")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim_matches('/');
-    let is_dir = method == "operations/purge";
-    let (parent, name) = match path.rsplit_once('/') {
-        Some((d, n)) => (d, n),
-        None => ("", path),
-    };
-    let folder = kv_join(&[sub, parent]);
-    let files = crate::kvault::list_files(&cfg.base, &cfg.token)
-        .await
-        .map_err(|e| anyhow!("{}", rcgui_i18n::f("站点索引读取失败: {}", &[&(e)])))?;
-    let ids = crate::kvault::pick_targets(&files, &folder, name, is_dir);
-    if ids.is_empty() {
-        return Err(anyhow!(
-            "{}",
-            rcgui_i18n::f(
-                "站点索引里没有 {}/{}（可能已经被删掉了）",
-                &[&(folder.trim_matches('/')), &(name)]
-            )
-        ));
-    }
-    for id in &ids {
-        crate::kvault::delete_file(&cfg.base, &cfg.token, id)
-            .await
-            .map_err(|e| anyhow!("{}", rcgui_i18n::f("站点删除失败: {}", &[&(e)])))?;
-    }
-    Ok(Some(json!({ "deleted": ids.len() })))
-}
-
-/// 拼远程内的路径：跳过空段，段之间用 `/`。
-fn kv_join(parts: &[&str]) -> String {
-    parts
-        .iter()
-        .map(|p| p.trim().trim_matches('/'))
-        .filter(|p| !p.is_empty())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 /// 只读解析 rclone.conf 里的 `[远程名]` 段：不启动进程、不碰 RC。
 ///
 /// 只在 RC 拿不到列表时兜底（rclone 没在跑、或者认证对不上）。读不到就返回空，
@@ -408,21 +320,20 @@ fn remotes_from_conf() -> Vec<String> {
 
 #[async_trait::async_trait]
 impl CapProvider for HostCaps {
+    // 能力层只按名字转给内核。哪一类远程要由插件接管、请求怎么编码、
+    // 认领者缺席时该说什么，全在 `remote_ops` 里：这里不该出现任何具体远程类型的业务。
     async fn rclone_call(&self, method: String, params: Value) -> Result<Value> {
         let client = self.rc.client().await;
-        // K-Vault 远程上 rclone 的写方法一定是 403（站点 DAV 只放行读）。
-        // 这是传输层的事实，不是插件策略：删除接到站点 API，改名/移动说明原因。
-        if let Some(v) = kv_write_op(&client, &self.store, &method, &params).await? {
-            return Ok(v);
-        }
         client.call(&method, &params).await.map_err(Into::into)
     }
 
+    // 插件要往「自己管的远程」上传，走的不是这里，而是 `http.upload`：宿主弹对话框
+    // 拿到路径、授权一次发送，字节不经过 wasm。这个函数只管普通 rclone 远程。
     async fn upload_file(
         &self,
         fs: String,
         remote_path: String,
-        filename: String,
+        _filename: String,
         data_b64: String,
     ) -> Result<Value> {
         let data = base64::engine::general_purpose::STANDARD
@@ -434,37 +345,6 @@ impl CapProvider for HostCaps {
         let tmp = tmp_dir.join(&name);
         std::fs::write(&tmp, &data)?;
         let client = self.rc.client().await;
-
-        // K-Vault 远程：站点 DAV 写方法一律 403，上传只能走 `POST /api/v1/upload`。
-        // 插件的上传全都汇到这一个函数，所以在这里分流就够了。
-        // 目录沿用插件算好的路径（相对存储根），是否在前缀之内由站点的令牌策略判；
-        // 越界时站点回 POLICY_FOLDER_DENIED，比这里悄悄搬到别的目录更可信。
-        if let Some((remote, sub)) = fs.split_once(':') {
-            if let Some(cfg) = crate::kv_cfg_lookup(&client, &self.store, remote).await {
-                let dir = remote_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-                let folder = kv_join(&[sub, dir]);
-                // 插件给的 final_name 才带扩展名（临时文件是 up-<pid>-<ts>），
-                // 站点按扩展名判类型，所以名字必须用 final_name。
-                let shown = if filename.trim().is_empty() {
-                    remote_path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(name.as_str())
-                        .to_string()
-                } else {
-                    filename.clone()
-                };
-                let r = crate::kvault::upload(&cfg, &tmp, &shown, &folder).await;
-                let _ = std::fs::remove_file(&tmp);
-                let up =
-                    r.map_err(|e| anyhow!("{}", rcgui_i18n::f("站点上传失败: {}", &[&(e)])))?;
-                return Ok(json!({
-                    "link": up.link,
-                    "name": up.name,
-                    "deduped": up.dedup,
-                }));
-            }
-        }
 
         let r = client
             .copyfile(&rclone_client::local_fs(&tmp_dir), &name, &fs, &remote_path)
@@ -574,7 +454,9 @@ impl CapProvider for HostCaps {
                 })
                 .await
             }
-            "fs.write_text" => {
+            // `fs.write_file` 是早期名字。权限表和 `docs/PLUGIN.md` 都还把它
+            // 列为可用的别名，参数与行为完全一样，所以两个名字共用这一份实现。
+            "fs.write_text" | "fs.write_file" => {
                 let path = Self::p_str(&params, "path");
                 let text = Self::p_str(&params, "text");
                 let append = Self::p_bool(&params, "append", false);
@@ -642,7 +524,9 @@ impl CapProvider for HostCaps {
                 })
                 .await
             }
-            "fs.remove" => {
+            // 同上：`fs.remove_dir` 是早期名字。目录走 `remove_dir_all`、
+            // 文件走 `remove_file`，两个名字共用的就是这套分流。
+            "fs.remove" | "fs.remove_dir" => {
                 let path = Self::p_str(&params, "path");
                 spawn_blocking(move || {
                     let p = Path::new(&path);
@@ -787,7 +671,11 @@ impl CapProvider for HostCaps {
                     })
                     .unwrap_or_default();
                 let start = Self::p_str(&params, "start_dir");
-                spawn_blocking(move || {
+                // 插件只能说「面板里哪一栏」（`form_key`），说不了路径：下面是宿主自己
+                // 弹的对话框，用户按了「打开」之后才把那个路径记进上传授权表。
+                let form_key = Self::p_str(&params, "form_key");
+                let plugin_id = Self::p_str(&params, "_plugin");
+                let picked = spawn_blocking(move || {
                     let mut d = rfd::FileDialog::new();
                     if !title.is_empty() {
                         d = d.set_title(&title);
@@ -799,9 +687,24 @@ impl CapProvider for HostCaps {
                     if !start.is_empty() {
                         d = d.set_directory(&start);
                     }
-                    Ok(json!({ "path": d.pick_file().map(|p| p.display().to_string()).unwrap_or_default() }))
+                    // 取消是正常结果（`None`），不是错误；包成 `Ok` 只是因为
+                    // 宿主这个 `spawn_blocking` 只收「返回 `Result` 的闭包」。
+                    Ok(d.pick_file())
                 })
-                .await
+                .await?;
+                let path = picked.map(|p| p.display().to_string()).unwrap_or_default();
+                // 取消时什么都不记：空路径进授权表，下一次 http.upload 就会拿它去读盘。
+                if !path.is_empty() && !form_key.is_empty() {
+                    if let Err(e) =
+                        plugin_host::upload::grant(&plugin_id, &form_key, Path::new(&path))
+                    {
+                        // 授权没记下不算这次挑选失败：用户已经挑到了文件，
+                        // 返回值照旧给它；失败原因写到插件日志里，别让对话框白挑一次。
+                        self.log(format!("上传授权没记下来（{}）：{:#}", form_key, e))
+                            .await;
+                    }
+                }
+                Ok(json!({ "path": path }))
             }
             "fs.pick_dir" => {
                 let title = Self::p_str(&params, "title");
@@ -822,7 +725,8 @@ impl CapProvider for HostCaps {
                 })
                 .await
             }
-            "fs.pe_info" => {
+            // 同上：`fs.inspect_exe` 是早期名字，返回的是同一份 PE 信息。
+            "fs.pe_info" | "fs.inspect_exe" => {
                 let path = Self::p_str(&params, "path");
                 spawn_blocking(move || Ok(pe_info_json(&path))).await
             }
@@ -1004,6 +908,14 @@ impl CapProvider for HostCaps {
                 Ok(json!({ "path": dest, "bytes": done, "sha256": sha }))
             }
 
+            // 流式上传：把用户在宿主文件对话框里亲手挑过的那个文件发出去。
+            // 路径查表、上限、超时、请求头禁令、幂等键都在 `plugin_host::upload`
+            // 里，这里只负责把插件 id（宿主注入的 `_plugin`）和参数交过去。
+            "http.upload" => {
+                let plugin_id = Self::p_str(&params, "_plugin");
+                plugin_host::upload::upload(&plugin_id, &params).await
+            }
+
             // ---------------- 进程 ----------------
             "proc.run" => {
                 let program = Self::p_str(&params, "program");
@@ -1158,7 +1070,7 @@ impl CapProvider for HostCaps {
                 }
                 // 该 rclone 版本没有 operations/cat（实测 404），
                 // 因此走 copyfile 到唯一临时目录再读回来，和图片直链同一路径。
-                // fs 串必须带冒号：`k-vault` 会被当成相对本地目录，
+                // fs 串必须带冒号：不带冒号的串会被当成相对本地目录，
                 // copyfile 直接回 `object not found`（实测 404）。
                 let fs = if remote.contains(':') {
                     remote.clone()
@@ -1726,17 +1638,24 @@ fn pe_info(p: &Path) -> Result<(String, String, String, String)> {
     ))
 }
 
+/// 数字签名的 PowerShell 命令。路径只经由环境变量传入，不进脚本源码。
+///
+/// 路径来自用户选择的文件，里面可以有单引号、分号、换行；这些字符只要出现在脚本文本里
+/// 就得靠转义保证不被当代码。环境变量的值 PowerShell 只当数据读，路径怎么长都无所谓。
+fn signature_command(path: &str) -> std::process::Command {
+    // 固定字符串：脚本内容与路径完全无关，路径再看也不会改变要执行的语句。
+    const SCRIPT: &str = "$s=Get-AuthenticodeSignature -LiteralPath $env:RCGUI_SIG_PATH; \
+         if($s.Status -eq 'Valid'){'VALID'}else{$s.Status.ToString()}; \
+         if($s.SignerCertificate){$s.SignerCertificate.Subject}";
+    let mut cmd = std::process::Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .env("RCGUI_SIG_PATH", path);
+    cmd
+}
+
 /// 数字签名（PowerShell `Get-AuthenticodeSignature`，拿不到就返回 unknown）。
 fn signature_json(path: &str) -> Value {
-    let quoted = path.replace('\'', "''");
-    let script = format!(
-        "$s=Get-AuthenticodeSignature -LiteralPath '{quoted}'; \
-         if($s.Status -eq 'Valid'){{'VALID'}}else{{$s.Status.ToString()}}; \
-         if($s.SignerCertificate){{$s.SignerCertificate.Subject}}"
-    );
-    let mut cmd = std::process::Command::new("powershell.exe");
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()]);
-    let Ok(v) = run_capture(cmd, Duration::from_secs(20)) else {
+    let Ok(v) = run_capture(signature_command(path), Duration::from_secs(20)) else {
         return json!({ "status": "unknown", "signer": "" });
     };
     let text = v.get("stdout").and_then(|x| x.as_str()).unwrap_or("");
@@ -1827,16 +1746,228 @@ mod search_tests {
         });
     }
 
-    /// 插件的 `fs` 是「远程名:存储根内的子路径」，站点目录要拼成
-    /// 「子路径 / remote_path 里的目录」，空段一律丢掉。
+    /// 能力层不许认识任何具体远程类型：这类业务现在全在各自插件里。
+    ///
+    /// 守的是分工。这里只要出现一个远程类型名或它的写桥，就意味着宿主又在替那个
+    /// 插件实现协议——而插件停用后这段代码依然在，于是「专用远程被当普通 WebDAV
+    /// 访问」的老问题就回来了。所以断言的是「一整片都不许出现」，不是「只许出现在某处」。
     #[test]
-    fn kv_join_builds_site_folder() {
-        assert_eq!(super::kv_join(&["image_bed", ""]), "image_bed");
-        assert_eq!(super::kv_join(&["", "2026/10"]), "2026/10");
-        assert_eq!(
-            super::kv_join(&["image_bed", "/2026/10/"]),
-            "image_bed/2026/10"
+    fn the_capability_layer_knows_no_remote_type() {
+        let src = include_str!("caps.rs").replace("\r\n", "\n");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod search_tests {")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            prod.len() > 1000,
+            "扫描基准不对（切分标记变了），先修这个用例"
         );
-        assert_eq!(super::kv_join(&["", ""]), "");
+        for bad in [
+            "kvault",
+            "k-vault",
+            "kv_bridge",
+            "kv_cfg_lookup",
+            "kv_write_op",
+            "kv_plugin_gone",
+            "站点",
+        ] {
+            let hit: Vec<&str> = prod.lines().filter(|l| l.contains(bad)).collect();
+            assert!(hit.is_empty(), "能力层里不该出现 {bad}：{hit:?}");
+        }
+    }
+
+    /// 路径只许出现在环境变量里，不许进 PowerShell 的脚本文本。
+    ///
+    /// 以前路径是拼进脚本字符串的，靠把单引号翻倍兜底；这条守的是更简单的事实：
+    /// 脚本内容与路径无关，所以引号、分号、换行、`$()` 都不可能是代码。
+    #[test]
+    fn signature_command_never_inlines_the_path() {
+        let hostile = "C:\\tmp\\a'; Remove-Item C:\\ -Recurse; '\n$(calc.exe)\"& whoami";
+        let cmd = signature_command(hostile);
+
+        let env = cmd
+            .get_envs()
+            .find(|(k, _)| k.to_string_lossy() == "RCGUI_SIG_PATH")
+            .expect("必须通过 RCGUI_SIG_PATH 传路径");
+        assert_eq!(env.1.unwrap().to_string_lossy().as_ref(), hostile);
+
+        for a in cmd.get_args() {
+            let s = a.to_string_lossy();
+            assert!(!s.contains(hostile), "参数里不该有路径: {s}");
+            assert!(!s.contains("Remove-Item"), "参数里不该有路径片段: {s}");
+            assert!(!s.contains("calc.exe"), "参数里不该有路径片段: {s}");
+        }
+
+        // 换成另一个路径，命令行完全不变——说明路径没参与拼接
+        let other = signature_command("D:\\x\\b.exe");
+        assert_eq!(
+            cmd.get_args().map(|a| a.to_owned()).collect::<Vec<_>>(),
+            other.get_args().map(|a| a.to_owned()).collect::<Vec<_>>()
+        );
+    }
+
+    /// 上传授权只认真实存在的普通文件，以及插件能叫得上名字的字段。
+    ///
+    /// 授权表是插件唯一能拿到的路径来源，所以入口不能宽松：空插件 id、带空格或冒号的
+    /// 字段名、不存在的路径、目录，全都要当场拒掉；拒得晚了，插件就多了一条读盘的路。
+    #[test]
+    fn grant_accepts_a_real_file_and_refuses_everything_else() {
+        let dir = std::env::temp_dir().join(format!("rcgui-grant-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("picked.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        assert!(
+            plugin_host::upload::grant("caps-grant-test", "avatar", &file).is_ok(),
+            "普通文件 + 合法字段名应当被接受"
+        );
+        // 授权表在进程里是全局的：用完就撤，免得影响同一进程里别的用例。
+        plugin_host::upload::revoke_plugin("caps-grant-test");
+
+        assert!(
+            plugin_host::upload::grant("", "avatar", &file).is_err(),
+            "空插件 id 不能被接受"
+        );
+        for bad in ["a b", "a:b", ""] {
+            let r = plugin_host::upload::grant("caps-grant-test", bad, &file);
+            assert!(r.is_err(), "字段名 {bad:?} 不合法，不该进授权表");
+            let msg = format!("{:#}", r.err().unwrap());
+            assert!(
+                msg.contains("UPLOAD_BAD_PARAM"),
+                "报错要带错误码，宿主排查时才认得出是哪一类：{msg}"
+            );
+        }
+        assert!(
+            plugin_host::upload::grant("caps-grant-test", "avatar", &dir.join("not-there.txt"))
+                .is_err(),
+            "不存在的路径不能被接受"
+        );
+        assert!(
+            plugin_host::upload::grant("caps-grant-test", "avatar", &dir).is_err(),
+            "目录不是可上传的文件"
+        );
+        plugin_host::upload::revoke_plugin("caps-grant-test");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 面板那一栏的授权只能在「用户真的挑到了文件」之后写。
+    ///
+    /// 守两件事：`fs.pick_file` 必须从参数里取 `form_key` 和宿主注入的 `_plugin`；
+    /// 授权调用必须落在那句空值判断里面——否则用户点「取消」同样会往表里塞一个空路径，
+    /// 下一次 `http.upload` 就会拿它去读盘。
+    #[test]
+    fn pick_file_grants_only_after_a_real_pick() {
+        let src = include_str!("caps.rs").replace("\r\n", "\n");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod search_tests {")
+            .next()
+            .expect("文件里应当有测试模块");
+
+        let arm = prod
+            .split("\"fs.pick_file\" => {")
+            .nth(1)
+            .expect("fs.pick_file 分支应当存在")
+            .split("\"fs.pick_dir\" => {")
+            .next()
+            .expect("fs.pick_file 分支应当以 fs.pick_dir 开头收尾");
+
+        assert!(
+            arm.contains("Self::p_str(&params, \"form_key\")"),
+            "宿主得知道插件问的是面板里哪一栏"
+        );
+        assert!(
+            arm.contains("Self::p_str(&params, \"_plugin\")"),
+            "插件 id 由宿主注入，这里要读出来"
+        );
+
+        let guard = arm
+            .find("if !path.is_empty() && !form_key.is_empty() {")
+            .expect("授权必须写在『挑到了文件』之后");
+        let grant = arm
+            .find("plugin_host::upload::grant(&plugin_id, &form_key, Path::new(&path))")
+            .expect("挑到文件后要记进上传授权表");
+        assert!(
+            guard < grant,
+            "grant 必须落在那句空值判断里面，取消时不能写表"
+        );
+    }
+
+    /// 能力表（`plugin_host::config::cap_of_op`）里列出的每个 op，宿主都得真能处理。
+    ///
+    /// 表是插件作者唯一的说明书：表里写着、宿主却没人认，插件要跑到那一行才报
+    /// 「宿主不认识的能力」，看着像插件自己写错了。`cap_of_op` 是个 match、没有
+    /// 可枚举的公开清单，所以这里按源码文本核对，两边任何一侧挪了地方都会红。
+    #[test]
+    fn every_op_in_the_capability_table_is_handled_somewhere() {
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let read = |rel: &str| {
+            std::fs::read_to_string(crates.join(rel)).unwrap_or_else(|e| {
+                panic!("读不到 {}（{}）：文件挪了位置就要改这个测试的路径", rel, e)
+            })
+        };
+
+        // 表里的 op。`fs.write_file` 之外还有 check.sha256 这类文件名与路径字面量，
+        // 交给 `cap_of_op` 自己筛——它回 `None` 的就不是 op。
+        let table = read("plugin/src/config.rs");
+        let body = table
+            .split("pub fn cap_of_op(op: &str) -> Option<&'static str> {")
+            .nth(1)
+            .expect("能力表应当还写在 config.rs 的 cap_of_op 里")
+            .split("\n}")
+            .next()
+            .expect("能力表函数体应当以单独的 } 收尾");
+
+        let mut ops: Vec<&str> = Vec::new();
+        let mut rest = body;
+        while let Some(start) = rest.find('"') {
+            let after = &rest[start + 1..];
+            let Some(end) = after.find('"') else { break };
+            let op = &after[..end];
+            if plugin_host::config::cap_of_op(op).is_some() {
+                ops.push(op);
+            }
+            rest = &after[end + 1..];
+        }
+        ops.sort_unstable();
+        ops.dedup();
+        assert!(
+            ops.len() > 30,
+            "只解析出 {} 个 op，表的结构可能变了：{:?}",
+            ops.len(),
+            ops
+        );
+
+        // 宿主的处理点有两处：`cap_call` 的 match 臂，以及 `plugin_host` 自己接、
+        // 根本不经过 `cap_call` 的那几个（`kv.get_all`/`kv.set`/`kv.delete`/
+        // `ui.toast`/`rclone.call`）。
+        let host = include_str!("caps.rs").replace("\r\n", "\n");
+        let host = host
+            .split("\n#[cfg(test)]\nmod search_tests {")
+            .next()
+            .expect("文件里应当有测试模块");
+        let lib = read("plugin/src/lib.rs").replace("\r\n", "\n");
+        let lib = lib.split("\n#[cfg(test)]").next().unwrap_or(&lib);
+
+        // 已知且有意保留的例外：`kv.get` 在权限表（`config.rs`）和
+        // `docs/PLUGIN.md` 的权限表里都出现过，但从来没有实现过
+        // （`git log -S'"kv.get" =>'` 零命中），正文 API 清单里也没有它。凭空给它
+        // 定一个返回形状比诚实报错更糟，留在这里等表的所有者决定：删掉，还是
+        // 定义成单键读。
+        const KNOWN_GAPS: &[&str] = &["kv.get"];
+
+        let missing: Vec<&&str> = ops
+            .iter()
+            .filter(|op| !KNOWN_GAPS.contains(*op))
+            .filter(|op| {
+                let quoted = format!("\"{op}\"");
+                !host.contains(&quoted) && !lib.contains(&quoted)
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "这些 op 在能力表里，但宿主和插件运行时都没有处理：{:?}",
+            missing
+        );
     }
 }

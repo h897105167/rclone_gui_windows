@@ -81,25 +81,31 @@ async fn fetch(ctx: &Arc<Ctx>) -> Fetched {
         out.serves = Some(parse_serves(&v));
     }
     if let Some((names, dump)) = remotes {
+        // 列表里显示的类型要和编辑器用同一个判据：都看参数里的标记键，而标记键
+        // 有没有实现取决于**当前有没有插件声明那个类型**。插件没装 / 没启用时
+        // 这里查不到人，带标记的远程就老实显示成它真实的后端名，和编辑器里看到的
+        // 一致 —— 两处各说一套，用户会以为自己的远程被改坏了。
+        let derived = crate::remote_types::collect(ctx);
         out.remotes = Some(
             names
                 .into_iter()
                 .map(|n| {
                     let entry = dump.get(&n);
-                    let mut rtype = entry
+                    let stored = entry
                         .and_then(|e| e.get("type"))
                         .and_then(|x| x.as_str())
                         .unwrap_or("?")
                         .to_string();
-                    // K-Vault 远程在 rclone 里就是 webdav：界面上要显示成 k-vault，
-                    // 否则用户看到「类型 webdav」会以为自己的专用远程没保存对。
-                    if rtype == crate::kvault::BACKEND
-                        && entry
-                            .map(crate::kvault::KvCfg::is_marked_entry)
-                            .unwrap_or(false)
-                    {
-                        rtype = crate::kvault::TYPE.to_string();
-                    }
+                    // 这里要的是显示名（编辑器那边要的是 id）。
+                    let rtype = match entry.and_then(|e| e.as_object()) {
+                        Some(params) => {
+                            match crate::remote_types::owner_of_params(&derived, params) {
+                                Some(d) => d.name.clone(),
+                                None => stored,
+                            }
+                        }
+                        None => stored,
+                    };
                     RemoteState {
                         name: n,
                         rtype,
@@ -464,6 +470,11 @@ async fn spawn_usage(
         let ui2 = ui.clone();
         let n = name.clone();
         tokio::spawn(async move {
+            // 插件不在的远程连用量都不去问：问成功了会给表格填上一个数字，
+            // 看起来就像这远程还能用，点进去却全被拒。
+            if crate::remote_blocked(&ctx2, &n).await.is_some() {
+                return;
+            }
             let usage =
                 match tokio::time::timeout(Duration::from_secs(15), client.about(&format!("{n}:")))
                     .await

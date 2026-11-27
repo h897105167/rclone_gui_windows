@@ -33,6 +33,21 @@ pub struct Derived {
     pub defaults: BTreeMap<String, String>,
     /// 声明它的插件 id，用于提示"这个类型来自哪个插件"。
     pub plugin: String,
+    /// 远程参数里「这条归我管」的标记键（插件的 `remote_types[].marker`，缺省是 id）。
+    ///
+    /// 判定一条远程属于谁，看的是**参数里有没有这个键**，不是看它的 `type`
+    /// 或显示名：用户可能改过显示名，`type` 又永远是 `base_type`。
+    pub marker: String,
+    /// 这个类型承接的远程操作（`list` / `upload` / `delete` / `rclone-write`）。
+    ///
+    /// 空表表示插件只提供类型、不接管任何操作：那种远程仍按 `base_type` 的
+    /// 原生方式访问，插件的存在不改变它怎么读写。
+    pub ops: Vec<String>,
+    /// 早期由主程序代管、现在该交给插件的设置命名空间（插件的 `adopt_legacy`）。
+    ///
+    /// 主程序只读一次、只读不删：这些命名空间里的东西是用户的旧配置，插件写坏了
+    /// 还能重来，删掉就没了。名字全来自插件清单，主程序里不出现任何具体名字。
+    pub legacy: Vec<String>,
 }
 
 impl Derived {
@@ -44,6 +59,11 @@ impl Derived {
         let mut p = self.defaults.clone();
         p.insert("type".to_string(), self.base_type.clone());
         p
+    }
+
+    /// 插件是否声明会做这个远程操作。
+    pub fn takes(&self, op: &str) -> bool {
+        self.ops.iter().any(|o| o == op)
     }
 }
 
@@ -116,6 +136,9 @@ fn from_manifests(
                 base_type: rt.base_type.clone(),
                 defaults: rt.defaults.clone(),
                 plugin: cfg.id.clone(),
+                marker: rt.marker_key(),
+                ops: rt.ops.clone(),
+                legacy: cfg.adopt_legacy.clone(),
             });
         }
     }
@@ -126,6 +149,53 @@ fn from_manifests(
 /// 这条类型 id 是不是派生类型；是则返回它的定义。
 pub fn find<'a>(list: &'a [Derived], type_id: &str) -> Option<&'a Derived> {
     list.iter().find(|d| d.id == type_id)
+}
+
+/// 哪个插件在管这个标记键。
+///
+/// 标记键是远程参数里的一个普通参数名（插件在自己的 `remote_types[].marker` 里
+/// 声明，缺省用它的类型 id）。远程带了这个参数，就说明它是这种类型建出来的，
+/// 列目录、上传、删除都该找那个插件做。
+///
+/// 插件停用或卸载后这里给 `None`。调用方**不能**因此把它当普通后端去访问：
+/// 那种远程的读写协议只有插件知道，硬走 `base_type` 的原生方式等于绕过插件的
+/// 接口说明，结果往往是半个目录、写坏的文件，或者干脆把令牌发给了错的地址。
+pub fn marker_owner<'a>(list: &'a [Derived], marker: &str) -> Option<&'a Derived> {
+    list.iter().find(|d| d.marker == marker)
+}
+
+/// 从一条远程的参数里看出它归哪个插件管。
+///
+/// 认的是**参数里有这个标记键**且值不是关闭状态（空串、`0`、`false`、`no`
+/// 都算没设）。特意不看 `type`：所有派生类型的 `type` 都是同一个 `base_type`，
+/// 看它等于把「普通 webdav」和「插件的 webdav」混成一类。
+///
+/// 参数直接来自 rclone 的配置（`config dump`/`config get`），因此是字符串表；
+/// 别的形状（数字、布尔）按"有值"处理，宁可多认也不要漏认。
+pub fn owner_of_params<'a>(
+    list: &'a [Derived],
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> Option<&'a Derived> {
+    list.iter()
+        .find(|d| marker_is_set(params.get(d.marker.as_str())))
+}
+
+/// 标记参数是否处于「开」的状态。
+pub fn marker_is_set(v: Option<&serde_json::Value>) -> bool {
+    match v {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
+        Some(serde_json::Value::String(s)) => {
+            let s = s.trim();
+            !(s.is_empty()
+                || s == "0"
+                || s.eq_ignore_ascii_case("false")
+                || s.eq_ignore_ascii_case("no"))
+        }
+        // 数组/对象不是参数该有的形状；有内容就算设了，交给插件自己判。
+        Some(_) => true,
+    }
 }
 
 /// 落盘时应该写的 `type`：派生类型换成它的 `base_type`，普通类型原样返回。
@@ -168,6 +238,19 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             plugin: "com.example.plugin".into(),
+            // 清单里不写 marker 时用类型 id（`RemoteType::marker_key` 的兜底）
+            marker: id.into(),
+            ops: Vec::new(),
+            legacy: Vec::new(),
+        }
+    }
+
+    /// 带 marker / ops 的类型，用来测「标记键和类型 id 不一致」与按能力分派。
+    fn with_ops(id: &str, marker: &str, ops: &[&str]) -> Derived {
+        Derived {
+            marker: marker.into(),
+            ops: ops.iter().map(|o| o.to_string()).collect(),
+            ..d(id, id, "webdav", &[])
         }
     }
 
@@ -295,5 +378,111 @@ mod tests {
     fn missing_plugin_directory_is_not_an_error() {
         let root = std::env::temp_dir().join("rcgui-no-such-plugins-dir");
         assert!(collect_in(&root, &enabled_of(&[]), "0.3.0").is_empty());
+    }
+
+    #[test]
+    fn marker_owner_is_none_once_the_declaring_plugin_is_gone() {
+        let list = vec![d("kvault", "K-Vault", "webdav", &[("kvault", "1")])];
+        assert_eq!(
+            marker_owner(&list, "kvault").map(|d| d.plugin.as_str()),
+            Some("com.example.plugin")
+        );
+        // 插件停用/卸载后清单里没有这一项：桥必须停手，别把普通 webdav 当 K-Vault。
+        assert!(marker_owner(&[], "kvault").is_none());
+        // 显示名不是 id，拿名字来问等于问错人。
+        assert!(marker_owner(&list, "K-Vault").is_none());
+    }
+
+    #[test]
+    fn owner_of_params_reads_the_marker_not_the_backend_type() {
+        // 标记键和类型 id 故意取不一样的字符串：判定只能靠参数里的键。
+        let list = vec![with_ops(
+            "k-vault",
+            "kvault",
+            &["remote.list", "remote.upload"],
+        )];
+        let marked = serde_json::json!({"type": "webdav", "kvault": "1", "vendor": "other"});
+        let plain = serde_json::json!({"type": "webdav", "vendor": "other"});
+        assert_eq!(
+            owner_of_params(&list, marked.as_object().unwrap()).map(|d| d.plugin.as_str()),
+            Some("com.example.plugin")
+        );
+        // 普通 webdav 的参数里没有这个键：不能被认领，否则它的读写会被插件接管。
+        assert!(owner_of_params(&list, plain.as_object().unwrap()).is_none());
+    }
+
+    #[test]
+    fn owner_of_params_treats_off_values_as_unset() {
+        let list = vec![with_ops("k-vault", "kvault", &["remote.list"])];
+        for off in [
+            serde_json::json!(""),
+            serde_json::json!("0"),
+            serde_json::json!("false"),
+            serde_json::json!(" NO "),
+            serde_json::json!(0),
+            serde_json::json!(false),
+        ] {
+            let p = serde_json::json!({"kvault": off});
+            assert!(
+                owner_of_params(&list, p.as_object().unwrap()).is_none(),
+                "关掉的值不该被当成认领：{}",
+                p
+            );
+        }
+        for on in [
+            serde_json::json!("1"),
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!(true),
+        ] {
+            let p = serde_json::json!({"kvault": on});
+            assert!(
+                owner_of_params(&list, p.as_object().unwrap()).is_some(),
+                "开着就代表认领：{}",
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn only_declared_ops_are_taken() {
+        use crate::remote_ops::{DELETE, LIST, UPLOAD, WRITE};
+        let dt = with_ops("k-vault", "kvault", &[LIST, UPLOAD]);
+        assert!(dt.takes(LIST));
+        assert!(dt.takes(UPLOAD));
+        assert!(!dt.takes(DELETE));
+        assert!(!dt.takes(WRITE));
+        // 什么都没声明：只提供类型，不接管操作。
+        let type_only = with_ops("k-vault", "kvault", &[]);
+        for op in [LIST, UPLOAD, DELETE, WRITE] {
+            assert!(!type_only.takes(op), "{} 不该被接管", op);
+        }
+    }
+
+    #[test]
+    fn manifest_marker_and_ops_reach_the_derived_type() {
+        let cfg = manifest(
+            "kvault",
+            serde_json::json!([{
+                "id": "k-vault",
+                "name": "K-Vault",
+                "base_type": "webdav",
+                "marker": "kvault",
+                "ops": ["remote.list", "remote.upload", "remote.delete", "remote.rclone-write"],
+            }]),
+        );
+        let list = from_manifests(std::iter::once(cfg), &enabled_of(&[("kvault", true)]));
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].marker, "kvault");
+        assert_eq!(list[0].ops.len(), 4);
+        assert!(list[0].takes("remote.delete"));
+        // 清单不写 marker 时用类型 id 兜底，老插件不用改配置。
+        let old = manifest(
+            "kvault",
+            serde_json::json!([{"id": "k-vault", "name": "K-Vault", "base_type": "webdav"}]),
+        );
+        let old = from_manifests(std::iter::once(old), &enabled_of(&[("kvault", true)]));
+        assert_eq!(old[0].marker, "k-vault");
+        assert!(old[0].ops.is_empty());
     }
 }

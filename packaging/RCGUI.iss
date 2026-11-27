@@ -68,6 +68,14 @@ SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayName={#AppName}
 UninstallDisplayIcon={app}\rclone-gui.exe
+; 安装向导自己的图标。这张图和 exe、托盘、任务栏是同一张：build.rs 用
+; crates\app\src\icon_asset.rs 画出 crates\app\assets\rcgui.ico 再嵌进 exe，
+; build-release.ps1 把同一个文件用 /DSetupIcon 传进来。
+; 没传（老分支、手工编译）时这一行整个不生成，安装包退回 Inno 默认图标，
+; 而不是编译失败——图标不能拦住打包。
+#ifdef SetupIcon
+SetupIconFile={#SetupIcon}
+#endif
 ; 装之前请用户先关掉正在运行的 RCGUI，否则 exe 被占用会装不进去。
 CloseApplications=yes
 RestartApplications=no
@@ -98,9 +106,11 @@ Source: "{#SourceDir}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversi
 Source: "{#SourceDir}\assets\plugins\*"; DestDir: "{app}\assets\plugins"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 [Icons]
-Name: "{group}\{#AppName}"; Filename: "{app}\rclone-gui.exe"
-Name: "{group}\{#AppName} 卸载"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\rclone-gui.exe"; Tasks: desktopicon
+; IconFilename 指回程序自己：快捷方式不再依赖 shell 去目标 exe 里"猜"图标，
+; exe 里现在有 16~128 像素那套图标资源，快捷方式与任务栏按钮因此一致。
+Name: "{group}\{#AppName}"; Filename: "{app}\rclone-gui.exe"; IconFilename: "{app}\rclone-gui.exe"
+Name: "{group}\{#AppName} 卸载"; Filename: "{uninstallexe}"; IconFilename: "{app}\rclone-gui.exe"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\rclone-gui.exe"; IconFilename: "{app}\rclone-gui.exe"; Tasks: desktopicon
 
 [Run]
 ; 装完可以让用户直接打开；静默安装时不弹。

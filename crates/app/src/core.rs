@@ -350,6 +350,9 @@ pub enum Phase {
     Running { pid: u32, url: String },
     /// 上次启动失败
     Failed(String),
+    /// 起来过，自己退出了（退出码或异常终止）。和 `Failed` 分开，
+    /// 是因为"根本没起来"和"起来又死了"要查的地方不一样。
+    Exited(String),
 }
 
 impl Phase {
@@ -360,6 +363,7 @@ impl Phase {
             Phase::Stopped => "内核未启动".to_string(),
             Phase::Running { pid, url } => format!("内核运行中（pid {pid}，{url}）"),
             Phase::Failed(e) => format!("内核启动失败：{e}"),
+            Phase::Exited(e) => format!("内核已退出：{e}"),
         }
     }
 }
@@ -372,6 +376,11 @@ impl Phase {
 pub struct Core {
     inner: Mutex<Option<Running>>,
     last_error: Mutex<Option<String>>,
+    /// 上一次「起来之后又自己退出」的原因。
+    ///
+    /// 和 `last_error`（根本没起来）分开存：两种故障要查的地方不同，
+    /// 界面上也不该把"启动失败"套在一句退出码上。成功启动时清掉。
+    last_exit: Mutex<Option<String>>,
 }
 
 impl Core {
@@ -386,6 +395,7 @@ impl Core {
                 "找不到内核 {}（来源不明，请在设置里指定 rclone.exe 路径）",
                 spec.exe.display()
             );
+            *self.last_exit.lock().unwrap() = None;
             self.set_error(e.to_string());
             return Err(e);
         }
@@ -426,6 +436,7 @@ impl Core {
                             };
                             *self.inner.lock().unwrap() = Some(running);
                             *self.last_error.lock().unwrap() = None;
+                            *self.last_exit.lock().unwrap() = None;
                             return Ok(());
                         }
                         Err(e) => {
@@ -451,6 +462,8 @@ impl Core {
         }
         let e = last.unwrap_or_else(|| anyhow!("内核启动失败（原因未知）"));
         let msg = format!("{}（日志：{}）", e, spec.log_file.display());
+        // 这次的失败是"没起来"，不该被上一次的退出原因盖住。
+        *self.last_exit.lock().unwrap() = None;
         self.set_error(msg.clone());
         Err(anyhow!(msg))
     }
@@ -500,12 +513,46 @@ impl Core {
                 };
             }
         }
+        // 退出原因排在启动失败前面：同一次启动里两者可能都留了痕，
+        // 但"起来了又死"是用户先要看的那一条。
+        if let Ok(e) = self.last_exit.lock() {
+            if let Some(e) = e.as_ref() {
+                return Phase::Exited(e.clone());
+            }
+        }
         if let Ok(e) = self.last_error.lock() {
             if let Some(e) = e.as_ref() {
                 return Phase::Failed(e.clone());
             }
         }
         Phase::Stopped
+    }
+
+    /// 查看内核是否已经自行退出；退出了就收掉句柄并记下原因。
+    ///
+    /// 返回 `Some(原因)` 只在**这一次**调用新发现进程没了时给出，之后的调用返回
+    /// `None`——原因已经进了 `phase()`，每 2 秒重复报同一条只会把界面刷成噪声。
+    /// 拿不到退出状态（句柄异常）时也当作没发现新情况，由 `is_running()` 兜底。
+    ///
+    /// 只碰自己这个 child 句柄，不会按名字去找或杀任何进程。
+    pub fn reap_dead(&self) -> Option<String> {
+        let mut g = self.inner.lock().unwrap();
+        let r = g.as_mut()?;
+        let status = match r.child.try_wait() {
+            Ok(None) => return None,
+            Ok(Some(s)) => s,
+            Err(_) => return None,
+        };
+        let pid = r.pid;
+        let reason = match status.code() {
+            Some(c) => format!("内核进程已自行退出（pid {pid}，退出码 {c}）"),
+            None => format!("内核进程已自行退出（pid {pid}，被强制终止）"),
+        };
+        // 先记原因再丢句柄：丢句柄会走 Drop 里的 stop()，但那是收一个已经
+        // 死掉的 child，不会动别的进程。
+        *self.last_exit.lock().unwrap() = Some(reason.clone());
+        drop(g.take());
+        Some(reason)
     }
 
     fn set_error(&self, msg: String) {

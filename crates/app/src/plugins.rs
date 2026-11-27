@@ -138,6 +138,8 @@ pub fn ensure_builtin(ctx: &Arc<Ctx>) -> Vec<String> {
             eprintln!("释放内置插件 {} 失败: {e:#}", cfg.id);
             continue;
         }
+        // 用户卸载过、现在又装了回来：把当时备份的设置放回原位（已有则不覆盖）。
+        restore_kv_backup(&dest_root, &cfg.id);
         // 迁移：旧版本体把 imagehost 释放成**单文件** `plugins/imagehost.wasm`，
         // 而插件资产现在一律是目录包。同一个 id 同时存在文件与目录时扫描会列出两张
         // 卡片（各自还有一份启用记录），所以在装包成功后删掉那个旧文件。
@@ -196,12 +198,20 @@ pub fn restore_builtin(ctx: &Arc<Ctx>, id: &str) -> Result<()> {
         found.ok_or_else(|| anyhow!("{}", rcgui_i18n::f("内置插件 {} 不在安装包里", &[&(id)])))?;
     let dest = plugins_dir().join(plugin_host::config::sanitize_dir_name(id));
     if dest.exists() {
+        // 重新释放本体要删掉旧目录，而用户的设置就住在里面：先备份，装完再放回去。
+        backup_kv_file(&plugins_dir(), id);
         std::fs::remove_dir_all(&dest).ok();
     }
-    copy_dir(&src, &dest)
+    copy_dir(&src, &dest)?;
+    restore_kv_backup(&plugins_dir(), id);
+    Ok(())
 }
 
 /// 卸载插件：删插件本体（目录或单文件 .wasm）+ 该插件的 kv 数据 + 清启用记录。
+///
+/// kv 数据（`plugins/<id>/kv.json`，插件自己的设置）删之前会先备份到
+/// `plugins/_removed/<id>/`，重装时由 [`restore_kv_backup`] 放回原位 ——
+/// 否则用户卸载一次插件，站点地址和令牌就没了，只能重新要一遍。
 ///
 /// `path` 是 [`Row::path`] —— 插件在磁盘上的**真实位置**。不能用 id 反推：
 /// - 新格式插件是 `plugins/<id>/` 目录；
@@ -226,6 +236,8 @@ pub fn uninstall(ctx: &Arc<Ctx>, id: &str, path: &str) -> Result<PathBuf> {
 /// 只做文件系统那部分：删插件本体 + 它的 kv 目录。抽出来是为了能单测
 /// （[`uninstall`] 还要动 `Ctx` 里的配置，测试里不好造）。
 fn remove_plugin_files(path: &Path, plugins_root: &Path, id: &str) -> Result<PathBuf> {
+    // 备份赶在任何删除之前：目录格式插件的本体和它的 kv.json 是同一个目录。
+    backup_kv_file(plugins_root, id);
     let removed = if path.is_dir() {
         plugin_host::bundle::uninstall(path)?
     } else if path.is_file() {
@@ -248,6 +260,76 @@ fn remove_plugin_files(path: &Path, plugins_root: &Path, id: &str) -> Result<Pat
         std::fs::remove_dir_all(&kv_dir).ok();
     }
     Ok(removed)
+}
+
+/// 插件设置（`kv.json`）的备份目录。卸载前把文件放到这里，装回来时再取回。
+fn removed_kv_dir(plugins_root: &Path, id: &str) -> PathBuf {
+    plugins_root
+        .join("_removed")
+        .join(plugin_host::config::sanitize_dir_name(id))
+}
+
+/// 卸载前备份插件的 `kv.json`，返回备份文件路径；没有设置可备份时返回 `None`。
+///
+/// 插件设置和插件本体在同一个目录（`plugins/<id>/kv.json`），删本体就把设置带走。
+/// K-Vault 的站点地址、令牌、导入记录全在那份文件里，重装等于从零开始配一遍，
+/// 所以要在任何删除动作之前先留一份。
+fn backup_kv_file(plugins_root: &Path, id: &str) -> Option<PathBuf> {
+    let src = plugins_root
+        .join(plugin_host::config::sanitize_dir_name(id))
+        .join("kv.json");
+    if !src.is_file() {
+        return None;
+    }
+    let dest_dir = removed_kv_dir(plugins_root, id);
+    std::fs::create_dir_all(&dest_dir).ok()?;
+    let dest = dest_dir.join("kv.json");
+    std::fs::copy(&src, &dest).ok()?;
+    Some(dest)
+}
+
+/// 装回插件后把备份的设置放回原位。
+///
+/// 只补空位：目标位置已经有 `kv.json` 就什么都不做 —— 那可能是用户重装后在插件页
+/// 重新填过的值，用旧备份盖掉等于让他再填一次。备份文件本身保留，不做删除：
+/// 本次恢复失败（磁盘满、权限）时下次启动还能再试一次。
+fn restore_kv_backup(plugins_root: &Path, id: &str) {
+    let dir = plugins_root.join(plugin_host::config::sanitize_dir_name(id));
+    if dir.join("kv.json").exists() {
+        return;
+    }
+    let backup = removed_kv_dir(plugins_root, id).join("kv.json");
+    if !backup.is_file() {
+        return;
+    }
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let _ = std::fs::copy(&backup, dir.join("kv.json"));
+}
+
+/// 装完一个包之后，把它卸载时备份的设置放回原位。
+///
+/// 三个装包入口（插件商店下载、选 zip、选文件夹）都要调：用户卸载过 K-Vault，
+/// 重装之后站点地址和令牌应该还在，不然等于让他从头配一遍。
+/// 只补空位（见 [`restore_kv_backup`]）：新包自带 `kv.json`、或插件已经建了新设置，
+/// 都不会被旧备份覆盖。`Kept`（版本没变、磁盘上一个字节都没动）也照样调一次，
+/// 那次调用里恢复函数只会走「目标已存在 → 直接返回」这条路。
+pub fn restore_backup_after_install(outcome: &plugin_host::package::InstallOutcome) {
+    restore_backup_after_install_in(&plugins_dir(), outcome);
+}
+
+/// 同 [`restore_backup_after_install`]，插件根目录由调用方给（测试用）。
+fn restore_backup_after_install_in(
+    plugins_root: &Path,
+    outcome: &plugin_host::package::InstallOutcome,
+) {
+    let id = match outcome {
+        plugin_host::package::InstallOutcome::Added { id, .. }
+        | plugin_host::package::InstallOutcome::Upgraded { id, .. }
+        | plugin_host::package::InstallOutcome::Kept { id, .. } => id,
+    };
+    restore_kv_backup(plugins_root, id);
 }
 
 /// 这个 id 是不是「随程序一起发」的（卸载后需要墓碑，否则会被自动释放回来）。
@@ -914,7 +996,12 @@ pub async fn dispatch_http(ctx: &Arc<Ctx>, id: &str, req: Value) -> Result<Value
 }
 
 /// 调一次插件：`action` 由 config.json 的 action 控件决定。
-async fn call_plugin(ctx: &Arc<Ctx>, id: &str, action: &str, extra: Value) -> Result<Value> {
+pub(crate) async fn call_plugin(
+    ctx: &Arc<Ctx>,
+    id: &str,
+    action: &str,
+    extra: Value,
+) -> Result<Value> {
     let (dir, cfg) =
         loaded_config(id).ok_or_else(|| anyhow!("{}", rcgui_i18n::f("找不到插件 {}", &[&(id)])))?;
     let mut params = json!({
@@ -2188,6 +2275,124 @@ mod tests {
 
         assert_eq!(removed, dir);
         assert!(!dir.exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 卸载插件不能把用户填过的设置一起扔了：kv.json 要先备份到 `_removed/<id>/`。
+    ///
+    /// K-Vault 的站点地址、令牌、导入记录全在 `plugins/<id>/kv.json` 里，
+    /// 而它和插件本体同目录 —— 直接删目录就等于让用户重装后从零配一遍。
+    #[test]
+    fn uninstall_keeps_a_backup_of_plugin_settings() {
+        let root = tmp_dir("backup");
+        let dir = root.join("kvault");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), b"{}").unwrap();
+        let settings = br#"{"site":{"url":"https://kv.example","token":"t0ken"}}"#;
+        std::fs::write(dir.join("kv.json"), settings).unwrap();
+
+        remove_plugin_files(&dir, &root, "kvault").unwrap();
+
+        assert!(!dir.exists(), "插件目录本身要删掉");
+        let backup = root.join("_removed").join("kvault").join("kv.json");
+        assert!(backup.is_file(), "卸载前必须留下设置备份");
+        assert_eq!(std::fs::read(&backup).unwrap(), settings);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 装回来时把备份放回原位；用户已经重新填过的（live 有文件）一律不覆盖。
+    #[test]
+    fn restore_only_fills_the_empty_slot() {
+        let root = tmp_dir("restore");
+        let live_dir = root.join("kvault");
+        std::fs::create_dir_all(&live_dir).unwrap();
+        let backup_dir = root.join("_removed").join("kvault");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(backup_dir.join("kv.json"), b"{\"old\":1}").unwrap();
+
+        restore_kv_backup(&root, "kvault");
+        assert_eq!(
+            std::fs::read(live_dir.join("kv.json")).unwrap(),
+            b"{\"old\":1}",
+            "空位要用备份填上"
+        );
+
+        std::fs::write(live_dir.join("kv.json"), b"{\"new\":2}").unwrap();
+        restore_kv_backup(&root, "kvault");
+        assert_eq!(
+            std::fs::read(live_dir.join("kv.json")).unwrap(),
+            b"{\"new\":2}",
+            "已有设置不能被旧备份盖掉"
+        );
+        assert!(backup_dir.join("kv.json").is_file(), "备份留到下次还能用");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 三条装包路径（选 zip、选文件夹、插件商店）装成功后都要恢复备份。
+    ///
+    /// 这是结构测试：三条路是各自独立的代码，漏掉一条，那条路装回来的插件就是空的，
+    /// 用户会以为「重装一次数据就没了」。数的是源码里的调用点，不是行为。
+    #[test]
+    fn every_install_entry_restores_the_backup() {
+        let main_src = include_str!("main.rs").replace("\r\n", "\n");
+        let store_src = include_str!("store.rs").replace("\r\n", "\n");
+        assert_eq!(
+            main_src
+                .matches("restore_backup_after_install(&outcome)")
+                .count(),
+            2,
+            "选 zip 与选文件夹两个入口各要调一次"
+        );
+        assert_eq!(
+            store_src
+                .matches("restore_backup_after_install(&outcome)")
+                .count(),
+            1,
+            "插件商店那条路也要调一次"
+        );
+    }
+
+    /// 装回来的设置只填空位：新包自带 `kv.json`、或重装后用户已经填过，旧备份不许盖。
+    ///
+    /// 两个安装结果都走同一个函数：`Kept`（磁盘没动）用来验补位，`Upgraded` 用来验不覆盖。
+    #[test]
+    fn install_puts_the_backup_back_only_where_the_slot_is_empty() {
+        let root = tmp_dir("install-restore");
+        let backup_dir = root.join("_removed").join("kvault");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(backup_dir.join("kv.json"), b"{\"site\":\"old\"}").unwrap();
+        let live_dir = root.join("kvault");
+        std::fs::create_dir_all(&live_dir).unwrap();
+
+        let kept = plugin_host::package::InstallOutcome::Kept {
+            id: "kvault".to_string(),
+            installed: "1.0.0".to_string(),
+            offered: "1.0.0".to_string(),
+        };
+        restore_backup_after_install_in(&root, &kept);
+        assert_eq!(
+            std::fs::read(live_dir.join("kv.json")).unwrap(),
+            b"{\"site\":\"old\"}",
+            "卸载时留下的设置要回到空位里"
+        );
+
+        // 包的 id 与目录名必须同大小写：sanitize_dir_name 只替换非法字符，不做大小写归一。
+        std::fs::write(live_dir.join("kv.json"), b"{\"site\":\"new\"}").unwrap();
+        let upgraded = plugin_host::package::InstallOutcome::Upgraded {
+            id: "kvault".to_string(),
+            from: "1.0.0".to_string(),
+            to: "1.1.0".to_string(),
+        };
+        restore_backup_after_install_in(&root, &upgraded);
+        assert_eq!(
+            std::fs::read(live_dir.join("kv.json")).unwrap(),
+            b"{\"site\":\"new\"}",
+            "已有设置优先，旧备份不许盖"
+        );
+        assert!(
+            backup_dir.join("kv.json").is_file(),
+            "备份留着：下次恢复失败还能重来"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

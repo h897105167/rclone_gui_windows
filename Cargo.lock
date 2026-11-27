@@ -4608,14 +4608,17 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plugin_host"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
  "crc32fast",
  "flate2",
+ "futures-util",
+ "rand 0.8.8",
  "rcgui-i18n",
+ "reqwest",
  "semver",
  "serde",
  "serde_json",
@@ -4623,6 +4626,19 @@ dependencies = [
  "tokio",
  "wasmtime",
  "wasmtime-wasi",
+]
+
+[[package]]
+name = "plugin_it"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "plugin_host",
+ "reqwest",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -4992,11 +5008,11 @@ dependencies = [
 
 [[package]]
 name = "rcgui-i18n"
-version = "0.3.0"
+version = "0.3.1"
 
 [[package]]
 name = "rcgui-profile"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "rcgui-i18n",
@@ -5006,7 +5022,7 @@ dependencies = [
 
 [[package]]
 name = "rcgui-rc"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rcgui-i18n",
  "reqwest",
@@ -5017,7 +5033,7 @@ dependencies = [
 
 [[package]]
 name = "rclone-gui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -5051,7 +5067,7 @@ dependencies = [
 
 [[package]]
 name = "rclone_client"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "rand 0.8.8",
@@ -5193,12 +5209,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
 ]
 
@@ -6907,6 +6925,19 @@ checksum = "1ab7a13a23790fe91ea4eb7526a1f3131001d874e3e00c2976c48861f2e82920"
 dependencies = [
  "leb128",
  "wasmparser",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

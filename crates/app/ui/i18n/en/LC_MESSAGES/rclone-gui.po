@@ -688,9 +688,6 @@ msgstr "Light"
 msgid "测试中…"
 msgstr "Testing…"
 
-msgid "测试连接"
-msgstr "Test connection"
-
 msgid "浏览远程路径"
 msgstr "Browse remote path"
 
@@ -760,8 +757,8 @@ msgstr "Delete remote {}?"
 msgid "确认删除选中的 {} 项？（文件夹将整体删除）"
 msgstr "Delete the {} selected item(s)? (folders are removed entirely)"
 
-msgid "确认卸载「{}」？插件目录与该插件的设置会一并删除。"
-msgstr "Uninstall \"{}\"? Its plugin directory and settings will be deleted as well."
+msgid "确认卸载「{}」？插件目录与该插件的设置会一并删除（插件的历史数据会另存备份，重新安装后自动恢复）。"
+msgstr "Uninstall \"{}\"? Its plugin directory and settings will be deleted as well. (The plugin's historical data is backed up separately and restored automatically when you reinstall it.)"
 
 msgid "确认导出"
 msgstr "Confirm export"
@@ -1066,8 +1063,8 @@ msgstr "Install"
 msgid "常规"
 msgstr "General"
 
-msgid "内核与连接"
-msgstr "Core & connection"
+msgid "内核"
+msgstr "Core"
 
 msgid "备份与同步"
 msgstr "Backup & sync"
@@ -1233,3 +1230,126 @@ msgstr "Parent folder"
 
 msgid "进入文件夹 {}"
 msgstr "Open folder {}"
+
+msgid "需要的权限"
+msgstr "Permissions required"
+
+msgid "重试启动内核"
+msgstr "Retry starting core"
+
+msgid "托管方式"
+msgstr "Managed core"
+
+msgid "正在连接内核…"
+msgstr "Connecting to core…"
+
+msgid "连接由本程序自动建立：内核一起来就握手，链路断了自动重试，不需要手动连接或断开。"
+msgstr "The app connects on its own: it handshakes as soon as the core is up and retries if the link drops. No manual connect or disconnect."
+
+msgid "内核随本应用一起启停，不需要手动开关。异常退出会在上面的状态里写明原因，并自动重试启动。"
+msgstr "The core starts and stops with this app, so there is no manual switch. If it exits unexpectedly, the status above says why and the app retries."
+
+msgid "打开系统窗口，选择本机的源文件夹"
+msgstr "Open the system dialog and pick the local source folder"
+
+msgid "连到远程仓库，选一个已有的目录；打不开时会保留现在填的值"
+msgstr "Connect to the remote and pick an existing directory; if it cannot be opened, the value you typed stays"
+
+msgid "正在读取远程目录…"
+msgstr "Reading remote directories…"
+
+msgid "选择本地文件夹"
+msgstr "Pick the local folder"
+
+msgid "选择本机目录"
+msgstr "Pick a local directory"
+
+msgid "已选择本地文件夹：{}"
+msgstr "Local folder selected: {}"
+
+msgid "还没连上 rclone，等连上再选云端目录"
+msgstr "rclone is not connected yet; pick the cloud directory once it is"
+
+msgid "没选远程，云端目录没有改动"
+msgstr "No remote was picked, so the cloud directory is unchanged"
+
+msgid "已选择云端目录：{}"
+msgstr "Cloud directory selected: {}"
+
+msgid "这个位置现在打不开，云端目录保持原值：{}"
+msgstr "This location cannot be opened right now, so the cloud directory keeps its previous value: {}"
+
+msgid "打不开这个位置：{}"
+msgstr "Cannot open this location: {}"
+
+msgid "读不到远程列表：{}"
+msgstr "Cannot read the remote list: {}"
+
+msgid "看不懂这个路径：{}"
+msgstr "Cannot parse this path: {}"
+
+msgid "列不出来：{}"
+msgstr "Cannot list it: {}"
+
+msgid "文件里有一条归属记录缺远程名、插件 id 或标记键，跳过这一条"
+msgstr "An ownership record in the file is missing its remote name, plugin id or marker key; skipping it"
+
+msgid "本机没有远程「{}」，文件里那条归属记录没有登记"
+msgstr "No remote named \"{}\" exists on this machine, so that ownership record was not registered"
+
+msgid "本机远程「{}」的参数里没有标记键「{}」，它现在是普通远程，文件里那条归属记录没有登记"
+msgstr "Remote \"{}\" has no marker key \"{}\" in its parameters, so it is a plain remote now; that ownership record was not registered"
+
+msgid "远程「{}」原本登记给插件「{}」，这份文件说是「{}」，本机参数与文件一致，已改成后者"
+msgstr "Remote \"{}\" was registered to plugin \"{}\" but this file says \"{}\"; the local parameters agree with the file, so the record now follows it"
+
+msgid "远程「{}」还登记为插件「{}」管的，但这次没读到它的参数，这条登记没有动"
+msgstr "Remote \"{}\" is still registered to plugin \"{}\" but its parameters could not be read this time, so that record was left alone"
+
+msgid "远程「{}」在文件里是普通远程、本机参数里也没有「{}」标记，原来的登记撤掉了"
+msgstr "Remote \"{}\" is a plain remote in this file and its local parameters carry no \"{}\" marker, so the old record was dropped"
+
+msgid "远程归属登记表读不出来，这次导入没有动它：{}"
+msgstr "The remote ownership table cannot be read, so this import left it untouched: {}"
+
+msgid "远程归属登记已更新（新登记 {} 条，撤销 {} 条），改动前的表存为 {}"
+msgstr "Remote ownership table updated ({} added, {} dropped); the previous table was saved as {}"
+
+msgid "远程归属登记已建立（新登记 {} 条）"
+msgstr "Remote ownership table created ({} added)"
+
+msgid "远程归属登记没写成功，导入的其他部分已完成：{}"
+msgstr "The remote ownership table could not be saved; the rest of the import is done: {}"
+
+msgid "这次启动没能读出远程列表，插件远程的归属无从判断：{}"
+msgstr "The remote list could not be read at startup, so plugin remotes cannot be identified: {}"
+
+msgid "远程归属登记表读不出来，插件远程的操作会全部被拒绝：{}"
+msgstr "The remote ownership table cannot be read, so every plugin remote will be refused: {}"
+
+msgid "远程归属登记表读不出来，这次导出没有带上归属：{}"
+msgstr "The remote ownership table cannot be read, so this export carries no ownership records: {}"
+
+msgid "；含 {} 条远程归属"
+msgstr "; includes {} ownership record(s)"
+
+msgid "；远程归属登记表读不出来，这次文件里没有归属记录"
+msgstr "; the remote ownership table cannot be read, so this file has no ownership records"
+
+msgid "；远程归属：{}"
+msgstr "; remote ownership: {}"
+
+msgid "远程归属记录超出上限（≤200）"
+msgstr "Too many remote ownership records (limit 200)"
+
+msgid "远程归属记录 \"{}\" 缺少远程名或插件 id"
+msgstr "Remote ownership record \"{}\" is missing its remote name or plugin id"
+
+msgid "远程归属记录里的远程名 \"{}\" 不合法"
+msgstr "Remote ownership record has an invalid remote name: \"{}\""
+
+msgid "远程归属记录 \"{}\" 的插件 id \"{}\" 不合法"
+msgstr "Remote ownership record \"{}\" has an invalid plugin id: \"{}\""
+
+msgid "远程归属记录 \"{}\" 的标记键 \"{}\" 不合法"
+msgstr "Remote ownership record \"{}\" has an invalid marker key: \"{}\""

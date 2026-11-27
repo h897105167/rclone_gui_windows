@@ -38,6 +38,16 @@ pub(crate) fn region<'a>(src: &'a str, from: &str, to: &str) -> Option<&'a str> 
     Some(&rest[..end])
 }
 
+/// 去掉全部空白之后的源码，用来判断"这件事有没有发生"，而不是"这行字怎么排的"。
+///
+/// 断言里写 `client.copyfile(` 这类带点的方法调用时，这个区别很要命：`rustfmt` 会把
+/// 长调用在点处折成 `client` 与 `.copyfile(` 两行，同一份接线（入口先问闸门、再动手）
+/// 就查不到那个字面量了。断言应该对折行、缩进、行尾都不敏感——否则红的是排版，
+/// 而人还以为接线断了。
+pub(crate) fn squash(src: &str) -> String {
+    src.split_whitespace().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +110,27 @@ mod tests {
             assert!(body.contains("one();"), "{label}: 少了 first 的调用");
             assert!(!body.contains("two();"), "{label}: 把 second 也包进来了");
         }
+    }
+
+    /// 同一段接线换个排版（点处折行、缩进、行尾）必须压缩成同一串。
+    ///
+    /// 这正是 CI 上真红过的那种差异：`client.copyfile(a, b)` 被折成 `client` +
+    /// `.copyfile(a, b)`，按字面量找不到，看着像入口没接线。
+    #[test]
+    fn squash_ignores_line_breaks_and_indentation() {
+        let one_line =
+            "if let Some(m) = gate() { assert!(m); } let r = client.copyfile(a, b).await;";
+        let wrapped = "if let Some(m) = gate() {\n    assert!(m);\n}\nlet r = client\n    .copyfile(a, b)\n    .await;\n";
+        let crlf = wrapped.replace('\n', "\r\n");
+        assert_eq!(squash(one_line), squash(wrapped), "折行与缩进不该改变结果");
+        assert_eq!(squash(wrapped), squash(&crlf), "行尾不该改变结果");
+        assert!(
+            squash(wrapped).contains("client.copyfile("),
+            "压缩后才查得到带点的方法调用"
+        );
+        assert!(
+            !wrapped.contains("client.copyfile("),
+            "原样是查不到的——这正是要修的"
+        );
     }
 }

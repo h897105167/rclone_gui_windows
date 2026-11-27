@@ -32,7 +32,7 @@ use crate::config::AppConfig;
 use rcgui_profile::proxy::{plan_apply, ApplyPlan, ProxyConfigValues, ProxyProfile};
 use rcgui_profile::{MountProfile, ProxyRegistry, RemoteProxyBinding, ServeProfile};
 use rcgui_rc::RcClient;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // ---------------- 期望状态 ----------------
 
@@ -400,11 +400,23 @@ pub async fn collect_proxy_actual(
     (out, errors)
 }
 
+/// `fs` 形如 `remote:sub/dir`，取出远程名。
+///
+/// 没有冒号时整串就是远程名（`compose_fs` 在子路径为空时也带冒号，
+/// 但手写的档案可能不带，别在这里 panic）。
+fn remote_of(fs: &str) -> &str {
+    fs.split(':').next().unwrap_or(fs)
+}
+
 /// 执行动作序列。单条失败不影响其他条目。
+///
+/// `blocked` 里是「这个远程现在不能用，原因如下」——由调用方算好传进来，
+/// 因为这里只拿得到 `RcClient`，判断不了插件启没启用。
 pub async fn execute(
     client: &RcClient,
     cfg: &mut AppConfig,
     actions: &[Action],
+    blocked: &HashMap<String, String>,
 ) -> ReconcileReport {
     let mut rep = ReconcileReport::default();
     for a in actions {
@@ -455,6 +467,14 @@ pub async fn execute(
                 }
             }
             Action::Mount { fs, point } => {
+                // 类型没有实现的远程不挂：插件不在时挂上去只多一个打不开的盘符，
+                // 还会让用户以为它照常能用。条目留在 `cfg.auto_mounts` 里，
+                // 插件装回来下次重载照旧恢复。
+                if let Some(msg) = blocked.get(remote_of(fs)) {
+                    rep.failed
+                        .push(rcgui_i18n::f("{}：{}", &[&(a.describe()), &(msg)]));
+                    continue;
+                }
                 let opts = serde_json::json!({ "vfs_cache_mode": "writes", "read_only": false });
                 match tokio::time::timeout(crate::MOUNT_RC_TIMEOUT, client.mount(fs, point, opts))
                     .await
@@ -477,6 +497,13 @@ pub async fn execute(
                 Err(e) => rep.failed.push(format!("{}：{e}", a.describe())),
             },
             Action::StartServe { stype, fs, addr } => {
+                // 服务把远程内容重新暴露成一个局域网地址：插件不在时起它，
+                // 只是多出一个打不开的地址。条目仍留在 `cfg.auto_serves` 里。
+                if let Some(msg) = blocked.get(remote_of(fs)) {
+                    rep.failed
+                        .push(rcgui_i18n::f("{}：{}", &[&(a.describe()), &(msg)]));
+                    continue;
+                }
                 match client.serve_start(stype, fs, addr, "", "").await {
                     Ok(_) => {
                         rep.done.push(a.describe());
@@ -505,7 +532,11 @@ pub async fn execute(
 /// 先 clone 出配置、放锁、再调用（把结果写回）。原因是本函数内部有 `await`，
 /// 而 `std::sync::MutexGuard` 不是 `Send`，跨越 `await` 会让整个 future 变成
 /// 非 `Send`，无法交给 `tokio::spawn`。
-pub async fn reconcile(client: &RcClient, cfg: &mut AppConfig) -> ReconcileReport {
+pub async fn reconcile(
+    client: &RcClient,
+    cfg: &mut AppConfig,
+    blocked: &HashMap<String, String>,
+) -> ReconcileReport {
     let (desired, mut errors) = desired_from(cfg);
     let actual = collect_actual(client).await;
     let remotes: Vec<String> = desired.remotes.iter().map(|r| r.remote.clone()).collect();
@@ -513,7 +544,7 @@ pub async fn reconcile(client: &RcClient, cfg: &mut AppConfig) -> ReconcileRepor
     errors.extend(proxy_errors);
     let (actions, plan_errors) = plan(&desired, &actual, &proxy_actual);
     errors.extend(plan_errors);
-    let mut rep = execute(client, cfg, &actions).await;
+    let mut rep = execute(client, cfg, &actions, blocked).await;
     rep.failed.extend(errors);
     rep
 }

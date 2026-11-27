@@ -67,7 +67,7 @@ pub fn cap_of_op(op: &str) -> Option<&'static str> {
         // 早期命名，保留兼容
         "fs.inspect_exe" | "fs.write_file" | "fs.remove_dir" => "fs",
 
-        "http.download" | "http.json" | "http.text" | "http.request" => "http",
+        "http.download" | "http.json" | "http.text" | "http.request" | "http.upload" => "http",
         "proc.start" | "proc.stop" | "proc.status" | "proc.run" => "proc",
         "net.port_open" => "net",
         "rclone.call" | "rclone.upload_file" | "rclone.cat" | "rclone.remotes" => "rclone",
@@ -603,7 +603,56 @@ pub struct RemoteType {
     /// 它按自己的规则解析，宿主不做类型推断。
     #[serde(default)]
     pub defaults: std::collections::BTreeMap<String, String>,
+    /// 「这条远程归我管」的标记参数名。
+    ///
+    /// 插件在 `defaults` 里把同名参数写成一个非空值，宿主就认定带着这个参数的
+    /// 远程属于这个类型：列目录、上传、删除都交给插件做；插件不在时这条远程
+    /// 谁也不许碰（不能被当普通后端操作，那会绕过插件的接口说明）。
+    ///
+    /// 不写等于用 `id` 当标记名，老插件不用改配置。
+    #[serde(default)]
+    pub marker: Option<String>,
+    /// 这个类型能承接哪些远程操作，见 [`REMOTE_OPS`]。
+    ///
+    /// 空表表示「只提供类型，不接管任何操作」，这种远程仍然按 `base_type`
+    /// 的原生方式访问（插件的存在不改变它的读写行为）。
+    #[serde(default)]
+    pub ops: Vec<String>,
 }
+
+impl RemoteType {
+    /// 判断某条远程是否属于本类型的标记参数名。
+    pub fn marker_key(&self) -> String {
+        match self.marker.as_deref().map(str::trim) {
+            Some(m) if !m.is_empty() => m.to_string(),
+            // 老插件只在 defaults 里写了标记、没写 marker：用它自己的 id 兜底。
+            _ => self.id.clone(),
+        }
+    }
+
+    /// 是否声明了某项远程操作。
+    pub fn supports(&self, op: &str) -> bool {
+        self.ops.iter().any(|o| o == op)
+    }
+}
+
+/// 插件能承接的远程操作名。
+///
+/// 这几个名字是宿主和插件之间的接口，不是 rclone 的 RC 方法名，也**不是**插件
+/// 面板上的动作名（面板那些叫 `list`/`upload`/`remove`，参数完全不同）。带
+/// `remote.` 前缀正是为了两者不会互相撞上：宿主发 `remote.list`，只可能被
+/// 「负责列目录」的那一支接住。
+/// - `remote.list`：列一个目录（返回文件名、是否目录、大小、时间）
+/// - `remote.upload`：把宿主已经落在临时目录里的一个文件送上去
+/// - `remote.delete`：删一个文件或目录
+/// - `remote.rclone-write`：宿主替插件挡下的写类 RC 调用（改名、建目录等），
+///   由插件决定支持还是明确拒绝
+pub const REMOTE_OPS: &[&str] = &[
+    "remote.list",
+    "remote.upload",
+    "remote.delete",
+    "remote.rclone-write",
+];
 
 /// `config.json` 的内容。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -661,6 +710,14 @@ pub struct PluginConfig {
     /// 建好的远程配置仍然留在 rclone 的 `config` 里，不会丢数据。
     #[serde(default)]
     pub remote_types: Vec<RemoteType>,
+    /// 早期版本由宿主代管的设置命名空间，插件要求接管时列在这里。
+    ///
+    /// 宿主升级后第一次看到某个启用的插件声明了某个命名空间，会把那份数据
+    /// 原样交给它（只读一次，不删除、不覆盖它自己的数据），之后不再重复。
+    /// 这样"原先写在主程序里的设置"能搬到插件里，而主程序代码里不需要知道
+    /// 这些设置叫什么名字——名字全来自插件自己的清单。
+    #[serde(default)]
+    pub adopt_legacy: Vec<String>,
 }
 
 impl PluginConfig {
@@ -833,6 +890,60 @@ impl PluginConfig {
                         rcgui_i18n::f("{} 的参数 {} 过长（> 4096 字节）", &[&(at), &(k)])
                     );
                 }
+            }
+            // 标记名要能当 rclone 参数名用：宿主拿它去 params 里找键，
+            // 形状不对只会得到"永远没命中"，那种错要到用户建完远程才看得出来。
+            if let Some(m) = rt.marker.as_deref().map(str::trim) {
+                if !m.is_empty() {
+                    let ok = m
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+                    if !ok {
+                        bail!(
+                            "{}",
+                            rcgui_i18n::f("{} 的 marker 不是合法的参数名：{}", &[&(at), &(m)])
+                        );
+                    }
+                    if m == "type" {
+                        bail!("{}", rcgui_i18n::f("{} 的 marker 不能是 type", &[&(at)]));
+                    }
+                }
+            }
+            // 说得出「能做什么」才算接得住：写错的操作名会让宿主以为插件会做，
+            // 真到列目录时才失败，用户看到的是功能时好时坏。
+            for op in &rt.ops {
+                if !REMOTE_OPS.contains(&op.as_str()) {
+                    bail!(
+                        "{}",
+                        rcgui_i18n::f(
+                            "{} 声明了宿主不认识的远程操作：{}（只支持 {}）",
+                            &[&(at), &(op), &(REMOTE_OPS.join(" / "))]
+                        )
+                    );
+                }
+            }
+            if rt.ops.len()
+                != rt
+                    .ops
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+            {
+                bail!("{}", rcgui_i18n::f("{} 的 ops 里有重复项", &[&(at)]));
+            }
+        }
+        // 早期设置命名空间交给谁，名字由插件说：这里只检查形状，免得
+        // 一个笔误的命名空间名在启动时静默跳过（用户以为设置搬过去了）。
+        for ns in &self.adopt_legacy {
+            let ok = !ns.trim().is_empty()
+                && ns
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            if !ok {
+                bail!(
+                    "{}",
+                    rcgui_i18n::f("adopt_legacy 里有不合法的命名空间名：{}", &[&(ns)])
+                );
             }
         }
         Ok(())
@@ -1078,6 +1189,7 @@ mod tests {
         assert_eq!(cap_of_op("fs.pick_file"), Some("fs"));
         assert_eq!(cap_of_op("proc.start"), Some("proc"));
         assert_eq!(cap_of_op("http.download"), Some("http"));
+        assert_eq!(cap_of_op("http.upload"), Some("http"));
         assert_eq!(cap_of_op("rclone.call"), Some("rclone"));
         assert_eq!(cap_of_op("rm -rf"), None);
     }
