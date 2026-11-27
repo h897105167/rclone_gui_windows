@@ -532,6 +532,12 @@ impl Watchers {
         self.pending.get(id).and_then(|p| p.problem.clone())
     }
 
+    /// 测试要看「它卡在哪一步」。界面上没有这个数字，所以不进正式代码。
+    #[cfg(test)]
+    fn blocked_by(&self, id: &str) -> Option<Setback> {
+        self.pending.get(id).and_then(Pending::blocked_by)
+    }
+
     #[cfg(test)]
     fn gen_of(&self, id: &str) -> Option<u64> {
         self.live.get(id).map(|live| live.gen)
