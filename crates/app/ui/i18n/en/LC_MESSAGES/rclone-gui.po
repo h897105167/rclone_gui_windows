@@ -688,9 +688,6 @@ msgstr "Light"
 msgid "测试中…"
 msgstr "Testing…"
 
-msgid "测试连接"
-msgstr "Test connection"
-
 msgid "浏览远程路径"
 msgstr "Browse remote path"
 
@@ -1066,8 +1063,8 @@ msgstr "Install"
 msgid "常规"
 msgstr "General"
 
-msgid "内核与连接"
-msgstr "Core & connection"
+msgid "内核"
+msgstr "Core"
 
 msgid "备份与同步"
 msgstr "Backup & sync"

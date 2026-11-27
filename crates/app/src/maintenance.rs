@@ -1042,8 +1042,8 @@ async fn core_install(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
 /// 只在自己拥有的子进程被停掉之后调用。外部实例是别人的进程，它的连接状态
 /// 以及快照都不该因为这里的一个动作被抹掉。
 ///
-/// `hint` 会被放进连接面板的错误行：忘掉端点后状态是「未连接」、错误为空，
-/// 光看界面分不清是「正在换内核」还是「又出故障了」，所以由调用方给一句话。
+/// `hint` 会被当成这条连接状态的失败原因：忘掉端点后状态是「未连接」、错误为空，
+/// 光看仪表盘分不清是「正在换内核」还是「又出故障了」，所以由调用方给一句话。
 async fn forget_core_endpoint(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, hint: Option<&str>) {
     ctx.rc.forget().await;
     let mut view = crate::snapshot_view(ctx).await;
@@ -1089,7 +1089,7 @@ async fn reconnect_after_core_change(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) -> b
     let endpoint = view.endpoint.clone();
     crate::apply_conn_view(ui, view);
     if live {
-        // 连接卡换成新端口了，但远程列表、挂载、任务还是旧内核那一份。
+        // 仪表盘已经指向新端口，但远程列表、挂载、任务还是旧内核那一份。
         // 这里主动拉一次（force）：等下一跳轮询不可靠——轮询有「内容没变就不重绘」
         // 的闸门，取数失败时还会沿用旧快照，界面就停在上一代内核的数据上。
         let ctx2 = ctx.clone();

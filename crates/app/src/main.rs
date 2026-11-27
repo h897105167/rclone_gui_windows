@@ -336,7 +336,6 @@ enum Cmd {
     /// 插件列表检索词变化
     PluginSearch,
     SettingsSave,
-    SettingsTest,
     /// 导出 rcgui.conf 到指定路径
     ConfExport {
         path: PathBuf,
@@ -412,8 +411,6 @@ struct Ctx {
     speed_meter: Arc<std::sync::Mutex<Option<(f64, std::time::Instant)>>>,
     /// 窗口是否可见且未最小化（由 UI 线程每 500ms 采样写入）：门控轮询
     visible: Arc<std::sync::atomic::AtomicBool>,
-    /// 连接/握手进行中（防止连点重复发起）
-    conn_busy: Arc<std::sync::atomic::AtomicBool>,
     /// 已通过「导入预览」校验、等待用户点「应用导入」的文档。
     /// 两步流程本身就是一次确认：预览不写盘，应用才写盘并先备份。
     pending_import: Arc<std::sync::Mutex<Option<rcgui_profile::bundle::RcguiConf>>>,
@@ -3154,6 +3151,23 @@ impl TypeChoices {
     }
 }
 
+/// 打开「新建远程」时重建类型清单：换成完整清单，再按搜索框里还留着的关键字过滤一次。
+///
+/// 搜索词挂在全局属性上，关掉对话框它不会自己清空。只重建清单、不管关键字，界面就会
+/// 「框里写着 kvault、列表却是全部类型」，直到用户再敲一个字才对上（用户实测踩过）。
+///
+/// 返回界面上要显示的清单与 `type-idx` 该写的下标；下标为 `None` 时保存路径会拒绝，
+/// 不会拿旧选中项去建一个别的后端。
+fn rebuilt_type_choices(
+    t: &mut TypeChoices,
+    all: Vec<TypeChoice>,
+    query: &str,
+) -> (Vec<TypeChoice>, Option<usize>) {
+    t.reset(all, None);
+    let kept = t.refilter(query.trim(), None);
+    (t.visible.clone(), kept.idx)
+}
+
 /// 组装一张完整的类型清单：内核报的后端 + 启用插件声明的派生类型。
 ///
 /// 清单里只放真实存在的东西：`providers` 为空（内核没连上、也没有上次成功的缓存）
@@ -3685,7 +3699,6 @@ fn main() {
         last_bwlimit: Arc::new(std::sync::Mutex::new(String::new())),
         speed_meter: Arc::new(std::sync::Mutex::new(None)),
         visible: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        conn_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         pending_import: Arc::new(std::sync::Mutex::new(None)),
         http_server: Arc::new(tokio::sync::Mutex::new(None)),
         hub: Arc::new(state::Hub::new()),
@@ -4365,11 +4378,9 @@ fn notify_show() {
 /// 连接状态在 UI 上的投影。所有字段都可安全展示（不含密码）。
 #[derive(Clone, Default)]
 struct ConnView {
-    status: String,
     live: bool,
     /// 曾连上、现已断开：界面展示的是上次快照
     stale: bool,
-    busy: bool,
     /// 含用户名的安全展示串
     endpoint: String,
     /// 裸地址（仪表盘用）
@@ -4377,8 +4388,6 @@ struct ConnView {
     version: String,
     /// 当前端点是不是我们自己拉起的托管内核（仪表盘据此显示「托管 / 外部」）
     managed: bool,
-    config_path: String,
-    last_refresh: String,
     /// 失败原因，或「已连接但有告警」的说明
     error: String,
 }
@@ -4386,12 +4395,6 @@ struct ConnView {
 struct ConnOutcome {
     view: ConnView,
     version: Option<rcgui_rc::VersionInfo>,
-}
-
-fn now_hms() -> String {
-    use chrono::Timelike as _;
-    let n = chrono::Local::now();
-    format!("{:02}:{:02}:{:02}", n.hour(), n.minute(), n.second())
 }
 
 /// 「没连上」这一支要显示的 RC 地址。
@@ -4410,22 +4413,12 @@ fn startup_endpoint_url(configured: &str, fallback: &str) -> String {
 
 fn apply_conn_view(ui: &Weak<MainWindow>, v: ConnView) {
     let _ = ui.upgrade_in_event_loop(move |ui| {
-        let s = ui.global::<SettingsG>();
-        s.set_conn_status(v.status.as_str().into());
-        s.set_conn_live(v.live);
-        s.set_conn_stale(v.stale);
-        s.set_conn_busy(v.busy);
-        s.set_conn_endpoint(v.endpoint.as_str().into());
-        s.set_conn_version(v.version.as_str().into());
-        s.set_conn_config_path(v.config_path.as_str().into());
-        s.set_conn_last_refresh(v.last_refresh.as_str().into());
-        s.set_conn_error(v.error.as_str().into());
-        // 仪表盘复用同一份状态：running/stale 必须与设置页一致
+        // 仪表盘/顶栏是唯一显示连接状态的地方：设置页不再有连接卡片。
         let d = ui.global::<DashboardG>();
         d.set_running(v.live);
         d.set_stale(v.stale);
         // 连接身份（地址/版本/托管）以前只在启动时写一次，换内核后就一直显示旧端口。
-        // 这里每次投影都重写：谁最后知道真实端点，顶栏和连接卡就跟着谁走。
+        // 这里每次投影都重写：谁最后知道真实端点，顶栏就跟着谁走。
         d.set_url(v.endpoint_url.as_str().into());
         d.set_managed(v.managed);
         if !v.version.is_empty() {
@@ -4440,14 +4433,12 @@ async fn snapshot_view(ctx: &Arc<Ctx>) -> ConnView {
     let status = ctx.rc.status().await;
     let ep = ctx.rc.endpoint().await;
     ConnView {
-        status: status.label().to_string(),
         live: status.is_live(),
         stale: status == ConnStatus::Stale,
         endpoint: ep.display(),
         endpoint_url: ep.url.clone(),
         managed: ctx.maint.core.is_running(),
         error: ctx.rc.last_error().await.unwrap_or_default(),
-        last_refresh: now_hms(),
         ..Default::default()
     }
 }
@@ -4476,18 +4467,14 @@ async fn handshake_only(ctx: &Arc<Ctx>) -> ConnOutcome {
             } else {
                 hs.version.version.clone()
             };
-            let p = hs.config_path();
-            view.config_path = if p.is_empty() { "—".to_string() } else { p };
             // 能力告警与缺失能力分开描述（不要把「能力缺失」说成「连接失败」）
             let mut notes = Vec::new();
             if hs.auth_unset {
                 // 连上了但对端没配 RC 鉴权：除 core/version 外全是 403，
-                // 挂载 / 服务 / 参数读取都做不了。状态说得比「能力受限」更明确；
-                // 具体文案由握手自己塞进 warnings（下面统一并入 notes），
-                // 这里不要再补一条，否则同一件事在界面上会被说两遍。
-                view.status = rcgui_i18n::t("已连接（对端未配置鉴权）").to_string();
+                // 挂载 / 服务 / 参数读取都做不了。具体文案由握手自己塞进
+                // warnings（下面统一并入 notes），这里不要再补一条，
+                // 否则同一件事会被说两遍。
             } else if !hs.is_compatible() {
-                view.status = rcgui_i18n::t("已连接（能力受限）").to_string();
                 notes.push(rcgui_i18n::f("缺少必需能力：{}", &[&(hs.missing_text())]));
             }
             notes.extend(hs.warnings.iter().cloned());
@@ -4501,7 +4488,6 @@ async fn handshake_only(ctx: &Arc<Ctx>) -> ConnOutcome {
             ctx.rc.set_disconnected(Some(e.describe())).await;
             let mut view = snapshot_view(ctx).await;
             view.error = format!("{}：{}（{}）", e.kind.label(), e.kind.hint(), e.detail);
-            view.last_refresh = now_hms();
             ConnOutcome {
                 view,
                 version: None,
@@ -4525,7 +4511,6 @@ async fn connect_report(ctx: &Arc<Ctx>) -> ConnOutcome {
             Err(e) => {
                 let mut view = snapshot_view(ctx).await;
                 view.error = e.to_string();
-                view.last_refresh = now_hms();
                 ConnOutcome {
                     view,
                     version: None,
@@ -4559,46 +4544,11 @@ async fn connect_report(ctx: &Arc<Ctx>) -> ConnOutcome {
         Err(e) => {
             let mut view = snapshot_view(ctx).await;
             view.error = e.to_string();
-            view.last_refresh = now_hms();
             ConnOutcome {
                 view,
                 version: None,
             }
         }
-    }
-}
-
-/// 用户触发的重新握手：置忙 → 握手 → 复位 → 应用到 UI → 分类提示。
-///
-/// 只会握手，不会拉起或停止进程——进程的生命周期归托管值守所有，
-/// 界面上也没有手动连接/断开的入口了。
-async fn rehandshake(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
-    if ctx
-        .conn_busy
-        .swap(true, std::sync::atomic::Ordering::SeqCst)
-    {
-        toast(ui, 0, rcgui_i18n::t("正在连接，请稍候"));
-        return;
-    }
-    let _ = ui.upgrade_in_event_loop(|ui| ui.global::<SettingsG>().set_conn_busy(true));
-    let out = handshake_only(ctx).await;
-    ctx.conn_busy
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    let live = out.view.live;
-    let err = out.view.error.clone();
-    apply_conn_view(ui, out.view);
-    if live {
-        if err.is_empty() {
-            toast(ui, 1, rcgui_i18n::t("连接成功"));
-        } else {
-            toast(ui, 2, err);
-        }
-        // 连上后自动恢复上次的挂载/服务（rclone 自己不持久化 mount/serve）。
-        // 代理的「待应用」也在同一处补下发，且必须先于 replay 完成 ——
-        // 否则刚重建的挂载/服务会用到旧代理。
-        spawn_restore(ctx, ui);
-    } else {
-        toast(ui, 2, rcgui_i18n::f("连接失败：{}", &[&(err)]));
     }
 }
 
@@ -5170,13 +5120,6 @@ async fn backend_main(ctx: Arc<Ctx>, ui: Weak<MainWindow>, rx: &mut mpsc::Unboun
                         // 限速只在配置值变化时下发（apply_global_limit 内部已判重）
                         if t % 2 == 0 {
                             apply_global_limit(&ctx2, &ui2).await;
-                        }
-                        // 已连接时更新「上次刷新」时间戳
-                        if t % 5 == 0 {
-                            let ts = now_hms();
-                            let _ = ui2.upgrade_in_event_loop(move |ui| {
-                                ui.global::<SettingsG>().set_conn_last_refresh(ts.into());
-                            });
                         }
                     });
                 }
@@ -7961,11 +7904,19 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 // 一项都没有 = 内核没连上、也没有上次成功的缓存、还没有插件声明类型。
                 // 这时下拉留空、保存被拒，并说明怎么恢复；不塞任何编造的类型。
                 let empty = choices.is_empty();
-                let first = choices.first().cloned();
-                let idx = match ctx2.type_choices.lock() {
-                    Ok(mut t) => t.reset(choices.clone(), None),
-                    Err(_) => 0,
+                // 搜索框里的关键字是全局属性，关掉对话框它不会自己清空。只重建清单、
+                // 不管关键字，界面就会「写着 kvault、列着 76 项」，直到用户再敲一个字
+                // 才同步（验收实测过）。这里按当前关键字立刻重算一次：用户的搜索词留着，
+                // 列表与它一致；一条都不剩时下标是 None，保存会被拒。
+                let query = read_ui(&ui2, |ui| ui.global::<RemotesG>().get_type_query())
+                    .await
+                    .unwrap_or_default();
+                let (shown, picked) = match ctx2.type_choices.lock() {
+                    Ok(mut t) => rebuilt_type_choices(&mut t, choices.clone(), &query),
+                    // 锁被毒死（别处 panic 过）：退化成一个不筛选的清单，至少能选。
+                    Err(_) => (choices.clone(), if empty { None } else { Some(0) }),
                 };
+                let first = picked.and_then(|i| shown.get(i)).cloned();
                 // 派生类型带着插件给的初始参数：直接铺进「原始参数」，用户
                 // 不用自己敲已知的键。`type` 不写进文本，保存时按 backend 落盘。
                 let seed = first
@@ -7977,10 +7928,10 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                 // 派生类型只是个名字：字段表按它落盘时的 base_type 取，
                 // 插件额外要的键由插件声明的默认值补上。
                 let fields_type = first.as_ref().map(form_fields_type).unwrap_or_default();
-                let shown = choices.clone();
                 // 空清单必须传 `None`：界面写 -1，保存路径据此拒绝，而不是
-                // 悄悄用第 0 项建一个别的后端。
-                let pick = if empty { None } else { Some(idx) };
+                // 悄悄用第 0 项建一个别的后端。搜索一条都不剩时 `picked` 也是
+                // `None`，走同一个拒绝路径。
+                let pick = if empty { None } else { picked };
                 let _ = ui2.upgrade_in_event_loop(move |ui| {
                     push_type_selection(&ui, &shown, pick);
                     if !seed.is_empty() {
@@ -8003,11 +7954,9 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         .to_ascii_lowercase()
                         .contains("authentication must be set up")
                     {
-                        rcgui_i18n::t("端口上的 rclone 没有接受本程序的凭据：可能不是本程序启动的内核。请到「设置 → 内核与连接」查看状态。")
+                        rcgui_i18n::t("端口上的 rclone 没有接受本程序的凭据：可能不是本程序启动的内核。请到「设置 → 内核」查看状态。")
                     } else {
-                        rcgui_i18n::t(
-                            "请到「设置 → 内核与连接」查看内核状态：内核由本程序自动启动并握手。",
-                        )
+                        rcgui_i18n::t("请到「设置 → 内核」查看状态：内核由本程序自动启动并握手。")
                     };
                     toast(
                         &ui2,
@@ -8117,6 +8066,12 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
                         ui.global::<RemotesG>().set_edit_params(seeded.into());
                     });
                 }
+            }
+            // 一条都不剩：类型已经没选中，表单却还铺着上一个类型的字段，看起来
+            // 像「按它填完就能保存」。按空类型重铺，只留通用输入；保存本来就会被拒。
+            if result.idx.is_none() {
+                let providers = get_providers(&ctx).await;
+                update_editor_fields(ui, &providers, "");
             }
             let note: Option<String> = match (result.idx.is_some(), switched_to.as_ref()) {
                 // 一条都不剩：界面写成 -1，保存会被拒，所以要让用户知道该改搜索词。
@@ -9738,11 +9693,6 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             }
             false
         }
-        Cmd::SettingsTest => {
-            // 测试连接 = 完整握手，并把结果写回连接状态区（不再只报「连接正常」）
-            rehandshake(ctx, ui).await;
-            false
-        }
         Cmd::ConfExport {
             path,
             include_secrets,
@@ -11227,12 +11177,6 @@ fn wire_callbacks(
             let _ = tx.send(Cmd::SettingsSave);
         }
     });
-    ui.on_settings_test({
-        let tx = tx.clone();
-        move || {
-            let _ = tx.send(Cmd::SettingsTest);
-        }
-    });
     // 档案导入导出（阶段 5A）：文件选择在 UI 线程做，真正的读写交给后台
     ui.on_conf_export({
         let tx = tx.clone();
@@ -12559,6 +12503,36 @@ mod tests {
         t.reset(sample_types(), None);
         assert!(t.selected(-1).is_none());
         assert_eq!(t.selected(0).unwrap().id, "alias");
+    }
+
+    /// 关掉再打开「新建远程」：搜索框里的关键字还留着，列表必须当场按它重算。
+    ///
+    /// 用户实测的现象：插件停用时搜 kvault（0 项）→ 取消 → 启用插件 → 重开对话框，
+    /// 框里写着 kvault、列表却是全部类型，直到再敲一个字才对上。中间那一步里
+    /// 「搜索词」和「列表」各说各话，用户看到的是与自己搜索无关的类型。
+    #[test]
+    fn reopening_the_editor_filters_by_the_kept_query() {
+        let mut t = TypeChoices::default();
+        let (shown, idx) = rebuilt_type_choices(&mut t, sample_types(), "vaul");
+        assert_eq!(
+            shown.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["k-vault"],
+            "保留的关键字命中的只有 K-Vault，列表必须只剩它"
+        );
+        assert_eq!(idx, Some(0), "命中的这一项就是界面该指向的那一项");
+        assert_eq!(t.selected(0).unwrap().id, "k-vault");
+
+        // 同一个实例下次打开时关键字已清空：回到完整清单，下标回第一项。
+        let (shown, idx) = rebuilt_type_choices(&mut t, sample_types(), "   ");
+        assert_eq!(shown.len(), 3);
+        assert_eq!(idx, Some(0));
+
+        // 一个都不匹配：清单空、下标 None。保存路径据此拒绝，表单也不会铺
+        // 任何类型的字段（`fields_type` 随 `shown` 一起空掉）。
+        let (shown, idx) = rebuilt_type_choices(&mut t, sample_types(), "kvault-plugin-gone");
+        assert!(shown.is_empty());
+        assert_eq!(idx, None, "没有匹配项时不能假装选中了第 0 项");
+        assert!(t.selected(-1).is_none());
     }
 
     /// 插件类型只是个名字：参数表要按它真正落盘时的后端取。

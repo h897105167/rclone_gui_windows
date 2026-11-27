@@ -594,18 +594,6 @@ export global SettingsG {
     in-out property <[string]> log-levels: ["DEBUG", "INFO", "NOTICE", "ERROR"];
     in-out property <int> log-level-idx: 1;
 
-    // ---------- 连接状态区（阶段 3） ----------
-    // status 文案由 Rust 侧按 ConnStatus 给出：未连接 / 已连接 / 已断开（显示的是上次快照）
-    in-out property <string> conn-status: @tr("未连接");
-    in-out property <bool> conn-live: false;
-    in-out property <bool> conn-stale: false;
-    in-out property <bool> conn-busy: false;
-    in-out property <string> conn-endpoint: "";
-    in-out property <string> conn-version: "—";
-    in-out property <string> conn-config-path: "—";
-    in-out property <string> conn-last-refresh: "—";
-    in-out property <string> conn-error: "";
-
     // ---------- 档案导入 / 导出（阶段 5A） ----------
     /// 已有「导入预览」结果、可以点「应用导入」时置 true（两步流程 = 一次确认）
     in-out property <bool> conf-pending: false;
@@ -5248,7 +5236,6 @@ component PluginsView inherits Rectangle {
 component SettingsView inherits Rectangle {
     background: transparent;
     callback save;
-    callback test;
     callback pick-exe;
     callback options-save;
     // 档案导入导出（阶段 5A）
@@ -5265,7 +5252,7 @@ component SettingsView inherits Rectangle {
     // 第一参是动作名，第二参是目标 id（商店条目、同步任务等），空串表示不针对具体对象。
     callback maintenance-action(string, string);
 
-    // 当前页签：0 常规 / 1 内核与连接 / 2 备份与同步 / 3 更新与诊断。
+    // 当前页签：0 常规 / 1 内核 / 2 备份与同步 / 3 更新与诊断。
     // 纯界面状态，不进 Rust 配置——换页不改变任何设置项本身。
     property <int> tab: 0;
 
@@ -5279,7 +5266,7 @@ component SettingsView inherits Rectangle {
             padding-bottom: 6px;
             spacing: 4px;
             TabBtn { label: @tr("常规"); selected: root.tab == 0; act => { root.tab = 0; } }
-            TabBtn { label: @tr("内核与连接"); selected: root.tab == 1; act => { root.tab = 1; } }
+            TabBtn { label: @tr("内核"); selected: root.tab == 1; act => { root.tab = 1; } }
             TabBtn { label: @tr("备份与同步"); selected: root.tab == 2; act => { root.tab = 2; } }
             TabBtn { label: @tr("更新与诊断"); selected: root.tab == 3; act => { root.tab = 3; } }
             Rectangle {}
@@ -5545,77 +5532,9 @@ component SettingsView inherits Rectangle {
                 }
             }
 
-            // 连接（RC API）：地址与口令由 RCGUI 自己生成，界面上只做只读展示——
-            // 临时随机口令一旦变成可编辑字段，用户就会把它当成需要长期维护的东西。
-            if root.tab == 1 : Card {
-                title: @tr("连接（rclone RC API）");
-                VerticalLayout {
-                    spacing: 10px;
-                    Text {
-                        text: @tr("RC 地址与口令由 RCGUI 自己生成，下面显示的是实际连上的端点。");
-                        font-size: 12px;
-                        color: ThemeG.text-dim;
-                        wrap: word-wrap;
-                    }
-                    // 连接状态（阶段 3）：区分「运行中 / 已断开（显示上次快照）/ 未连接」。
-                    // 两种模式共用这一段只读摘要，看得出连的是谁、有没有断开。
-                    HorizontalLayout {
-                        spacing: 8px;
-                        height: 26px;
-                        // Slint 两个对齐别混：alignment 是主轴（水平）对齐，写成 center 会把整行内容居中；
-                        // 交叉轴（垂直）居中要用 cross-axis-alignment。8px 圆点在默认 stretch 下会被拉成竖条。
-                        cross-axis-alignment: center;
-                        FieldLabel { text: @tr("状态"); width: 46px; vertical-alignment: center; }
-                        Rectangle {
-                            width: 8px;
-                            height: 8px;
-                            border-radius: 4px;
-                            background: SettingsG.conn-live ? ThemeG.ok : (SettingsG.conn-stale ? ThemeG.warn : ThemeG.err);
-                        }
-                        Text {
-                            text: SettingsG.conn-status;
-                            font-size: 13px;
-                            color: SettingsG.conn-live ? ThemeG.ok : (SettingsG.conn-stale ? ThemeG.warn : ThemeG.text-dim);
-                            vertical-alignment: center;
-                        }
-                        // 只在连上（或显示上次快照）时露出端点：未连接时 conn-endpoint 是默认回环占位值，
-                        // 与外部模式里用户填的 RC 地址不是一回事，露出来会误导。
-                        Text {
-                            text: (SettingsG.conn-live || SettingsG.conn-stale) ? SettingsG.conn-endpoint : "";
-                            font-size: 12px;
-                            color: ThemeG.text-dim;
-                            vertical-alignment: center;
-                            overflow: elide;
-                            horizontal-stretch: 1;
-                        }
-                    }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        height: 20px;
-                        Text { text: @tr("版本 {}", SettingsG.conn-version); font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; }
-                        Text { text: @tr("· 配置文件 {}", SettingsG.conn-config-path); font-size: 12px; color: ThemeG.text-dim; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
-                    }
-                    Text {
-                        text: @tr("上次刷新 {}", SettingsG.conn-last-refresh);
-                        font-size: 12px;
-                        color: ThemeG.text-dim;
-                        vertical-alignment: center;
-                    }
-                    if SettingsG.conn-error != "" : Text {
-                        text: SettingsG.conn-error;
-                        font-size: 12px;
-                        color: ThemeG.err;
-                        wrap: word-wrap;
-                    }
-                    Text {
-                        text: SettingsG.conn-busy ? @tr("正在连接内核…") : @tr("连接由本程序自动建立：内核一起来就握手，链路断了自动重试，不需要手动连接或断开。");
-                        font-size: 12px;
-                        color: ThemeG.text-dim;
-                        wrap: word-wrap;
-                    }
-                }
-            }
-
+            // 连接状态不在这里显示：内核由本程序随应用启停并自动握手，
+            // 用户没有可做的动作。顶栏与仪表盘那两个状态点已经是同一份数据，
+            // 再摆一张卡片只会让人以为连接需要自己维护。
             HorizontalLayout {
                 spacing: 12px;
                 if root.tab == 1 : Card {
@@ -5970,12 +5889,11 @@ component SettingsView inherits Rectangle {
                 }
             }
 
-            // 保存与测试对所有页都适用，所以固定在最下面，不跟页签走。
+            // 保存对所有页都适用，所以固定在最下面，不跟页签走。
             HorizontalLayout {
                 spacing: 8px;
                 height: 36px;
                 PillBtn { label: @tr("保存设置"); primary: true; clicked => { root.save(); } }
-                PillBtn { label: @tr("测试连接"); clicked => { root.test(); } }
                 Rectangle {}
                 FieldLabel { text: @tr("配置文件: {}", SettingsG.cfg-path); vertical-alignment: center; }
             }
@@ -6510,7 +6428,6 @@ export component MainWindow inherits Window {
     callback plugins-rescan();
     callback copy-text(string);
     callback settings-save();
-    callback settings-test();
     callback pick-exe();
     callback options-save();
     callback conf-export();
@@ -6909,7 +6826,6 @@ export component MainWindow inherits Window {
                 }
                 if NavG.idx == 7 : SettingsView {
                     save => { root.settings-save(); }
-                    test => { root.settings-test(); }
                     pick-exe => { root.pick-exe(); }
                     options-save => { root.options-save(); }
                     conf-export => { root.conf-export(); }

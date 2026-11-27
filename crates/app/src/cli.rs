@@ -46,7 +46,7 @@ const PAGES: &[&str] = &[
 ];
 
 /// 设置对话框的分页（`main.slint` 里设置窗的 tab 顺序）。
-const SETTINGS_TABS: &[&str] = &["常规", "内核与连接", "备份与同步", "更新与诊断"];
+const SETTINGS_TABS: &[&str] = &["常规", "内核", "备份与同步", "更新与诊断"];
 
 /// 插件的两个分页。
 const PLUGIN_TABS: &[&str] = &["已安装", "商店"];
@@ -422,7 +422,7 @@ pub fn diagnostics_with(facts: RuntimeFacts) -> Result<serde_json::Value> {
         None => {
             if resolve_error.is_none() {
                 warnings.push(
-                    "没有找到 rclone 内核：在「设置 → 内核与连接」里指定内核路径（core.path），或让程序下载官方内核"
+                    "没有找到 rclone 内核：在「设置 → 内核」里指定内核路径（core.path），或让程序下载官方内核"
                         .to_string(),
                 );
             }
