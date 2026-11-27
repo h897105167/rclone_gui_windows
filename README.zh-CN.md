@@ -130,7 +130,7 @@ cd rclone_gui_windows
 
 作者通过向 [`docs/store/index.json`](docs/store/index.json) 提 PR 来提交清单；提交规则、审核门槛和 CI 会跑的检查在 [`docs/store/README.md`](docs/store/README.md)。商店里没有任何托管在仓库里的可执行代码——条目只是一个 URL 加一个 SHA-256，应用在解压前会核对 hash。
 
-0.3.0 的新建远程列表只采用当前 rclone 内核返回的类型和已启用插件声明的预设。[kvault 插件](https://github.com/h897105167/rcgui-plugin-kvault) 提供 K-Vault 连接向导与 WebDAV 预设，不再由本体无条件添加该类型。文件上传仍通过本体保留的站点 API 适配层处理，旧远程也可继续编辑。插件已作为 [kvault 0.3.1](https://github.com/h897105167/rcgui-plugin-kvault/releases/tag/v0.3.1) 发布，从商店安装而不是随程序打包：条目指向那个 Release 资产，应用在解压前核对 SHA-256。它要求 RCGUI 0.3.2 及以上，因为它的面板要在你打字时跟着刷新；更低的版本会在安装前被拒。
+0.3.0 的新建远程列表只采用当前 rclone 内核返回的类型和已启用插件声明的预设。[kvault 插件](https://github.com/h897105167/rcgui-plugin-kvault) 提供 K-Vault 连接向导与 WebDAV 预设，不再由本体无条件添加该类型。文件上传仍通过本体保留的站点 API 适配层处理，旧远程也可继续编辑。插件已作为 [kvault 0.3.2](https://github.com/h897105167/rcgui-plugin-kvault/releases/tag/v0.3.2) 发布，从商店安装而不是随程序打包：条目指向那个 Release 资产，应用在解压前核对 SHA-256。它要求 RCGUI 0.3.2 及以上，因为它的面板要在你打字时跟着刷新；更低的版本会在安装前被拒。
 
 <img src="docs/plugins-store-preview.png" alt="RCGUI 0.3.0 开发版：插件窗口的商店标签页" width="720">
 

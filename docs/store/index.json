@@ -15,11 +15,11 @@
     {
       "id": "kvault",
       "name": "K-Vault",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "description": "把一台 K-Vault 站点配成 rclone 远程：填站点地址和访问令牌，测通后建出 webdav 远程，并在插件里直接列目录、上传、删除。站点协议全在插件里，主程序只负责通用转发。",
       "repository": "https://github.com/h897105167/rcgui-plugin-kvault",
-      "url": "https://github.com/h897105167/rcgui-plugin-kvault/releases/download/v0.3.1/kvault-0.3.1.zip",
-      "sha256": "353ada468231675143349106e79b1f9d5301b9a2b0a4121cf868b6004c5bfbd2",
+      "url": "https://github.com/h897105167/rcgui-plugin-kvault/releases/download/v0.3.2/kvault-0.3.2.zip",
+      "sha256": "9c21cf3f27ab26430ed3f0bf2c500c8415d2e38534b7d2dd8b1f58a4bae76367",
       "min_gui_version": "0.3.2",
       "capabilities": ["kv", "ui", "http", "rclone"]
     },

@@ -658,10 +658,16 @@ mod tests {
             .iter()
             .find(|e| e.id == "kvault")
             .expect("商店索引里少了 kvault");
-        assert_eq!(kv.version, "0.3.1", "版本要和发布出来的 zip 同名");
+        assert_eq!(kv.version, "0.3.2", "版本要和发布出来的 zip 同名");
         assert_eq!(
             kv.url,
-            "https://github.com/h897105167/rcgui-plugin-kvault/releases/download/v0.3.1/kvault-0.3.1.zip"
+            "https://github.com/h897105167/rcgui-plugin-kvault/releases/download/v0.3.2/kvault-0.3.2.zip"
+        );
+        // 这条哈希是那个 Release 资产的指纹，也是用户装包前唯一的凭据：
+        // 抄错一个字符，下载完会在最后一步被拒，用户只看到「校验失败」。
+        assert_eq!(
+            kv.sha256, "9c21cf3f27ab26430ed3f0bf2c500c8415d2e38534b7d2dd8b1f58a4bae76367",
+            "商店条目必须指向 kvault v0.3.2 Release 里那个 zip 的 sha256"
         );
         // 这条门槛是收录它的全部意义：0.3.2 之前的宿主每次按键只把文本存进表单，
         // 从不重新向插件要状态，装上去就是填完地址和令牌、按钮一直灰着。
