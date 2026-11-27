@@ -24,6 +24,7 @@
 
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::config;
@@ -463,20 +464,59 @@ pub async fn upload_paths(
 
 /// 从 rclone 的 `远程:路径` 里取出远程名。
 ///
-/// 只有第一段冒号前面才算远程名，而且得像个名字：本地 Windows 路径 `C:\img\a.png`
-/// 的 `C` 也是「冒号前面的一段」，把它当远程名会让一次普通的上传跑去问插件要授权。
-/// 返回 `None` 表示这是本机路径，按原生处理。
+/// 只有第一段冒号前面才算远程名，而且得像个名字。返回 `None` 表示这一定是本机路径，
+/// 不用问归属。
+///
+/// 判「一定是本机路径」的标准是盘符后面紧跟分隔符（`C:\img\a.png`、`C:/img/a.png`）：
+/// 那是 Windows 绝对路径，rclone 的 `fs` 不会这么写。单个字母后面不跟分隔符的
+/// （`x:`、`x:album`）两头都可能——既是盘符相对路径的样子，也可能真是一条叫 `x` 的
+/// 远程。这里不替用户拍板，交回 `Some` 让归属去问：没人认领才按原生走，
+/// 有插件认领就必须走它，不能因为「看着像盘符」把一条插件远程当成原生写入。
 fn remote_name_of(fs: &str) -> Option<&str> {
-    let (name, _) = fs.split_once(':')?;
+    let (name, rest) = fs.split_once(':')?;
     let name = name.trim();
     if name.is_empty() || name.contains('/') || name.contains('\\') {
         return None;
     }
-    // 单个字母当远程名不是没人干过，但更常见的是盘符：`C:` / `D:`。
-    if name.len() == 1 && name.chars().all(|c| c.is_ascii_alphabetic()) {
+    let drive_like = name.len() == 1 && name.chars().all(|c| c.is_ascii_alphabetic());
+    if drive_like && (rest.starts_with('\\') || rest.starts_with('/')) {
         return None;
     }
     Some(name)
+}
+
+/// 一次上传专属的授权键。
+///
+/// 授权表按 `(插件, 键)` 记账，`grant` 是覆盖式写入：两条并发上传用同一个键，后一条会
+/// 顶掉前一条，插件回来取字节时拿到的是别人的文件，撤销时也会误撤别人那条。所以键里
+/// 必须带一个进程内唯一的流水号。
+///
+/// 只能用 ASCII 字母数字和 `.`/`_`/`-`（`plugin_host::upload::is_key` 的约束），远端
+/// 文件名因此不能直接当键：中文名会让这条授权根本建不起来。
+static GRANT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn grant_key(seq: u64) -> String {
+    format!("cap-{}-{}", std::process::id(), seq)
+}
+
+fn next_grant_key() -> String {
+    grant_key(GRANT_SEQ.fetch_add(1, Ordering::SeqCst))
+}
+
+/// 一条授权从建立到撤销的全权负责人。
+///
+/// 插件真正发送时会自己把授权取走（`claim`），那时撤销是空操作；留着它是为了
+/// 「发起方没走到发送那一步」的路径——插件缺席、协议报错、或者调用方中途把 future
+/// 丢掉（取消）。这三种情况下授权都不该在表里留到过期。
+struct GrantGuard {
+    plugin: String,
+    key: String,
+}
+
+impl Drop for GrantGuard {
+    fn drop(&mut self) {
+        plugin_host::upload::revoke(&self.plugin, &self.key);
+    }
 }
 
 /// 这次上传该由谁发字节。
@@ -522,7 +562,7 @@ fn target_of(fs: &str, remote_path: &str, file_name: &str) -> (String, String) {
 /// 都在这里被挡住，不会退回到「用错协议写一遍」。
 ///
 /// 字节只走一次：`src` 按 [`plugin_host::upload::grant`] 的规矩授权给插件，插件发完
-/// 就作废。失败时主动撤销，免得那张授权在过期前一直留着。
+/// 就作废；没走到发送的路径由 [`GrantGuard`] 收尾，不会留到过期。
 pub async fn upload_file_owned(
     ctx: &Arc<Ctx>,
     fs: &str,
@@ -538,23 +578,21 @@ pub async fn upload_file_owned(
         return Ok(None);
     };
     let (dir, name) = target_of(fs, remote_path, file_name);
-    // 授权表的键必须是 ASCII（见 `plugin_host::upload` 的 `is_key`），所以远端文件名
-    // 不能直接当键用：中文名会让这条授权根本建不起来。
-    let key = "remote-0".to_string();
+    let key = next_grant_key();
     plugin_host::upload::grant(&plugin, &key, src).map_err(|e| format!("{e}"))?;
+    // 从这里开始，这条授权由 guard 负责撤销：成功时插件已经取走（撤销是空操作），
+    // 失败和取消都由 Drop 兜住。
+    let _guard = GrantGuard {
+        plugin: plugin.clone(),
+        key: key.clone(),
+    };
     let extra = json!({
         "remote": remote,
         "path": dir,
         "file_name": name,
         "file_key": key,
     });
-    match forward(ctx, &owner, remote, UPLOAD, extra).await {
-        Ok(v) => Ok(Some(v)),
-        Err(e) => {
-            plugin_host::upload::revoke(&plugin, &key);
-            Err(e)
-        }
-    }
+    forward(ctx, &owner, remote, UPLOAD, extra).await.map(Some)
 }
 
 /// 把路径拆成「要发的文件」。目录只展一层还是递归，是宿主的选择：
@@ -1176,5 +1214,95 @@ mod tests {
             target_of("kvault:/", "/a.png", "a.png"),
             (String::new(), "a.png".to_string())
         );
+    }
+
+    #[test]
+    fn a_single_letter_remote_is_still_asked_who_owns_it() {
+        // `x:` 两头都可能：盘符相对路径，或者真有一条叫 `x` 的远程。以前一律当盘符，
+        // 于是一条合法的插件远程 `x:` 直接滑进原生写入——那就是拿 WebDAV 的 PUT 去写
+        // 别人家的接口。
+        assert_eq!(remote_name_of("x:"), Some("x"));
+        assert_eq!(remote_name_of("x:album/a.png"), Some("x"));
+        // 有人认领就走插件。
+        let owner = uploader("x", "某插件", &[LIST, UPLOAD]);
+        assert_eq!(pick_uploader(&owner, "x"), Ok(Some("x".to_string())));
+        // 没人认领还是原生，普通上传的行为没变。
+        assert_eq!(pick_uploader(&Owner::Native, "x"), Ok(None));
+        // 盘符后面紧跟分隔符才是板上钉钉的本机路径。
+        assert_eq!(remote_name_of(r"x:\album\a.png"), None);
+        assert_eq!(remote_name_of("x:/album"), None);
+    }
+
+    #[test]
+    fn every_upload_holds_its_own_grant_key() {
+        let a = next_grant_key();
+        let b = next_grant_key();
+        assert_ne!(a, b, "两条上传不能共用一个授权键");
+        // 键要过得了 `plugin_host::upload` 的 `is_key`：ASCII，长度不超过 64。
+        for key in [&a, &b] {
+            assert!(key.len() <= 64, "{key}");
+            assert!(
+                key.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_uploads_never_share_a_grant_key() {
+        // 并发上传靠这个号区分授权。撞一次，插件回来取字节拿到的就是别人的文件，
+        // 撤销时还会把别人那条一起撤掉。
+        let seen = std::sync::Mutex::new(std::collections::HashSet::new());
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..64 {
+                        let key = next_grant_key();
+                        assert!(seen.lock().unwrap().insert(key), "授权键撞了");
+                    }
+                });
+            }
+        });
+        assert_eq!(seen.into_inner().unwrap().len(), 8 * 64);
+    }
+
+    #[test]
+    fn a_finished_upload_releases_only_its_own_authorisation() {
+        let dir =
+            std::env::temp_dir().join(format!("rg-grants-{}-{}", std::process::id(), grant_key(0)));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let first = dir.join("first.png");
+        let second = dir.join("second.png");
+        std::fs::write(&first, b"first").expect("写 first");
+        std::fs::write(&second, b"second").expect("写 second");
+
+        let plugin = "rg-grant-scope-test";
+        let key_a = next_grant_key();
+        let key_b = next_grant_key();
+        plugin_host::upload::grant(plugin, &key_a, &first).expect("登记 first");
+        plugin_host::upload::grant(plugin, &key_b, &second).expect("登记 second");
+        // 键不同，两条授权才不会互相顶掉。
+        assert!(plugin_host::upload::waiting(plugin, &key_a));
+        assert!(plugin_host::upload::waiting(plugin, &key_b));
+
+        {
+            let _guard = GrantGuard {
+                plugin: plugin.to_string(),
+                key: key_a.clone(),
+            };
+        }
+        // 一条走完只撤自己那条；另一条还在等它自己的发送，不能被连带撤掉。
+        assert!(
+            !plugin_host::upload::waiting(plugin, &key_a),
+            "走完的授权该撤掉"
+        );
+        assert!(
+            plugin_host::upload::waiting(plugin, &key_b),
+            "别撤别人的授权"
+        );
+
+        plugin_host::upload::revoke(plugin, &key_b);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
