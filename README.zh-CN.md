@@ -6,7 +6,7 @@
 
 rclone 的 Windows 桌面前端，用 Rust 写，界面用 [Slint](https://slint.dev)。没有 webview：窗口是原生的，由 Slint 直接绘制，通过 rclone 自己的 RC API 与它通信。
 
-**当前状态：0.3.4 正在开发中。** 对外发布过的最新版本是 **v0.3.3**。本文里标“开发中”的东西都只存在于 HEAD，尚未发布；只有 tag、GitHub Release 和下面列出的那些产物同时存在，才算发布。版本规则与措辞规范见 [`docs/VERSIONING.md`](docs/VERSIONING.md) 和 [`docs/CHANGELOG.md`](docs/CHANGELOG.md)。`v0.3.0` 和 `v0.3.1` 都没有过 tag：下文说的「0.3.0」就是这一批工作，它随 0.3.2 一起发布。
+**当前状态：0.3.5 正在开发中。** 对外发布过的最新版本是 **v0.3.3**（`v0.3.4` 打过 tag 但没有 Release——那次发布被取消，所以它不算发布出去的版本）。本文里标“开发中”的东西都只存在于 HEAD，尚未发布；只有 tag、GitHub Release 和下面列出的那些产物同时存在，才算发布。版本规则与措辞规范见 [`docs/VERSIONING.md`](docs/VERSIONING.md) 和 [`docs/CHANGELOG.md`](docs/CHANGELOG.md)。`v0.3.0` 和 `v0.3.1` 都没有过 tag：下文说的「0.3.0」就是这一批工作，它随 0.3.2 一起发布。
 
 ## 0.3.0 改了什么
 
