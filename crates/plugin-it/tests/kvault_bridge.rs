@@ -9,6 +9,7 @@
 //! 就是失败——不能靠「全是跳过」假装通过。
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use plugin_host::config::REMOTE_OPS;
 use plugin_host::Allowed;
@@ -61,10 +62,15 @@ fn field_of(body: &Value, key: &str) -> String {
 }
 
 /// 写一个小文件并返回路径；测试结束后不清理，临时目录里的几十字节不值得加 teardown。
+///
+/// 名字前面挂一个进程内序号：同一个测试二进制里的用例是并行跑的，两个用例写同一个
+/// 文件名时，后写的那个会把前一个刚登记授权的文件改掉，授权那边看到长度或修改时间
+/// 变了就报「文件在挑选之后被改过」——错的不是被测代码，是这个助手。
 fn temp_file(name: &str, body: &[u8]) -> PathBuf {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!("plugin-it-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("建临时目录失败");
-    let path = dir.join(name);
+    let path = dir.join(format!("{}-{}", SEQ.fetch_add(1, Ordering::SeqCst), name));
     std::fs::write(&path, body).expect("写临时文件失败");
     path
 }
