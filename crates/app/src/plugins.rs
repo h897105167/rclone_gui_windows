@@ -38,9 +38,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use plugin_host::config::{ControlKind, FieldKind, PluginConfig, PluginSetting, CONFIG_JSON};
 use plugin_host::{bundle, Allowed, CapProvider};
 use serde_json::{json, Map, Value};
-use slint::{ComponentHandle as _, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle as _, Model, ModelRc, SharedString, VecModel};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// 插件根目录（用户插件与内置插件都装在这里，二者同构）。
@@ -909,6 +910,15 @@ pub fn effective_form(setting: &PluginSetting, store: &KvStore, id: &str) -> Map
     form
 }
 
+/// 表单被改过多少次。刷新面板前先取一次、回来再比一次：
+/// 期间用户又敲了字，这份响应就是过期的，丢掉，免得旧结果盖掉新输入。
+static FORM_REV: AtomicU64 = AtomicU64::new(0);
+
+/// 当前表单版本号。只增不减，调用方用 `!=` 判断"期间有没有人动过表单"。
+pub fn form_rev() -> u64 {
+    FORM_REV.load(Ordering::SeqCst)
+}
+
 /// 写一个表单字段（用户输入时立刻落盘，避免崩溃丢配置）。
 pub fn set_form_field(store: &KvStore, id: &str, key: &str, value: &str) {
     // 英文界面里下拉框显示的是译文，落盘前必须还原成插件认识的原值。
@@ -916,6 +926,8 @@ pub fn set_form_field(store: &KvStore, id: &str, key: &str, value: &str) {
     let mut form = form_of(store, id);
     form.insert(key.to_string(), Value::String(value));
     let _ = store.set(id, "form", Value::Object(form));
+    // 每个字符都算一次改动：在途的旧刷新据此判定自己过期
+    FORM_REV.fetch_add(1, Ordering::SeqCst);
 }
 
 /// 下拉框回传的是**显示文案**，落盘前按 `config.json` 的选项表反查回落盘值。
@@ -1302,13 +1314,28 @@ impl PanelReopen {
     }
 }
 
+thread_local! {
+    /// 面板行的模型只留一个实例。ListView 记的是"模型里第 i 行"，换一个新模型等于把
+    /// 所有行重造一遍：正在输入的框会失焦、光标跳回开头、没上屏的输入法候选被吃掉。
+    /// 所以重拉面板时只换内容（`set_vec`），打字途中的刷新更只贴变了的那几行
+    /// （见 [`patch_panel`]）。
+    static PANEL_ROWS: Rc<VecModel<PanelRow>> = Rc::new(VecModel::from(Vec::<PanelRow>::new()));
+}
+
+/// 面板行模型（UI 线程里共享的那一个）。
+fn panel_model() -> Rc<VecModel<PanelRow>> {
+    PANEL_ROWS.with(|m| m.clone())
+}
+
 /// 把面板行、页签和指定的页推到界面（**必须在 UI 线程调用**）。
 ///
 /// 页由调用方决定：`page_after_reopen` 算好再传进来，这里不再自己猜。
 pub fn apply_panel_with_page(ui: &crate::MainWindow, rows: &[PanelData], page: &str) {
     let g = ui.global::<crate::PluginsG>();
     let list = panel_to_slint(rows);
-    g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(list))));
+    let rows_model = panel_model();
+    rows_model.set_vec(list);
+    g.set_panel_rows(ModelRc::from(rows_model));
 
     let pages = pages_of(rows);
     let model: Vec<SharedString> = pages.iter().map(|p| p.as_str().into()).collect();
@@ -1347,13 +1374,19 @@ pub fn apply_panel_reopened(
 /// 只清行会留下上一个插件的页签，用户点进去什么也没有。
 pub fn clear_panel(ui: &crate::MainWindow) {
     let g = ui.global::<crate::PluginsG>();
-    let none: Vec<PanelRow> = Vec::new();
-    g.set_panel_rows(ModelRc::from(Rc::new(VecModel::from(none))));
+    let rows_model = panel_model();
+    rows_model.set_vec(Vec::<PanelRow>::new());
+    g.set_panel_rows(ModelRc::from(rows_model));
     let none: Vec<SharedString> = Vec::new();
     g.set_panel_pages(ModelRc::from(Rc::new(VecModel::from(none))));
     g.set_panel_page("".into());
 }
-fn apply_body(ctx: &Arc<Ctx>, id: &str, body: &Value) -> Option<(i32, String)> {
+
+/// 把插件回的 `values` 合并回表单。
+///
+/// 只在"用户没在打字"的时机用：插件会顺手规范化这些值（例如去掉末尾 `/`），
+/// 合并回去会改写用户刚敲的字、并把光标顶到别处。
+fn merge_values(ctx: &Arc<Ctx>, id: &str, body: &Value) {
     // 1) values → 表单
     if let Some(values) = body.get("values").and_then(|v| v.as_object()) {
         let mut form = form_of(&ctx.store, id);
@@ -1363,6 +1396,10 @@ fn apply_body(ctx: &Arc<Ctx>, id: &str, body: &Value) -> Option<(i32, String)> {
         }
         let _ = ctx.store.set(id, "form", Value::Object(form));
     }
+}
+
+/// 记下插件回的状态、校验项和下拉候选；不碰表单。
+fn apply_state(ctx: &Arc<Ctx>, id: &str, body: &Value) {
     // 2) 状态
     let mut state = Map::new();
     if let Some(s) = body.get("status").and_then(|v| v.as_str()) {
@@ -1416,6 +1453,10 @@ fn apply_body(ctx: &Arc<Ctx>, id: &str, body: &Value) -> Option<(i32, String)> {
         old.insert("choices".into(), Value::Object(merged));
         let _ = ctx.store.set(id, "_state", Value::Object(old));
     }
+}
+
+/// 插件要弹的提示，转成 `toast` 用的 (级别, 文案)。
+fn toast_of(body: &Value) -> Option<(i32, String)> {
     // 3) 提示
     body.get("toast").and_then(|t| {
         let msg = t.get("message").and_then(|m| m.as_str())?.to_string();
@@ -1426,6 +1467,12 @@ fn apply_body(ctx: &Arc<Ctx>, id: &str, body: &Value) -> Option<(i32, String)> {
         };
         Some((kind, msg))
     })
+}
+
+fn apply_body(ctx: &Arc<Ctx>, id: &str, body: &Value) -> Option<(i32, String)> {
+    merge_values(ctx, id, body);
+    apply_state(ctx, id, body);
+    toast_of(body)
 }
 
 /// 把 `rc` 声明应用到连接设置（插件决定该连哪里，宿主只负责执行）。
@@ -1983,6 +2030,158 @@ pub async fn build_panel(ctx: &Arc<Ctx>, id: &str) -> Result<Vec<PanelData>> {
     // 每次重建都刷新一次要求：插件不再要轮询时这里会把它撤掉
     set_repeat(id, &body);
     Ok(compose(&cfg.plugin_setting, &body, &form, id))
+}
+
+/// 只重算插件状态，不碰表单。
+///
+/// 和 [`build_panel`] 的唯一区别是不把插件回的 `values` 合并回表单：插件会规范化
+/// 那些值（例如去掉站点地址末尾的 `/`），合并回去等于替用户改字、把光标顶走。
+/// 用户正在输入时用这个，其余时机仍走 [`build_panel`]。
+async fn build_panel_status_only(ctx: &Arc<Ctx>, id: &str) -> Option<Vec<PanelData>> {
+    let (_dir, cfg) = loaded_config(id)?;
+    if cfg.plugin_setting.controls.is_empty() {
+        return None;
+    }
+    // 连状态都问不到（插件刚崩、被停用）就先不刷新：输入框里的字比状态行重要
+    let body = call_plugin(ctx, id, "state", Value::Null).await.ok()?;
+    apply_state(ctx, id, &body);
+    let form = effective_form(&cfg.plugin_setting, &ctx.store, id);
+    let body = merge_saved_choices(&ctx.store, id, body);
+    set_repeat(id, &body);
+    Some(compose(&cfg.plugin_setting, &body, &form, id))
+}
+
+/// 两行在界面上看起来是不是一样。
+///
+/// 只比画得出来的字段。`img` 不比：只有 image 行才有，重贴一次不影响输入。
+fn same_row(a: &PanelRow, b: &PanelRow) -> bool {
+    a.kind == b.kind
+        && a.key == b.key
+        && a.label == b.label
+        && a.text == b.text
+        && a.value == b.value
+        && a.field_kind == b.field_kind
+        && a.placeholder == b.placeholder
+        && a.selected_index == b.selected_index
+        && a.progress == b.progress
+        && a.ok == b.ok
+        && a.lamp == b.lamp
+        && a.warning == b.warning
+        && a.enabled == b.enabled
+        && a.page == b.page
+        && a.options.iter().eq(b.options.iter())
+        && a.buttons.iter().count() == b.buttons.iter().count()
+        && a.buttons.iter().zip(b.buttons.iter()).all(|(x, y)| {
+            x.label == y.label
+                && x.action == y.action
+                && x.style == y.style
+                && x.enabled == y.enabled
+        })
+}
+
+/// 一行该怎么更新：要写回内容就返回它，不用动就返回 `None`。
+///
+/// `editing` 那一行的文字归用户。输入框显示什么全靠模型里的 `value`，这里改它
+/// 等于替用户改字，光标还会跳回开头。按钮的可用性照样跟着新结果走——用户敲完
+/// 地址，「测试连接」就该亮起来，这也是这个函数存在的全部理由。
+fn row_after_patch(old: &PanelRow, new: &PanelRow, editing: &str) -> Option<PanelRow> {
+    let mut next = new.clone();
+    if !editing.is_empty() && next.key.as_str() == editing {
+        next.value = old.value.clone();
+        next.selected_index = old.selected_index;
+    }
+    if same_row(old, &next) {
+        None
+    } else {
+        Some(next)
+    }
+}
+
+/// 把新算出来的一版面贴到当前模型上，只改动真正变了的那几行。
+///
+/// 用 `set_row_data` 而不是换模型：换模型会让列表把所有行重造一遍，正在编辑的
+/// 输入框会失焦、光标跳回开头、未上屏的输入法候选被吃掉。`editing` 那一行连
+/// `value` 都不动——模型是输入框的文字来源，改它等于替用户改字。
+///
+/// 行结构变了（换了插件、页签增删、字段增删）就不是"贴几行"能解决的，返回
+/// `false`，交给调用方整体重建。
+pub fn patch_panel(ui: &crate::MainWindow, rows: &[PanelData], editing: &str) -> bool {
+    let g = ui.global::<crate::PluginsG>();
+    let model = panel_model();
+    if model.row_count() != rows.len() {
+        return false;
+    }
+    let wanted = pages_of(rows);
+    let shown: Vec<String> = g.get_panel_pages().iter().map(|p| p.to_string()).collect();
+    if shown != wanted {
+        return false;
+    }
+    for (i, row) in rows.iter().enumerate() {
+        let Some(old) = model.row_data(i) else {
+            return false;
+        };
+        // 同一个位置换了内容，说明这已经不是同一张面板了
+        if old.kind.as_str() != row.kind.as_str() || old.key.as_str() != row.key.as_str() {
+            return false;
+        }
+        let next = row.to_slint();
+        if let Some(next) = row_after_patch(&old, &next, editing) {
+            model.set_row_data(i, next);
+        }
+    }
+    true
+}
+
+// 输入框的刷新：同一时刻只跑一个，跑着的时候又来了字符就记一笔，跑完再补一次。
+static REFRESH_BUSY: AtomicBool = AtomicBool::new(false);
+static REFRESH_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// 用户改了表单里的一个字段之后，把状态行和按钮可用性补上。
+///
+/// 每次刷新都要问一次插件（一次 WASM 调用），而打字是一串很快的按键：同一时刻
+/// 只跑一个刷新，期间来的改动只记一笔，跑完再补一次，所以最后落地的那次一定是
+/// 针对最新内容的。就算某次结果晚到了，`editing` 那一行的文字也读不到它——
+/// 见 [`patch_panel`]。
+pub async fn refresh_panel_after_edit(
+    ctx: &Arc<Ctx>,
+    ui: &slint::Weak<crate::MainWindow>,
+    id: &str,
+    editing: &str,
+) {
+    if REFRESH_BUSY.swap(true, Ordering::SeqCst) {
+        REFRESH_DIRTY.store(true, Ordering::SeqCst);
+        return;
+    }
+    let editing = editing.to_string();
+    loop {
+        REFRESH_DIRTY.store(false, Ordering::SeqCst);
+        // 问插件之前先记下表单版本：回来时版本变了，这次结果说的就不是现在的内容
+        let seen = form_rev();
+        let rows = build_panel_status_only(ctx, id).await;
+        let stale = form_rev() != seen || REFRESH_DIRTY.load(Ordering::SeqCst);
+        match rows {
+            None => break,
+            Some(rows) => {
+                if !stale {
+                    let plugin = id.to_string();
+                    let key = editing.clone();
+                    let _ = ui.upgrade_in_event_loop(move |ui| {
+                        // 用户可能已经关掉面板或换了插件，别把旧内容糊上去
+                        if ui.global::<crate::PluginsG>().get_panel_plugin().as_str() != plugin {
+                            return;
+                        }
+                        if !patch_panel(&ui, &rows, &key) {
+                            apply_panel(&ui, &rows);
+                        }
+                    });
+                }
+            }
+        }
+        if !stale {
+            break;
+        }
+    }
+    REFRESH_BUSY.store(false, Ordering::SeqCst);
 }
 
 /// 执行面板上的一个动作按钮。
@@ -2660,5 +2859,105 @@ mod tests {
         }];
         let before = PanelReopen::capture("com.example.kvault", "高级");
         assert_eq!(before.resolve("com.example.kvault", &rows), "");
+    }
+
+    fn panel_row(key: &str, value: &str, enabled: bool) -> PanelRow {
+        PanelData {
+            kind: "field".into(),
+            key: key.into(),
+            value: value.into(),
+            enabled,
+            ..Default::default()
+        }
+        .to_slint()
+    }
+
+    /// 用户在「站点地址」里敲字：文字归用户，按钮可用性归插件。
+    ///
+    /// 0.3.1 的毛病就是这条规则没落地。不刷新，按钮永远是灰的；整版重建，正在敲
+    /// 的字被吞回去。这条测试要求两件事同时成立。
+    #[test]
+    fn typing_keeps_its_text_while_the_test_button_turns_on() {
+        let old = panel_row("base", "https://vault.example.com", false);
+        // 用户又敲了一个字符，插件这时才算出来「能测了」
+        let new = panel_row("base", "https://vault.example.com/", true);
+
+        let patch = row_after_patch(&old, &new, "base").expect("按钮状态变了，这一行必须更新");
+
+        assert_eq!(
+            patch.value.as_str(),
+            "https://vault.example.com",
+            "正在编辑的输入框，文字只能来自用户"
+        );
+        assert!(patch.enabled, "地址填上了，控件要跟着变成可用");
+    }
+
+    /// 什么都没变就别写：每写一行界面都要重画，白画会打断输入法候选。
+    #[test]
+    fn an_unchanged_field_is_not_rewritten() {
+        let old = panel_row("base", "https://vault.example.com", true);
+
+        assert!(
+            row_after_patch(&old, &old.clone(), "base").is_none(),
+            "刷新结果和当前行一样，就不该动它"
+        );
+    }
+
+    /// 用户编辑的是地址，别的行不能被冻住：插件换了内容就得显示新内容。
+    #[test]
+    fn rows_other_than_the_one_being_edited_take_the_new_text() {
+        let old = panel_row("dav_url", "https://old.example.com/dav", false);
+        let new = panel_row("dav_url", "https://vault.example.com/dav", true);
+
+        let patch = row_after_patch(&old, &new, "base").expect("内容变了就要更新");
+
+        assert_eq!(
+            patch.value.as_str(),
+            "https://vault.example.com/dav",
+            "没在编辑的行按插件的说法显示"
+        );
+        assert!(patch.enabled);
+    }
+
+    /// 下拉框的选中项也归用户：刷新回来不能把刚选的项拨回存档里的那个。
+    #[test]
+    fn a_select_keeps_the_option_the_user_just_picked() {
+        let mut old = panel_row("storage", "", true);
+        old.selected_index = 2; // 用户刚点了第三项
+        let mut new = panel_row("storage", "", true);
+        new.selected_index = 0; // 插件照存档说第一项
+        new.enabled = false; // 但这一行这会儿不该能点
+
+        let patch = row_after_patch(&old, &new, "storage").expect("可用性变了要更新");
+
+        assert_eq!(patch.selected_index, 2, "选中项是用户的手，不是插件的存档");
+        assert!(!patch.enabled, "可用性照样跟着新结果走");
+    }
+
+    /// 每个字符都要让表单版本 +1：「这次结果是不是过期了」全靠它判断。
+    ///
+    /// 少了这一步，晚到的旧结果会被当成最新的贴上去，用户就会看到自己刚删掉的
+    /// 地址又冒出来、按钮又变回灰色。
+    #[test]
+    fn every_keystroke_moves_the_form_version() {
+        let root = tmp_dir("formrev");
+        let store = KvStore::new(root.clone());
+
+        let before = form_rev();
+        set_form_field(&store, "kvault", "base", "https://vault.example.com");
+        let once = form_rev();
+        set_form_field(&store, "kvault", "base", "https://vault.example.com/");
+        let twice = form_rev();
+
+        assert!(once > before, "第一个字符就该让在途的刷新作废");
+        assert!(twice > once, "每次编辑都要单独记一次");
+
+        let form = form_of(&store, "kvault");
+        assert_eq!(
+            form.get("base").and_then(|v| v.as_str()),
+            Some("https://vault.example.com/"),
+            "表单里留的是最后一次敲进去的内容"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }

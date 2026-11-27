@@ -40,6 +40,26 @@ fn items_of(v: &Value) -> Vec<(String, bool)> {
         .unwrap_or_default()
 }
 
+/// 面板上某个按钮此刻能不能点。
+///
+/// 缺字段一律当「不能点」：宿主正是这么理解的，测试如果缺省成 `true`，插件哪天漏发
+/// `enabled` 就会是绿的，而用户看到的是一个永远灰着的按钮。
+fn flag_of(body: &Value, button: &str) -> bool {
+    body.get("enabled")
+        .and_then(|e| e.get(button))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// 面板上某个输入框回显的值。
+fn field_of(body: &Value, key: &str) -> String {
+    body.get("values")
+        .and_then(|v| v.get(key))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
 /// 写一个小文件并返回路径；测试结束后不清理，临时目录里的几十字节不值得加 teardown。
 fn temp_file(name: &str, body: &[u8]) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("plugin-it-{}", std::process::id()));
@@ -521,4 +541,111 @@ async fn the_manifest_declares_everything_the_host_router_reads() {
     let m = h.manifest().await.expect("wasm 没有返回 manifest");
     assert_eq!(m["version"].as_str(), Some(cfg.version.as_str()));
     assert_eq!(m["id"].as_str(), Some(cfg.id.as_str()));
+}
+
+/// 用户每敲一个字符，宿主就会重问一次面板；这一问必须看见「正在输入的那份表单」。
+///
+/// 输入框里的字存在插件命名空间的 `form` 键里，插件只有把这份表单叠到已保存的设置上，
+/// 按钮才会亮。曾经这里只读已保存的那份，于是「先填站点地址」永远成立、`测试连接`
+/// 永远是灰的——而能保存设置的只有测试连接之后的动作，用户就永远走不出去。
+#[tokio::test]
+async fn typing_the_site_turns_the_test_button_on() {
+    let Some(h) = kvault_harness().await else {
+        eprintln!("{SKIP_NOTE}");
+        return;
+    };
+    let base = h.site.base();
+    let before = h.host.kv_snapshot();
+    // 一个字都还没保存：这份表单就是用户此刻输入框里的内容。
+    let body = h
+        .call(
+            "state",
+            json!({ "form": { "base": base.clone(), "token": "test-token" } }),
+        )
+        .await
+        .expect("填了站点地址，面板应当能重拉出来");
+
+    assert!(
+        flag_of(&body, "test"),
+        "填了站点地址却还点不了测试连接：{body}"
+    );
+    assert!(
+        flag_of(&body, "create"),
+        "地址和令牌都在，建远程却还是灰的：{body}"
+    );
+    assert_eq!(
+        field_of(&body, "base"),
+        base,
+        "面板回显的地址与输入框里输入的不一致：{body}"
+    );
+    assert_eq!(
+        h.host.kv_snapshot(),
+        before,
+        "只是重拉了一次面板，用户存的设置却被改写了"
+    );
+}
+
+/// 地址框被清空之后，面板不能还停在「已就绪」。
+///
+/// 已保存的设置仍然是好的，所以这条只能靠表单说得算：用户删掉了字，按钮就必须跟着灰掉，
+/// 否则点下去测的是一个他已经不打算用的地址。
+#[tokio::test]
+async fn clearing_the_address_puts_the_buttons_back_to_waiting() {
+    let Some(h) = kvault_harness().await else {
+        eprintln!("{SKIP_NOTE}");
+        return;
+    };
+    let base = h.site.base();
+    h.host.put_kv(
+        "site",
+        json!({ "base": base, "token": "test-token", "folder": "album" }),
+    );
+    let body = h
+        .call("state", json!({ "form": { "base": "" } }))
+        .await
+        .expect("清空地址之后，面板仍然要能重拉");
+
+    assert!(
+        !flag_of(&body, "test"),
+        "地址已经清空，测试连接却还能点：{body}"
+    );
+    assert_eq!(
+        field_of(&body, "base"),
+        "",
+        "输入框已经清空，面板却把旧地址塞了回去：{body}"
+    );
+}
+
+/// 存过设置之后，正在输入的那份仍然说了算。
+///
+/// 这是「改完地址还没点保存」的常态：面板回显必须是用户刚敲的字，不能是上次存下来的那份。
+#[tokio::test]
+async fn a_saved_site_never_overwrites_what_is_being_typed() {
+    let Some(h) = kvault_harness().await else {
+        eprintln!("{SKIP_NOTE}");
+        return;
+    };
+    let saved = h.site.base();
+    h.host.put_kv(
+        "site",
+        json!({ "base": saved, "token": "test-token", "folder": "album" }),
+    );
+    let typed = "https://new.example.com";
+    let body = h
+        .call(
+            "state",
+            json!({ "form": { "base": typed, "token": "test-token" } }),
+        )
+        .await
+        .expect("改了地址之后，面板仍然要能重拉");
+
+    assert_eq!(
+        field_of(&body, "base"),
+        typed,
+        "面板回显的是旧设置，用户刚敲的地址被覆盖了：{body}"
+    );
+    assert!(
+        flag_of(&body, "test"),
+        "地址已经改成能用的样子，测试连接却还是灰的：{body}"
+    );
 }
