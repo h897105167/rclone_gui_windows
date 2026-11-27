@@ -2269,11 +2269,22 @@ pub async fn tick(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         );
     }
     if !ready.is_empty() {
-        let fired: Vec<SyncTask> = tasks
-            .iter()
-            .filter(|t| ready.iter().any(|id| id == &t.id))
-            .cloned()
-            .collect();
+        let mut fired: Vec<SyncTask> = Vec::new();
+        for task in tasks.iter().filter(|t| ready.iter().any(|id| id == &t.id)) {
+            // 盘没挂上、网络盘掉线时，通知说的是「里面全没了」。镜像任务照着删就是
+            // 清空云端，所以空目录一律只报告、不执行。
+            if crate::sync_watch::refuses_an_empty_mirror(task) {
+                set_sync_status(
+                    ui,
+                    f(
+                        "任务「{}」的本机目录现在是空的，镜像这一轮不自动跑：怕把云端一起清空。确实是您清空的，就在那一行按「运行」",
+                        &[&display_name(task)],
+                    ),
+                );
+                continue;
+            }
+            fired.push(task.clone());
+        }
         run_tasks(ctx, ui, fired).await;
     }
     push_sync_rows(ctx, ui);

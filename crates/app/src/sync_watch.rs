@@ -55,6 +55,25 @@ pub fn watches(task: &SyncTask) -> bool {
     }
 }
 
+/// 变化触发的镜像任务，本机目录变成空的就不动手。
+///
+/// 盘符没挂上、网络盘掉线、目录被改名之后原地又建了个空的——这几种情况下系统
+/// 通知告诉我们的是「里面的东西全没了」。镜像任务照做就是把云端整棵树删掉，
+/// 一次误读的代价太大，所以这里只报告、不执行；用户确实清空了本机、想把删除
+/// 同步下去，可以在那一行上按「运行」。
+///
+/// 只读一遍目录的第一项，不递归：这个判断每轮都要做，不能变成一次扫盘。
+pub fn refuses_an_empty_mirror(task: &SyncTask) -> bool {
+    if !crate::sync_tasks::is_mirror(task) {
+        return false;
+    }
+    match std::fs::read_dir(root_of(task)) {
+        Ok(mut entries) => entries.next().is_none(),
+        // 打不开的情况由扫描那边报「目录不在了」，这里不重复下结论。
+        Err(_) => false,
+    }
+}
+
 /// 一条任务「有没有变化等着同步」的状态。
 ///
 /// 单独拆出来是为了能直接测：这些判断一旦错了，症状是「用户改了文件，同步没动」，
@@ -669,6 +688,31 @@ mod tests {
         assert!(
             until(|| ws.sync(&[task.clone()]).is_empty()),
             "目录回来了就重新接手"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 盘没挂上、网络盘掉线时目录还在但是空的：镜像任务不能因此把云端清空。
+    #[test]
+    fn an_empty_folder_does_not_drive_a_mirror_task() {
+        let dir = temp_dir("empty-mirror");
+        let mut task = base_task(DIR_UP, true, Some(true));
+        task.local = dir.to_string_lossy().to_string();
+        task.mode = MODE_SYNC.to_string();
+
+        assert!(
+            refuses_an_empty_mirror(&task),
+            "空目录大概是盘没挂上，不是用户把文件删光了"
+        );
+
+        write(&dir, "a.txt", b"x");
+        assert!(!refuses_an_empty_mirror(&task), "有东西了就照常跑");
+
+        std::fs::remove_file(dir.join("a.txt")).expect("删测试文件");
+        task.mode = crate::sync_tasks::MODE_COPY.to_string();
+        assert!(
+            !refuses_an_empty_mirror(&task),
+            "只复制的任务不会删东西，空目录没有危险"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
