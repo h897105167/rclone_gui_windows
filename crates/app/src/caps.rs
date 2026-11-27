@@ -245,6 +245,12 @@ pub struct HostCaps {
     pub rc: Arc<RcState>,
     pub store: Arc<KvStore>,
     pub progress: Arc<ProgressHub>,
+    /// 整个程序的状态，只给「按远程所有者分派」这一类判断用。
+    ///
+    /// 比如 `rclone.upload_file` 要先知道这条远程是普通 rclone 远程还是插件托管的，
+    /// 那个判断（`remote_ops::owner_of`）要看插件清单和远程登记表，光有 `rc` 与
+    /// `store` 做不到。`Ctx` 自己不存 `HostCaps`，所以这里放 `Arc<Ctx>` 不会绕成环。
+    pub ctx: Arc<crate::Ctx>,
 }
 
 impl HostCaps {
@@ -318,6 +324,46 @@ fn remotes_from_conf() -> Vec<String> {
     Vec::new()
 }
 
+/// 每次上传单独一个临时文件名。
+///
+/// `chrono_ts` 只有毫秒加纳秒，两个请求在同一时刻拿到同一个名字并非不可能，
+/// 而临时文件同名就意味着两个上传互相覆盖对方的字节。加一个进程内自增号，
+/// 名字就彻底不会撞。
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn tmp_name() -> String {
+    format!(
+        "up-{}-{}-{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+        chrono_ts()
+    )
+}
+
+/// 上传用的临时副本，离开作用域就删。
+///
+/// 用 Drop 而不是在函数末尾手写 `remove_file`：取消（调用方把 future 丢掉）、
+/// 读盘失败、协议报错都会走到这里，漏一条路径就会在数据目录里攒下用户的图片。
+struct TempCopy {
+    path: std::path::PathBuf,
+}
+
+impl TempCopy {
+    fn new(path: std::path::PathBuf) -> TempCopy {
+        TempCopy { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 #[async_trait::async_trait]
 impl CapProvider for HostCaps {
     // 能力层只按名字转给内核。哪一类远程要由插件接管、请求怎么编码、
@@ -327,13 +373,22 @@ impl CapProvider for HostCaps {
         client.call(&method, &params).await.map_err(Into::into)
     }
 
-    // 插件要往「自己管的远程」上传，走的不是这里，而是 `http.upload`：宿主弹对话框
-    // 拿到路径、授权一次发送，字节不经过 wasm。这个函数只管普通 rclone 远程。
+    // `rclone.upload_file` 的目标可能是普通 rclone 远程，也可能是插件托管的那种，
+    // 所以先问一句「这条远程归谁管」，再决定字节交给谁发。
+    //
+    // 为什么不能一律 copyfile：插件托管的远程在内核眼里只是个普通 WebDAV 地址，
+    // 而对方的服务端只放行它自己的上传接口，原生 PUT 会被回一句
+    // `403 Forbidden: this WebDAV endpoint is read-only`。何况上传地址、去重开关这
+    // 些只有插件知道，也只有它算得出给用户的那个直链。
+    //
+    // 插件那一路不把字节塞进 wasm：宿主先把内容落到临时文件，用
+    // [`plugin_host::upload::grant`] 授权这一次发送，再把「哪个文件、发到哪、叫什么
+    // 名字」告诉它。插件读不到别的路径，也读不到第二次。
     async fn upload_file(
         &self,
         fs: String,
         remote_path: String,
-        _filename: String,
+        filename: String,
         data_b64: String,
     ) -> Result<Value> {
         let data = base64::engine::general_purpose::STANDARD
@@ -341,18 +396,35 @@ impl CapProvider for HostCaps {
             .map_err(|e| anyhow!("{}", rcgui_i18n::f("base64 解码失败: {}", &[&(e)])))?;
         let tmp_dir = config::data_dir().join("tmp");
         std::fs::create_dir_all(&tmp_dir)?;
-        let name = format!("up-{}-{}", std::process::id(), chrono_ts());
-        let tmp = tmp_dir.join(&name);
-        std::fs::write(&tmp, &data)?;
-        let client = self.rc.client().await;
+        let name = tmp_name();
+        // 先建副本再写内容：写到一半出错时那条路径也得有人负责删掉。
+        let tmp = TempCopy::new(tmp_dir.join(&name));
+        std::fs::write(tmp.path(), &data)?;
 
-        let r = client
-            .copyfile(&rclone_client::local_fs(&tmp_dir), &name, &fs, &remote_path)
-            .await
-            .map_err(anyhow::Error::from);
-        let _ = std::fs::remove_file(&tmp);
-        r?;
-        Ok(json!({}))
+        match crate::remote_ops::upload_file_owned(
+            &self.ctx,
+            &fs,
+            &remote_path,
+            &filename,
+            tmp.path(),
+        )
+        .await
+        {
+            // 插件传完了：它的回复里带着名字、直链和去重标记，原样往上交，
+            // 上层（图床插件之类）靠 `link` 决定给用户真实直链还是本机代理地址。
+            Ok(Some(v)) => Ok(v),
+            // 这条远程不归插件管：照旧走原生 copyfile。
+            Ok(None) => {
+                let client = self.rc.client().await;
+                client
+                    .copyfile(&rclone_client::local_fs(&tmp_dir), &name, &fs, &remote_path)
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .map(|()| json!({}))
+            }
+            // 认领者不在或不肯接：如实报出来，不退回原生访问。
+            Err(e) => Err(anyhow!(e)),
+        }
     }
 
     async fn kv_get_all(&self, plugin_id: &str) -> Result<Value> {
@@ -1969,5 +2041,36 @@ mod search_tests {
             "这些 op 在能力表里，但宿主和插件运行时都没有处理：{:?}",
             missing
         );
+    }
+}
+
+#[cfg(test)]
+mod upload_temp_tests {
+    use super::*;
+
+    #[test]
+    fn every_upload_gets_its_own_temp_name() {
+        // 两个上传在同一毫秒里开始也能各写各的副本：名字撞了就是一份字节覆盖另一份，
+        // 插件发出去的内容和用户看到的文件对不上。
+        let a = tmp_name();
+        let b = tmp_name();
+        assert_ne!(a, b, "临时副本名撞了");
+    }
+
+    #[test]
+    fn a_temp_copy_never_survives_its_scope() {
+        let dir = std::env::temp_dir().join(format!("rg-tmpcopy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let path = dir.join(tmp_name());
+        std::fs::write(&path, b"bytes").expect("写文件");
+
+        {
+            let copy = TempCopy::new(path.clone());
+            assert!(copy.path().exists());
+        }
+        // 中途返回、报错或取消都是靠 Drop 收尾，不能留在用户的数据目录里。
+        assert!(!path.exists(), "临时副本离开作用域就该消失");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

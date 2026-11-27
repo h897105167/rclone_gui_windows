@@ -9,6 +9,7 @@
 //! 就是失败——不能靠「全是跳过」假装通过。
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use plugin_host::config::REMOTE_OPS;
 use plugin_host::Allowed;
@@ -61,10 +62,15 @@ fn field_of(body: &Value, key: &str) -> String {
 }
 
 /// 写一个小文件并返回路径；测试结束后不清理，临时目录里的几十字节不值得加 teardown。
+///
+/// 名字前面挂一个进程内序号：同一个测试二进制里的用例是并行跑的，两个用例写同一个
+/// 文件名时，后写的那个会把前一个刚登记授权的文件改掉，授权那边看到长度或修改时间
+/// 变了就报「文件在挑选之后被改过」——错的不是被测代码，是这个助手。
 fn temp_file(name: &str, body: &[u8]) -> PathBuf {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!("plugin-it-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("建临时目录失败");
-    let path = dir.join(name);
+    let path = dir.join(format!("{}-{}", SEQ.fetch_add(1, Ordering::SeqCst), name));
     std::fs::write(&path, body).expect("写临时文件失败");
     path
 }
@@ -234,6 +240,55 @@ async fn upload_sends_the_picked_bytes_and_the_idempotency_key() {
     assert!(
         !up.fields.is_empty(),
         "上传请求里没有任何文本字段，插件漏了站点要的参数"
+    );
+    plugin_host::upload::revoke(PLUGIN_ID, key);
+}
+
+/// 回包必须带着站点给的直链和去重标记。
+///
+/// 主程序的 `rclone.upload_file` 拿到这个回包后，`link` 非空就把它当图片地址给桌面端，
+/// 空了才会退到「本机代理」那条路——那串 `127.0.0.1` 在别的设备上打不开。
+/// 所以站点回了直链、插件却没往外递，用户在别处就看不到图。
+#[tokio::test]
+async fn the_upload_reply_carries_the_site_link_and_the_dedupe_flag() {
+    let Some(h) = kvault_harness().await else {
+        eprintln!("{SKIP_NOTE}");
+        return;
+    };
+    let path = temp_file("cover.png", b"\x89PNG\r\n\x1a\nfake-bytes");
+    // 键名与主程序 `upload_file_owned` 用的那个一致：一次上传只有一格授权。
+    let key = "remote-0";
+    plugin_host::upload::grant(PLUGIN_ID, key, &path).expect("登记授权失败");
+
+    let got = h
+        .call(
+            "remote.upload",
+            json!({
+                "remote": "vault",
+                "path": "album",
+                "file_name": "cover.png",
+                "file_key": key,
+            }),
+        )
+        .await
+        .expect("remote.upload 调用失败");
+
+    let link = got.get("link").and_then(Value::as_str).unwrap_or("");
+    // 站点在测试里回的是相对地址 `/f/a.png`，插件补全后才是能直接打开的链接。
+    assert!(
+        link.ends_with("/f/a.png"),
+        "直链应该来自站点的回复并补全成完整地址：{}",
+        text_of(&got)
+    );
+    assert!(
+        link.contains("://"),
+        "直链没补全，桌面端拿到的是相对路径：{link}"
+    );
+    assert_eq!(
+        got.get("deduped").and_then(Value::as_bool),
+        Some(false),
+        "站点说这次不是重复文件，回包就该照实说：{}",
+        text_of(&got)
     );
     plugin_host::upload::revoke(PLUGIN_ID, key);
 }
@@ -648,4 +703,119 @@ async fn a_saved_site_never_overwrites_what_is_being_typed() {
         flag_of(&body, "test"),
         "地址已经改成能用的样子，测试连接却还是灰的：{body}"
     );
+}
+
+/// 宿主把插件托管的远程整个交给插件之后，字节只能走站点的上传接口。
+///
+/// 用户报的 `403 Forbidden: this WebDAV endpoint is read-only` 就是反例：主程序以前
+/// 一律用 rclone 的 copyfile，对这种远程等于往只读的 DAV 面发 PUT。这里按宿主真实的
+/// 请求形状（`remote`/`path`/`file_name`/`file_key`）走一遍，检查两件事：一条 PUT 都没有，
+/// 且字节、文件名、目标目录三项都对得上。
+#[tokio::test]
+async fn a_host_routed_upload_never_touches_the_read_only_dav_surface() {
+    let Some(h) = kvault_harness().await else {
+        eprintln!("{SKIP_NOTE}");
+        return;
+    };
+    let bytes: &[u8] = b"\x89PNG\r\n\x1a\nhost-routed";
+    let path = temp_file("routed.png", bytes);
+    // 主程序的授权键是 `cap-<pid>-<序号>`，这里照同样的形状取一个。
+    let key = "cap-4242-0";
+    plugin_host::upload::grant(PLUGIN_ID, key, &path).expect("登记授权失败");
+
+    let got = h
+        .call(
+            "remote.upload",
+            json!({
+                "remote": "vault",
+                "path": "album/sub",
+                "file_name": "routed.png",
+                "file_key": key,
+            }),
+        )
+        .await
+        .expect("remote.upload 调用失败");
+
+    let hits = h.site.hits();
+    assert!(
+        !hits.iter().any(|line| line.starts_with("PUT ")),
+        "字节被发到只读的 DAV 面上了：{hits:?}"
+    );
+    assert!(
+        hits.iter().any(|line| line == "POST /api/v1/upload"),
+        "站点没收到上传接口的请求：{hits:?}"
+    );
+
+    let uploads = h.site.uploads();
+    assert_eq!(uploads.len(), 1, "应该恰好一次上传");
+    let up = &uploads[0];
+    assert_eq!(up.file_bytes, bytes, "站点收到的字节和挑中的文件不一致");
+    assert_eq!(up.file_name, "routed.png", "文件名对不上：{}", up.file_name);
+    let folder = up
+        .fields
+        .iter()
+        .find(|(name, _)| name == "folderPath")
+        .map(|(_, value)| value.clone());
+    assert_eq!(
+        folder.as_deref(),
+        Some("album/sub"),
+        "上传目标目录不对：{:?}",
+        up.fields
+    );
+
+    let link = got.get("link").and_then(Value::as_str).unwrap_or("");
+    assert!(
+        link.starts_with("http://") && link.contains("://"),
+        "桌面端拿到的应该是补全过的直链：{link}"
+    );
+    plugin_host::upload::revoke(PLUGIN_ID, key);
+}
+
+/// 连着两次上传各用各的授权：第二次不会顶掉第一次，字节也不会串。
+///
+/// 授权表按 `(插件, 键)` 记，键一旦重复，后登记的会把前一条覆盖掉——那时第二次上传
+/// 发出去的是第一个文件，撤销时撤的也是别人那格。这里连着走两遍，逐次核对字节。
+#[tokio::test]
+async fn two_uploads_in_a_row_keep_their_own_files() {
+    let Some(h) = kvault_harness().await else {
+        eprintln!("{SKIP_NOTE}");
+        return;
+    };
+    let first: &[u8] = b"\x89PNG\r\n\x1a\nfirst";
+    let second: &[u8] = b"\x89PNG\r\n\x1a\nsecond";
+    let path_a = temp_file("first.png", first);
+    let path_b = temp_file("second.png", second);
+    let key_a = "cap-7-0";
+    let key_b = "cap-7-1";
+    plugin_host::upload::grant(PLUGIN_ID, key_a, &path_a).expect("登记第一条授权失败");
+    plugin_host::upload::grant(PLUGIN_ID, key_b, &path_b).expect("登记第二条授权失败");
+    assert!(
+        plugin_host::upload::waiting(PLUGIN_ID, key_a),
+        "后登记的授权顶掉了前一条"
+    );
+
+    for (key, name) in [(key_a, "first.png"), (key_b, "second.png")] {
+        h.call(
+            "remote.upload",
+            json!({
+                "remote": "vault",
+                "path": "album",
+                "file_name": name,
+                "file_key": key,
+            }),
+        )
+        .await
+        .expect("remote.upload 调用失败");
+        assert!(
+            !plugin_host::upload::waiting(PLUGIN_ID, key),
+            "{key} 发完就该作废，留在表里下次会被别人拿去用"
+        );
+    }
+
+    let uploads = h.site.uploads();
+    assert_eq!(uploads.len(), 2, "站点应该收到两次上传");
+    assert_eq!(uploads[0].file_bytes, first, "第一次上传的字节不对");
+    assert_eq!(uploads[0].file_name, "first.png");
+    assert_eq!(uploads[1].file_bytes, second, "第二次上传的字节不对");
+    assert_eq!(uploads[1].file_name, "second.png");
 }

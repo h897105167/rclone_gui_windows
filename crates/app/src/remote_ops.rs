@@ -24,6 +24,7 @@
 
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::config;
@@ -459,6 +460,139 @@ pub async fn upload_paths(
         }
     }
     Ok(up)
+}
+
+/// 从 rclone 的 `远程:路径` 里取出远程名。
+///
+/// 只有第一段冒号前面才算远程名，而且得像个名字。返回 `None` 表示这一定是本机路径，
+/// 不用问归属。
+///
+/// 判「一定是本机路径」的标准是盘符后面紧跟分隔符（`C:\img\a.png`、`C:/img/a.png`）：
+/// 那是 Windows 绝对路径，rclone 的 `fs` 不会这么写。单个字母后面不跟分隔符的
+/// （`x:`、`x:album`）两头都可能——既是盘符相对路径的样子，也可能真是一条叫 `x` 的
+/// 远程。这里不替用户拍板，交回 `Some` 让归属去问：没人认领才按原生走，
+/// 有插件认领就必须走它，不能因为「看着像盘符」把一条插件远程当成原生写入。
+fn remote_name_of(fs: &str) -> Option<&str> {
+    let (name, rest) = fs.split_once(':')?;
+    let name = name.trim();
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    let drive_like = name.len() == 1 && name.chars().all(|c| c.is_ascii_alphabetic());
+    if drive_like && (rest.starts_with('\\') || rest.starts_with('/')) {
+        return None;
+    }
+    Some(name)
+}
+
+/// 一次上传专属的授权键。
+///
+/// 授权表按 `(插件, 键)` 记账，`grant` 是覆盖式写入：两条并发上传用同一个键，后一条会
+/// 顶掉前一条，插件回来取字节时拿到的是别人的文件，撤销时也会误撤别人那条。所以键里
+/// 必须带一个进程内唯一的流水号。
+///
+/// 只能用 ASCII 字母数字和 `.`/`_`/`-`（`plugin_host::upload::is_key` 的约束），远端
+/// 文件名因此不能直接当键：中文名会让这条授权根本建不起来。
+static GRANT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn grant_key(seq: u64) -> String {
+    format!("cap-{}-{}", std::process::id(), seq)
+}
+
+fn next_grant_key() -> String {
+    grant_key(GRANT_SEQ.fetch_add(1, Ordering::SeqCst))
+}
+
+/// 一条授权从建立到撤销的全权负责人。
+///
+/// 插件真正发送时会自己把授权取走（`claim`），那时撤销是空操作；留着它是为了
+/// 「发起方没走到发送那一步」的路径——插件缺席、协议报错、或者调用方中途把 future
+/// 丢掉（取消）。这三种情况下授权都不该在表里留到过期。
+struct GrantGuard {
+    plugin: String,
+    key: String,
+}
+
+impl Drop for GrantGuard {
+    fn drop(&mut self) {
+        plugin_host::upload::revoke(&self.plugin, &self.key);
+    }
+}
+
+/// 这次上传该由谁发字节。
+///
+/// `Ok(None)` 是普通远程，调用方照旧走 rclone；`Ok(Some(id))` 是托管这条远程的插件；
+/// `Err` 是必须原样告诉用户的原因——认领者缺席时绝不能退回原生访问，那等于拿错协议
+/// 去写用户的站点。
+fn pick_uploader(owner: &Owner, remote: &str) -> Result<Option<String>, String> {
+    match owner {
+        Owner::Native => Ok(None),
+        Owner::Orphan { marker } => Err(orphan_msg(remote, marker)),
+        Owner::Plugin { id, .. } if owner.takes(UPLOAD) => Ok(Some(id.clone())),
+        Owner::Plugin { name, .. } => Err(not_taken_msg(remote, UPLOAD, name)),
+    }
+}
+
+/// 目标位置拆成「目录 + 文件名」。
+///
+/// 拼法跟 rclone 的 `copyfile` 一致：`remote_path` 相对 `fs` 的路径部分。换条路走插件
+/// 时口径不能变，否则同一个请求在两种远程上会落到不同位置。
+fn target_of(fs: &str, remote_path: &str, file_name: &str) -> (String, String) {
+    let base = fs.split_once(':').map(|(_, p)| p).unwrap_or("");
+    let rel = if remote_path.trim().is_empty() {
+        file_name
+    } else {
+        remote_path
+    };
+    let full = join_dir(base, rel);
+    if full.is_empty() {
+        return (String::new(), file_name.to_string());
+    }
+    match full.rfind('/') {
+        Some(i) => (full[..i].to_string(), full[i + 1..].to_string()),
+        None => (String::new(), full),
+    }
+}
+
+/// 把已经落在临时文件里的内容交给托管这条远程的插件发送。
+///
+/// `Ok(None)` 表示这条远程不归插件管，调用方该走原生 `copyfile`；`Ok(Some(v))` 是插件
+/// 的回复，里面带着它自己算出的 `name`/`link`/`deduped`（K-Vault 走站点接口，只有它
+/// 知道直链长什么样）。`Err` 会在用户面前原样出现：认领者没启用、或者声明不接上传，
+/// 都在这里被挡住，不会退回到「用错协议写一遍」。
+///
+/// 字节只走一次：`src` 按 [`plugin_host::upload::grant`] 的规矩授权给插件，插件发完
+/// 就作废；没走到发送的路径由 [`GrantGuard`] 收尾，不会留到过期。
+pub async fn upload_file_owned(
+    ctx: &Arc<Ctx>,
+    fs: &str,
+    remote_path: &str,
+    file_name: &str,
+    src: &std::path::Path,
+) -> Result<Option<Value>, String> {
+    let Some(remote) = remote_name_of(fs) else {
+        return Ok(None);
+    };
+    let owner = owner_of(ctx, remote).await?;
+    let Some(plugin) = pick_uploader(&owner, remote)? else {
+        return Ok(None);
+    };
+    let (dir, name) = target_of(fs, remote_path, file_name);
+    let key = next_grant_key();
+    plugin_host::upload::grant(&plugin, &key, src).map_err(|e| format!("{e}"))?;
+    // 从这里开始，这条授权由 guard 负责撤销：成功时插件已经取走（撤销是空操作），
+    // 失败和取消都由 Drop 兜住。
+    let _guard = GrantGuard {
+        plugin: plugin.clone(),
+        key: key.clone(),
+    };
+    let extra = json!({
+        "remote": remote,
+        "path": dir,
+        "file_name": name,
+        "file_key": key,
+    });
+    forward(ctx, &owner, remote, UPLOAD, extra).await.map(Some)
 }
 
 /// 把路径拆成「要发的文件」。目录只展一层还是递归，是宿主的选择：
@@ -995,5 +1129,180 @@ mod tests {
         let claims = BTreeMap::new();
         assert_eq!(resolve_in(&claims, &[], "dav"), Owner::Native);
         assert_eq!(resolve_in(&claims, &table(), "dav"), Owner::Native);
+    }
+
+    // ---- `rclone.upload_file`：字节该由谁发、发到哪儿 ----
+
+    fn uploader(id: &str, name: &str, ops: &[&str]) -> Owner {
+        Owner::Plugin {
+            id: id.into(),
+            name: name.into(),
+            ops: ops.iter().map(|o| (*o).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_windows_drive_is_not_a_remote_name() {
+        // `C:\imgs\a.png` 里冒号前只有盘符。认成远程名的话，一次往本机目录的普通上传
+        // 会跑去问插件要授权，用户看到的提示是「远程 C 由插件提供」。
+        assert_eq!(remote_name_of(r"C:\imgs\a.png"), None);
+        assert_eq!(remote_name_of("D:/imgs/a.png"), None);
+        assert_eq!(remote_name_of("C:/"), None);
+        // 真的远程名照常认。
+        assert_eq!(remote_name_of("kvault:/blog/a.png"), Some("kvault"));
+        assert_eq!(remote_name_of("kvault:"), Some("kvault"));
+        // 冒号前面带路径分隔符的，不是远程名。
+        assert_eq!(remote_name_of("./a:b.png"), None);
+        assert_eq!(remote_name_of(":a.png"), None);
+    }
+
+    #[test]
+    fn a_native_remote_keeps_the_old_path() {
+        // 没有插件认领就得返回 `None`：调用方照旧 copyfile，普通远程的上传行为不变。
+        assert_eq!(pick_uploader(&Owner::Native, "pic"), Ok(None));
+    }
+
+    #[test]
+    fn a_missing_plugin_fails_instead_of_falling_back() {
+        // 插件停用、远程还在：这时候退回原生 copyfile 就是拿 WebDAV 的 PUT 去写一个
+        // 只认自己接口的站点，用户看到的只会是那条莫名其妙的 403。必须明说。
+        let owner = Owner::Orphan {
+            marker: "kvault".into(),
+        };
+        let msg = pick_uploader(&owner, "kvault").expect_err("不能退回原生访问");
+        assert!(msg.contains("没有启用"), "{msg}");
+        assert!(msg.contains("kvault"), "{msg}");
+    }
+
+    #[test]
+    fn a_plugin_that_does_not_take_uploads_says_so() {
+        // 插件甲只声明了 list 与 delete：主程序不能替它猜怎么收文件。
+        let owner = owner_in(&table(), &params(json!({"type": "webdav", "alpha": "1"})));
+        let msg = pick_uploader(&owner, "pic").expect_err("没声明就不接管");
+        assert!(msg.contains("插件甲"), "{msg}");
+        assert!(msg.contains(UPLOAD), "{msg}");
+    }
+
+    #[test]
+    fn the_plugin_that_declares_uploads_gets_the_file() {
+        let owner = uploader("kvault", "K-Vault", &[LIST, UPLOAD]);
+        assert_eq!(
+            pick_uploader(&owner, "kvault"),
+            Ok(Some("kvault".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_target_matches_what_a_native_copy_would_write() {
+        // 与 copyfile 同口径：`remote_path` 相对 `fs` 的路径部分。换条路走插件时位置
+        // 不能变，否则同一个请求在两种远程上会落到不同的地方。
+        assert_eq!(
+            target_of("kvault:/blog", "2024/a.png", "a.png"),
+            ("blog/2024".to_string(), "a.png".to_string())
+        );
+        assert_eq!(
+            target_of("kvault:", "a.png", "a.png"),
+            (String::new(), "a.png".to_string())
+        );
+        // 只给了文件名：目标不能退化成空路径。
+        assert_eq!(
+            target_of("kvault:/blog", "", "IMG_0001.png"),
+            ("blog".to_string(), "IMG_0001.png".to_string())
+        );
+        // 两侧多余的斜杠不能叠出空层。
+        assert_eq!(
+            target_of("kvault:/", "/a.png", "a.png"),
+            (String::new(), "a.png".to_string())
+        );
+    }
+
+    #[test]
+    fn a_single_letter_remote_is_still_asked_who_owns_it() {
+        // `x:` 两头都可能：盘符相对路径，或者真有一条叫 `x` 的远程。以前一律当盘符，
+        // 于是一条合法的插件远程 `x:` 直接滑进原生写入——那就是拿 WebDAV 的 PUT 去写
+        // 别人家的接口。
+        assert_eq!(remote_name_of("x:"), Some("x"));
+        assert_eq!(remote_name_of("x:album/a.png"), Some("x"));
+        // 有人认领就走插件。
+        let owner = uploader("x", "某插件", &[LIST, UPLOAD]);
+        assert_eq!(pick_uploader(&owner, "x"), Ok(Some("x".to_string())));
+        // 没人认领还是原生，普通上传的行为没变。
+        assert_eq!(pick_uploader(&Owner::Native, "x"), Ok(None));
+        // 盘符后面紧跟分隔符才是板上钉钉的本机路径。
+        assert_eq!(remote_name_of(r"x:\album\a.png"), None);
+        assert_eq!(remote_name_of("x:/album"), None);
+    }
+
+    #[test]
+    fn every_upload_holds_its_own_grant_key() {
+        let a = next_grant_key();
+        let b = next_grant_key();
+        assert_ne!(a, b, "两条上传不能共用一个授权键");
+        // 键要过得了 `plugin_host::upload` 的 `is_key`：ASCII，长度不超过 64。
+        for key in [&a, &b] {
+            assert!(key.len() <= 64, "{key}");
+            assert!(
+                key.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_uploads_never_share_a_grant_key() {
+        // 并发上传靠这个号区分授权。撞一次，插件回来取字节拿到的就是别人的文件，
+        // 撤销时还会把别人那条一起撤掉。
+        let seen = std::sync::Mutex::new(std::collections::HashSet::new());
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..64 {
+                        let key = next_grant_key();
+                        assert!(seen.lock().unwrap().insert(key), "授权键撞了");
+                    }
+                });
+            }
+        });
+        assert_eq!(seen.into_inner().unwrap().len(), 8 * 64);
+    }
+
+    #[test]
+    fn a_finished_upload_releases_only_its_own_authorisation() {
+        let dir =
+            std::env::temp_dir().join(format!("rg-grants-{}-{}", std::process::id(), grant_key(0)));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let first = dir.join("first.png");
+        let second = dir.join("second.png");
+        std::fs::write(&first, b"first").expect("写 first");
+        std::fs::write(&second, b"second").expect("写 second");
+
+        let plugin = "rg-grant-scope-test";
+        let key_a = next_grant_key();
+        let key_b = next_grant_key();
+        plugin_host::upload::grant(plugin, &key_a, &first).expect("登记 first");
+        plugin_host::upload::grant(plugin, &key_b, &second).expect("登记 second");
+        // 键不同，两条授权才不会互相顶掉。
+        assert!(plugin_host::upload::waiting(plugin, &key_a));
+        assert!(plugin_host::upload::waiting(plugin, &key_b));
+
+        {
+            let _guard = GrantGuard {
+                plugin: plugin.to_string(),
+                key: key_a.clone(),
+            };
+        }
+        // 一条走完只撤自己那条；另一条还在等它自己的发送，不能被连带撤掉。
+        assert!(
+            !plugin_host::upload::waiting(plugin, &key_a),
+            "走完的授权该撤掉"
+        );
+        assert!(
+            plugin_host::upload::waiting(plugin, &key_b),
+            "别撤别人的授权"
+        );
+
+        plugin_host::upload::revoke(plugin, &key_b);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

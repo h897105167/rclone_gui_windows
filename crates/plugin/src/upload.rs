@@ -130,6 +130,16 @@ pub fn revoke(plugin: &str, form_key: &str) {
         .remove(&(plugin.trim().to_string(), form_key.to_string()));
 }
 
+/// 这条授权还在不在。
+///
+/// 宿主发完一次上传（或者中途失败、被取消）之后用它确认自己那条确实撤掉了。
+/// 只看不取：取走授权的是 `claim`，那条路径还要记「一次挑选只放行一次发送」，
+/// 这里顺手删掉就会让真正的发送拿不到文件。
+pub fn waiting(plugin: &str, form_key: &str) -> bool {
+    let key = (plugin.trim().to_string(), form_key.to_string());
+    state().grants.lock().unwrap().contains_key(&key)
+}
+
 /// 撤掉一个插件的全部授权（卸载、停用、切走面板时用）。
 pub fn revoke_plugin(plugin: &str) {
     let plugin = plugin.trim();
@@ -1163,6 +1173,66 @@ mod tests {
         let out = upload("plug-busy", &params_for(&server.url)).await.unwrap();
         assert_eq!(out["status"], 200);
         assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn two_grants_with_different_keys_keep_their_own_bytes() {
+        let _gate = gate();
+        let first: Vec<u8> = b"first-image-bytes-0123456789".to_vec();
+        let second: Vec<u8> = b"second-image-bytes-9876543210".to_vec();
+        let path_a = tmp_file("pair-a.bin", &first);
+        let path_b = tmp_file("pair-b.bin", &second);
+
+        let key_a = "cap-1-0";
+        let key_b = "cap-1-1";
+        grant("plug-pair", key_a, &path_a).unwrap();
+        grant("plug-pair", key_b, &path_b).unwrap();
+        // 后登记的一条不能顶掉先登记的那条，否则第二条上传会拿到第一个文件。
+        assert!(waiting("plug-pair", key_a));
+        assert!(waiting("plug-pair", key_b));
+
+        let server_a = fake(
+            "200 OK",
+            "Content-Type: application/json\r\n",
+            br#"{"ok":true}"#,
+        );
+        let mut params_a = params_for(&server_a.url);
+        params_a["source"]["form_key"] = json!(key_a);
+        params_a["file"]["name"] = json!("a.png");
+        upload("plug-pair", &params_a).await.unwrap();
+        let seen_a = server_a.seen.lock().unwrap().clone();
+        let body_a = body_of(&seen_a);
+        assert!(
+            body_a.windows(first.len()).any(|w| w == first.as_slice()),
+            "第一条上传发的不是它自己的字节"
+        );
+        assert!(
+            !body_a.windows(second.len()).any(|w| w == second.as_slice()),
+            "第一条上传串进了另一份文件的字节"
+        );
+        // 目标也得对得上：文件名是这次请求自己的。
+        assert!(String::from_utf8_lossy(body_a).contains("a.png"));
+
+        // 发完的那条授权立刻作废，另一条还在等它自己的发送。
+        assert!(!waiting("plug-pair", key_a), "发完的授权该作废");
+        assert!(waiting("plug-pair", key_b), "另一条授权不该被撤");
+
+        let server_b = fake(
+            "200 OK",
+            "Content-Type: application/json\r\n",
+            br#"{"ok":true}"#,
+        );
+        let mut params_b = params_for(&server_b.url);
+        params_b["source"]["form_key"] = json!(key_b);
+        params_b["file"]["name"] = json!("b.png");
+        upload("plug-pair", &params_b).await.unwrap();
+        let seen_b = server_b.seen.lock().unwrap().clone();
+        let body_b = body_of(&seen_b);
+        assert!(
+            body_b.windows(second.len()).any(|w| w == second.as_slice()),
+            "第二条上传发的不是它自己的字节"
+        );
+        assert!(String::from_utf8_lossy(body_b).contains("b.png"));
     }
 
     #[tokio::test]
