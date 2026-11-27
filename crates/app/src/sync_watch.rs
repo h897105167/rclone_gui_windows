@@ -453,6 +453,7 @@ fn root_of(task: &SyncTask) -> PathBuf {
 mod tests {
     use super::*;
     use crate::sync_tasks::{DIR_DOWN, DIR_UP, MODE_COPY, MODE_SYNC};
+    use std::path::Path;
     use std::sync::atomic::AtomicU64;
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
