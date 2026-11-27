@@ -13165,19 +13165,55 @@ mod tests {
         }
     }
 
-    /// 「文件夹同步」这一页新加的界面文案同样要有 msgid。
+    /// 「文件夹同步」这一页里每一句 `@tr()` 都要在 `.po` 里有 msgid。
     ///
-    /// 侧栏标签、卡片标题、行内的自动开关三处缺任何一条，英文界面上就会混进中文。
+    /// 抄一份清单来断言，等于把「以后新加的文案」留给下一个人去发现：这一页是从
+    /// 「传输」搬过来的，搬的过程中就有四条只有中文的标签混了进来。所以这里直接扫
+    /// `main.slint` 里 `component SyncView` 这一整块，扫到的每一条都必须有译文。
+    ///
+    /// 扫的是 `@tr("…")` 里的 msgid 本身：`@tr("下次：{}", s.next)` 这种带参数的
+    /// 只取引号里那段。msgid 里含转义引号的文案扫不准，这一页目前没有这种文案。
     #[test]
     fn folder_sync_page_strings_have_a_po_entry() {
+        let src = include_str!("../ui/main.slint");
+        let start = src
+            .find("component SyncView inherits Rectangle {")
+            .expect("`main.slint` 里应当有 SyncView 组件");
+        let rest = &src[start..];
+        let end = rest
+            .find("\ncomponent ")
+            .expect("SyncView 之后应当还有别的组件");
+        let block = &rest[..end];
+
         let po = include_str!("../ui/i18n/en/LC_MESSAGES/rclone-gui.po");
-        for msgid in ["文件夹同步", "同步任务", "自动：开", "自动：关"] {
+        let mut from = 0;
+        let mut seen = 0;
+        while let Some(open) = block[from..].find("@tr(\"") {
+            let tail = &block[from + open + "@tr(\"".len()..];
+            let mut close = None;
+            let mut escaped = false;
+            for (i, ch) in tail.char_indices() {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    close = Some(i);
+                    break;
+                }
+            }
+            let Some(len) = close else { break };
+            let msgid = &tail[..len];
             let entry = format!("msgid \"{msgid}\"");
             assert!(
                 po.contains(entry.as_str()),
                 "`.po` 缺少 msgid「{msgid}」，英文界面会显示中文"
             );
+            seen += 1;
+            from += open + "@tr(\"".len() + len + 1;
         }
+        // 这一页有三十多条 `@tr`；扫到的太少说明上面切块的位置已经对不上了。
+        assert!(seen > 20, "只扫到 {seen} 条 @tr，切块可能没对上 SyncView");
     }
 
     /// 用户挑过的文件授权必须在三条退出路径上一起失效：插件停用、插件卸载、程序退出。
