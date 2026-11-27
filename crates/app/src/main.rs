@@ -3420,7 +3420,7 @@ pub(crate) async fn refresh_remote_types(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) 
     let _ = ui.upgrade_in_event_loop(move |u| {
         push_type_selection(&u, &shown, pick);
         if lost {
-            toast(
+            toast_ui(
                 &u,
                 2,
                 t("这个类型在当前内核里没有了：请重新选一个类型再保存"),
