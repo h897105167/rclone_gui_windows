@@ -41,6 +41,7 @@ const PAGES: &[&str] = &[
     "挂载",
     "服务",
     "传输",
+    "文件夹同步",
     "插件",
     "设置",
 ];
@@ -73,6 +74,7 @@ const MAINTENANCE_ACTIONS: &[(&str, &str)] = &[
     ("sync-save", "保存同步任务"),
     ("sync-run", "立即运行同步任务"),
     ("sync-toggle", "启用/停用同步任务"),
+    ("sync-auto", "开关：本机文件夹有变化就提前跑一轮"),
     ("sync-delete", "删除同步任务"),
     ("diagnostics", "在界面上显示诊断信息"),
 ];
@@ -955,6 +957,13 @@ pub fn tree_json() -> serde_json::Value {
                     "role": "list", "name": "传输任务", "note": "含进度、速度、取消"
                 }));
             }
+            "文件夹同步" => {
+                children.push(serde_json::json!({
+                    "role": "list",
+                    "name": "同步任务",
+                    "note": "每项含方向、状态、下次时间，以及运行/启用/自动/删除四个按钮"
+                }));
+            }
             _ => {}
         }
         pages.push(serde_json::json!({
@@ -1475,9 +1484,10 @@ mod tests {
     #[test]
     fn pages_match_ui_page_names() {
         // 与 main.slint 的 page-names 必须逐字一致，否则快照与界面各说一套。
-        assert_eq!(PAGES.len(), 8);
+        assert_eq!(PAGES.len(), 9);
         assert_eq!(PAGES[0], "仪表盘");
-        assert_eq!(PAGES[7], "设置");
+        assert_eq!(PAGES[6], "文件夹同步");
+        assert_eq!(PAGES[8], "设置");
         assert_eq!(SETTINGS_TABS.len(), 4);
     }
 
@@ -1518,6 +1528,7 @@ mod tests {
             "sync-save",
             "sync-run",
             "sync-toggle",
+            "sync-auto",
             "sync-delete",
             "diagnostics",
         ] {

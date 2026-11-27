@@ -126,7 +126,7 @@
 
 ## 现在的状态
 
-- 索引里目前是三个真实发布过的插件：`imagehost` 0.6.1、`kvault` 0.3.1、`teldrive` 0.3.0，
+- 索引里目前是三个真实发布过的插件：`imagehost` 0.6.1、`kvault` 0.3.2、`teldrive` 0.3.0，
   三者的 sha256 都对着 GitHub Release 资产核过。
 - `imagehost` 与 `teldrive` 同时在 `plugins/manifest.json` 里（随程序发布），
   `kvault` 只在商店里：它的面板要在用户打字时跟着刷新，这需要 RCGUI 0.3.2 起的宿主，

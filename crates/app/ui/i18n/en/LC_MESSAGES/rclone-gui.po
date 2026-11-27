@@ -976,6 +976,27 @@ msgstr "Transfers"
 msgid "文件夹同步"
 msgstr "Folder sync"
 
+msgid "同步任务"
+msgstr "Sync jobs"
+
+msgid "自动：开"
+msgstr "Auto: on"
+
+msgid "自动：关"
+msgstr "Auto: off"
+
+msgid "本机文件夹有变化就提前跑一轮：靠系统文件变化通知，不是定时扫盘。程序启动后会先跑一轮确认，关机期间发生的变化也补上。只对「本地 → 云端」的任务生效——反方向本机变化是您自己的编辑，不会触发同步。镜像任务默认不开，手动开了之后本机的删除也会同步到云端；本机目录变成空的时候只提醒、不自动跑"
+msgstr "Starts a round early when the local folder changes: it follows system file-change notifications instead of rescanning the folder on a timer. One confirmation round runs after startup, so changes made while the program was closed are caught up too. Only applies to local → remote jobs — in the other direction local changes are your own edits and never start a sync. Mirror jobs stay off by default; once you turn it on, local deletions reach the remote too. If the local folder becomes empty it only reports and does not run"
+
+msgid "任务名称"
+msgstr "Job name"
+
+msgid "同步方向"
+msgstr "Direction"
+
+msgid "同步周期（小时）"
+msgstr "Interval (hours)"
+
 msgid "按周期在两个文件夹之间做增量复制：目标已有且不比源旧的同名文件会跳过；目标里多出来的文件不会被删除。"
 msgstr "Copies only what is new or changed between two folders, on a schedule. A file already at the destination is skipped unless the source is newer; extra files at the destination are never deleted."
 

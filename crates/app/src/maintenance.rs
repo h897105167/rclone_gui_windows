@@ -86,6 +86,9 @@ struct State {
     pending_update: Option<update::UpdateInfo>,
     last_due: Option<Instant>,
     last_poll: Option<Instant>,
+    /// 每个同步任务的文件变化监视、待同步状态和重试时刻。只存内存：重启后重新盯一遍，
+    /// 靠"最新修改时间是否晚于上次同步"补上停机期间漏掉的变化，而不是重新记一遍基线。
+    watchers: crate::sync_watch::Watchers,
     /// 上一次推给界面的同步行指纹，用来避免每秒重设 model 导致列表闪烁/丢选中。
     sync_fingerprint: String,
     /// 内核安装/更新进度，避免同一个安装动作并发重入。
@@ -218,6 +221,17 @@ pub fn load_into_ui(ui: &MainWindow, cfg: &crate::config::AppConfig) {
 
 // ───────────────────────────── 行构造 ─────────────────────────────
 
+/// 进「文件夹同步」页时把已保存的任务灌进界面。
+///
+/// 只重画任务列表，不动表单里那几个输入框：用户可能正填到一半切走又切回来，
+/// 进去一次就把草稿清掉是最容易被骂的那种"贴心"。
+pub fn load_sync_into_ui(ctx: &Arc<Ctx>, ui: &MainWindow) {
+    let cfg = ctx.cfg.lock().unwrap().clone();
+    let rows = sync_rows(&cfg.sync_tasks, Some(&ctx.maint.engine));
+    let g = ui.global::<MaintenanceG>();
+    g.set_sync_items(ModelRc::new(VecModel::from(rows)));
+}
+
 /// 同步任务列表。`engine` 为 None 时表示"还没开始跑"，状态只从配置里读。
 fn sync_rows(tasks: &[SyncTask], engine: Option<&sync_tasks::Engine>) -> Vec<SyncRow> {
     let now = chrono::Local::now();
@@ -260,6 +274,9 @@ fn sync_rows(tasks: &[SyncTask], engine: Option<&sync_tasks::Engine>) -> Vec<Syn
                 remote: task.remote.clone().into(),
                 direction: sync_tasks::ui_direction(task).into(),
                 enabled: task.enabled,
+                // 这一行现在还会不会因为本机变化自己跑起来。别只显示"启用"：
+                // 用户想知道的是"我改完文件它会不会自己动"，那是两件事。
+                auto: crate::sync_watch::watches(task),
                 status: status.into(),
                 next: next.into(),
             }
@@ -289,8 +306,8 @@ fn push_sync_rows(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let mut print = String::new();
     for r in &rows {
         print.push_str(&format!(
-            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\n",
-            r.id, r.name, r.local, r.remote, r.direction, r.status, r.next
+            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\n",
+            r.id, r.name, r.local, r.remote, r.direction, r.enabled, r.auto, r.status, r.next
         ));
     }
     {
@@ -519,6 +536,7 @@ pub async fn handle(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, action: &str, id: &st
         "sync-pick-remote" => sync_pick_remote(ctx, &ui).await,
         "sync-run" => sync_run(ctx, &ui, id).await,
         "sync-toggle" => sync_toggle(ctx, &ui, id).await,
+        "sync-auto" => sync_auto(ctx, &ui, id).await,
         "sync-delete" => sync_delete(ctx, &ui, id).await,
         "diagnostics" => diagnostics(ctx, &ui).await,
         other => {
@@ -1796,6 +1814,8 @@ async fn sync_save(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
         // 界面这一版没有镜像选项：只做 copy。要删目标必须另外显式开启。
         mode: sync_tasks::MODE_COPY.to_string(),
         enabled: true,
+        // 没选过就是 None：盯不盯由模式决定（只复制盯，镜像不盯），见 sync_watch::watches。
+        auto_sync: None,
         interval_hours: hours.max(0) as u32,
         last_run: String::new(),
         last_status: String::new(),
@@ -1814,9 +1834,12 @@ async fn sync_save(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
             // 保留原有的运行记录：改个间隔不该把"上次跑成没跑成"擦掉。
             let last_run = slot.last_run.clone();
             let last_status = slot.last_status.clone();
+            let auto_sync = slot.auto_sync;
             *slot = task.clone();
             slot.last_run = last_run;
             slot.last_status = last_status;
+            // 「自动」是这一行上的开关，改名字改间隔不该把它重置回默认。
+            slot.auto_sync = auto_sync;
         } else {
             cfg.sync_tasks.push(task.clone());
         }
@@ -1863,6 +1886,9 @@ async fn sync_run(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
     let client = ctx.rc.client().await;
     match sync_tasks::start(&client, &ctx.maint.engine, &task).await {
         Ok(jobid) => {
+            // 手动按「运行」也算这一轮开工了：跑动期间来的变化要留着补一轮，
+            // 不能因为「没人告诉监视端它在跑」就被当成已经同步过。
+            ctx.maint.state().watchers.note_running(id);
             // 立刻记下"已经跑过"，否则调度器 30 秒后又会看到它到期。
             let stamp = rcgui_profile::now_iso();
             {
@@ -1916,6 +1942,41 @@ async fn sync_toggle(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
         // 停用只是不再排下一轮；正在跑的这一次让它跑完，否则用户会以为文件传了一半。
         text.push_str(&t("。正在进行的这一轮会跑完，之后不再启动。"));
     }
+    set_sync_status(ui, text);
+}
+
+/// 开关「本机有变化就提前跑一轮」。
+///
+/// 下行任务（云端 → 本机）上这个开关存着但不生效：那方向里本机文件的变化正是用户自己的
+/// 编辑，拿它去触发同步会把编辑覆盖掉。所以这里如实说"不会触发"，而不是显示一个亮着的
+/// 开关让用户以为它在管用。
+async fn sync_auto(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
+    let (now_auto, up, mirror) = {
+        let mut cfg = ctx.cfg.lock().unwrap();
+        let Some(slot) = cfg.sync_tasks.iter_mut().find(|t| t.id == id) else {
+            set_sync_status(ui, f("找不到任务：{}", &[&id]));
+            return;
+        };
+        // 从现在的实际状态取反，而不是翻转字段：镜像任务没选过时是「不开」，第一次点要变成开。
+        let want = !crate::sync_watch::watches(slot);
+        slot.auto_sync = Some(want);
+        let up = sync_tasks::is_up(slot);
+        let mirror = sync_tasks::is_mirror(slot);
+        let _ = crate::config::save(&cfg);
+        (want, up, mirror)
+    };
+    // 开关变了也要让指纹变：否则列表上的「自动」标记要等下一次状态变化才刷新。
+    ctx.maint.state().sync_fingerprint.clear();
+    push_sync_rows(ctx, ui);
+    let text = if !now_auto {
+        t("已关闭自动同步：只按间隔运行").to_string()
+    } else if !up {
+        t("已打开自动同步，但这是「云端 → 本机」的任务：本机文件的变化不会触发同步").to_string()
+    } else if mirror {
+        t("已打开自动同步：本机文件夹一变就提前跑一轮。这是镜像任务，本机的删除也会跟着同步到云端").to_string()
+    } else {
+        t("已打开自动同步：本机文件夹有变化就提前跑一轮").to_string()
+    };
     set_sync_status(ui, text);
 }
 
@@ -2182,6 +2243,61 @@ pub async fn tick(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         ctx.maint.state().last_due = Some(now);
         spawn_due(ctx, ui).await;
     }
+    // 本机目录的变化靠系统通知，这里只收一拍事件队列，不扫盘。
+    let tasks: Vec<SyncTask> = {
+        let cfg = ctx.cfg.lock().unwrap();
+        cfg.sync_tasks.clone()
+    };
+    let (ready, problems) = {
+        let now = Instant::now();
+        let mut st = ctx.maint.state();
+        // 该盯的目录对齐一遍：任务删了、停用了、方向改了，监视线程跟着撤掉。
+        let mut problems = st.watchers.sync(&tasks, now);
+        let tick = st.watchers.pump(now);
+        problems.extend(tick.problems);
+        (tick.ready, problems)
+    };
+    if let Some((id, why)) = problems.first() {
+        let name = tasks
+            .iter()
+            .find(|t| &t.id == id)
+            .map(display_name)
+            .unwrap_or_else(|| id.clone());
+        set_sync_status(
+            ui,
+            f(
+                "任务「{}」的文件夹看不住，这一轮不自动同步：{}",
+                &[&name, why],
+            ),
+        );
+    }
+    if !ready.is_empty() {
+        let mut fired: Vec<SyncTask> = Vec::new();
+        for task in tasks.iter().filter(|t| ready.iter().any(|id| id == &t.id)) {
+            // 盘没挂上、网络盘掉线、目录被改名之后再建一个空的、权限被收走：通知说的是
+            // 「里面全没了」，或者干脆读不出来。镜像任务照着删就是清空云端，所以一律只
+            // 报告、不执行。
+            if crate::sync_watch::refuses_a_mirror_round(task) {
+                // 这一轮不跑，但欠着的那一次变化还在。挡住、不自燃：等到下一次变化、
+                // 目录回来，或者用户自己按「运行」——每分钟重试一次只是打扰。
+                ctx.maint.state().watchers.note_setback(
+                    &task.id,
+                    crate::sync_watch::Setback::Guarded,
+                    Instant::now(),
+                );
+                set_sync_status(
+                    ui,
+                    f(
+                        "任务「{}」的本机目录现在是空的或者读不了，镜像这一轮不自动跑：怕把云端一起清空。确实是您清空的，就在那一行按「运行」",
+                        &[&display_name(task)],
+                    ),
+                );
+                continue;
+            }
+            fired.push(task.clone());
+        }
+        run_tasks(ctx, ui, fired).await;
+    }
     push_sync_rows(ctx, ui);
 }
 
@@ -2197,6 +2313,15 @@ async fn poll_finished(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let finished = sync_tasks::poll(&client, &ctx.maint.engine).await;
     if finished.is_empty() {
         return;
+    }
+    // 这一轮结束了：把监视端记的"正在跑"清掉。失败时待同步状态还留着，过一会儿再试。
+    {
+        let now = Instant::now();
+        let mut st = ctx.maint.state();
+        for item in &finished {
+            st.watchers
+                .note_round_finished(&item.task_id, item.status == "ok", now);
+        }
     }
     let changed = {
         let mut cfg = ctx.cfg.lock().unwrap();
@@ -2231,9 +2356,6 @@ async fn poll_finished(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
 
 /// 到点的任务起一轮。已有 job 在跑的任务跳过（不重复启动同一目录）。
 async fn spawn_due(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
-    if !ctx.rc.is_live() {
-        return;
-    }
     let now = chrono::Local::now();
     let due: Vec<SyncTask> = {
         let cfg = ctx.cfg.lock().unwrap();
@@ -2245,6 +2367,42 @@ async fn spawn_due(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             .cloned()
             .collect()
     };
+    run_tasks(ctx, ui, due).await;
+}
+
+/// 起一轮这些任务。内核没连上、或者已经有 job 在跑的任务都直接跳过。
+async fn run_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, tasks: Vec<SyncTask>) {
+    if tasks.is_empty() {
+        return;
+    }
+    if !ctx.rc.is_live() {
+        // 连内核都没连上：变化是欠着的，得把它记回去，否则监视端以为这一轮已经在跑。
+        // 这是「启动失败」那一类：隔一会儿再试，间隔逐次拉长。
+        let now = Instant::now();
+        let mut st = ctx.maint.state();
+        for task in &tasks {
+            st.watchers
+                .note_setback(&task.id, crate::sync_watch::Setback::Deferred, now);
+        }
+        return;
+    }
+    let mut due: Vec<SyncTask> = Vec::new();
+    {
+        let now = Instant::now();
+        for task in tasks {
+            if ctx.maint.engine.is_active(&task.id) {
+                // 引擎已经在跑这个目录（到期和文件变化常常落在同一拍）。这一轮没真的开始，
+                // 不能算同步过：记成「等那一轮结束」，那一轮收尾时解开会补一次。
+                ctx.maint.state().watchers.note_setback(
+                    &task.id,
+                    crate::sync_watch::Setback::Busy,
+                    now,
+                );
+            } else {
+                due.push(task);
+            }
+        }
+    }
     if due.is_empty() {
         return;
     }
@@ -2252,8 +2410,18 @@ async fn spawn_due(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let mut started = Vec::new();
     for task in due {
         match sync_tasks::start(&client, &ctx.maint.engine, &task).await {
-            Ok(jobid) => started.push((task, jobid)),
+            Ok(jobid) => {
+                // 定时这一轮也开工了。跑动期间来的变化记在监视端，收尾时按标记数补一轮；
+                // 少了这一步，变化会被当成「这一轮已经同步过」。
+                ctx.maint.state().watchers.note_running(&task.id);
+                started.push((task, jobid));
+            }
             Err(e) => {
+                ctx.maint.state().watchers.note_setback(
+                    &task.id,
+                    crate::sync_watch::Setback::Deferred,
+                    Instant::now(),
+                );
                 let mut cfg = ctx.cfg.lock().unwrap();
                 if let Some(slot) = cfg.sync_tasks.iter_mut().find(|t| t.id == task.id) {
                     slot.last_status = format!("failed: {e}");
@@ -2458,6 +2626,7 @@ mod tests {
             direction: direction.to_string(),
             mode: sync_tasks::MODE_COPY.to_string(),
             enabled: true,
+            auto_sync: None,
             interval_hours: 6,
             last_run: String::new(),
             last_status: String::new(),
@@ -2645,5 +2814,150 @@ mod tests {
             "外部模式必须先去返回，不能顺路停掉某个进程"
         );
         assert!(custom < stop, "手填路径必须先返回，原文件不能被动");
+    }
+
+    // ───────────────── 自动同步：调度链的信号顺序 ─────────────────
+    //
+    // 这里照抄 `tick` / `run_tasks` / `sync_run` / `poll_finished` 调监视端的顺序，
+    // 不碰真实的 rclone：要验的是「一轮在跑的时候来了一条变化，收尾之后还会不会补」。
+    // 定时、手动、变化触发三条路各自的开工标记就在这里体现。
+
+    fn watch_task(tag: &str) -> (std::path::PathBuf, SyncTask) {
+        let dir = std::env::temp_dir().join(format!("rcgui-chain-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let mut t = task(sync_tasks::DIR_UP, "t1");
+        t.local = dir.display().to_string();
+        t.auto_sync = Some(true);
+        (dir, t)
+    }
+
+    /// 走到「监视端刚接手、那一轮已经跑完」：这时候没有欠账。
+    fn after_takeover(ws: &mut crate::sync_watch::Watchers, task: &SyncTask, at: Instant) {
+        assert!(
+            ws.sync(std::slice::from_ref(task), at).is_empty(),
+            "监视器该建起来"
+        );
+        let later = at + crate::sync_watch::SETTLE + std::time::Duration::from_millis(10);
+        assert_eq!(
+            ws.pump(later).ready,
+            vec![task.id.clone()],
+            "接手后先跑一轮"
+        );
+        ws.note_running(&task.id);
+        ws.note_round_finished(&task.id, true, at);
+        assert!(!ws.wants_round(&task.id), "接手那一轮跑完不该再欠着");
+    }
+
+    /// 定时这一轮跑到一半时来的变化，收尾之后必须补一次。
+    ///
+    /// 这一轮没经过 `take_ready`（到期就直接开工），所以只有 `note_running` 能让
+    /// 监视端知道「跑动期间的变化已经同步过了没有」——原来漏掉的正是这一步。
+    #[test]
+    fn a_timer_round_keeps_the_change_that_arrives_while_it_runs() {
+        let (dir, task) = watch_task("timer");
+        let mut ws = crate::sync_watch::Watchers::default();
+        let t0 = Instant::now();
+        after_takeover(&mut ws, &task, t0);
+
+        ws.note_running(&task.id);
+        ws.note_change(&task.id, t0 + std::time::Duration::from_millis(500));
+        // 静默窗口还没过，这一轮就结束了。
+        ws.note_round_finished(&task.id, true, t0 + std::time::Duration::from_millis(600));
+
+        assert!(ws.wants_round(&task.id), "跑动期间的变化不能算同步过");
+        let at = t0 + std::time::Duration::from_millis(600) + crate::sync_watch::SETTLE;
+        assert_eq!(
+            ws.pump(at + std::time::Duration::from_millis(10)).ready,
+            vec![task.id.clone()],
+            "补一次"
+        );
+
+        ws.note_running(&task.id);
+        ws.note_round_finished(&task.id, true, at + std::time::Duration::from_secs(60));
+        assert!(
+            ws.pump(at + std::time::Duration::from_secs(120))
+                .ready
+                .is_empty(),
+            "补过之后没有新变化就别再跑"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 手动按「运行」的那一轮同样要留住跑动期间的变化。
+    #[test]
+    fn a_manual_round_keeps_the_change_that_arrives_while_it_runs() {
+        let (dir, task) = watch_task("manual");
+        let mut ws = crate::sync_watch::Watchers::default();
+        let t0 = Instant::now();
+        after_takeover(&mut ws, &task, t0);
+
+        ws.note_running(&task.id);
+        ws.note_change(&task.id, t0 + std::time::Duration::from_millis(100));
+        ws.note_round_finished(&task.id, true, t0 + std::time::Duration::from_millis(200));
+
+        assert!(ws.wants_round(&task.id), "手动那一轮跑动期间的变化也要补");
+        let at = t0 + std::time::Duration::from_millis(200) + crate::sync_watch::SETTLE;
+        assert_eq!(
+            ws.pump(at + std::time::Duration::from_millis(10)).ready,
+            vec![task.id.clone()]
+        );
+
+        ws.note_running(&task.id);
+        ws.note_round_finished(&task.id, true, at + std::time::Duration::from_secs(30));
+        assert!(
+            ws.pump(at + std::time::Duration::from_secs(90))
+                .ready
+                .is_empty(),
+            "一轮就够"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一轮从头到尾没人动过文件，收尾之后不能再跑一轮。
+    #[test]
+    fn a_round_without_a_change_does_not_bring_another() {
+        let (dir, task) = watch_task("quiet");
+        let mut ws = crate::sync_watch::Watchers::default();
+        let t0 = Instant::now();
+        after_takeover(&mut ws, &task, t0);
+
+        ws.note_running(&task.id);
+        ws.note_round_finished(&task.id, true, t0 + std::time::Duration::from_secs(5));
+
+        assert!(!ws.wants_round(&task.id), "没变化就不欠");
+        assert!(
+            ws.pump(t0 + std::time::Duration::from_secs(120))
+                .ready
+                .is_empty(),
+            "别自己加一遍"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 事件还在队列里、这一轮就已经收尾了：那条变化不能被当成「已同步」。
+    ///
+    /// 「队列里那条事件终于被 pump 取到」用 `note_change` 代替——真正的 pump 需要
+    /// 真实文件事件，而这里要验的是先后顺序。
+    #[test]
+    fn a_change_sitting_in_the_queue_survives_the_round_finishing() {
+        let (dir, task) = watch_task("queued");
+        let mut ws = crate::sync_watch::Watchers::default();
+        let t0 = Instant::now();
+        after_takeover(&mut ws, &task, t0);
+
+        ws.note_running(&task.id);
+        ws.note_round_finished(&task.id, true, t0 + std::time::Duration::from_secs(5));
+        // 收尾之后事件才被取到。
+        ws.note_change(&task.id, t0 + std::time::Duration::from_secs(5));
+
+        assert!(ws.wants_round(&task.id), "晚到的那条变化要留着");
+        let at = t0 + std::time::Duration::from_secs(5) + crate::sync_watch::SETTLE;
+        assert_eq!(
+            ws.pump(at + std::time::Duration::from_millis(10)).ready,
+            vec![task.id.clone()],
+            "晚到的变化也补一轮"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

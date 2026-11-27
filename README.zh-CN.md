@@ -6,7 +6,7 @@
 
 rclone 的 Windows 桌面前端，用 Rust 写，界面用 [Slint](https://slint.dev)。没有 webview：窗口是原生的，由 Slint 直接绘制，通过 rclone 自己的 RC API 与它通信。
 
-**当前状态：0.3.3 正在开发中。** 对外发布过的最新版本是 **v0.3.2**。本文里标“开发中”的东西都只存在于 HEAD，尚未发布；只有 tag、GitHub Release 和下面列出的那些产物同时存在，才算发布。版本规则与措辞规范见 [`docs/VERSIONING.md`](docs/VERSIONING.md) 和 [`docs/CHANGELOG.md`](docs/CHANGELOG.md)。`v0.3.0` 和 `v0.3.1` 都没有过 tag：下文说的「0.3.0」就是这一批工作，它随 0.3.2 一起发布。
+**当前状态：0.3.4 正在开发中。** 对外发布过的最新版本是 **v0.3.3**。本文里标“开发中”的东西都只存在于 HEAD，尚未发布；只有 tag、GitHub Release 和下面列出的那些产物同时存在，才算发布。版本规则与措辞规范见 [`docs/VERSIONING.md`](docs/VERSIONING.md) 和 [`docs/CHANGELOG.md`](docs/CHANGELOG.md)。`v0.3.0` 和 `v0.3.1` 都没有过 tag：下文说的「0.3.0」就是这一批工作，它随 0.3.2 一起发布。
 
 ## 0.3.0 改了什么
 
@@ -55,6 +55,7 @@ rclone 的 Windows 桌面前端，用 Rust 写，界面用 [Slint](https://slint
 | **挂载** | 用缓存模式与只读标志挂到盘符，确认盘符真的出现了，从官方或镜像源装 WinFsp，重连后重建记住的挂载 | 已发布 |
 | **服务** | 把远程以 HTTP / WebDAV / FTP / SFTP / DLNA 提供出去，带各自的凭据；启动、停止、查看，重连后重建 | 已发布 |
 | **传输** | 进行中与已完成的传输，进度、速度、总量，后台任务按种类标注 | 已发布 |
+| **文件夹同步** | 按方向和间隔把一个本地文件夹同步到远程；本机文件夹有变化时可以提前跑一轮（默认开启，只对「本地 → 云端」生效，反方向本机变化是自己的编辑），打不开的目录只报一次 | 开发中 |
 | **插件** | 安装、启用、停用、卸载；渲染声明式设置面板；恢复被删掉的内置插件；打开插件目录 | 已发布 |
 | **设置** | RC 端点与凭据、主题、强调色、语言、winget 镜像、配置文件路径、`rcgui.conf` 导入导出、内核选择 | 端点与外观已发布；**内核选择开发中** |
 | **插件商店** | 浏览静态索引，查看权限与来源，安装校验过 hash 的发布包 | 开发中（索引、页面和应用里的商店客户端都在树里，尚未发布） |
@@ -129,7 +130,7 @@ cd rclone_gui_windows
 
 作者通过向 [`docs/store/index.json`](docs/store/index.json) 提 PR 来提交清单；提交规则、审核门槛和 CI 会跑的检查在 [`docs/store/README.md`](docs/store/README.md)。商店里没有任何托管在仓库里的可执行代码——条目只是一个 URL 加一个 SHA-256，应用在解压前会核对 hash。
 
-0.3.0 的新建远程列表只采用当前 rclone 内核返回的类型和已启用插件声明的预设。[kvault 插件](https://github.com/h897105167/rcgui-plugin-kvault) 提供 K-Vault 连接向导与 WebDAV 预设，不再由本体无条件添加该类型。文件上传仍通过本体保留的站点 API 适配层处理，旧远程也可继续编辑。插件已作为 [kvault 0.3.1](https://github.com/h897105167/rcgui-plugin-kvault/releases/tag/v0.3.1) 发布，从商店安装而不是随程序打包：条目指向那个 Release 资产，应用在解压前核对 SHA-256。它要求 RCGUI 0.3.2 及以上，因为它的面板要在你打字时跟着刷新；更低的版本会在安装前被拒。
+0.3.0 的新建远程列表只采用当前 rclone 内核返回的类型和已启用插件声明的预设。[kvault 插件](https://github.com/h897105167/rcgui-plugin-kvault) 提供 K-Vault 连接向导与 WebDAV 预设，不再由本体无条件添加该类型。文件上传仍通过本体保留的站点 API 适配层处理，旧远程也可继续编辑。插件已作为 [kvault 0.3.2](https://github.com/h897105167/rcgui-plugin-kvault/releases/tag/v0.3.2) 发布，从商店安装而不是随程序打包：条目指向那个 Release 资产，应用在解压前核对 SHA-256。它要求 RCGUI 0.3.2 及以上，因为它的面板要在你打字时跟着刷新；更低的版本会在安装前被拒。
 
 <img src="docs/plugins-store-preview.png" alt="RCGUI 0.3.0 开发版：插件窗口的商店标签页" width="720">
 

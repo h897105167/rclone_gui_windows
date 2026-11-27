@@ -152,6 +152,9 @@ export struct SyncRow {
     // "local-to-remote" | "remote-to-local"
     direction: string,
     enabled: bool,
+    /// 本机有变化时会不会提前跑一轮。只在「本地 → 远程」上可能为 true：
+    /// 反方向时本机文件的变化就是用户自己的编辑，不能拿来触发同步。
+    auto: bool,
     status: string,
     next: string,
 }
@@ -3958,10 +3961,6 @@ component TransfersView inherits Rectangle {
     callback task-search(string);
     callback limit-apply();                  // 应用全局限速（tx:rx）
     callback job-stop(int);
-    // 文件夹同步的动作走和设置页同一个内核入口（maintenance-action），
-    // 不另开一套回调：第二参是任务 id，空串表示「表单里的这一条」。
-    callback maintenance-action(string, string);
-    property <int> ttab: 0;                  // 0=传输任务，1=文件夹同步
 
     VerticalLayout {
         padding: 24px;
@@ -3971,52 +3970,32 @@ component TransfersView inherits Rectangle {
             height: 34px;
             Text { text: @tr("传输"); font-size: 16px; font-weight: 700; color: ThemeG.text; vertical-alignment: center; }
             Rectangle { horizontal-stretch: 1; }
-            if root.ttab == 0 : LineEdit {
+            LineEdit {
                 accessible-label: @tr("搜索任务");
                 width: 200px;
                 text <=> TransfersG.task-search;
                 placeholder-text: @tr("搜索任务");
                 edited(t) => { root.task-search(t); }
             }
-            if root.ttab == 0 : CheckBox {
+            CheckBox {
                 text: @tr("隐藏已完成任务");
                 checked <=> TransfersG.hide-done;
                 toggled => { root.hide-done-changed(); }
             }
-            // 用 if 而不是 visible：visible:false 的元素不显示，但仍占着
-            // 布局里的位置（这里会给标题行留一段空档）。if 为假时元素根本
-            // 不生成，才真的让位。
-            if root.ttab == 0 : IconBtn {
+            IconBtn {
                 label: "\u{E72C}";
                 a11y-label: @tr("刷新");
                 clicked => { root.refresh(); }
             }
         }
-        // 两个页签：一次性的传输任务，与按周期重复的文件夹同步，是两种东西。
-        // 混在一页里，用户很难看出「哪些会自己再跑」。
-        HorizontalLayout {
-            height: 34px;
-            spacing: 4px;
-            TabBtn {
-                label: @tr("传输任务");
-                selected: root.ttab == 0;
-                act => { root.ttab = 0; }
-            }
-            TabBtn {
-                label: @tr("文件夹同步");
-                selected: root.ttab == 1;
-                act => { root.ttab = 1; }
-            }
-            Rectangle {}
-        }
-        if TransfersG.effective != "" && root.ttab == 0 : Text {
+        if TransfersG.effective != "" : Text {
             text: @tr("当前生效的全局限速：{}", TransfersG.effective);
             font-size: 12px;
             color: ThemeG.text-dim;
         }
 
         // ---------- 网速监控 + 全局限速（rclone 仅支持全局 tx:rx） ----------
-        if root.ttab == 0 : Card {
+        Card {
             title: @tr("网速与限速");
             fill: false;
             VerticalLayout {
@@ -4067,7 +4046,7 @@ component TransfersView inherits Rectangle {
         }
 
         // ---------- 后台任务 ----------
-        if root.ttab == 0 : Card {
+        Card {
             title: @tr("后台任务（{}）", TransfersG.tasks.length);
             pad: 0px;
             fill: true;
@@ -4171,12 +4150,25 @@ component TransfersView inherits Rectangle {
             }
         }
 
-        // ---------- 文件夹同步 ----------
-        //
-        // 与上面的传输任务不同：这些任务会按周期自己再跑一次，所以单独一页，
-        // 免得和一次性任务混在一起看不出哪些还在继续跑。
-        if root.ttab == 1 : Card {
-            title: @tr("文件夹同步");
+    }
+}
+
+component SyncView inherits Rectangle {
+    background: transparent;
+    // 同步动作与设置页共用同一个内核入口，第二参是任务 id，空串表示「表单里的这一条」。
+    callback maintenance-action(string, string);
+
+    VerticalLayout {
+        padding: 24px;
+        spacing: 12px;
+        HorizontalLayout {
+            spacing: 8px;
+            height: 34px;
+            Text { text: @tr("文件夹同步"); font-size: 16px; font-weight: 700; color: ThemeG.text; vertical-alignment: center; }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        Card {
+            title: @tr("同步任务");
             vertical-stretch: 1;
             VerticalLayout {
                 spacing: 10px;
@@ -4267,6 +4259,14 @@ component TransfersView inherits Rectangle {
                                 compact: true;
                                 disabled: MaintenanceG.busy;
                                 clicked => { root.maintenance-action("sync-toggle", s.id); }
+                            }
+                            PillBtn {
+                                label: s.auto ? @tr("自动：开") : @tr("自动：关");
+                                primary: s.auto;
+                                compact: true;
+                                disabled: MaintenanceG.busy;
+                                hint: @tr("本机文件夹有变化就提前跑一轮：靠系统文件变化通知，不是定时扫盘。程序启动后会先跑一轮确认，关机期间发生的变化也补上。只对「本地 → 云端」的任务生效——反方向本机变化是您自己的编辑，不会触发同步。镜像任务默认不开，手动开了之后本机的删除也会同步到云端；本机目录变成空的时候只提醒、不自动跑");
+                                clicked => { root.maintenance-action("sync-auto", s.id); }
                             }
                             PillBtn {
                                 label: @tr("删除");
@@ -6320,8 +6320,8 @@ export component MainWindow inherits Window {
     min-height: 600px;
     background: ThemeG.bg;
 
-    property <[string]> page-names: [@tr("仪表盘"), @tr("文件"), @tr("远程"), @tr("挂载"), @tr("服务"), @tr("传输"), @tr("插件"), @tr("设置")];
-    property <[string]> nav-icons: ["\u{E80F}", "\u{E8B7}", "\u{E753}", "\u{E8CE}", "\u{E909}", "\u{E895}", "\u{EA86}", "\u{E713}"];
+    property <[string]> page-names: [@tr("仪表盘"), @tr("文件"), @tr("远程"), @tr("挂载"), @tr("服务"), @tr("传输"), @tr("文件夹同步"), @tr("插件"), @tr("设置")];
+    property <[string]> nav-icons: ["\u{E80F}", "\u{E8B7}", "\u{E753}", "\u{E8CE}", "\u{E909}", "\u{E895}", "\u{E8C8}", "\u{EA86}", "\u{E713}"];
     // 侧栏「传输」呼吸灯相位：没有后台任务时恒为 0（不读 animation-tick，静止不重绘）
     property <float> nav-pulse: DashboardG.transfers > 0 ? (mod(animation-tick(), 1.6s) / 1.6s) : 0;
 
@@ -6564,6 +6564,12 @@ export component MainWindow inherits Window {
                     pulse-opacity: 0.25 + 0.75 * Math.abs(sin(180deg * root.nav-pulse));
                     act => { NavG.idx = 5; root.nav-select(5); }
                 }
+                NavItem {
+                    glyph: root.nav-icons[6];
+                    label: root.page-names[6];
+                    selected: NavG.idx == 6;
+                    act => { NavG.idx = 6; root.nav-select(6); }
+                }
 
                 HorizontalLayout {
                     height: 26px;
@@ -6572,16 +6578,16 @@ export component MainWindow inherits Window {
                     Text { text: @tr("系统"); font-size: 10px; font-weight: 600; color: ThemeG.text-dim; vertical-alignment: center; }
                 }
                 NavItem {
-                    glyph: root.nav-icons[6];
-                    label: root.page-names[6];
-                    selected: NavG.idx == 6;
-                    act => { NavG.idx = 6; root.nav-select(6); }
-                }
-                NavItem {
                     glyph: root.nav-icons[7];
                     label: root.page-names[7];
                     selected: NavG.idx == 7;
                     act => { NavG.idx = 7; root.nav-select(7); }
+                }
+                NavItem {
+                    glyph: root.nav-icons[8];
+                    label: root.page-names[8];
+                    selected: NavG.idx == 8;
+                    act => { NavG.idx = 8; root.nav-select(8); }
                 }
 
                 Rectangle {}
@@ -6801,10 +6807,11 @@ export component MainWindow inherits Window {
                     task-search(t) => { root.transfers-task-search(t); }
                     limit-apply() => { root.limit-apply(); }
                     job-stop(id) => { root.job-stop(id); }
-                    // 同步动作与设置页共用同一个内核入口，第二参是任务 id
+                }
+                if NavG.idx == 6 : SyncView {
                     maintenance-action(a, id) => { root.maintenance-action(a, id); }
                 }
-                if NavG.idx == 6 : PluginsView {
+                if NavG.idx == 7 : PluginsView {
                     viewport-h: root.height;
                     rescan => { root.plugins-rescan(); }
                     plugin-toggle(i) => { root.plugin-toggle(i); }
@@ -6824,7 +6831,7 @@ export component MainWindow inherits Window {
                     // 商店动作与插件面板动作共用同一个内核入口，第二参是被操作对象的 id
                     store-action(a, id) => { root.maintenance-action(a, id); }
                 }
-                if NavG.idx == 7 : SettingsView {
+                if NavG.idx == 8 : SettingsView {
                     save => { root.settings-save(); }
                     pick-exe => { root.pick-exe(); }
                     options-save => { root.options-save(); }

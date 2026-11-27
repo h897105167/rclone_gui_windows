@@ -6,7 +6,7 @@
 
 A Windows desktop front end for [rclone](https://rclone.org/), written in Rust with a [Slint](https://slint.dev) interface. There is no webview: the window is native, drawn by Slint, and talks to rclone over rclone's own RC API.
 
-**Status: version 0.3.3 is in development.** The newest released build is **v0.3.2**. Everything this page marks *developing* is in the tree at HEAD and has not shipped; nothing here is called released until a tag, a GitHub Release and the assets listed below actually exist together. The version history and the exact wording rules are in [`docs/VERSIONING.md`](docs/VERSIONING.md) and [`docs/CHANGELOG.md`](docs/CHANGELOG.md). Neither `v0.3.0` nor `v0.3.1` got a tag: what the sections below call "0.3.0" is this same body of work, which shipped as 0.3.2.
+**Status: version 0.3.4 is in development.** The newest released build is **v0.3.3**. Everything this page marks *developing* is in the tree at HEAD and has not shipped; nothing here is called released until a tag, a GitHub Release and the assets listed below actually exist together. The version history and the exact wording rules are in [`docs/VERSIONING.md`](docs/VERSIONING.md) and [`docs/CHANGELOG.md`](docs/CHANGELOG.md). Neither `v0.3.0` nor `v0.3.1` got a tag: what the sections below call "0.3.0" is this same body of work, which shipped as 0.3.2.
 
 ## What changed in 0.3.0
 
@@ -55,6 +55,7 @@ Status legend: **released** = present in v0.2.1; **developing** = in the tree at
 | **Mounts** | Mount to a drive letter with cache mode and read-only flags, see whether the letter appeared, install WinFsp from the official or a mirror source, re-create remembered mounts after the next connect | released |
 | **Services** | Serve a remote over HTTP, WebDAV, FTP, SFTP or DLNA with per-service credentials; start, stop, inspect, and re-create remembered services on reconnect | released |
 | **Transfers** | Live and finished transfers with progress, speed and totals, background jobs labelled by kind | released |
+| **Folder sync** | Sync a local folder to a remote on a chosen direction and interval; a round can start early when the local folder changes (on by default, only for local → remote, because local changes in the other direction are your own edits), and a folder that cannot be read is reported once | developing |
 | **Plugins** | Install, enable, disable, uninstall; declarative settings panel; restore a built-in plugin you removed; open the plugin directory | released |
 | **Settings** | RC endpoint and credentials, theme, accent colour, language, winget mirror, config path, `rcgui.conf` import/export, core selection | endpoint and appearance released; **core selection developing** |
 | **Plugin store** | Browse the static index, look up permissions and source, install a verified release archive | developing (index, page and the in-app client are all in the tree; unpublished) |
@@ -129,7 +130,7 @@ Every entry is a URL plus a SHA-256 that the app verifies before unpacking, so t
 
 Authors submit a manifest through a pull request to [`docs/store/index.json`](docs/store/index.json); the submission rules, the review gate and the checks the CI runs are in [`docs/store/README.md`](docs/store/README.md). Nothing in the store is executable code hosted by the repository — entries are URLs plus a SHA-256, and the app verifies the hash before unpacking.
 
-In 0.3.0, the new-remote list comes from the connected rclone core and presets declared by enabled plugins. The [kvault plugin](https://github.com/h897105167/rcgui-plugin-kvault) supplies the K-Vault connection wizard and WebDAV preset; the app no longer inserts that type unconditionally. The app retains the site's file-upload adapter and compatibility with existing remotes. The plugin ships as [kvault 0.3.1](https://github.com/h897105167/rcgui-plugin-kvault/releases/tag/v0.3.1) and is installed from the store, not bundled: the entry points at that Release asset and the app verifies its SHA-256 before unpacking. It requires RCGUI 0.3.2 or newer, because its panel has to be refreshed while you type; older builds are refused before installation.
+In 0.3.0, the new-remote list comes from the connected rclone core and presets declared by enabled plugins. The [kvault plugin](https://github.com/h897105167/rcgui-plugin-kvault) supplies the K-Vault connection wizard and WebDAV preset; the app no longer inserts that type unconditionally. The app retains the site's file-upload adapter and compatibility with existing remotes. The plugin ships as [kvault 0.3.2](https://github.com/h897105167/rcgui-plugin-kvault/releases/tag/v0.3.2) and is installed from the store, not bundled: the entry points at that Release asset and the app verifies its SHA-256 before unpacking. It requires RCGUI 0.3.2 or newer, because its panel has to be refreshed while you type; older builds are refused before installation.
 
 <img src="docs/plugins-store-preview.png" alt="RCGUI 0.3.0 development build: the Plugins window with the Store tab open" width="720">
 

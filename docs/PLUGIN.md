@@ -1050,7 +1050,8 @@ kvault_dedup    = 1                        # 同名去重（deduplicate）
 - 这个 `config.json` 必须能被宿主解析，宿主侧有专门的用例盯着
   （`crates/plugin/src/config.rs:1174 real_kvault_config_parses`）——字段名写错就是用户装上
   打不开；
-- 它**不在** `plugins/manifest.json` 里，也**不在**商店索引里：还没发布。
+- 它**不在** `plugins/manifest.json` 里（不随便携包附带），但**已经在**商店索引里：
+  条目是 `kvault` 的正式 Release（当前 0.3.2），`min_gui_version` 写 `0.3.2`。
 
 ---
 
