@@ -117,8 +117,15 @@ pub struct Pending {
     /// 有值时这一轮跑不了。`take_ready` 会一直答「不」，直到有人把它解掉——
     /// 这正是「不是所有没跑成的都该自己重试」的落点。
     blocked: Option<Setback>,
-    /// 跑这一轮期间又来了变化。结束时据此再补一轮，而不是当作已经同步过。
-    during: bool,
+    /// 「值得跑一轮」的次数，只增不减。
+    ///
+    /// 结束一轮时拿它和开工时的快照比，就知道跑起来之后有没有新变化。
+    /// 这件事原来用一个布尔量记，得靠调用方先把 `running` 置上才算得对；定时和手动
+    /// 那两条路没走 `take_ready`，`running` 一直是 false，于是跑动期间来的变化被当成
+    /// 「这一轮已经同步过了」清掉——用户改了文件，界面报成功，文件其实没传。
+    marks: u64,
+    /// 这一轮开工时的 `marks`。结束时和当前值比。
+    marks_at_start: u64,
     retry_at: Option<Instant>,
     /// 连续失败次数，只用来算退避间隔。
     fails: u32,
@@ -130,7 +137,7 @@ impl Pending {
     pub fn note_change(&mut self, now: Instant) {
         self.dirty = true;
         self.seen = Some(now);
-        self.during = self.during || self.running;
+        self.marks = self.marks.saturating_add(1);
         // 目录里又有东西了，镜像那关可以重新判；真还是空的，下一拍会再挡一次。
         // 「等一轮结束」那种阻塞不在这里解：那一轮还没结束。
         if self.blocked == Some(Setback::Guarded) {
@@ -142,7 +149,7 @@ impl Pending {
     pub fn expect_a_round(&mut self, now: Instant) {
         self.dirty = true;
         self.seen = Some(now);
-        self.during = self.during || self.running;
+        self.marks = self.marks.saturating_add(1);
     }
 
     /// 记下盯不住的原因。返回 true 表示这是一条「新」消息，界面只需要说一次。
@@ -174,9 +181,21 @@ impl Pending {
         }
         self.dirty = false;
         self.running = true;
-        self.during = false;
+        self.marks_at_start = self.marks;
         self.retry_at = None;
         true
+    }
+
+    /// 一轮同步真的开始了——不是「我打算跑」，是 rclone 那头已经收了活。
+    ///
+    /// 定时、手动、变化触发三条路都得走这里。少了这一步，跑动期间来的变化在收尾时
+    /// 会被当作「这一轮已经同步过」而丢掉。已经处于「正在跑」时不动快照：那说明
+    /// 这一轮就是 [`Pending::take_ready`] 认领的，开工时刻早就记下了。
+    pub fn note_running(&mut self) {
+        if !self.running {
+            self.running = true;
+            self.marks_at_start = self.marks;
+        }
     }
 
     /// 这一轮没能真的开始，把愿望还回去，并记下卡在哪一步。
@@ -207,9 +226,11 @@ impl Pending {
     pub fn note_round_finished(&mut self, ok: bool, now: Instant) {
         self.running = false;
         // 结束之后不管哪种阻塞都该解开：条件已经变了（要么这一轮动手了，要么它可以再试了）。
-        let owed = self.during || self.blocked.is_some();
+        // 「欠不欠一轮」看开工之后的标记数有没有涨，而不是看谁记得把 running 置上。
+        let owed = self.marks != self.marks_at_start || self.blocked.is_some();
         self.blocked = None;
-        self.during = false;
+        // 快照跟着走到这一轮收尾：再下一轮从此刻算「跑起来之后又变了没有」。
+        self.marks_at_start = self.marks;
         if ok {
             self.fails = 0;
             self.dirty = owed;
@@ -507,6 +528,13 @@ impl Watchers {
         }
     }
 
+    /// 一轮同步真的开始了。定时、手动、变化触发三条路都要调，见 [`Pending::note_running`]。
+    pub fn note_running(&mut self, id: &str) {
+        if let Some(pending) = self.pending.get_mut(id) {
+            pending.note_running();
+        }
+    }
+
     /// 一轮结束。`ok` 为假时会把这次变化留着重试。
     pub fn note_round_finished(&mut self, id: &str, ok: bool, now: Instant) {
         if let Some(pending) = self.pending.get_mut(id) {
@@ -514,8 +542,16 @@ impl Watchers {
         }
     }
 
+    /// 测试用的「来了一次变化」：正式代码里只有 [`Watchers::pump`] 收事件时才这么记。
     #[cfg(test)]
-    fn is_pending(&self, id: &str) -> bool {
+    pub(crate) fn note_change(&mut self, id: &str, now: Instant) {
+        if let Some(pending) = self.pending.get_mut(id) {
+            pending.note_change(now);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_pending(&self, id: &str) -> bool {
         self.pending
             .get(id)
             .map(Pending::is_pending)
@@ -523,7 +559,7 @@ impl Watchers {
     }
 
     #[cfg(test)]
-    fn wants_round(&self, id: &str) -> bool {
+    pub(crate) fn wants_round(&self, id: &str) -> bool {
         self.pending.get(id).map(|p| p.dirty).unwrap_or(false)
     }
 
@@ -534,7 +570,7 @@ impl Watchers {
 
     /// 测试要看「它卡在哪一步」。界面上没有这个数字，所以不进正式代码。
     #[cfg(test)]
-    fn blocked_by(&self, id: &str) -> Option<Setback> {
+    pub(crate) fn blocked_by(&self, id: &str) -> Option<Setback> {
         self.pending.get(id).and_then(Pending::blocked_by)
     }
 

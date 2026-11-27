@@ -1886,6 +1886,9 @@ async fn sync_run(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
     let client = ctx.rc.client().await;
     match sync_tasks::start(&client, &ctx.maint.engine, &task).await {
         Ok(jobid) => {
+            // 手动按「运行」也算这一轮开工了：跑动期间来的变化要留着补一轮，
+            // 不能因为「没人告诉监视端它在跑」就被当成已经同步过。
+            ctx.maint.state().watchers.note_running(id);
             // 立刻记下"已经跑过"，否则调度器 30 秒后又会看到它到期。
             let stamp = rcgui_profile::now_iso();
             {
@@ -2407,7 +2410,12 @@ async fn run_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, tasks: Vec<SyncTask>) 
     let mut started = Vec::new();
     for task in due {
         match sync_tasks::start(&client, &ctx.maint.engine, &task).await {
-            Ok(jobid) => started.push((task, jobid)),
+            Ok(jobid) => {
+                // 定时这一轮也开工了。跑动期间来的变化记在监视端，收尾时按标记数补一轮；
+                // 少了这一步，变化会被当成「这一轮已经同步过」。
+                ctx.maint.state().watchers.note_running(&task.id);
+                started.push((task, jobid));
+            }
             Err(e) => {
                 ctx.maint.state().watchers.note_setback(
                     &task.id,
@@ -2806,5 +2814,150 @@ mod tests {
             "外部模式必须先去返回，不能顺路停掉某个进程"
         );
         assert!(custom < stop, "手填路径必须先返回，原文件不能被动");
+    }
+
+    // ───────────────── 自动同步：调度链的信号顺序 ─────────────────
+    //
+    // 这里照抄 `tick` / `run_tasks` / `sync_run` / `poll_finished` 调监视端的顺序，
+    // 不碰真实的 rclone：要验的是「一轮在跑的时候来了一条变化，收尾之后还会不会补」。
+    // 定时、手动、变化触发三条路各自的开工标记就在这里体现。
+
+    fn watch_task(tag: &str) -> (std::path::PathBuf, SyncTask) {
+        let dir = std::env::temp_dir().join(format!("rcgui-chain-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let mut t = task(sync_tasks::DIR_UP, "t1");
+        t.local = dir.display().to_string();
+        t.auto_sync = Some(true);
+        (dir, t)
+    }
+
+    /// 走到「监视端刚接手、那一轮已经跑完」：这时候没有欠账。
+    fn after_takeover(ws: &mut crate::sync_watch::Watchers, task: &SyncTask, at: Instant) {
+        assert!(
+            ws.sync(std::slice::from_ref(task), at).is_empty(),
+            "监视器该建起来"
+        );
+        let later = at + crate::sync_watch::SETTLE + std::time::Duration::from_millis(10);
+        assert_eq!(
+            ws.pump(later).ready,
+            vec![task.id.clone()],
+            "接手后先跑一轮"
+        );
+        ws.note_running(&task.id);
+        ws.note_round_finished(&task.id, true, at);
+        assert!(!ws.wants_round(&task.id), "接手那一轮跑完不该再欠着");
+    }
+
+    /// 定时这一轮跑到一半时来的变化，收尾之后必须补一次。
+    ///
+    /// 这一轮没经过 `take_ready`（到期就直接开工），所以只有 `note_running` 能让
+    /// 监视端知道「跑动期间的变化已经同步过了没有」——原来漏掉的正是这一步。
+    #[test]
+    fn a_timer_round_keeps_the_change_that_arrives_while_it_runs() {
+        let (dir, task) = watch_task("timer");
+        let mut ws = crate::sync_watch::Watchers::default();
+        let t0 = Instant::now();
+        after_takeover(&mut ws, &task, t0);
+
+        ws.note_running(&task.id);
+        ws.note_change(&task.id, t0 + std::time::Duration::from_millis(500));
+        // 静默窗口还没过，这一轮就结束了。
+        ws.note_round_finished(&task.id, true, t0 + std::time::Duration::from_millis(600));
+
+        assert!(ws.wants_round(&task.id), "跑动期间的变化不能算同步过");
+        let at = t0 + std::time::Duration::from_millis(600) + crate::sync_watch::SETTLE;
+        assert_eq!(
+            ws.pump(at + std::time::Duration::from_millis(10)).ready,
+            vec![task.id.clone()],
+            "补一次"
+        );
+
+        ws.note_running(&task.id);
+        ws.note_round_finished(&task.id, true, at + std::time::Duration::from_secs(60));
+        assert!(
+            ws.pump(at + std::time::Duration::from_secs(120))
+                .ready
+                .is_empty(),
+            "补过之后没有新变化就别再跑"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 手动按「运行」的那一轮同样要留住跑动期间的变化。
+    #[test]
+    fn a_manual_round_keeps_the_change_that_arrives_while_it_runs() {
+        let (dir, task) = watch_task("manual");
+        let mut ws = crate::sync_watch::Watchers::default();
+        let t0 = Instant::now();
+        after_takeover(&mut ws, &task, t0);
+
+        ws.note_running(&task.id);
+        ws.note_change(&task.id, t0 + std::time::Duration::from_millis(100));
+        ws.note_round_finished(&task.id, true, t0 + std::time::Duration::from_millis(200));
+
+        assert!(ws.wants_round(&task.id), "手动那一轮跑动期间的变化也要补");
+        let at = t0 + std::time::Duration::from_millis(200) + crate::sync_watch::SETTLE;
+        assert_eq!(
+            ws.pump(at + std::time::Duration::from_millis(10)).ready,
+            vec![task.id.clone()]
+        );
+
+        ws.note_running(&task.id);
+        ws.note_round_finished(&task.id, true, at + std::time::Duration::from_secs(30));
+        assert!(
+            ws.pump(at + std::time::Duration::from_secs(90))
+                .ready
+                .is_empty(),
+            "一轮就够"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一轮从头到尾没人动过文件，收尾之后不能再跑一轮。
+    #[test]
+    fn a_round_without_a_change_does_not_bring_another() {
+        let (dir, task) = watch_task("quiet");
+        let mut ws = crate::sync_watch::Watchers::default();
+        let t0 = Instant::now();
+        after_takeover(&mut ws, &task, t0);
+
+        ws.note_running(&task.id);
+        ws.note_round_finished(&task.id, true, t0 + std::time::Duration::from_secs(5));
+
+        assert!(!ws.wants_round(&task.id), "没变化就不欠");
+        assert!(
+            ws.pump(t0 + std::time::Duration::from_secs(120))
+                .ready
+                .is_empty(),
+            "别自己加一遍"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 事件还在队列里、这一轮就已经收尾了：那条变化不能被当成「已同步」。
+    ///
+    /// 「队列里那条事件终于被 pump 取到」用 `note_change` 代替——真正的 pump 需要
+    /// 真实文件事件，而这里要验的是先后顺序。
+    #[test]
+    fn a_change_sitting_in_the_queue_survives_the_round_finishing() {
+        let (dir, task) = watch_task("queued");
+        let mut ws = crate::sync_watch::Watchers::default();
+        let t0 = Instant::now();
+        after_takeover(&mut ws, &task, t0);
+
+        ws.note_running(&task.id);
+        ws.note_round_finished(&task.id, true, t0 + std::time::Duration::from_secs(5));
+        // 收尾之后事件才被取到。
+        ws.note_change(&task.id, t0 + std::time::Duration::from_secs(5));
+
+        assert!(ws.wants_round(&task.id), "晚到的那条变化要留着");
+        let at = t0 + std::time::Duration::from_secs(5) + crate::sync_watch::SETTLE;
+        assert_eq!(
+            ws.pump(at + std::time::Duration::from_millis(10)).ready,
+            vec![task.id.clone()],
+            "晚到的变化也补一轮"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
