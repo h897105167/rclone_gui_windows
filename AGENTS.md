@@ -2,7 +2,7 @@
 
 RCGUI is a Windows GUI for managing rclone remotes, mounts and serves, written in Rust with a Slint (native, no webview) interface. This document is the working agreement for coding agents: what must not break, which documents are authoritative, and how to build and verify. Read it, plus [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), before changing code.
 
-Version in the tree is **0.3.3 in development**. The newest released version is **v0.3.2**. Do not describe in-development work as released, in code, docs or commit messages. Neither `0.3.0` nor `0.3.1` got a tag; the batch the docs call "0.3.0 development" shipped as **0.3.2**, and `v0.3.2` is now a real Release. Plugin packages declare the floor they actually need: the new plugin protocol starts at `min_gui_version = "0.3.1"`, and a plugin whose panel state has to follow what the user is still typing needs `"0.3.2"`, because only 0.3.2 and later re-ask the plugin for state after each keystroke.
+Version in the tree is **0.3.4 in development**. The newest released version is **v0.3.3**. Do not describe in-development work as released, in code, docs or commit messages. Neither `0.3.0` nor `0.3.1` got a tag; the batch the docs call "0.3.0 development" shipped as **0.3.2**, and `v0.3.2` and `v0.3.3` are both real Releases. Plugin packages declare the floor they actually need: the new plugin protocol starts at `min_gui_version = "0.3.1"`, and a plugin whose panel state has to follow what the user is still typing needs `"0.3.2"`, because only 0.3.2 and later re-ask the plugin for state after each keystroke.
 
 ## 1. Product Boundaries
 
