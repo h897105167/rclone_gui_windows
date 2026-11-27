@@ -3429,7 +3429,6 @@ pub(crate) async fn refresh_remote_types(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) 
     });
 }
 
-///
 /// 派生类型落盘的就是 `base_type`（例如 `kvault` 存成 `webdav`），所以它的参数表
 /// 与后端自己的那张是同一张；插件独有的键由 `seed_derived_defaults` 铺进原始参数框。
 fn form_fields_type(choice: &TypeChoice) -> String {

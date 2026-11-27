@@ -69,7 +69,7 @@ pub async fn run(backend: &mut dyn Backend, before: Snapshot, want: &str) -> Ver
 
     if let Err(e) = backend.commit(want).await {
         // 配置都没写下去：把内存里的旧值放回去，旧内核按旧配置重新起。
-        let restored = backend.restore(before).await;
+        let restored = backend.restore(before.clone()).await;
         if was_running {
             backend.start().await;
         }
