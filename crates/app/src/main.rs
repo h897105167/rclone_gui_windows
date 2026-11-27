@@ -3374,8 +3374,28 @@ async fn remote_list_rows(
         .collect()))
 }
 
-/// 删除成功后本地摘行（必须在 UI 线程内调用）。
+/// 这一层目录该问谁要。
 ///
+/// 插件接管的远程只有插件的 `remote.list` 分得清「这一层有哪些条目」：不传路径时
+/// 浏览要的是真正的远程根，而上传要的是配置里的目录，两者在插件里是不同的语义。
+/// 所以归属确定时一律用插件的答复，**不**退回原生列表——插件被卸掉、登记表坏掉的
+/// 时候，原生列表会给出「成功但空」的结果，界面上就是「路径已经进去了、里面没东西」，
+/// 比一句原因难查得多。
+#[derive(Debug)]
+enum DirListing {
+    /// 问过插件：要么这一层的行，要么给用户看的原因。
+    Plugin(Result<Vec<FileRow>, String>),
+    /// 不归插件管，照旧问 rclone。
+    Native,
+}
+
+fn dir_listing(rows: Option<Result<Vec<FileRow>, String>>) -> DirListing {
+    match rows {
+        Some(res) => DirListing::Plugin(res),
+        None => DirListing::Native,
+    }
+}
+
 /// 不刷新列表的原因：远端可能有目录缓存（几分钟才失效，删完不会主动失效），
 /// 立刻重取会把条目又读回来，看起来像「删了没效果」。先本地摘掉，下次刷新
 /// 再以服务端为准。
@@ -5693,15 +5713,30 @@ async fn files_navigate(
         return;
     }
     let proxy_ep = remote_proxy_endpoint(ctx, &remote);
-    let client = ctx.rc.client().await;
-    let fs = format!("{remote}:");
-    let res = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        client.list(&fs, &target, None),
-    )
+    // 排序和刷新页用同一份：同一层目录，从「进入」看到和从「刷新」看到必须是同一个顺序。
+    let (sort_key, sort_desc) = read_ui(ui, |u| {
+        let g = u.global::<FilesG>();
+        (g.get_sort_key().to_string(), g.get_sort_desc())
+    })
     .await
-    .map_err(|_| anyhow!("{}", rcgui_i18n::t("请求超时")))
-    .and_then(|r| r.map_err(anyhow::Error::from));
+    .unwrap_or_else(|| (String::from("name"), false));
+
+    let res: Result<Vec<FileRow>, String> =
+        match dir_listing(remote_list_rows(ctx, &remote, &target, &sort_key, sort_desc).await) {
+            DirListing::Plugin(res) => res,
+            DirListing::Native => {
+                let client = ctx.rc.client().await;
+                let fs = format!("{remote}:");
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    client.list(&fs, &target, None),
+                )
+                .await
+                .map_err(|_| rcgui_i18n::t("请求超时").to_string())
+                .and_then(|r| r.map_err(|e| e.to_string()))
+                .map(|entries| file_rows(&entries, &sort_key, sort_desc))
+            }
+        };
 
     let cur_seq = read_ui(ui, |u| u.global::<FilesG>().get_seq())
         .await
@@ -5714,14 +5749,11 @@ async fn files_navigate(
         let g = ui.global::<FilesG>();
         g.set_loading(false);
         match res {
-            Ok(entries) => {
+            Ok(rows) => {
                 // 成功后才更新路径，避免网络慢时拼出不存在的路径
                 g.set_path(target.clone().into());
                 apply_crumbs(&ui, file_crumbs(&remote, &target));
-                let key = g.get_sort_key().to_string();
-                let desc = g.get_sort_desc();
                 // 走 set_file_entries：新建/切换目录后勾选态必须清空且长度对齐
-                let rows = file_rows(&entries, &key, desc);
                 set_file_entries(&ui, rows);
             }
             Err(e) => {
@@ -12325,6 +12357,54 @@ mod tests {
         assert_eq!(parent_path(""), "");
     }
 
+    fn row(name: &str, is_dir: bool) -> FileRow {
+        FileRow {
+            name: name.into(),
+            is_dir,
+            size: if is_dir {
+                String::new().into()
+            } else {
+                "1 KB".into()
+            },
+            mtime: "2026-11-27 10:00".into(),
+        }
+    }
+
+    /// 插件管着这层目录：用它的行，原生列表不该再插一脚。
+    #[test]
+    fn a_plugin_owned_folder_is_listed_by_the_plugin() {
+        let listed = dir_listing(Some(Ok(vec![
+            row("image_bed", true),
+            row("root-test.png", false),
+        ])));
+        match listed {
+            DirListing::Plugin(Ok(rows)) => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[1].name.as_str(), "root-test.png");
+            }
+            other => panic!("插件给的列表被丢了：{other:?}"),
+        }
+    }
+
+    /// 插件在、但列不出来：要把原因交上去，绝不退回原生列表。
+    ///
+    /// 退回原生列表的后果正是这次报的 bug：路径已经切进 `image_bed`，列表却是空的，
+    /// 看起来像「这个目录里没东西」，而不是「插件没工作」。
+    #[test]
+    fn a_plugin_failure_is_reported_instead_of_falling_back() {
+        let listed = dir_listing(Some(Err("插件还没装好".to_string())));
+        match listed {
+            DirListing::Plugin(Err(why)) => assert_eq!(why, "插件还没装好"),
+            other => panic!("插件报的错被吞了：{other:?}"),
+        }
+    }
+
+    /// 不归插件管的远程照旧问 rclone。
+    #[test]
+    fn a_native_remote_still_asks_rclone() {
+        assert!(matches!(dir_listing(None), DirListing::Native));
+    }
+
     /// 文件夹不能移动到它自己或它的子目录里。
     #[test]
     fn move_target_cannot_be_inside_source() {
@@ -12971,6 +13051,29 @@ mod tests {
                 "{sig} 没有问 remote_blocked：插件不在时这个入口就是旁路"
             );
         }
+
+        // 文件页的进入、返回、面包屑、手输路径都汇到 `files_navigate`：它必须先把
+        // 这一层交给插件问（`remote_list_rows`），原生 `client.list` 只留给不归插件
+        // 管的远程。这条用例盯的就是这个分流本身——之前它整段走原生，于是插件远程
+        // 的子目录永远是空的，而根目录又恰好正常，很容易被当成「站点上没有文件」。
+        let nav = crate::source_scan::squash(
+            crate::source_scan::function_body(prod, "async fn files_navigate(")
+                .unwrap_or_else(|| panic!("找不到函数 async fn files_navigate(，是不是改名了")),
+        );
+        let ask_plugin = nav.find("remote_list_rows(").unwrap_or_else(|| {
+            panic!("files_navigate 没有问插件要列表：插件管的远程一进子目录就是空的")
+        });
+        let native = nav.find("client.list(").unwrap_or_else(|| {
+            panic!("files_navigate 里找不到原生列表：普通 rclone 远程就列不出来了")
+        });
+        assert!(
+            ask_plugin < native,
+            "files_navigate 先调原生 client.list 再问插件：插件管的远程会被原生列表盖成空"
+        );
+        assert!(
+            nav.contains("DirListing::Native"),
+            "files_navigate 没有把「不归插件管」当成一种情况处理"
+        );
 
         // 自动恢复（挂载与服务）在另一个文件，那边同样是入口。
         // 计数也压掉空白：折行不该让「少查一处」和「排版变了」混成一个红。
