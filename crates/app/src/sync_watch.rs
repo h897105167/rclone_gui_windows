@@ -164,12 +164,10 @@ impl Watchers {
         self.map.retain(|id, _| alive.contains(id));
     }
 
+    /// 只在测试里数一下还盯着几个任务。界面上没有这个数字，所以不进正式代码。
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.map.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
     }
 }
 
@@ -400,7 +398,6 @@ mod tests {
         let alive: HashSet<String> = ["keep".to_string()].into_iter().collect();
         ws.retain(&alive);
         assert_eq!(ws.len(), 1);
-        assert!(!ws.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
