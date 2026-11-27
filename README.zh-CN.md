@@ -6,7 +6,7 @@
 
 rclone 的 Windows 桌面前端，用 Rust 写，界面用 [Slint](https://slint.dev)。没有 webview：窗口是原生的，由 Slint 直接绘制，通过 rclone 自己的 RC API 与它通信。
 
-**当前状态：0.3.1 正在开发中。** 对外发布的版本仍是 **v0.2.1**。本文里标“开发中”的东西都只存在于 HEAD，尚未发布；只有 tag、GitHub Release 和下面列出的那些产物同时存在，才算发布。版本规则与措辞规范见 [`docs/VERSIONING.md`](docs/VERSIONING.md) 和 [`docs/CHANGELOG.md`](docs/CHANGELOG.md)。没有 `v0.3.0` 这个版本：下文说的「0.3.0」就是这一批工作，它随 0.3.1 一起发布。
+**当前状态：0.3.2 正在开发中。** 对外发布的版本仍是 **v0.2.1**。本文里标“开发中”的东西都只存在于 HEAD，尚未发布；只有 tag、GitHub Release 和下面列出的那些产物同时存在，才算发布。版本规则与措辞规范见 [`docs/VERSIONING.md`](docs/VERSIONING.md) 和 [`docs/CHANGELOG.md`](docs/CHANGELOG.md)。`v0.3.0` 和 `v0.3.1` 都没有过 tag：下文说的「0.3.0」就是这一批工作，它随 0.3.2 一起发布。
 
 ## 0.3.0 改了什么
 
@@ -129,7 +129,7 @@ cd rclone_gui_windows
 
 作者通过向 [`docs/store/index.json`](docs/store/index.json) 提 PR 来提交清单；提交规则、审核门槛和 CI 会跑的检查在 [`docs/store/README.md`](docs/store/README.md)。商店里没有任何托管在仓库里的可执行代码——条目只是一个 URL 加一个 SHA-256，应用在解压前会核对 hash。
 
-0.3.0 的新建远程列表只采用当前 rclone 内核返回的类型和已启用插件声明的预设。[kvault 插件](https://github.com/h897105167/rcgui-plugin-kvault) 提供 K-Vault 连接向导与 WebDAV 预设，不再由本体无条件添加该类型。文件上传仍通过本体保留的站点 API 适配层处理，旧远程也可继续编辑。插件源码与测试包正在评审，**尚未发布、尚未进入商店**；商店只收录已有真实 Release 且校验通过的资产。
+0.3.0 的新建远程列表只采用当前 rclone 内核返回的类型和已启用插件声明的预设。[kvault 插件](https://github.com/h897105167/rcgui-plugin-kvault) 提供 K-Vault 连接向导与 WebDAV 预设，不再由本体无条件添加该类型。文件上传仍通过本体保留的站点 API 适配层处理，旧远程也可继续编辑。插件已作为 [kvault 0.3.1](https://github.com/h897105167/rcgui-plugin-kvault/releases/tag/v0.3.1) 发布，从商店安装而不是随程序打包：条目指向那个 Release 资产，应用在解压前核对 SHA-256。它要求 RCGUI 0.3.2 及以上，因为它的面板要在你打字时跟着刷新；更低的版本会在安装前被拒。
 
 <img src="docs/plugins-store-preview.png" alt="RCGUI 0.3.0 开发版：插件窗口的商店标签页" width="720">
 
