@@ -4265,7 +4265,7 @@ component SyncView inherits Rectangle {
                                 primary: s.auto;
                                 compact: true;
                                 disabled: MaintenanceG.busy;
-                                hint: @tr("本机文件夹有变化就提前跑一轮：靠系统文件变化通知，不是定时扫盘。只对「本地 → 云端」的任务生效——反方向本机变化是您自己的编辑，不会触发同步。镜像任务默认不开，手动开了之后本机的删除也会同步到云端");
+                                hint: @tr("本机文件夹有变化就提前跑一轮：靠系统文件变化通知，不是定时扫盘。程序启动后会先跑一轮确认，关机期间发生的变化也补上。只对「本地 → 云端」的任务生效——反方向本机变化是您自己的编辑，不会触发同步。镜像任务默认不开，手动开了之后本机的删除也会同步到云端；本机目录变成空的时候只提醒、不自动跑");
                                 clicked => { root.maintenance-action("sync-auto", s.id); }
                             }
                             PillBtn {

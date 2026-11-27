@@ -2249,7 +2249,7 @@ pub async fn tick(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         let now = Instant::now();
         let mut st = ctx.maint.state();
         // 该盯的目录对齐一遍：任务删了、停用了、方向改了，监视线程跟着撤掉。
-        let mut problems = st.watchers.sync(&tasks);
+        let mut problems = st.watchers.sync(&tasks, now);
         let tick = st.watchers.pump(now);
         problems.extend(tick.problems);
         (tick.ready, problems)
@@ -2274,6 +2274,12 @@ pub async fn tick(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             // 盘没挂上、网络盘掉线时，通知说的是「里面全没了」。镜像任务照着删就是
             // 清空云端，所以空目录一律只报告、不执行。
             if crate::sync_watch::refuses_an_empty_mirror(task) {
+                // 这一轮不跑，但欠着的那一次变化还在：把愿望还回去（不重试，等下一次变化
+                // 或用户自己按「运行」），否则这条任务以后再也不会自动触发。
+                ctx.maint
+                    .state()
+                    .watchers
+                    .note_not_started(&task.id, false, Instant::now());
                 set_sync_status(
                     ui,
                     f(
@@ -2369,14 +2375,26 @@ async fn run_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, tasks: Vec<SyncTask>) 
         let now = Instant::now();
         let mut st = ctx.maint.state();
         for task in &tasks {
-            st.watchers.note_started(&task.id, false, now);
+            st.watchers.note_not_started(&task.id, true, now);
         }
         return;
     }
-    let due: Vec<SyncTask> = tasks
-        .into_iter()
-        .filter(|t| !ctx.maint.engine.is_active(&t.id))
-        .collect();
+    let mut due: Vec<SyncTask> = Vec::new();
+    {
+        let now = Instant::now();
+        for task in tasks {
+            if ctx.maint.engine.is_active(&task.id) {
+                // 引擎已经在跑这个目录（到期和文件变化常常落在同一拍）。这一轮没真的开始，
+                // 不能算同步过：把愿望还回去，等正在跑的那轮结束再补一次。
+                ctx.maint
+                    .state()
+                    .watchers
+                    .note_not_started(&task.id, false, now);
+            } else {
+                due.push(task);
+            }
+        }
+    }
     if due.is_empty() {
         return;
     }
@@ -2389,7 +2407,7 @@ async fn run_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, tasks: Vec<SyncTask>) 
                 ctx.maint
                     .state()
                     .watchers
-                    .note_started(&task.id, false, Instant::now());
+                    .note_not_started(&task.id, true, Instant::now());
                 let mut cfg = ctx.cfg.lock().unwrap();
                 if let Some(slot) = cfg.sync_tasks.iter_mut().find(|t| t.id == task.id) {
                     slot.last_status = format!("failed: {e}");
