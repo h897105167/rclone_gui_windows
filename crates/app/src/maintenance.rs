@@ -861,7 +861,7 @@ async fn core_switch(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, want: &str) -> bool 
             set_core_status(
                 ui,
                 if want.is_empty() {
-                    t("已改用托管内核，并已连上。")
+                    t("已改用托管内核，并已连上。").to_string()
                 } else {
                     f("已切换到 {}，并已连上。", &[&want])
                 },
@@ -871,7 +871,11 @@ async fn core_switch(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, want: &str) -> bool 
                 "core",
                 &format!(
                     "内核已切换并连上：{}",
-                    if want.is_empty() { "托管" } else { &want }
+                    if want.is_empty() {
+                        "托管"
+                    } else {
+                        want.as_str()
+                    }
                 ),
             );
             // 换了一组作业号、换了一个进程：挂载与 serve 要重新报给新内核。
