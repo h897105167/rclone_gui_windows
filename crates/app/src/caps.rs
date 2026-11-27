@@ -336,9 +336,10 @@ impl CapProvider for HostCaps {
     // `rclone.upload_file` 的目标可能是普通 rclone 远程，也可能是插件托管的那种，
     // 所以先问一句「这条远程归谁管」，再决定字节交给谁发。
     //
-    // 为什么不能一律 copyfile：K-Vault 这类远程在内核里就是个 WebDAV 地址，站点只
-    // 放行它自己的接口，原生 PUT 会被回一句 `403 Forbidden: this WebDAV endpoint is
-    // read-only`；而且站点地址、去重开关都在插件手里，只有它能算出给用户的那个直链。
+    // 为什么不能一律 copyfile：插件托管的远程在内核眼里只是个普通 WebDAV 地址，
+    // 而对方的服务端只放行它自己的上传接口，原生 PUT 会被回一句
+    // `403 Forbidden: this WebDAV endpoint is read-only`。何况上传地址、去重开关这
+    // 些只有插件知道，也只有它算得出给用户的那个直链。
     //
     // 插件那一路不把字节塞进 wasm：宿主先把内容落到临时文件，用
     // [`plugin_host::upload::grant`] 授权这一次发送，再把「哪个文件、发到哪、叫什么
@@ -369,7 +370,7 @@ impl CapProvider for HostCaps {
         .await
         {
             // 插件传完了：它的回复里带着名字、直链和去重标记，原样往上交，
-            // 上层（imagehost 之类）靠 `link` 决定给用户站点地址还是本机代理地址。
+            // 上层（图床插件之类）靠 `link` 决定给用户真实直链还是本机代理地址。
             Ok(Some(v)) => Ok(v),
             // 这条远程不归插件管：照旧走原生 copyfile。
             Ok(None) => {
