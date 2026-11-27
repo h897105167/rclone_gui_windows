@@ -121,7 +121,7 @@ async fn the_manifest_agrees_with_the_shipped_config() {
 }
 
 #[tokio::test]
-async fn listing_walks_every_page_and_puts_folders_first() {
+async fn the_remote_root_lists_the_real_root_not_the_upload_folder() {
     let Some(h) = kvault_harness().await else {
         eprintln!("{SKIP_NOTE}");
         return;
@@ -136,21 +136,17 @@ async fn listing_walks_every_page_and_puts_folders_first() {
     let items = items_of(&got);
     let names: Vec<String> = items.iter().map(|(n, _)| n.clone()).collect();
 
-    // 站点第一页只给两条并说还有下一页（photo.png、big.bin），第二页才给
-    // notes.txt。`path` 传空串时插件列的是这条远程自己的上传目录（假宿主配的
-    // 是 `album`），所以这一层里能看见 photo.png（第一页）、notes.txt（第二页）
-    // 和由 album/2026 折出来的子目录 2026：两页都读到，说明翻页真的走了。
+    // 主程序的文件页在远程根上，面包屑第一项就是远程名，所以这里必须列远程根：
+    // 假站点的三条记录都在 `album` 下（`album` 与 `album/2026`），根这一层只有
+    // 一个目录 `album`。以前空路径回退到上传目录，界面写着远程根、内容却是
+    // 上传目录那一层，位置与内容对不上。
     assert_eq!(
         names,
-        vec![
-            "2026".to_string(),
-            "notes.txt".to_string(),
-            "photo.png".to_string()
-        ],
-        "上传目录这一层应该先目录后文件、且覆盖两页：{}",
+        vec!["album".to_string()],
+        "远程根这一层应该只有 album 目录：{}",
         text_of(&got)
     );
-    assert!(items[0].1, "目录没有排在文件前面：{}", text_of(&got));
+    assert!(items[0].1, "album 应该是目录：{}", text_of(&got));
 
     let hits = h.site.hits();
     let lists = hits
@@ -256,8 +252,9 @@ async fn the_upload_reply_carries_the_site_link_and_the_dedupe_flag() {
         return;
     };
     let path = temp_file("cover.png", b"\x89PNG\r\n\x1a\nfake-bytes");
-    // 键名与主程序 `upload_file_owned` 用的那个一致：一次上传只有一格授权。
-    let key = "remote-0";
+    // 主程序给每次上传单独一格授权（`cap-<进程号>-<序号>`），这里用不重样的键，
+    // 免得并行跑的另一个用例把这次的授权顶掉——那会变成「发出去的是别人的文件」。
+    let key = "it-reply-link";
     plugin_host::upload::grant(PLUGIN_ID, key, &path).expect("登记授权失败");
 
     let got = h
@@ -289,6 +286,88 @@ async fn the_upload_reply_carries_the_site_link_and_the_dedupe_flag() {
         Some(false),
         "站点说这次不是重复文件，回包就该照实说：{}",
         text_of(&got)
+    );
+    plugin_host::upload::revoke(PLUGIN_ID, key);
+}
+
+/// 没给路径的上传仍然落在这条远程配好的目录里。
+///
+/// 图床选完文件就调 `remote.upload`，此时界面没有「当前目录」可传。所以空路径
+/// 对上传必须回退到配好的目录（这里假宿主配的是 `album`，真机上就是「上传图片
+/// 路径」那种设置）。列目录那边相反：空路径必须真的是远程根，否则文件页顶部
+/// 写着远程根、列出来的却是上传目录那一层。
+#[tokio::test]
+async fn an_upload_without_a_path_still_lands_in_the_configured_folder() {
+    let Some(h) = kvault_harness().await else {
+        eprintln!("{SKIP_NOTE}");
+        return;
+    };
+    let path = temp_file("cover.png", b"\x89PNG\r\n\x1a\nfake-bytes");
+    let key = "it-default-folder";
+    plugin_host::upload::grant(PLUGIN_ID, key, &path).expect("登记授权失败");
+
+    h.call(
+        "remote.upload",
+        json!({
+            "remote": "vault",
+            "path": "",
+            "file_name": "cover.png",
+            "file_key": key,
+        }),
+    )
+    .await
+    .expect("remote.upload 调用失败");
+
+    let uploads = h.site.uploads();
+    assert_eq!(uploads.len(), 1, "站点应该恰好收到一次上传");
+    let folder = uploads[0]
+        .fields
+        .iter()
+        .find(|(name, _)| name == "folderPath")
+        .map(|(_, value)| value.as_str());
+    assert_eq!(
+        folder,
+        Some("album"),
+        "空路径上传没有落到配置的上传目录，图床的默认目录变了"
+    );
+    plugin_host::upload::revoke(PLUGIN_ID, key);
+}
+
+/// 传了子目录就传到子目录，不能被默认目录顶掉。
+#[tokio::test]
+async fn an_upload_inside_a_subfolder_keeps_that_subfolder() {
+    let Some(h) = kvault_harness().await else {
+        eprintln!("{SKIP_NOTE}");
+        return;
+    };
+    let path = temp_file("cover.png", b"\x89PNG\r\n\x1a\nfake-bytes");
+    let key = "it-subfolder";
+    plugin_host::upload::grant(PLUGIN_ID, key, &path).expect("登记授权失败");
+
+    h.call(
+        "remote.upload",
+        json!({
+            "remote": "vault",
+            "path": "album/2026",
+            "file_name": "cover.png",
+            "file_key": key,
+        }),
+    )
+    .await
+    .expect("remote.upload 调用失败");
+
+    let uploads = h.site.uploads();
+    assert_eq!(uploads.len(), 1, "站点应该恰好收到一次上传");
+    let folder = uploads[0]
+        .fields
+        .iter()
+        .find(|(name, _)| name == "folderPath")
+        .map(|(_, value)| value.as_str());
+    assert_eq!(
+        folder,
+        Some("album/2026"),
+        "子目录上传被改到了别的位置：{:?}",
+        uploads[0].fields
     );
     plugin_host::upload::revoke(PLUGIN_ID, key);
 }
@@ -474,20 +553,51 @@ async fn settings_without_the_newer_fields_are_read_as_written() {
         json!({ "base": base, "token": "test-token", "folder": "album" }),
     );
     let before = h.host.kv_snapshot();
+    // 列目录走远程根：设置里的 `folder` 是上传的默认位置，不再是浏览的起点。
     let got = h
         .call("remote.list", json!({ "remote": "", "path": "" }))
         .await
         .expect("只有早期字段的设置，应当照旧能用");
     let rows = items_of(&got);
     assert!(
-        rows.iter()
-            .any(|(name, is_dir)| name == "photo.png" && !*is_dir),
-        "设置里的目录没被用上：{rows:?}"
+        rows.iter().any(|(name, is_dir)| name == "album" && *is_dir),
+        "早期设置下远程根没列出来：{rows:?}"
     );
+
+    // 上传仍然用上设置里的目录：旧记录的 `folder` 必须在传给上传时读出来。
+    let path = temp_file("cover.png", b"\x89PNG\r\n\x1a\nfake-bytes");
+    let key = "it-legacy-settings";
+    plugin_host::upload::grant(PLUGIN_ID, key, &path).expect("登记授权失败");
+    h.call(
+        "remote.upload",
+        json!({
+            "remote": "",
+            "path": "",
+            "file_name": "cover.png",
+            "file_key": key,
+        }),
+    )
+    .await
+    .expect("只有早期字段的设置，上传也应当照旧能用");
+    let uploads = h.site.uploads();
+    assert_eq!(uploads.len(), 1, "站点应该恰好收到一次上传");
+    let folder = uploads[0]
+        .fields
+        .iter()
+        .find(|(name, _)| name == "folderPath")
+        .map(|(_, value)| value.as_str());
+    assert_eq!(
+        folder,
+        Some("album"),
+        "早期设置里的目录没被用上，上传落到了别处：{:?}",
+        uploads[0].fields
+    );
+    plugin_host::upload::revoke(PLUGIN_ID, key);
+
     assert_eq!(
         h.host.kv_snapshot(),
         before,
-        "只是列了一次目录，用户存的设置却被改写了"
+        "只是列了一次目录、传了一个文件，用户存的设置却被改写了"
     );
 }
 
