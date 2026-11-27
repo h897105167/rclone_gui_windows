@@ -268,6 +268,13 @@ pub struct SyncTask {
     pub mode: String,
     #[serde(default = "d_true")]
     pub enabled: bool,
+    /// 本机文件夹有变化就提前跑一轮，不必等到下一个间隔。
+    ///
+    /// 只对「本地 → 远程」方向生效：反过来的时候，本机文件的变化正是用户自己的编辑，
+    /// 拿它去触发同步会把编辑覆盖掉（见 `crate::sync_watch::watches`）。
+    /// 老配置文件里没有这一项时按打开处理——新功能默认就要能用。
+    #[serde(default = "d_true")]
+    pub auto_sync: bool,
     /// 间隔小时，0 表示只在启动时跑一次
     #[serde(default = "d_six")]
     pub interval_hours: u32,

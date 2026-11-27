@@ -630,6 +630,8 @@ fn apply_sync_tasks(tasks: &[rcgui_profile::SyncTaskRef], cfg: &mut AppConfig) -
                     t.mode.clone()
                 },
                 enabled: t.enabled && !wants_mirror,
+                // 配置文件里还没有这一项：导入后按默认打开处理，与本地新建的任务一致。
+                auto_sync: true,
                 interval_hours: if t.interval_hours == 0 { 6 } else { t.interval_hours },
                 // 导入时刻当作"上次运行"，把第一轮推到下一个间隔之后
                 last_run: now.clone(),

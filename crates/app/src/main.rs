@@ -31,6 +31,7 @@ mod source_scan;
 mod state;
 mod store;
 mod sync_tasks;
+mod sync_watch;
 mod update;
 
 /// 测试期独占界面语言。
@@ -284,6 +285,8 @@ enum Cmd {
     },
     /// 传输页：进入 / 刷新
     TransfersEnter,
+    /// 文件夹同步页：进入时重画任务列表
+    SyncEnter,
     HideDoneChanged,
     /// 应用全局限速（上传/下载）
     LimitApply,
@@ -8951,6 +8954,11 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             apply_global_limit(ctx, ui).await;
             false
         }
+        Cmd::SyncEnter => {
+            let ctx = ctx.clone();
+            let _ = ui.upgrade_in_event_loop(move |ui| maintenance::load_sync_into_ui(&ctx, &ui));
+            false
+        }
         Cmd::HideDoneChanged => {
             build_tasks(ctx, ui).await;
             false
@@ -10855,7 +10863,10 @@ fn wire_callbacks(
                 5 => {
                     let _ = tx.send(Cmd::TransfersEnter);
                 }
-                7 => {
+                6 => {
+                    let _ = tx.send(Cmd::SyncEnter);
+                }
+                8 => {
                     let _ = tx.send(Cmd::OptionsLoad);
                 }
                 _ => {}

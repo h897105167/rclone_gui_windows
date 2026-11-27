@@ -10,6 +10,7 @@
 //!   绝不写进 `config.json`——否则下一次启动会拿一个已死的密码去连。
 //! - 同一个动作重入时（连点）必须自己挡掉：新增/更新/拉取都有各自的闸门。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,6 +25,7 @@ use crate::core;
 use crate::plugins;
 use crate::store;
 use crate::sync_tasks;
+use crate::sync_watch;
 use crate::update;
 use crate::{Cmd, Ctx, MainWindow, MaintenanceG, StoreRow, SyncRow};
 
@@ -86,6 +88,11 @@ struct State {
     pending_update: Option<update::UpdateInfo>,
     last_due: Option<Instant>,
     last_poll: Option<Instant>,
+    /// 上一次扫本机目录的时刻。与 `last_due` 分开计时：扫目录比判断到期贵得多。
+    last_scan: Option<Instant>,
+    /// 每个同步任务上次扫到的目录指纹。只存内存：重启后重新记基线，
+    /// 不会把"上次运行期间改过的文件"当成刚发生的变化再传一遍。
+    watchers: crate::sync_watch::Watchers,
     /// 上一次推给界面的同步行指纹，用来避免每秒重设 model 导致列表闪烁/丢选中。
     sync_fingerprint: String,
     /// 内核安装/更新进度，避免同一个安装动作并发重入。
@@ -218,6 +225,17 @@ pub fn load_into_ui(ui: &MainWindow, cfg: &crate::config::AppConfig) {
 
 // ───────────────────────────── 行构造 ─────────────────────────────
 
+/// 进「文件夹同步」页时把已保存的任务灌进界面。
+///
+/// 只重画任务列表，不动表单里那几个输入框：用户可能正填到一半切走又切回来，
+/// 进去一次就把草稿清掉是最容易被骂的那种"贴心"。
+pub fn load_sync_into_ui(ctx: &Arc<Ctx>, ui: &MainWindow) {
+    let cfg = ctx.cfg.lock().unwrap().clone();
+    let rows = sync_rows(&cfg.sync_tasks, Some(&ctx.maint.engine));
+    let g = ui.global::<MaintenanceG>();
+    g.set_sync_items(ModelRc::new(VecModel::from(rows)));
+}
+
 /// 同步任务列表。`engine` 为 None 时表示"还没开始跑"，状态只从配置里读。
 fn sync_rows(tasks: &[SyncTask], engine: Option<&sync_tasks::Engine>) -> Vec<SyncRow> {
     let now = chrono::Local::now();
@@ -260,6 +278,9 @@ fn sync_rows(tasks: &[SyncTask], engine: Option<&sync_tasks::Engine>) -> Vec<Syn
                 remote: task.remote.clone().into(),
                 direction: sync_tasks::ui_direction(task).into(),
                 enabled: task.enabled,
+                // 这一行现在还会不会因为本机变化自己跑起来。别只显示"启用"：
+                // 用户想知道的是"我改完文件它会不会自己动"，那是两件事。
+                auto: crate::sync_watch::watches(task),
                 status: status.into(),
                 next: next.into(),
             }
@@ -289,8 +310,8 @@ fn push_sync_rows(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let mut print = String::new();
     for r in &rows {
         print.push_str(&format!(
-            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\n",
-            r.id, r.name, r.local, r.remote, r.direction, r.status, r.next
+            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\n",
+            r.id, r.name, r.local, r.remote, r.direction, r.enabled, r.auto, r.status, r.next
         ));
     }
     {
@@ -519,6 +540,7 @@ pub async fn handle(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, action: &str, id: &st
         "sync-pick-remote" => sync_pick_remote(ctx, &ui).await,
         "sync-run" => sync_run(ctx, &ui, id).await,
         "sync-toggle" => sync_toggle(ctx, &ui, id).await,
+        "sync-auto" => sync_auto(ctx, &ui, id).await,
         "sync-delete" => sync_delete(ctx, &ui, id).await,
         "diagnostics" => diagnostics(ctx, &ui).await,
         other => {
@@ -1796,6 +1818,8 @@ async fn sync_save(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
         // 界面这一版没有镜像选项：只做 copy。要删目标必须另外显式开启。
         mode: sync_tasks::MODE_COPY.to_string(),
         enabled: true,
+        // 新建的任务默认跟着本机变化自动跑；想只按间隔跑就点一下那一行的「自动」。
+        auto_sync: true,
         interval_hours: hours.max(0) as u32,
         last_run: String::new(),
         last_status: String::new(),
@@ -1916,6 +1940,38 @@ async fn sync_toggle(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
         // 停用只是不再排下一轮；正在跑的这一次让它跑完，否则用户会以为文件传了一半。
         text.push_str(&t("。正在进行的这一轮会跑完，之后不再启动。"));
     }
+    set_sync_status(ui, text);
+}
+
+/// 开关「本机有变化就提前跑一轮」。
+///
+/// 下行任务（云端 → 本机）上这个开关存着但不生效：那方向里本机文件的变化正是用户自己的
+/// 编辑，拿它去触发同步会把编辑覆盖掉。所以这里如实说"不会触发"，而不是显示一个亮着的
+/// 开关让用户以为它在管用。
+async fn sync_auto(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
+    let (now_auto, up) = {
+        let mut cfg = ctx.cfg.lock().unwrap();
+        let Some(slot) = cfg.sync_tasks.iter_mut().find(|t| t.id == id) else {
+            set_sync_status(ui, f("找不到任务：{}", &[&id]));
+            return;
+        };
+        slot.auto_sync = !slot.auto_sync;
+        let v = slot.auto_sync;
+        let up = sync_tasks::is_up(slot);
+        let _ = crate::config::save(&cfg);
+        (v, up)
+    };
+    // 开关变了也要让指纹变：否则列表上的「自动」标记要等下一次状态变化才刷新。
+    ctx.maint.state().sync_fingerprint.clear();
+    push_sync_rows(ctx, ui);
+    let text = if !now_auto {
+        t("已关闭自动同步：只按间隔运行").to_string()
+    } else if up {
+        // 先记一份当前状态，之后才有"变化"可比——否则第一次扫描会把已有一切当成新增。
+        t("已打开自动同步：本机文件夹有变化就提前跑一轮（先记下当前状态）").to_string()
+    } else {
+        t("已打开自动同步，但这是「云端 → 本机」的任务：本机文件的变化不会触发同步").to_string()
+    };
     set_sync_status(ui, text);
 }
 
@@ -2182,7 +2238,73 @@ pub async fn tick(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         ctx.maint.state().last_due = Some(now);
         spawn_due(ctx, ui).await;
     }
+    // 本机目录的变化比"到期"来得随机，所以单独计时。
+    let scan_now = {
+        let st = ctx.maint.state();
+        st.last_scan
+            .map(|t| now.duration_since(t) >= sync_watch::SCAN_TICK)
+            .unwrap_or(true)
+    };
+    if scan_now {
+        ctx.maint.state().last_scan = Some(now);
+        let fired = scan_changes(ctx, ui);
+        if !fired.is_empty() {
+            let tasks: Vec<SyncTask> = {
+                let cfg = ctx.cfg.lock().unwrap();
+                cfg.sync_tasks
+                    .iter()
+                    .filter(|t| fired.iter().any(|id| id == &t.id))
+                    .cloned()
+                    .collect()
+            };
+            run_tasks(ctx, ui, tasks).await;
+        }
+    }
     push_sync_rows(ctx, ui);
+}
+
+/// 扫一遍该盯的本机目录，返回"变化已经停稳"的任务 id。
+///
+/// 扫描是同步文件 IO，一次最多看 `sync_watch::MAX_ENTRIES` 个文件。桌面程序里这点时间
+/// 换来的是不用为每个任务维护监视线程和系统通知句柄，也不会因为通知库在某些网络盘上
+/// 不触发而静默失灵。正在跑的任务直接跳过：这一轮复制期间的变化，等它跑完再看，
+/// 免得同一个目录被判定两次、叠着跑两轮。
+fn scan_changes(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) -> Vec<String> {
+    let (to_scan, alive) = {
+        let cfg = ctx.cfg.lock().unwrap();
+        let watched: Vec<SyncTask> = cfg
+            .sync_tasks
+            .iter()
+            .filter(|t| sync_watch::watches(t))
+            .cloned()
+            .collect();
+        let alive: HashSet<String> = watched.iter().map(|t| t.id.clone()).collect();
+        let to_scan: Vec<SyncTask> = watched
+            .into_iter()
+            .filter(|t| !ctx.maint.engine.is_active(&t.id))
+            .collect();
+        (to_scan, alive)
+    };
+    // 先清理：删掉的任务、改成"云端 → 本机"的任务不该一直占着指纹内存。
+    ctx.maint.state().watchers.retain(&alive);
+    let now = Instant::now();
+    let mut fired = Vec::new();
+    let mut problems: Vec<(String, String)> = Vec::new();
+    for task in to_scan {
+        let seen = sync_watch::scan(std::path::Path::new(&task.local));
+        match ctx.maint.state().watchers.observe(&task.id, seen, now) {
+            sync_watch::Step::Fire => fired.push(task.id.clone()),
+            sync_watch::Step::Problem(e) => problems.push((display_name(&task), e)),
+            sync_watch::Step::Idle => {}
+        }
+    }
+    if let Some((name, e)) = problems.first() {
+        set_sync_status(
+            ui,
+            f("任务「{}」的本地目录打不开，这轮不自动同步：{}", &[name, e]),
+        );
+    }
+    fired
 }
 
 /// 收尾已经结束的 job，写回 last_status。
@@ -2231,9 +2353,6 @@ async fn poll_finished(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
 
 /// 到点的任务起一轮。已有 job 在跑的任务跳过（不重复启动同一目录）。
 async fn spawn_due(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
-    if !ctx.rc.is_live() {
-        return;
-    }
     let now = chrono::Local::now();
     let due: Vec<SyncTask> = {
         let cfg = ctx.cfg.lock().unwrap();
@@ -2245,6 +2364,18 @@ async fn spawn_due(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
             .cloned()
             .collect()
     };
+    run_tasks(ctx, ui, due).await;
+}
+
+/// 起一轮这些任务。内核没连上、或者已经有 job 在跑的任务都直接跳过。
+async fn run_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, tasks: Vec<SyncTask>) {
+    if !ctx.rc.is_live() {
+        return;
+    }
+    let due: Vec<SyncTask> = tasks
+        .into_iter()
+        .filter(|t| !ctx.maint.engine.is_active(&t.id))
+        .collect();
     if due.is_empty() {
         return;
     }
@@ -2458,6 +2589,7 @@ mod tests {
             direction: direction.to_string(),
             mode: sync_tasks::MODE_COPY.to_string(),
             enabled: true,
+            auto_sync: true,
             interval_hours: 6,
             last_run: String::new(),
             last_status: String::new(),
