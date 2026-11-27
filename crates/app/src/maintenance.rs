@@ -749,63 +749,173 @@ async fn core_flavor(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, id: &str) {
     }
 }
 
-/// 改用托管内核：把手填的路径收进备选，之后由我们自己下载与替换。
+/// 把「换内核」接到真实的进程与配置上。
 ///
-/// 只改配置、不碰文件——用户填的那份 exe 原地留着，我们只是不再用它。下载与替换留在
-/// `core-install`，于是「不再用你挑的那份」和「真把它换掉」是两次点击，中间那步用户
-/// 能看清后果（换内核要重启内核，挂载与传输会断）。
-async fn core_adopt_managed(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+/// 顺序与责任链在 [`crate::kernel_switch`] 里，这里只提供动手的那几个动作。
+struct LiveCore {
+    ctx: Arc<Ctx>,
+}
+
+#[async_trait::async_trait]
+impl crate::kernel_switch::Backend for LiveCore {
+    /// 只停我们自己拉起来的那个：`Core::stop` 杀的是自己的 pid 句柄，
+    /// 用户手开的 rclone 不在这个句柄里，所以这里不存在误杀。
+    fn stop(&mut self) {
+        self.ctx.maint.core.stop();
+    }
+
+    fn running(&mut self) -> bool {
+        self.ctx.maint.core.is_running()
+    }
+
+    async fn commit(&mut self, path: &str) -> Result<(), String> {
+        let saved = {
+            let mut cfg = self.ctx.cfg.lock().unwrap();
+            if path.is_empty() {
+                // 改用托管：手填的路径记进备选，文件原地留着。
+                cfg.core.adopt_managed();
+            } else {
+                cfg.core.mode = "managed".to_string();
+                cfg.core.path = path.to_string();
+            }
+            crate::config::save(&cfg)
+        };
+        saved.map_err(|e| e.to_string())
+    }
+
+    async fn start(&mut self) -> String {
+        // 这句话不参与判定：`start_managed_core` 把失败原因也包在 `Some` 里。
+        start_managed_core(&self.ctx).await.unwrap_or_default()
+    }
+
+    fn alive(&mut self) -> bool {
+        self.ctx.maint.core.is_running()
+    }
+
+    async fn live(&mut self) -> bool {
+        crate::handshake_live(&self.ctx).await
+    }
+
+    async fn restore(&mut self, before: crate::kernel_switch::Snapshot) -> Result<(), String> {
+        let saved = {
+            let mut cfg = self.ctx.cfg.lock().unwrap();
+            cfg.core.mode = before.mode;
+            cfg.core.path = before.path;
+            crate::config::save(&cfg)
+        };
+        saved.map_err(|e| e.to_string())
+    }
+}
+
+/// 换内核：真的停掉旧的、写配置、起新的、连不上就退回去。
+///
+/// `want` 为空串表示「交回托管，由程序自己找」。
+///
+/// 与单纯的「保存」不同，这条路径会中断正在跑的传输与挂载——这是换内核的必然代价，
+/// 所以界面上那两个按钮的文案都写明了后果。失败一律落回一个能用的状态：旧配置退回去、
+/// 旧内核重新起起来，然后如实说明。
+async fn core_switch(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, want: &str) -> bool {
     if ctx.maint.state().busy_core {
         set_core_status(ui, t("内核操作已在进行中，请稍等"));
+        return false;
+    }
+    let want = want.trim().to_string();
+    if !want.is_empty() && !Path::new(&want).is_file() {
+        set_core_status(
+            ui,
+            f(
+                "指定的内核路径不是一个文件：{}（要么改对，要么清空改用自动查找）",
+                &[&want],
+            ),
+        );
+        return false;
+    }
+    let before = {
+        let cfg = ctx.cfg.lock().unwrap();
+        crate::kernel_switch::Snapshot {
+            mode: cfg.core.normalized_mode().to_string(),
+            path: cfg.core.path.trim().to_string(),
+        }
+    };
+    // 换内核 = 换一组远程类型：旧内核的提供商清单立刻作废，
+    // 正在飞的那次抓取也会因为 epoch 变了而落不进来。
+    crate::reset_providers_cache(ctx);
+    let was_running = ctx.maint.core.is_running();
+    set_core_status(
+        ui,
+        if was_running {
+            t("正在切换内核：先停掉现在这个（挂载与传输会中断），再启动新的…")
+        } else {
+            t("正在启动内核…")
+        },
+    );
+    let mut backend = LiveCore { ctx: ctx.clone() };
+    let verdict = crate::kernel_switch::run(&mut backend, before, &want).await;
+    match verdict {
+        crate::kernel_switch::Verdict::Connected => {
+            ctx.maint.state().core_watch = CoreWatch {
+                started_at: Some(Instant::now()),
+                ..CoreWatch::default()
+            };
+            set_core_retry_needed(ui, false);
+            set_core_status(
+                ui,
+                if want.is_empty() {
+                    t("已改用托管内核，并已连上。")
+                } else {
+                    f("已切换到 {}，并已连上。", &[&want])
+                },
+            );
+            crate::logging::event(
+                "info",
+                "core",
+                &format!(
+                    "内核已切换并连上：{}",
+                    if want.is_empty() { "托管" } else { &want }
+                ),
+            );
+            // 换了一组作业号、换了一个进程：挂载与 serve 要重新报给新内核。
+            crate::spawn_restore(ctx, ui);
+            crate::toast(ui, 1, t("内核已切换并连上。"));
+        }
+        crate::kernel_switch::Verdict::KeptOld => {
+            set_core_status(ui, t("新的内核没能连上，已退回并重新启动原来的内核。"));
+            crate::toast(ui, 2, t("换内核没成功：已经退回原来的内核。"));
+        }
+        crate::kernel_switch::Verdict::Degraded(why) => {
+            set_core_status(ui, f("换内核没成功：{}", &[&why]));
+            note_core_failure(ctx, ui, &why);
+        }
+    }
+    refresh_core_status(ctx, ui);
+    // 内核换了，远程类型就换了：把「新建远程」的下拉按新内核重排。
+    crate::refresh_remote_types(ctx, ui).await;
+    true
+}
+
+/// 改用托管内核：把手填的路径收进备选，并真的切过去。
+async fn core_adopt_managed(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    if !core_switch(ctx, ui, "").await {
         return;
     }
-    let (kept, running) = {
-        let mut cfg = ctx.cfg.lock().unwrap();
-        let was_external = cfg.core.normalized_mode() != "managed";
-        let kept = cfg.core.adopt_managed();
-        let running = ctx.maint.core.is_running();
-        if kept.is_some() || was_external {
-            if let Err(e) = crate::config::save(&cfg) {
-                crate::logging::event("error", "core", &format!("保存内核路径失败：{e}"));
-                set_core_status(ui, f("保存内核路径失败：{}", &[&e]));
-                return;
-            }
-        }
-        (kept, running)
+    let kept = {
+        let cfg = ctx.cfg.lock().unwrap();
+        cfg.core.kept_paths.first().cloned()
     };
     with_ui(ui, |u| {
         let g = u.global::<MaintenanceG>();
         g.set_core_path("".into());
     });
-    match kept {
-        Some(p) => {
-            crate::logging::event(
-                "info",
-                "core",
-                &format!("改用托管内核；原路径保留在备选里：{p}"),
-            );
-            set_core_status(
-                ui,
-                f(
-                    "已改用托管内核：原内核 {} 保留在原处（记进备选，不删文件）；点「安装 / 更新内核」下载所选渠道的版本",
-                    &[&p],
-                ),
-            );
-            if running {
-                crate::toast(
-                    ui,
-                    2,
-                    t("正在运行的内核是从那个路径启动的；点「安装 / 更新内核」会先停掉它（传输与挂载会中断）"),
-                );
-            } else {
-                crate::toast(ui, 1, t("已改用托管内核；原文件保留，随时可以填回去"));
-            }
-        }
-        None => {
-            set_core_status(ui, t("没有手填的内核路径，已经在用托管内核"));
-        }
+    if let Some(p) = kept {
+        crate::toast(
+            ui,
+            1,
+            f(
+                "已改用托管内核；原内核 {} 保留在原处（记进备选，不删文件）",
+                &[&p],
+            ),
+        );
     }
-    refresh_core_status(ctx, ui);
 }
 
 /// 重启内核之后的三种真实结局。
@@ -1163,6 +1273,10 @@ async fn core_stop(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     refresh_core_status(ctx, ui);
 }
 
+/// 保存并切换到界面上填的那个内核。
+///
+/// 以前这里只写配置：填了路径、点了保存，真正跑着的还是原来那个，用户以为换过了。
+/// 现在保存就是换——停旧的、写配置、起新的、连不上退回去，见 [`core_switch`]。
 async fn core_save(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     let picked = crate::read_ui(ui, |u: MainWindow| {
         u.global::<MaintenanceG>().get_core_path().to_string()
@@ -1172,36 +1286,7 @@ async fn core_save(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
         set_core_status(ui, t("读取界面设置失败"));
         return;
     };
-    let path = path.trim().to_string();
-    if !path.is_empty() {
-        let p = Path::new(&path);
-        if !p.is_file() {
-            set_core_status(
-                ui,
-                f(
-                    "指定的内核路径不是一个文件：{}（要么改对，要么清空改用自动查找）",
-                    &[&path],
-                ),
-            );
-            return;
-        }
-    }
-    {
-        let mut cfg = ctx.cfg.lock().unwrap();
-        // 严格按托管保存：界面上已经没有「外部 rclone」这个选项，任何残留的
-        // 旧值都在这里被纠正，不需要用户自己去找开关。
-        cfg.core.mode = "managed".to_string();
-        cfg.core.path = path.clone();
-    }
-    let save_result = {
-        let cfg = ctx.cfg.lock().unwrap().clone();
-        crate::config::save(&cfg)
-    };
-    match save_result {
-        Ok(()) => set_core_status(ui, t("已保存：内核由本程序管理")),
-        Err(e) => set_core_status(ui, f("保存内核设置失败：{}", &[&e])),
-    }
-    refresh_core_status(ctx, ui);
+    core_switch(ctx, ui, &path).await;
 }
 
 // ── 应用更新 ──

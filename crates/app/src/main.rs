@@ -13,6 +13,7 @@ mod config;
 mod core;
 mod http;
 mod icon_asset;
+mod kernel_switch;
 mod kv;
 mod lightweight;
 mod logging;
@@ -395,6 +396,12 @@ struct Ctx {
     /// 最近一次拉取 providers 失败的原因（空 = 成功）。用于在类型下拉为空时
     /// 告诉用户「为什么选不了类型」，而不是只给一个空下拉框。
     providers_err: Arc<std::sync::Mutex<Option<String>>>,
+    /// 换一次内核就加一。
+    ///
+    /// 抓 providers 要跨 `await`。换内核正好落在中间时，回来的清单属于**旧**内核；
+    /// 记下起点、回来再比一次，就能把它认出来并拒收，而不是写进缓存让「新建远程」
+    /// 一直显示上一个内核的类型。同理，内存缓存被清空之前起飞的请求也不会再写回来。
+    providers_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// 活动挂载缓存（含挂载中的 pending 项），用于筛选与盘符重复检测
     mounts_cache: Arc<std::sync::Mutex<Vec<MountRow>>>,
     /// 正在挂载中的 (rclone fs, 挂载点)
@@ -2960,6 +2967,24 @@ async fn read_fields_from_ui(ui: &Weak<MainWindow>) -> Vec<FieldRow> {
     .unwrap_or_default()
 }
 
+/// 当前内核的身份串：provider 缓存按它分家。
+///
+/// 只放「换个内核就一定会变」的东西：托管还是自己指定的、实际用哪个 exe、哪个渠道。
+/// 端口和 pid 不放——它们每次启动都不一样，写进来等于每次都是新身份，缓存永远用不上。
+fn providers_identity(cfg: &config::AppConfig) -> String {
+    format!(
+        "{}|{}|{}",
+        cfg.core.normalized_mode(),
+        cfg.core.path.trim(),
+        cfg.core.normalized_flavor().as_str()
+    )
+}
+
+/// 由当前配置算身份串。配置锁只在这里短暂持有，不跨 `await`。
+fn current_providers_identity(ctx: &Arc<Ctx>) -> String {
+    providers_identity(&ctx.cfg.lock().unwrap())
+}
+
 /// 获取 providers（优先内存缓存 → 网络 → 磁盘缓存）。
 ///
 /// **失败不能静默成空**：`config/providers` 拿不到时，类型下拉会是空的，
@@ -2967,6 +2992,10 @@ async fn read_fields_from_ui(ui: &Weak<MainWindow>) -> Vec<FieldRow> {
 /// 因此这里：
 /// 1. 把失败原因记进 `providers_err`，供 UI 提示；
 /// 2. 回落到上次成功时的磁盘缓存，离线也能继续建远程。
+///
+/// 缓存**只服务给它的那个内核**：身份串对不上就当没有缓存（见
+/// [`providers_identity`]）。换内核之后还拿上一个内核的类型清单去建远程，
+/// 用户会看到一堆当前内核根本不认识的类型。
 async fn get_providers(ctx: &Arc<Ctx>) -> Value {
     {
         let cache = ctx.providers_cache.lock().unwrap();
@@ -2974,18 +3003,33 @@ async fn get_providers(ctx: &Arc<Ctx>) -> Value {
             return v.clone();
         }
     }
+    let identity = current_providers_identity(ctx);
+    let epoch = ctx
+        .providers_epoch
+        .load(std::sync::atomic::Ordering::SeqCst);
     let client = ctx.rc.client().await;
-    match client.config_providers().await {
+    let fetched = client.config_providers().await;
+    // 这一趟跨了 `await`：中途换过内核（epoch 变了）、或者配置里的身份已经不同，
+    // 手上这份就是旧内核的答复。照实交给调用方去显示，但绝不写进缓存。
+    let stale = ctx
+        .providers_epoch
+        .load(std::sync::atomic::Ordering::SeqCst)
+        != epoch
+        || current_providers_identity(ctx) != identity;
+    match fetched {
         Ok(v) => {
+            if stale {
+                return v;
+            }
             *ctx.providers_cache.lock().unwrap() = Some(v.clone());
             *ctx.providers_err.lock().unwrap() = None;
-            save_providers_cache(&v);
+            save_providers_cache(&identity, &v);
             v
         }
         Err(e) => {
             let msg = e.to_string();
             *ctx.providers_err.lock().unwrap() = Some(msg);
-            match load_providers_cache() {
+            match load_providers_cache(&identity) {
                 Some(v) => {
                     *ctx.providers_cache.lock().unwrap() = Some(v.clone());
                     v
@@ -2996,34 +3040,82 @@ async fn get_providers(ctx: &Arc<Ctx>) -> Value {
     }
 }
 
+/// 内核换了：把 provider 缓存整个作废。
+///
+/// 先抬 epoch 再清内存：正在飞的那一趟回来后看到 epoch 变了，就不会把自己的结果
+/// 写回缓存；清内存是为了让下一次 `get_providers` 一定去问新内核，而不是直接把
+/// 上一个内核的清单还给它。
+pub(crate) fn reset_providers_cache(ctx: &Arc<Ctx>) {
+    ctx.providers_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    *ctx.providers_cache.lock().unwrap() = None;
+    *ctx.providers_err.lock().unwrap() = None;
+}
+
 /// 上次成功拿到的 `config/providers` 落盘位置。
 fn providers_cache_path() -> std::path::PathBuf {
     config::data_dir().join("providers_cache.json")
 }
 
-/// 把 provider 列表存盘（仅用于离线兜底；失败不影响主流程）。
-fn save_providers_cache(v: &Value) {
-    if v.get("providers")
-        .and_then(|p| p.as_array())
-        .map(|a| a.is_empty())
-        .unwrap_or(true)
-    {
-        return; // 空结果不值得覆盖掉一份好的缓存
-    }
-    let _ = std::fs::write(providers_cache_path(), v.to_string());
+/// 缓存文件的内容：清单 + 「这是哪个内核给的」。
+///
+/// 只存清单是不够的：`providers_cache.json` 在数据目录里跨内核、跨渠道都在，
+/// 换成本地自选的 fork 之后，离线兜底会把这个文件里官方版的类型表冒充成
+/// fork 的类型表（用户实测：换了内核，类型列表一个没变）。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProvidersCache {
+    /// [`providers_identity`] 的结果
+    identity: String,
+    /// `config/providers` 的原始回复
+    providers: Value,
 }
 
-fn load_providers_cache() -> Option<Value> {
-    let text = std::fs::read_to_string(providers_cache_path()).ok()?;
-    let v: Value = serde_json::from_str(&text).ok()?;
-    if v.get("providers")
+/// `providers` 字段是不是空的（缺字段也算空）。
+fn providers_are_empty(v: &Value) -> bool {
+    v.get("providers")
         .and_then(|p| p.as_array())
         .map(|a| a.is_empty())
         .unwrap_or(true)
-    {
+}
+
+/// 把 provider 列表存盘（仅用于离线兜底；失败不影响主流程）。
+fn save_providers_cache(identity: &str, v: &Value) {
+    save_providers_cache_at(&providers_cache_path(), identity, v);
+}
+
+/// [`save_providers_cache`] 的实际实现，路径由调用方给，测试才能不碰真实数据目录。
+///
+/// 返回是否真的写了盘：空清单不覆盖已有缓存（那是把一份好的兜底删掉）。
+fn save_providers_cache_at(path: &std::path::Path, identity: &str, v: &Value) -> bool {
+    if providers_are_empty(v) {
+        return false;
+    }
+    let body = ProvidersCache {
+        identity: identity.to_string(),
+        providers: v.clone(),
+    };
+    let Ok(text) = serde_json::to_string(&body) else {
+        return false;
+    };
+    std::fs::write(path, text).is_ok()
+}
+
+/// 读回离线兜底的缓存，只认身份相同的那份。
+///
+/// 旧版本写下的文件没有 `identity` 字段，解析会失败——那就当没有缓存：
+/// 一份不知道是谁给的类型表，比没有更危险。
+fn load_providers_cache(identity: &str) -> Option<Value> {
+    load_providers_cache_at(&providers_cache_path(), identity)
+}
+
+/// [`load_providers_cache`] 的实际实现，路径由调用方给。
+fn load_providers_cache_at(path: &std::path::Path, identity: &str) -> Option<Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let parsed: ProvidersCache = serde_json::from_str(&text).ok()?;
+    if parsed.identity != identity || providers_are_empty(&parsed.providers) {
         return None;
     }
-    Some(v)
+    Some(parsed.providers)
 }
 
 // ---------------- 新建远程的类型下拉 ----------------
@@ -3283,7 +3375,60 @@ fn push_type_selection(ui: &MainWindow, choices: &[TypeChoice], idx: Option<usiz
     });
 }
 
-/// 这个类型该用哪张参数表：一律按 rclone 的后端名取。
+/// 换内核之后，把「新建远程」的类型下拉按新内核重排一遍。
+///
+/// 只动类型清单，不动用户正在填的东西：名字、参数、高级/原始开关一概不碰，搜索框里的
+/// 字也照旧生效。选中项按**类型 id** 找回来（显示名会被插件换译文，id 不会）；
+/// 实在找不回来就写成「没选中」——宁可让保存拦一下，也不要拿另一套参数去建别的后端。
+///
+/// 编辑器没开着就什么都不做：清了锁内那份表，下次 `RemoteAdd` 会自己重建。
+pub(crate) async fn refresh_remote_types(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
+    let Some((open, picked, query)) = read_ui(ui, |u: MainWindow| {
+        let g = u.global::<RemotesG>();
+        (
+            g.get_show_editor(),
+            g.get_type_idx(),
+            g.get_type_query().to_string(),
+        )
+    })
+    .await
+    else {
+        return;
+    };
+    if !open {
+        return;
+    }
+    // 旧选中项先按 id 记住，再重建——顺序反过来就只能按显示名猜了。
+    let keep_id = {
+        let t = ctx.type_choices.lock().unwrap();
+        t.selected(picked).map(|c| c.id)
+    };
+    let providers = get_providers(ctx).await;
+    let derived = remote_types::collect(ctx);
+    let all = build_type_choices(&providers, &derived);
+    let (shown, idx) = {
+        let mut t = ctx.type_choices.lock().unwrap();
+        t.reset(all, keep_id.as_deref());
+        let keep = t.refilter(query.trim(), keep_id.as_deref());
+        (t.visible.clone(), keep.idx)
+    };
+    let kept = keep_id
+        .as_deref()
+        .and_then(|id| shown.iter().position(|c| c.id == id));
+    let lost = keep_id.is_some() && kept.is_none();
+    let pick = if picked < 0 { None } else { kept.or(idx) };
+    let _ = ui.upgrade_in_event_loop(move |u| {
+        push_type_selection(&u, &shown, pick);
+        if lost {
+            toast(
+                &u,
+                2,
+                t("这个类型在当前内核里没有了：请重新选一个类型再保存"),
+            );
+        }
+    });
+}
+
 ///
 /// 派生类型落盘的就是 `base_type`（例如 `kvault` 存成 `webdav`），所以它的参数表
 /// 与后端自己的那张是同一张；插件独有的键由 `seed_derived_defaults` 铺进原始参数框。
@@ -3717,6 +3862,7 @@ fn main() {
         remotes_cache: Arc::new(std::sync::Mutex::new(Vec::new())),
         providers_cache: Arc::new(std::sync::Mutex::new(None)),
         providers_err: Arc::new(std::sync::Mutex::new(None)),
+        providers_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         mounts_cache: Arc::new(std::sync::Mutex::new(Vec::new())),
         pending_mounts: Arc::new(std::sync::Mutex::new(Vec::new())),
         cancelled_mounts: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -10141,6 +10287,22 @@ fn wire_callbacks(
             });
         }
     });
+    // 维护页「程序路径」右边的「浏览…」。选中就填进输入框，取消就什么都不改——
+    // 只填不切：真正换内核要按旁边的「保存」，那一步会重启内核（传输与挂载会中断）。
+    ui.on_pick_exe({
+        let ui = ui.as_weak();
+        move || {
+            let Some(u) = ui.upgrade() else { return };
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("rclone", &["exe"])
+                .set_title(rcgui_i18n::t("选择 rclone 可执行文件"))
+                .pick_file()
+            {
+                u.global::<MaintenanceG>()
+                    .set_core_path(path.display().to_string().into());
+            }
+        }
+    });
     ui.on_refresh_dashboard({
         let tx = tx.clone();
         move || {
@@ -11639,6 +11801,96 @@ fn accent_rgb(cfg: &crate::config::AppConfig) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 缓存文件要连着「哪个内核给的」一起存。
+    ///
+    /// 只存清单的话，换成本地自选的 fork 之后，离线兜底会把官方版的类型表冒充成
+    /// fork 的类型表——用户看到的就是「换了内核，类型列表一个没变」。
+    #[test]
+    fn a_cache_from_another_kernel_is_not_served() {
+        let path = scratch_json("providers-cross-kernel");
+        let list = json!({"providers": [{"Name": "s3"}]});
+        assert!(save_providers_cache_at(&path, "managed||official", &list));
+
+        assert!(
+            load_providers_cache_at(&path, "managed||official").is_some(),
+            "同一个内核写的缓存要能用：离线时靠它建远程"
+        );
+        assert!(
+            load_providers_cache_at(&path, "managed|D:\\fork\\rclone.exe|official").is_none(),
+            "换了一个 exe 就不是同一个内核了，旧清单不能拿来充数"
+        );
+    }
+
+    /// 旧版本写下的缓存没有身份字段：整份当没有缓存。
+    ///
+    /// 一份不知道是谁给的类型表，比没有更危险——照它会建出一个当前内核不认识的远程。
+    #[test]
+    fn an_identity_less_cache_is_ignored() {
+        let path = scratch_json("providers-legacy-format");
+        std::fs::write(&path, r#"{"providers":[{"Name":"s3"}]}"#).unwrap();
+        assert!(load_providers_cache_at(&path, "managed||official").is_none());
+    }
+
+    /// 空清单不能覆盖一份好的兜底缓存。
+    #[test]
+    fn an_empty_list_never_overwrites_a_good_cache() {
+        let path = scratch_json("providers-empty-guard");
+        let good = json!({"providers": [{"Name": "s3"}]});
+        assert!(save_providers_cache_at(&path, "managed||official", &good));
+
+        assert!(!save_providers_cache_at(
+            &path,
+            "managed||official",
+            &json!({})
+        ));
+        assert!(!save_providers_cache_at(
+            &path,
+            "managed||official",
+            &json!({"providers": []})
+        ));
+        let kept = load_providers_cache_at(&path, "managed||official")
+            .expect("空结果不该把已经存好的清单冲掉");
+        assert_eq!(kept["providers"].as_array().map(|a| a.len()), Some(1));
+    }
+
+    /// 身份串跟着「托管与否 / 哪个 exe / 哪个渠道」走，不跟端口和 pid 走。
+    ///
+    /// 端口每次启动都变：把它写进身份，缓存就永远命中不了（每换一次内核都重新联网）。
+    #[test]
+    fn the_identity_follows_the_kernel_choice() {
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.core.mode = "managed".to_string();
+        cfg.core.path = String::new();
+        cfg.core.flavor = "official".to_string();
+        let managed_official = providers_identity(&cfg);
+
+        let mut local = cfg.clone();
+        local.core.mode = "external".to_string();
+        local.core.path = " D:\\rclone\\rclone.exe ".to_string();
+        let local_extra = providers_identity(&local);
+        assert_ne!(managed_official, local_extra, "换成本地内核必须换身份");
+
+        let mut same_path_other_flavor = local.clone();
+        same_path_other_flavor.core.flavor = "extra".to_string();
+        assert_ne!(
+            providers_identity(&local),
+            providers_identity(&same_path_other_flavor),
+            "同一个 exe 换渠道也是换内核"
+        );
+
+        // 前后空白不该造出两个身份：同一份配置文件读两遍要得到同一个串。
+        let mut spaced = local.clone();
+        spaced.core.path = "D:\\rclone\\rclone.exe".to_string();
+        assert_eq!(providers_identity(&local), providers_identity(&spaced));
+    }
+
+    /// 一个不碰真实数据目录的临时文件名：每个用例一个，互不干扰。
+    fn scratch_json(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rcgui-test-{}-{}", std::process::id(), tag));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        dir.join("providers_cache.json")
+    }
 
     #[test]
     fn accent_rgb_matches_theme_palette() {
