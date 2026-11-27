@@ -55,6 +55,7 @@ Status legend: **released** = present in v0.2.1; **developing** = in the tree at
 | **Mounts** | Mount to a drive letter with cache mode and read-only flags, see whether the letter appeared, install WinFsp from the official or a mirror source, re-create remembered mounts after the next connect | released |
 | **Services** | Serve a remote over HTTP, WebDAV, FTP, SFTP or DLNA with per-service credentials; start, stop, inspect, and re-create remembered services on reconnect | released |
 | **Transfers** | Live and finished transfers with progress, speed and totals, background jobs labelled by kind | released |
+| **Folder sync** | Sync a local folder to a remote on a chosen direction and interval; a round can start early when the local folder changes (on by default, only for local → remote, because local changes in the other direction are your own edits), and a folder that cannot be read is reported once | developing |
 | **Plugins** | Install, enable, disable, uninstall; declarative settings panel; restore a built-in plugin you removed; open the plugin directory | released |
 | **Settings** | RC endpoint and credentials, theme, accent colour, language, winget mirror, config path, `rcgui.conf` import/export, core selection | endpoint and appearance released; **core selection developing** |
 | **Plugin store** | Browse the static index, look up permissions and source, install a verified release archive | developing (index, page and the in-app client are all in the tree; unpublished) |
