@@ -2271,19 +2271,21 @@ pub async fn tick(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) {
     if !ready.is_empty() {
         let mut fired: Vec<SyncTask> = Vec::new();
         for task in tasks.iter().filter(|t| ready.iter().any(|id| id == &t.id)) {
-            // 盘没挂上、网络盘掉线时，通知说的是「里面全没了」。镜像任务照着删就是
-            // 清空云端，所以空目录一律只报告、不执行。
-            if crate::sync_watch::refuses_an_empty_mirror(task) {
-                // 这一轮不跑，但欠着的那一次变化还在：把愿望还回去（不重试，等下一次变化
-                // 或用户自己按「运行」），否则这条任务以后再也不会自动触发。
-                ctx.maint
-                    .state()
-                    .watchers
-                    .note_not_started(&task.id, false, Instant::now());
+            // 盘没挂上、网络盘掉线、目录被改名之后再建一个空的、权限被收走：通知说的是
+            // 「里面全没了」，或者干脆读不出来。镜像任务照着删就是清空云端，所以一律只
+            // 报告、不执行。
+            if crate::sync_watch::refuses_a_mirror_round(task) {
+                // 这一轮不跑，但欠着的那一次变化还在。挡住、不自燃：等到下一次变化、
+                // 目录回来，或者用户自己按「运行」——每分钟重试一次只是打扰。
+                ctx.maint.state().watchers.note_setback(
+                    &task.id,
+                    crate::sync_watch::Setback::Guarded,
+                    Instant::now(),
+                );
                 set_sync_status(
                     ui,
                     f(
-                        "任务「{}」的本机目录现在是空的，镜像这一轮不自动跑：怕把云端一起清空。确实是您清空的，就在那一行按「运行」",
+                        "任务「{}」的本机目录现在是空的或者读不了，镜像这一轮不自动跑：怕把云端一起清空。确实是您清空的，就在那一行按「运行」",
                         &[&display_name(task)],
                     ),
                 );
@@ -2372,10 +2374,12 @@ async fn run_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, tasks: Vec<SyncTask>) 
     }
     if !ctx.rc.is_live() {
         // 连内核都没连上：变化是欠着的，得把它记回去，否则监视端以为这一轮已经在跑。
+        // 这是「启动失败」那一类：隔一会儿再试，间隔逐次拉长。
         let now = Instant::now();
         let mut st = ctx.maint.state();
         for task in &tasks {
-            st.watchers.note_not_started(&task.id, true, now);
+            st.watchers
+                .note_setback(&task.id, crate::sync_watch::Setback::Deferred, now);
         }
         return;
     }
@@ -2385,11 +2389,12 @@ async fn run_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, tasks: Vec<SyncTask>) 
         for task in tasks {
             if ctx.maint.engine.is_active(&task.id) {
                 // 引擎已经在跑这个目录（到期和文件变化常常落在同一拍）。这一轮没真的开始，
-                // 不能算同步过：把愿望还回去，等正在跑的那轮结束再补一次。
-                ctx.maint
-                    .state()
-                    .watchers
-                    .note_not_started(&task.id, false, now);
+                // 不能算同步过：记成「等那一轮结束」，那一轮收尾时解开会补一次。
+                ctx.maint.state().watchers.note_setback(
+                    &task.id,
+                    crate::sync_watch::Setback::Busy,
+                    now,
+                );
             } else {
                 due.push(task);
             }
@@ -2404,10 +2409,11 @@ async fn run_tasks(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, tasks: Vec<SyncTask>) 
         match sync_tasks::start(&client, &ctx.maint.engine, &task).await {
             Ok(jobid) => started.push((task, jobid)),
             Err(e) => {
-                ctx.maint
-                    .state()
-                    .watchers
-                    .note_not_started(&task.id, true, Instant::now());
+                ctx.maint.state().watchers.note_setback(
+                    &task.id,
+                    crate::sync_watch::Setback::Deferred,
+                    Instant::now(),
+                );
                 let mut cfg = ctx.cfg.lock().unwrap();
                 if let Some(slot) = cfg.sync_tasks.iter_mut().find(|t| t.id == task.id) {
                     slot.last_status = format!("failed: {e}");
