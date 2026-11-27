@@ -6,7 +6,7 @@
 
 A Windows desktop front end for [rclone](https://rclone.org/), written in Rust with a [Slint](https://slint.dev) interface. There is no webview: the window is native, drawn by Slint, and talks to rclone over rclone's own RC API.
 
-**Status: version 0.3.1 is in development.** The newest released build is **v0.2.1**. Everything this page marks *developing* is in the tree at HEAD and has not shipped; nothing here is called released until a tag, a GitHub Release and the assets listed below actually exist together. The version history and the exact wording rules are in [`docs/VERSIONING.md`](docs/VERSIONING.md) and [`docs/CHANGELOG.md`](docs/CHANGELOG.md). There is no `v0.3.0`: what the sections below call "0.3.0" is this same body of work, which ships as 0.3.1.
+**Status: version 0.3.2 is in development.** The newest released build is **v0.2.1**. Everything this page marks *developing* is in the tree at HEAD and has not shipped; nothing here is called released until a tag, a GitHub Release and the assets listed below actually exist together. The version history and the exact wording rules are in [`docs/VERSIONING.md`](docs/VERSIONING.md) and [`docs/CHANGELOG.md`](docs/CHANGELOG.md). Neither `v0.3.0` nor `v0.3.1` got a tag: what the sections below call "0.3.0" is this same body of work, which ships as 0.3.2.
 
 ## What changed in 0.3.0
 
@@ -129,7 +129,7 @@ Every entry is a URL plus a SHA-256 that the app verifies before unpacking, so t
 
 Authors submit a manifest through a pull request to [`docs/store/index.json`](docs/store/index.json); the submission rules, the review gate and the checks the CI runs are in [`docs/store/README.md`](docs/store/README.md). Nothing in the store is executable code hosted by the repository — entries are URLs plus a SHA-256, and the app verifies the hash before unpacking.
 
-In 0.3.0, the new-remote list comes from the connected rclone core and presets declared by enabled plugins. The [kvault plugin](https://github.com/h897105167/rcgui-plugin-kvault) supplies the K-Vault connection wizard and WebDAV preset; the app no longer inserts that type unconditionally. The app retains the site's file-upload adapter and compatibility with existing remotes. The plugin source and test archive are under review, **unreleased and absent from the store**. Store entries require a real Release asset and verified checksum.
+In 0.3.0, the new-remote list comes from the connected rclone core and presets declared by enabled plugins. The [kvault plugin](https://github.com/h897105167/rcgui-plugin-kvault) supplies the K-Vault connection wizard and WebDAV preset; the app no longer inserts that type unconditionally. The app retains the site's file-upload adapter and compatibility with existing remotes. The plugin ships as [kvault 0.3.1](https://github.com/h897105167/rcgui-plugin-kvault/releases/tag/v0.3.1) and is installed from the store, not bundled: the entry points at that Release asset and the app verifies its SHA-256 before unpacking. It requires RCGUI 0.3.2 or newer, because its panel has to be refreshed while you type; older builds are refused before installation.
 
 <img src="docs/plugins-store-preview.png" alt="RCGUI 0.3.0 development build: the Plugins window with the Store tab open" width="720">
 

@@ -645,7 +645,7 @@ mod tests {
     /// 用户点安装会在最后一步被拒。这里直接读那份文件（编译期嵌进来，不联网、
     /// 不碰凭据），把「能不能装上」在测试里复现一遍。
     #[test]
-    fn the_shipped_store_index_lets_kvault_in_only_from_0_3_1() {
+    fn the_shipped_store_index_lets_kvault_in_only_from_0_3_2() {
         let parsed = parse_index(include_str!("../../../docs/store/index.json"))
             .expect("仓库里的商店索引读不出来");
         assert!(
@@ -658,19 +658,20 @@ mod tests {
             .iter()
             .find(|e| e.id == "kvault")
             .expect("商店索引里少了 kvault");
-        assert_eq!(kv.version, "0.3.0", "版本要和发布出来的 zip 同名");
+        assert_eq!(kv.version, "0.3.1", "版本要和发布出来的 zip 同名");
         assert_eq!(
             kv.url,
-            "https://github.com/h897105167/rcgui-plugin-kvault/releases/download/v0.3.0/kvault-0.3.0.zip"
+            "https://github.com/h897105167/rcgui-plugin-kvault/releases/download/v0.3.1/kvault-0.3.1.zip"
         );
-        // 这条门槛是收录它的全部意义：0.3.1 之前的宿主没有插件远程协议，
-        // 装进去只会在远程列表里显示成没人认领的类型。旧构建必须在安装前被拒。
-        assert_eq!(kv.min_gui_version, "0.3.1");
+        // 这条门槛是收录它的全部意义：0.3.2 之前的宿主每次按键只把文本存进表单，
+        // 从不重新向插件要状态，装上去就是填完地址和令牌、按钮一直灰着。
+        // 旧构建必须在安装前被拒。
+        assert_eq!(kv.min_gui_version, "0.3.2");
         assert!(
-            kv.allows_gui("0.3.0").is_err(),
-            "0.3.0 的宿主不该装得上需要新协议的 K-Vault"
+            kv.allows_gui("0.3.1").is_err(),
+            "0.3.1 的宿主不该装得上要求打字时刷新面板的 K-Vault"
         );
-        assert!(kv.allows_gui("0.3.1").is_ok());
+        assert!(kv.allows_gui("0.3.2").is_ok());
         let mut caps = kv.capabilities.clone();
         caps.sort();
         assert_eq!(

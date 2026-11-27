@@ -9365,10 +9365,15 @@ async fn handle_cmd_inner(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>, cmd: Cmd) -> bo
             })
             .await
             .unwrap_or_default();
-            if !id.is_empty() && !key.is_empty() {
-                // 立刻落盘：用户在输入框里的每个字符都要保住
-                plugins::set_form_field(&ctx.store, &id, &key, &value);
+            if id.is_empty() || key.is_empty() {
+                return false;
             }
+            // 立刻落盘：用户在输入框里的每个字符都要保住
+            plugins::set_form_field(&ctx.store, &id, &key, &value);
+            // 再按新内容重算状态和按钮可用性。不这么做，状态行会一直停在打开面板
+            // 那一刻说的话——"先填站点地址"、"建远程还需要令牌"、测试连接禁用，
+            // 用户填完了也没人问他。重算只贴变了的行，输入框的焦点和光标不动。
+            plugins::refresh_panel_after_edit(&ctx, ui, &id, &key).await;
             false
         }
         Cmd::PluginPanelPick { key, value } => {

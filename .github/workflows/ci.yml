@@ -114,7 +114,10 @@ jobs:
       # 插件在自己的仓库里，Release 目前也还没有资产可下载，所以按提交取源码现编：
       # 行里的 ref 是钉死的完整提交，不是分支——分支会漂，同一个 workflow 昨天跑的和
       # 今天跑的就不是同一份插件代码了。
-      # 这个提交是 codex/kvault-separation 上「已通过插件自己 CI、可打包」的那一个。
+      # 这个提交来自 codex/kvault-form-sync（插件仓库 PR #3），带着面板读表单的修复，
+      # 以及插件升到 0.3.1、门槛写成 min_gui_version = 0.3.2 的那次改动——
+      # 本程序这一版就是 0.3.2，两边门槛对齐，跨仓库那一组才跑得起来。
+      # 插件那边自己的 CI 在同一份代码上跑 fmt / wasm 目标 / 单测，两条线互补。
       # 插件升级时同步改这三行：ref、以及下面「确认测试会真跑」里期望的 wasm 体积下限。
       # 合并进 main 之后改成 ref: main 的提交哈希（仍然钉提交，不要写分支名）。
       #
@@ -126,8 +129,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: h897105167/rcgui-plugin-kvault
-          # Fix plugin release version validation
-          ref: de537cc93a2ee5f0c6ac1c56c45e01e2c257bea0
+          # Bump the plugin to 0.3.1 and require host 0.3.2
+          ref: 57ec31421c10f5fde66335930b1a82b84c8fed46
           path: _kvault
 
       - name: 确认插件不在主工作区里
