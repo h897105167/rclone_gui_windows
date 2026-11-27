@@ -25,7 +25,7 @@ exclude = ["_kvault"]
 # 版本号的唯一来源：所有成员用 version.workspace = true 继承，二进制通过
 # env!("CARGO_PKG_VERSION") 读取，插件看到的 gui_version 和商店里的
 # min_gui_version 比较都用这个值。改这里等于发一个新版本，规则见 docs/VERSIONING.md。
-version = "0.3.5"
+version = "0.3.6"
 edition = "2021"
 
 [workspace.dependencies]
