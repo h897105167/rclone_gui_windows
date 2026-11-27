@@ -260,6 +260,7 @@ pub fn build_bundle(
             direction: t.direction.clone(),
             mode: t.mode.clone(),
             enabled: t.enabled,
+            auto_sync: t.auto_sync,
             interval_hours: t.interval_hours,
         })
         .collect();
@@ -630,7 +631,8 @@ fn apply_sync_tasks(tasks: &[rcgui_profile::SyncTaskRef], cfg: &mut AppConfig) -
                     t.mode.clone()
                 },
                 enabled: t.enabled && !wants_mirror,
-                // 配置文件里还没有这一项：导入后按默认打开处理，与本地新建的任务一致。
+                // 文件里写了开关就照抄；没写（None）就交给调度器按模式默认：
+                // 只复制的任务跟着变化跑，镜像任务不动。
                 auto_sync: t.auto_sync,
                 interval_hours: if t.interval_hours == 0 { 6 } else { t.interval_hours },
                 // 导入时刻当作"上次运行"，把第一轮推到下一个间隔之后
@@ -961,6 +963,7 @@ mod tests {
                 direction: "up".into(),
                 mode: "sync".into(), // 文件要求镜像
                 enabled: true,
+                auto_sync: None,
                 interval_hours: 6,
             },
             rcgui_profile::SyncTaskRef {
@@ -971,6 +974,7 @@ mod tests {
                 direction: "down".into(),
                 mode: String::new(), // 没写模式
                 enabled: true,
+                auto_sync: None,
                 interval_hours: 0, // 没写间隔
             },
         ];
@@ -994,6 +998,26 @@ mod tests {
         // 顺带确认调度器算出来的下次运行时间在未来，而不是"立刻"
         let next = crate::sync_tasks::due_at(&cfg.sync_tasks[1], chrono::Local::now());
         assert!(next.is_some(), "启用的任务应当有下次运行时间");
+    }
+
+    /// 「跟着本机变化跑」这一项要有跨版本兼容：老文件里没有它，导入后不能变成
+    /// 「确定关闭」——那就等于替用户关掉了新功能；文件里明确写了 `false` 才照抄。
+    #[test]
+    fn an_old_file_without_the_auto_setting_imports_as_unset() {
+        let old: rcgui_profile::SyncTaskRef = serde_json::from_str(
+            r#"{"id":"t1","name":"照片","local":"D:\\照片","remote":"gdrive:photos"}"#,
+        )
+        .expect("老文件没有 auto_sync 字段也要能读");
+        assert_eq!(old.auto_sync, None, "没写就是没选过，不能默认成关闭");
+
+        let off: rcgui_profile::SyncTaskRef =
+            serde_json::from_str(r#"{"id":"t2","auto_sync":false}"#).expect("显式关闭能读");
+        assert_eq!(off.auto_sync, Some(false), "文件里写了 false 要照抄");
+
+        let mut cfg = AppConfig::default();
+        apply_sync_tasks(&[old, off], &mut cfg);
+        assert_eq!(cfg.sync_tasks[0].auto_sync, None);
+        assert_eq!(cfg.sync_tasks[1].auto_sync, Some(false));
     }
 
     /// 老配置文件没有 `app` 段时，不能把用户自选的内核路径等设置冲掉。
@@ -1034,6 +1058,7 @@ mod tests {
                 direction: "up".into(),
                 mode: "copy".into(),
                 enabled: true,
+                auto_sync: None,
                 interval_hours: 6,
             },
             rcgui_profile::SyncTaskRef {
@@ -1044,6 +1069,7 @@ mod tests {
                 direction: "down".into(),
                 mode: "sync".into(),
                 enabled: true,
+                auto_sync: None,
                 interval_hours: 12,
             },
         ]);
@@ -1060,6 +1086,7 @@ mod tests {
             direction: "up".into(),
             mode: "copy".into(),
             enabled: false,
+            auto_sync: None,
             interval_hours: 6,
         }]);
         assert!(!flag);

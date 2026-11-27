@@ -24,7 +24,6 @@ use crate::core;
 use crate::plugins;
 use crate::store;
 use crate::sync_tasks;
-use crate::sync_watch;
 use crate::update;
 use crate::{Cmd, Ctx, MainWindow, MaintenanceG, StoreRow, SyncRow};
 

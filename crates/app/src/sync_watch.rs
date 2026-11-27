@@ -652,7 +652,7 @@ mod tests {
         let mut ws = Watchers::default();
         let mut task = base_task(DIR_UP, true, Some(true));
         task.local = dir.to_string_lossy().to_string();
-        ws.sync(&[task]);
+        ws.sync(&[task.clone()]);
         std::thread::sleep(Duration::from_millis(300));
 
         std::fs::remove_dir_all(&dir).expect("整个目录删掉");

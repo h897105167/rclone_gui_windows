@@ -474,6 +474,13 @@ pub struct SyncTaskRef {
     /// `"copy"`（不删目标）| `"sync"`（镜像删除）
     pub mode: String,
     pub enabled: bool,
+    /// 本机文件夹有变化就提前跑一轮。
+    ///
+    /// `None` 表示文件里没写这一项，导入端照「本地新建任务」的规则处理：只要是在
+    /// 本机新建的任务，默认就跟着变化跑（镜像任务除外，见宿主的 `sync_watch`）。
+    /// 写成 `Some(true)` / `Some(false)` 就照抄，不再按默认猜。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_sync: Option<bool>,
     pub interval_hours: u32,
 }
 
