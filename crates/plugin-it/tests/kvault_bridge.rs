@@ -238,6 +238,55 @@ async fn upload_sends_the_picked_bytes_and_the_idempotency_key() {
     plugin_host::upload::revoke(PLUGIN_ID, key);
 }
 
+/// 回包必须带着站点给的直链和去重标记。
+///
+/// 主程序的 `rclone.upload_file` 拿到这个回包后，`link` 非空就把它当图片地址给桌面端，
+/// 空了才会退到「本机代理」那条路——那串 `127.0.0.1` 在别的设备上打不开。
+/// 所以站点回了直链、插件却没往外递，用户在别处就看不到图。
+#[tokio::test]
+async fn the_upload_reply_carries_the_site_link_and_the_dedupe_flag() {
+    let Some(h) = kvault_harness().await else {
+        eprintln!("{SKIP_NOTE}");
+        return;
+    };
+    let path = temp_file("cover.png", b"\x89PNG\r\n\x1a\nfake-bytes");
+    // 键名与主程序 `upload_file_owned` 用的那个一致：一次上传只有一格授权。
+    let key = "remote-0";
+    plugin_host::upload::grant(PLUGIN_ID, key, &path).expect("登记授权失败");
+
+    let got = h
+        .call(
+            "remote.upload",
+            json!({
+                "remote": "vault",
+                "path": "album",
+                "file_name": "cover.png",
+                "file_key": key,
+            }),
+        )
+        .await
+        .expect("remote.upload 调用失败");
+
+    let link = got.get("link").and_then(Value::as_str).unwrap_or("");
+    // 站点在测试里回的是相对地址 `/f/a.png`，插件补全后才是能直接打开的链接。
+    assert!(
+        link.ends_with("/f/a.png"),
+        "直链应该来自站点的回复并补全成完整地址：{}",
+        text_of(&got)
+    );
+    assert!(
+        link.contains("://"),
+        "直链没补全，桌面端拿到的是相对路径：{link}"
+    );
+    assert_eq!(
+        got.get("deduped").and_then(Value::as_bool),
+        Some(false),
+        "站点说这次不是重复文件，回包就该照实说：{}",
+        text_of(&got)
+    );
+    plugin_host::upload::revoke(PLUGIN_ID, key);
+}
+
 #[tokio::test]
 async fn upload_without_a_picked_file_is_refused_before_any_request() {
     let Some(h) = kvault_harness().await else {

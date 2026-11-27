@@ -445,13 +445,15 @@ struct HttpServer {
 impl Ctx {
     /// 一次插件调用的能力集合。
     ///
-    /// 收 `&Arc<Self>` 是为了留下签名余地：能力层自己不需要 `Ctx`，但调用方
-    /// （`plugins.rs` 的 HTTP 入口与面板按钮）手里就是 `&Arc<Ctx>`。
+    /// 收 `&Arc<Self>` 不只是留余地：`rclone.upload_file` 得先弄明白目标远程归谁管，
+    /// 那个判断（`remote_ops::owner_of`）要看插件清单和远程登记表，所以能力层手里
+    /// 需要完整的 `Ctx`。放进去的是同一个 `Arc`，`Ctx` 自己不存 `HostCaps`，不会成环。
     fn caps(self: &Arc<Self>) -> Arc<caps::HostCaps> {
         Arc::new(caps::HostCaps {
             rc: self.rc.clone(),
             store: self.store.clone(),
             progress: self.progress.clone(),
+            ctx: self.clone(),
         })
     }
 }

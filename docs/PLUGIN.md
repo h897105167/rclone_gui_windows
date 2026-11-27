@@ -609,12 +609,18 @@ call_plugin(ctx, id, action_key, form) → 方法 "request"，params 至少含�
 `object not found`，而旧的错误分类又把这条 404 误判成「方法不支持」，最终报成
 `operations/copy: couldn't find method`，真因完全看不见（已在 `caps.rs` / `error.rs` 修掉）。
 
-`rclone.upload_file` 的返回值随远端类型变化：
+`rclone.upload_file` 的返回值随目标远程归谁管而变：
 
 - 普通远端 → `{}`（走 rclone `operations/copyfile`）；
-- **k-vault 远端**（远端类型 `kvault`）→ `{ link, name, deduped }`，因为站点 DAV 写入
-  一律 403，只能走 `POST /api/v1/upload`；分流按**远端类型**判断，与本插件无关，
-  所以任何插件上传到 kvault 远端都拿到 `link`。`deduped: true` 表示站点判为重复并复用了旧文件。
+- **插件托管的远端**（比如远端类型 `kvault`）→ 该插件声明的 `{ link, name, deduped }`，
+  因为这类站点只认它自己的上传接口，DAV 写入一律 403（`this WebDAV endpoint is
+  read-only`）。`deduped: true` 表示站点判为重复并复用了旧文件。
+- 插件没声明接管上传、或认领它的插件当前没启用 → 报错，不会退回原生 `copyfile`
+  （那等于拿错协议去写用户的站点）。
+
+分流按**远程的归属**判断（`crates/app/src/remote_ops.rs` 的 `owner_of`），不写死任何插件：
+任何插件上传到插件托管的远端，都由**那个远端**的插件发字节，拿到的是它回的 `link`。
+宿主只多递过去「哪个文件、发到哪个目录、叫什么名字」，字节不经过 wasm。
 
 `rclone.upload_file` 既能当 `ops`（§5.6，返回值被丢弃），也能当 `need` 直接调用 ——
 **要拿直链就必须用 `need`**：`{"cap":"rclone.upload_file","key":"up","params":{…}}`，
@@ -999,14 +1005,15 @@ kvault_dedup    = 1                        # 同名去重（deduplicate）
 | 操作 | 走哪 | 说明 |
 |---|---|---|
 | 浏览 / 下载 | WebDAV（rclone 正常路径） | 无需改动，rclone 自己处理 |
-| 上传 | `POST /api/v1/upload` | 只在源或目标是 K-Vault 远程时改道（`crates/app/src/caps.rs:264`） |
+| 上传 | `POST /api/v1/upload` | 目标是插件托管的远程时改道（`crates/app/src/remote_ops.rs:526`） |
 | 列目录 | `GET /api/v1/files` | 站点索引，见 `crates/app/src/main.rs:3250` |
 | 删除 | `DELETE /api/v1/file/<id>` | 要先按名字翻出 id（`crates/app/src/main.rs:3297`） |
 | 改名 / 移动 / 新建目录 | 不支持 | 站点只读 + API 没有这些端点，本体直接提示去站点网页端操作 |
 
-插件视角：`rclone.upload_file` 的目标如果是 K-Vault 远程，宿主会把它接到站点 API
-上并回 `{link,name,deduped}`——这是既有插件（图床等）不必改代码就能继续用的**兼容路径**
-（`crates/app/src/caps.rs:419-438`）。插件不需要、也不应该自己去调站点的上传接口。
+插件视角：`rclone.upload_file` 的目标归某个插件管时，宿主把这次上传转给那个插件的
+`remote.upload`，回包里带着它给的 `{link,name,deduped}`——这是既有插件（图床等）不必改代码
+就能继续用的**兼容路径**（`crates/app/src/caps.rs:346` → `remote_ops::upload_file_owned`）。
+插件不需要、也不应该自己去调站点的上传接口。
 
 ### 11.3 令牌从哪来
 

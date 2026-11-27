@@ -245,6 +245,12 @@ pub struct HostCaps {
     pub rc: Arc<RcState>,
     pub store: Arc<KvStore>,
     pub progress: Arc<ProgressHub>,
+    /// 整个程序的状态，只给「按远程所有者分派」这一类判断用。
+    ///
+    /// 比如 `rclone.upload_file` 要先知道这条远程是普通 rclone 远程还是插件托管的，
+    /// 那个判断（`remote_ops::owner_of`）要看插件清单和远程登记表，光有 `rc` 与
+    /// `store` 做不到。`Ctx` 自己不存 `HostCaps`，所以这里放 `Arc<Ctx>` 不会绕成环。
+    pub ctx: Arc<crate::Ctx>,
 }
 
 impl HostCaps {
@@ -327,13 +333,21 @@ impl CapProvider for HostCaps {
         client.call(&method, &params).await.map_err(Into::into)
     }
 
-    // 插件要往「自己管的远程」上传，走的不是这里，而是 `http.upload`：宿主弹对话框
-    // 拿到路径、授权一次发送，字节不经过 wasm。这个函数只管普通 rclone 远程。
+    // `rclone.upload_file` 的目标可能是普通 rclone 远程，也可能是插件托管的那种，
+    // 所以先问一句「这条远程归谁管」，再决定字节交给谁发。
+    //
+    // 为什么不能一律 copyfile：K-Vault 这类远程在内核里就是个 WebDAV 地址，站点只
+    // 放行它自己的接口，原生 PUT 会被回一句 `403 Forbidden: this WebDAV endpoint is
+    // read-only`；而且站点地址、去重开关都在插件手里，只有它能算出给用户的那个直链。
+    //
+    // 插件那一路不把字节塞进 wasm：宿主先把内容落到临时文件，用
+    // [`plugin_host::upload::grant`] 授权这一次发送，再把「哪个文件、发到哪、叫什么
+    // 名字」告诉它。插件读不到别的路径，也读不到第二次。
     async fn upload_file(
         &self,
         fs: String,
         remote_path: String,
-        _filename: String,
+        filename: String,
         data_b64: String,
     ) -> Result<Value> {
         let data = base64::engine::general_purpose::STANDARD
@@ -344,15 +358,34 @@ impl CapProvider for HostCaps {
         let name = format!("up-{}-{}", std::process::id(), chrono_ts());
         let tmp = tmp_dir.join(&name);
         std::fs::write(&tmp, &data)?;
-        let client = self.rc.client().await;
 
-        let r = client
-            .copyfile(&rclone_client::local_fs(&tmp_dir), &name, &fs, &remote_path)
-            .await
-            .map_err(anyhow::Error::from);
+        let r = match crate::remote_ops::upload_file_owned(
+            &self.ctx,
+            &fs,
+            &remote_path,
+            &filename,
+            &tmp,
+        )
+        .await
+        {
+            // 插件传完了：它的回复里带着名字、直链和去重标记，原样往上交，
+            // 上层（imagehost 之类）靠 `link` 决定给用户站点地址还是本机代理地址。
+            Ok(Some(v)) => Ok(v),
+            // 这条远程不归插件管：照旧走原生 copyfile。
+            Ok(None) => {
+                let client = self.rc.client().await;
+                client
+                    .copyfile(&rclone_client::local_fs(&tmp_dir), &name, &fs, &remote_path)
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .map(|()| json!({}))
+            }
+            // 认领者不在或不肯接：如实报出来，不退回原生访问。
+            Err(e) => Err(anyhow!(e)),
+        };
+        // 两条路都在这次调用里读完了文件，临时副本留着只是占盘。
         let _ = std::fs::remove_file(&tmp);
-        r?;
-        Ok(json!({}))
+        r
     }
 
     async fn kv_get_all(&self, plugin_id: &str) -> Result<Value> {

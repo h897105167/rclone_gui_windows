@@ -461,6 +461,102 @@ pub async fn upload_paths(
     Ok(up)
 }
 
+/// 从 rclone 的 `远程:路径` 里取出远程名。
+///
+/// 只有第一段冒号前面才算远程名，而且得像个名字：本地 Windows 路径 `C:\img\a.png`
+/// 的 `C` 也是「冒号前面的一段」，把它当远程名会让一次普通的上传跑去问插件要授权。
+/// 返回 `None` 表示这是本机路径，按原生处理。
+fn remote_name_of(fs: &str) -> Option<&str> {
+    let (name, _) = fs.split_once(':')?;
+    let name = name.trim();
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    // 单个字母当远程名不是没人干过，但更常见的是盘符：`C:` / `D:`。
+    if name.len() == 1 && name.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(name)
+}
+
+/// 这次上传该由谁发字节。
+///
+/// `Ok(None)` 是普通远程，调用方照旧走 rclone；`Ok(Some(id))` 是托管这条远程的插件；
+/// `Err` 是必须原样告诉用户的原因——认领者缺席时绝不能退回原生访问，那等于拿错协议
+/// 去写用户的站点。
+fn pick_uploader(owner: &Owner, remote: &str) -> Result<Option<String>, String> {
+    match owner {
+        Owner::Native => Ok(None),
+        Owner::Orphan { marker } => Err(orphan_msg(remote, marker)),
+        Owner::Plugin { id, .. } if owner.takes(UPLOAD) => Ok(Some(id.clone())),
+        Owner::Plugin { name, .. } => Err(not_taken_msg(remote, UPLOAD, name)),
+    }
+}
+
+/// 目标位置拆成「目录 + 文件名」。
+///
+/// 拼法跟 rclone 的 `copyfile` 一致：`remote_path` 相对 `fs` 的路径部分。换条路走插件
+/// 时口径不能变，否则同一个请求在两种远程上会落到不同位置。
+fn target_of(fs: &str, remote_path: &str, file_name: &str) -> (String, String) {
+    let base = fs.split_once(':').map(|(_, p)| p).unwrap_or("");
+    let rel = if remote_path.trim().is_empty() {
+        file_name
+    } else {
+        remote_path
+    };
+    let full = join_dir(base, rel);
+    if full.is_empty() {
+        return (String::new(), file_name.to_string());
+    }
+    match full.rfind('/') {
+        Some(i) => (full[..i].to_string(), full[i + 1..].to_string()),
+        None => (String::new(), full),
+    }
+}
+
+/// 把已经落在临时文件里的内容交给托管这条远程的插件发送。
+///
+/// `Ok(None)` 表示这条远程不归插件管，调用方该走原生 `copyfile`；`Ok(Some(v))` 是插件
+/// 的回复，里面带着它自己算出的 `name`/`link`/`deduped`（K-Vault 走站点接口，只有它
+/// 知道直链长什么样）。`Err` 会在用户面前原样出现：认领者没启用、或者声明不接上传，
+/// 都在这里被挡住，不会退回到「用错协议写一遍」。
+///
+/// 字节只走一次：`src` 按 [`plugin_host::upload::grant`] 的规矩授权给插件，插件发完
+/// 就作废。失败时主动撤销，免得那张授权在过期前一直留着。
+pub async fn upload_file_owned(
+    ctx: &Arc<Ctx>,
+    fs: &str,
+    remote_path: &str,
+    file_name: &str,
+    src: &std::path::Path,
+) -> Result<Option<Value>, String> {
+    let Some(remote) = remote_name_of(fs) else {
+        return Ok(None);
+    };
+    let owner = owner_of(ctx, remote).await?;
+    let Some(plugin) = pick_uploader(&owner, remote)? else {
+        return Ok(None);
+    };
+    let (dir, name) = target_of(fs, remote_path, file_name);
+    // 授权表的键必须是 ASCII（见 `plugin_host::upload` 的 `is_key`），所以远端文件名
+    // 不能直接当键用：中文名会让这条授权根本建不起来。
+    let key = "remote-0".to_string();
+    plugin_host::upload::grant(&plugin, &key, src).map_err(|e| format!("{e}"))?;
+    let extra = json!({
+        "remote": remote,
+        "path": dir,
+        "file_name": name,
+        "file_key": key,
+    });
+    match forward(ctx, &owner, remote, UPLOAD, extra).await {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => {
+            plugin_host::upload::revoke(&plugin, &key);
+            Err(e)
+        }
+    }
+}
+
 /// 把路径拆成「要发的文件」。目录只展一层还是递归，是宿主的选择：
 /// 用户拖进来的文件夹照惯例是整个传上去，所以递归。
 ///
@@ -995,5 +1091,90 @@ mod tests {
         let claims = BTreeMap::new();
         assert_eq!(resolve_in(&claims, &[], "dav"), Owner::Native);
         assert_eq!(resolve_in(&claims, &table(), "dav"), Owner::Native);
+    }
+
+    // ---- `rclone.upload_file`：字节该由谁发、发到哪儿 ----
+
+    fn uploader(id: &str, name: &str, ops: &[&str]) -> Owner {
+        Owner::Plugin {
+            id: id.into(),
+            name: name.into(),
+            ops: ops.iter().map(|o| (*o).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_windows_drive_is_not_a_remote_name() {
+        // `C:\imgs\a.png` 里冒号前只有盘符。认成远程名的话，一次往本机目录的普通上传
+        // 会跑去问插件要授权，用户看到的提示是「远程 C 由插件提供」。
+        assert_eq!(remote_name_of(r"C:\imgs\a.png"), None);
+        assert_eq!(remote_name_of("D:/imgs/a.png"), None);
+        assert_eq!(remote_name_of("C:/"), None);
+        // 真的远程名照常认。
+        assert_eq!(remote_name_of("kvault:/blog/a.png"), Some("kvault"));
+        assert_eq!(remote_name_of("kvault:"), Some("kvault"));
+        // 冒号前面带路径分隔符的，不是远程名。
+        assert_eq!(remote_name_of("./a:b.png"), None);
+        assert_eq!(remote_name_of(":a.png"), None);
+    }
+
+    #[test]
+    fn a_native_remote_keeps_the_old_path() {
+        // 没有插件认领就得返回 `None`：调用方照旧 copyfile，普通远程的上传行为不变。
+        assert_eq!(pick_uploader(&Owner::Native, "pic"), Ok(None));
+    }
+
+    #[test]
+    fn a_missing_plugin_fails_instead_of_falling_back() {
+        // 插件停用、远程还在：这时候退回原生 copyfile 就是拿 WebDAV 的 PUT 去写一个
+        // 只认自己接口的站点，用户看到的只会是那条莫名其妙的 403。必须明说。
+        let owner = Owner::Orphan {
+            marker: "kvault".into(),
+        };
+        let msg = pick_uploader(&owner, "kvault").expect_err("不能退回原生访问");
+        assert!(msg.contains("没有启用"), "{msg}");
+        assert!(msg.contains("kvault"), "{msg}");
+    }
+
+    #[test]
+    fn a_plugin_that_does_not_take_uploads_says_so() {
+        // 插件甲只声明了 list 与 delete：主程序不能替它猜怎么收文件。
+        let owner = owner_in(&table(), &params(json!({"type": "webdav", "alpha": "1"})));
+        let msg = pick_uploader(&owner, "pic").expect_err("没声明就不接管");
+        assert!(msg.contains("插件甲"), "{msg}");
+        assert!(msg.contains(UPLOAD), "{msg}");
+    }
+
+    #[test]
+    fn the_plugin_that_declares_uploads_gets_the_file() {
+        let owner = uploader("kvault", "K-Vault", &[LIST, UPLOAD]);
+        assert_eq!(
+            pick_uploader(&owner, "kvault"),
+            Ok(Some("kvault".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_target_matches_what_a_native_copy_would_write() {
+        // 与 copyfile 同口径：`remote_path` 相对 `fs` 的路径部分。换条路走插件时位置
+        // 不能变，否则同一个请求在两种远程上会落到不同的地方。
+        assert_eq!(
+            target_of("kvault:/blog", "2024/a.png", "a.png"),
+            ("blog/2024".to_string(), "a.png".to_string())
+        );
+        assert_eq!(
+            target_of("kvault:", "a.png", "a.png"),
+            (String::new(), "a.png".to_string())
+        );
+        // 只给了文件名：目标不能退化成空路径。
+        assert_eq!(
+            target_of("kvault:/blog", "", "IMG_0001.png"),
+            ("blog".to_string(), "IMG_0001.png".to_string())
+        );
+        // 两侧多余的斜杠不能叠出空层。
+        assert_eq!(
+            target_of("kvault:/", "/a.png", "a.png"),
+            (String::new(), "a.png".to_string())
+        );
     }
 }
