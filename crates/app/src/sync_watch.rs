@@ -727,13 +727,21 @@ mod tests {
             .flooded
             .store(true, Ordering::SeqCst);
 
+        // 队列满记下的「欠一轮」和普通变化一样要等静默窗口过去，所以这一次 pump 只报告、不跑。
         let tick = ws.pump(later(t0));
-        assert_eq!(tick.ready, vec!["t1".to_string()], "满一次只该补一轮");
+        assert!(tick.ready.is_empty(), "刚记下的愿望要等静默窗口");
         assert_eq!(tick.problems.len(), 1, "只报一次");
         assert!(tick.problems[0].1.contains("队列满"));
-        // 队列清空了，标志也复位了：再 pump 不该重复报告。
-        let again = ws.pump(later(t0));
+        // 窗口过去了：补一轮，而且只补一轮。
+        assert_eq!(
+            ws.pump(later(later(t0))).ready,
+            vec!["t1".to_string()],
+            "满一次只该补一轮"
+        );
+        // 队列清空了，标志也复位了：再 pump 不该重复报告，也不该再跑一轮。
+        let again = ws.pump(later(later(t0)));
         assert!(again.problems.is_empty(), "同一个问题只说一次");
+        assert!(again.ready.is_empty(), "一轮就够");
     }
 
     #[test]
@@ -753,11 +761,12 @@ mod tests {
         assert_eq!(tick.problems.len(), 1, "目录不在了要报");
         assert!(ws.is_pending("t1"), "待处理状态要留着");
 
-        // 目录回来了：重新接手，并且再确认一轮。
+        // 目录回来了：重新接手，并且再确认一轮（接手记下的愿望同样要等静默窗口）。
         std::fs::create_dir_all(&dir).expect("重建目录");
         assert!(ws.sync(&[task], later(t0)).is_empty());
+        assert!(ws.pump(later(t0)).ready.is_empty(), "刚接手也要等静默窗口");
         assert_eq!(
-            ws.pump(later(t0)).ready,
+            ws.pump(later(later(t0))).ready,
             vec!["t1".to_string()],
             "目录回来后要补一轮"
         );
