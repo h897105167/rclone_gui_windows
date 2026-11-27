@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
 校验插件商店索引 docs/store/index.json。
 
@@ -217,6 +217,11 @@ foreach ($p in $plugins) {
 
 # 与 plugins/manifest.json 交叉核对：同一个插件在两处的 sha256 必须一致，
 # 否则应用按清单拉的和商店页面给人看的是两个不同的包。
+#
+# 清单里有、商店里没有：没问题，那是只随程序分发的插件。
+# 商店里有、清单里没有：也没问题，那是只从商店安装的第三方插件——清单是
+# 「构建时下载、随 exe 分发的白名单」，把别人的包塞进便携包不该是上架的前提。
+# 这里的边界只在于：同一个插件两边都有时，指的必须是同一个包。
 if ($ManifestPath) {
     $manifestFull = if ([System.IO.Path]::IsPathRooted($ManifestPath)) { $ManifestPath } else { Join-Path $root $ManifestPath }
     if (Test-Path -LiteralPath $manifestFull) {
@@ -233,7 +238,7 @@ if ($ManifestPath) {
             foreach ($p in $plugins) {
                 if (-not $p.id) { continue }
                 if (-not $byId.ContainsKey($p.id)) {
-                    Add-Error "商店里有 $($p.id)，但 plugins/manifest.json 里没有。要么清单漏了，要么这个包不是按清单发布的。"
+                    Write-Probe "$($p.id) 只在商店里：不随程序分发，应用按索引里的地址下载并校验。"
                     continue
                 }
                 if ($byId[$p.id].sha256 -ne $p.sha256) {

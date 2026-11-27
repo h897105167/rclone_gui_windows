@@ -641,6 +641,76 @@ mod tests {
         assert!(capability_line("systray").contains("未识别"));
     }
 
+    /// 仓库里那份 `docs/store/index.json` 就是发给用户的清单：写错一个字符，
+    /// 用户点安装会在最后一步被拒。这里直接读那份文件（编译期嵌进来，不联网、
+    /// 不碰凭据），把「能不能装上」在测试里复现一遍。
+    #[test]
+    fn the_shipped_store_index_lets_kvault_in_only_from_0_3_1() {
+        let parsed = parse_index(include_str!("../../../docs/store/index.json"))
+            .expect("仓库里的商店索引读不出来");
+        assert!(
+            parsed.warnings.is_empty(),
+            "索引里有条目过不了自身校验：{:?}",
+            parsed.warnings
+        );
+        let kv = parsed
+            .entries
+            .iter()
+            .find(|e| e.id == "kvault")
+            .expect("商店索引里少了 kvault");
+        assert_eq!(kv.version, "0.3.0", "版本要和发布出来的 zip 同名");
+        assert_eq!(
+            kv.url,
+            "https://github.com/h897105167/rcgui-plugin-kvault/releases/download/v0.3.0/kvault-0.3.0.zip"
+        );
+        // 这条门槛是收录它的全部意义：0.3.1 之前的宿主没有插件远程协议，
+        // 装进去只会在远程列表里显示成没人认领的类型。旧构建必须在安装前被拒。
+        assert_eq!(kv.min_gui_version, "0.3.1");
+        assert!(
+            kv.allows_gui("0.3.0").is_err(),
+            "0.3.0 的宿主不该装得上需要新协议的 K-Vault"
+        );
+        assert!(kv.allows_gui("0.3.1").is_ok());
+        let mut caps = kv.capabilities.clone();
+        caps.sort();
+        assert_eq!(
+            caps,
+            ["http", "kv", "rclone", "ui"],
+            "能力组要和包内 config.json 一致：多写一个就是多要一项授权"
+        );
+    }
+
+    /// 随包发布的插件（`plugins/manifest.json`）如果也在商店里，两处必须指同一个
+    /// 包。PowerShell 校验脚本只在 PR 流程里跑；这条让 `cargo test` 也能拦住
+    /// 「改了一处忘了另一处」——那会让应用按清单拉的包和商店页面展示的不是一个东西。
+    #[test]
+    fn a_bundled_plugin_points_at_the_same_package_in_the_store() {
+        let parsed = parse_index(include_str!("../../../docs/store/index.json"))
+            .expect("仓库里的商店索引读不出来");
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../../plugins/manifest.json"))
+                .expect("plugins/manifest.json 不是合法 JSON");
+        let list = manifest["plugins"]
+            .as_array()
+            .expect("manifest 缺少 plugins");
+        for p in list {
+            let id = p["id"].as_str().unwrap_or_default();
+            let Some(store) = parsed.entries.iter().find(|e| e.id == id) else {
+                continue; // 随包发布但没上架是允许的：商店只服务愿意自己装的用户
+            };
+            assert_eq!(
+                p["sha256"].as_str().unwrap_or_default(),
+                store.sha256,
+                "{id} 在清单与商店里的 sha256 不一致：两个包不是同一个东西"
+            );
+            assert_eq!(
+                p["tag"].as_str().unwrap_or_default(),
+                format!("v{}", store.version),
+                "{id} 的清单 tag 与商店 version 对不上"
+            );
+        }
+    }
+
     #[test]
     fn parse_version_handles_prefix_and_prerelease() {
         assert_eq!(parse_version("v0.3.0"), Some((0, 3, 0)));
