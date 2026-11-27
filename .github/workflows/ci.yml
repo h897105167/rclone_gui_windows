@@ -132,7 +132,7 @@ jobs:
         with:
           repository: h897105167/rcgui-plugin-kvault
           # Split the empty-path meaning between browsing and uploading
-          ref: a88d0408f897698c63ff96894ec98938f13db795
+          ref: 4bf4362d457a697cd912535f2d15be7a6b6e73da
           path: _kvault
 
       - name: 确认插件不在主工作区里
