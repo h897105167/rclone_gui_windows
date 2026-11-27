@@ -27,7 +27,9 @@
   （设计见 [ARCHITECTURE.md §1.1](ARCHITECTURE.md)，实现由核心会话完成，尚未验收。）
 - 插件面板支持图片行、多行文本字段与进度列。
 - 插件商店：`docs/store/index.json` 索引 + 静态商店页（GitHub Pages），
-  收录 `imagehost 0.6.1` 与 `teldrive 0.3.0`，二者 sha256 均已对真实 Release 资产核验。
+  收录 `imagehost 0.6.1`、`kvault 0.3.1` 与 `teldrive 0.3.0`，三者 sha256 均已对真实 Release
+  资产核验；`kvault` 的 `min_gui_version` 写 `0.3.2`，因为它的面板要在用户打字时刷新，
+  更低的构建装上去只会看到按钮一直是灰的。
 - CLI 规格：[CLI.md](CLI.md) 定义 `--version`、`--diagnostics --json`、
   `--validate-config <path>`、`--list-plugins`、`--export-accessibility-tree <path>`。
   文档同时说明静态可访问性树与真实 UIA 树的区别。

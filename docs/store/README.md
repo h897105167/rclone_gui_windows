@@ -126,10 +126,10 @@
 
 ## 现在的状态
 
-- 索引里目前是三个真实发布过的插件：`imagehost` 0.6.1、`kvault` 0.3.0、`teldrive` 0.3.0，
+- 索引里目前是三个真实发布过的插件：`imagehost` 0.6.1、`kvault` 0.3.1、`teldrive` 0.3.0，
   三者的 sha256 都对着 GitHub Release 资产核过。
 - `imagehost` 与 `teldrive` 同时在 `plugins/manifest.json` 里（随程序发布），
-  `kvault` 只在商店里：它需要 RCGUI 0.3.1 起的宿主协议，所以 `min_gui_version` 写的是 0.3.1，
-  仍标着 0.3.0 的旧构建会在安装前被拒。
+  `kvault` 只在商店里：它的面板要在用户打字时跟着刷新，这需要 RCGUI 0.3.2 起的宿主，
+  所以 `min_gui_version` 写的是 0.3.2，0.3.1 及更早的构建会在安装前被拒。
 - 应用里的商店页已经能用（列出、安装、更新、卸载）。页面上点"下载 zip"仍是手动路径，
   适合核对哈希或离线安装。
