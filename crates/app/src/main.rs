@@ -3423,7 +3423,7 @@ pub(crate) async fn refresh_remote_types(ctx: &Arc<Ctx>, ui: &Weak<MainWindow>) 
             toast_ui(
                 &u,
                 2,
-                t("这个类型在当前内核里没有了：请重新选一个类型再保存"),
+                rcgui_i18n::t("这个类型在当前内核里没有了：请重新选一个类型再保存"),
             );
         }
     });
