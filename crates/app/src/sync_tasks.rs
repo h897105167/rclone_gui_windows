@@ -614,7 +614,7 @@ mod tests {
             direction: DIR_UP.into(),
             mode: MODE_COPY.into(),
             enabled: true,
-            auto_sync: true,
+            auto_sync: None,
             interval_hours: DEFAULT_HOURS,
             last_run: String::new(),
             last_status: String::new(),

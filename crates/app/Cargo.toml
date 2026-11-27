@@ -54,4 +54,7 @@ async-trait = { workspace = true }
 semver = { workspace = true }
 rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# 本机文件夹的变化由系统通知（Windows 上是 ReadDirectoryChangesW）推动，不再靠定时比对
+# 文件数和总字节——那种比法会漏掉"改写一个同样大小的旧文件"和"改名"。
+notify = "8"
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_Globalization", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_Console"] }

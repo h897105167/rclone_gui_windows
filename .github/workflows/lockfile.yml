@@ -1,0 +1,28 @@
+name: 生成锁文件（临时）
+
+# 这台机器上跑不了 cargo（杀毒软件会隔离 Rust 的编译产物和测试程序），所以
+# 新依赖的 Cargo.lock 条目只能在 Actions 上解析出来，再把锁文件当产物带回来提交。
+# 锁文件进仓库之后这个工作流就该删掉，它的存在只为这一次。
+
+on:
+  push:
+    branches: ['fix/kvault-root-and-folder-sync-auto']
+    paths: ['crates/app/Cargo.toml']
+
+jobs:
+  lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo fetch
+        # fetch 只会补上缺的包，不会顺手把别的依赖升到最新版本。
+        run: cargo fetch
+      - name: 确认锁文件里确实记下了 notify
+        run: |
+          grep -A2 '^name = "notify"' Cargo.lock
+          grep -c '^\[\[package\]\]' Cargo.lock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Cargo.lock
+          path: Cargo.lock
+          if-no-files-found: error
