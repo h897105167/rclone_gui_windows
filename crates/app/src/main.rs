@@ -13165,6 +13165,21 @@ mod tests {
         }
     }
 
+    /// 「文件夹同步」这一页新加的界面文案同样要有 msgid。
+    ///
+    /// 侧栏标签、卡片标题、行内的自动开关三处缺任何一条，英文界面上就会混进中文。
+    #[test]
+    fn folder_sync_page_strings_have_a_po_entry() {
+        let po = include_str!("../ui/i18n/en/LC_MESSAGES/rclone-gui.po");
+        for msgid in ["文件夹同步", "同步任务", "自动：开", "自动：关"] {
+            let entry = format!("msgid \"{msgid}\"");
+            assert!(
+                po.contains(entry.as_str()),
+                "`.po` 缺少 msgid「{msgid}」，英文界面会显示中文"
+            );
+        }
+    }
+
     /// 用户挑过的文件授权必须在三条退出路径上一起失效：插件停用、插件卸载、程序退出。
     ///
     /// 少任何一条，后果都不是「多留一条记录」：停用的插件仍能把那个文件发出去，
