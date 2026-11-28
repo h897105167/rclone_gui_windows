@@ -2,7 +2,8 @@
 #
 # 这里不判断界面好不好用。Slint 窗口、拖拽、和真实 rclone 的交互在云上跑不了，
 # 那部分由人工在本机验收（见 CONTRIBUTING.md 的审查门槛）。
-# 真正出发布件的流程在 release.yml，只有打 tag 或人工触发才会跑。
+# 真正出发布件的流程在 release.yml，只有打 tag 或人工触发才会跑；人工触发只把安装包
+# 和便携版留成 workflow artifact，不创建 Release。
 name: ci
 
 on:
@@ -10,6 +11,11 @@ on:
     branches: [main, master]
   pull_request:
   workflow_dispatch:
+  # 每天也跑一次：依赖、runner 镜像、宿主协议任何一边悄悄变了，没人推代码也能发现。
+  # 定时跑出来的红不会自动开 issue——修不修、什么时候修，由人决定。
+  # cron 用 UTC：19:23 UTC 是北京时间 03:23。避开整点，GitHub 的整点排队最久。
+  schedule:
+    - cron: "23 19 * * *"
 
 # 默认只读：CI 只需要读代码，写权限只给 release.yml。
 permissions:

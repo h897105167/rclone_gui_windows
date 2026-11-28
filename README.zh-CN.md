@@ -93,6 +93,12 @@ cd rclone_gui_windows
 
 需要：Windows 10/11 x64、带 MSVC 工具链的 Rust，以及给插件用的 `rustup target add wasm32-wasip1`。WinFsp 可选，只有挂载页需要。
 
+### 在 GitHub 上构建（不需要本机工具链）
+
+每次推送、每个 PR，以及每天 19:23 UTC 都会在 GitHub 的 runner 上跑 `.github/workflows/ci.yml`：格式、Windows 上的全部测试、一个把固定版本的插件编成 wasm 并跑跨仓库用例的任务，外加一个便携版冒烟包。
+
+不想在本机装工具链、只要安装包的话，手动跑 **release**（`Actions` → `release` → `Run workflow`，选分支）：它把 `RCGUI-<版本>-windows-x64-setup.exe`、便携包和 `SHA256SUMS` 一起传成可下载的 artifact。手动跑不会创建 Release —— 那一步只在 `v*` tag 上执行。
+
 ## 性能
 
 0.3.0 不发布性能数字，因为还没有 0.3.0 的构建被量过。测量工具在仓库里，谁都能跑：

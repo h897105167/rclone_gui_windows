@@ -93,6 +93,12 @@ Packaging (`.\scripts\build-release.ps1`) refuses to run if the core or its `COP
 
 Requirements: Windows 10/11 x64, Rust with the MSVC toolchain, and `rustup target add wasm32-wasip1` for the plugins. WinFsp is optional and only needed for the Mounts page.
 
+### Build in the cloud
+
+Every push, every pull request and a daily run at 19:23 UTC of `.github/workflows/ci.yml` happens on GitHub's runners: formatting, the full test suite on Windows, one job that compiles the pinned plugin to wasm and runs the cross-repository tests, and a portable smoke package.
+
+For a real installer without a local toolchain, run **release** by hand (`Actions` → `release` → `Run workflow`, pick the branch). It uploads `RCGUI-<version>-windows-x64-setup.exe`, the portable zip and `SHA256SUMS` as one downloadable artifact. A manual run never creates a Release — that step only runs for a `v*` tag.
+
 ## Performance
 
 No performance numbers are published for 0.3.0, because no 0.3.0 build has been measured. The measurement tool is in the repository and anyone can run it:
